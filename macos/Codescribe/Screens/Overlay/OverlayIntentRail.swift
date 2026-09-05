@@ -157,6 +157,9 @@ struct OverlayIntentRail: View {
       .padding(.horizontal, 16)
       .padding(.vertical, 7)
       .allowsHitTesting(false)
+      .overlay {
+        OverlayWindowDragRegion(identifier: "overlay-dock-inert-drag-region")
+      }
 
       OverlayDockButton(
         title: "Show overlay actions",

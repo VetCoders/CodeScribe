@@ -75,6 +75,9 @@ final class OverlayController: ObservableObject {
   private let panelFactory: @MainActor (OverlayState, TextScaleController) -> NSPanel
   private let orderPanelFront: @MainActor (NSPanel) -> Void
   private let orderPanelOut: @MainActor (NSPanel) -> Void
+  /// A direct edge resize is the user's size decision for the current session.
+  /// The next recording may breathe again from that persisted starting point.
+  private var automaticContentSizingEnabled = true
   /// Latched across the session (preparing → started → stopped) because the
   /// Rust controller clears its assistive flag right after the stop pipeline —
   /// a single read at finalize would race it. Mid-hold upgrades (Fn → Fn+Shift)
@@ -121,6 +124,7 @@ final class OverlayController: ObservableObject {
     // terminal beat resets unconditionally.
     state.onRecordingPreparing = { [weak self] in
       guard let self else { return }
+      self.automaticContentSizingEnabled = true
       self.sessionWasAssistive = false
       self.refreshAssistiveLatch()
       self.showForRecording()
@@ -156,6 +160,9 @@ final class OverlayController: ObservableObject {
     // transcript overlay preference is off. The typed status is passive; this
     // seam only brings its already-reduced card on screen.
     state.onPresentationStatus = { [weak self] in self?.show() }
+    state.onTranscriptPresentationChanged = { [weak self] in
+      self?.resizeForProjectedContent()
+    }
     state.onSuccessfulDictation = {
       Task { @MainActor in
         _ = await ActivationPing.shared.recordFirstSuccessfulDictation()
@@ -210,11 +217,17 @@ final class OverlayController: ObservableObject {
         }
         self.state.userDraggedOverlay()
       }
+      floating.onUserResize = { [weak self] in
+        guard let self, !Self.isApplyingFrame else { return }
+        self.automaticContentSizingEnabled = false
+        self.state.userResizedOverlay()
+      }
     }
     // A pending fade-out must not leave a freshly shown panel invisible.
     panel.alphaValue = 1
     applyPlacement(animated: false)
     orderPanelFront(panel)
+    resizeForProjectedContent()
   }
 
   /// True while we `setFrame` from prefs. AppKit still fires `windowDidMove`
@@ -247,6 +260,41 @@ final class OverlayController: ObservableObject {
     } else {
       panel.setFrame(frame, display: false)
     }
+  }
+
+  /// Grow only: short projections keep the user's/restored resting size, long
+  /// projections reveal more lines until 60% of the visible screen, then the
+  /// native transcript scroll view takes over. Window-frame writes are direct
+  /// and unanimated; content keeps its existing reveal transition instead of
+  /// morphing the glass panel or exporting hosting constraints.
+  private func resizeForProjectedContent() {
+    guard automaticContentSizingEnabled, let panel else { return }
+    let screen = panel.screen ?? NSScreen.main
+    let text = state.mode == .formatted ? state.revisionDraft : state.listeningDisplay
+    let targetHeight = OverlayContentSizePolicy.preferredHeight(
+      for: text,
+      width: panel.frame.width,
+      textScale: textScale.scale,
+      screen: screen
+    )
+    guard targetHeight > panel.frame.height + 0.5 else { return }
+
+    Self.isApplyingFrame = true
+    defer { Self.isApplyingFrame = false }
+    let size = NSSize(width: panel.frame.width, height: targetHeight)
+    let origin: NSPoint
+    if state.freeMotion, let visible = screen?.visibleFrame {
+      origin = OverlayPlacement.clampOrigin(
+        NSPoint(x: panel.frame.minX, y: panel.frame.maxY - targetHeight),
+        size: size,
+        in: visible
+      )
+    } else {
+      origin =
+        OverlayPlacement.origin(for: state.placementAnchor, size: size, on: screen)
+        ?? NSPoint(x: panel.frame.minX, y: panel.frame.maxY - targetHeight)
+    }
+    panel.setFrame(NSRect(origin: origin, size: size), display: true)
   }
 
   func markStopped() {

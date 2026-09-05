@@ -28,7 +28,6 @@ struct DictationOverlayView: View {
   private let windowMinWidth: CGFloat = 320
   private let bodyMinHeight: CGFloat = 130
   private let transcriptMinHeight: CGFloat = 96
-  private let headerChromeInset: CGFloat = 46
   private var palette: OverlayAppearancePalette {
     OverlayAppearancePalette.resolve(colorScheme)
   }
@@ -84,19 +83,20 @@ struct DictationOverlayView: View {
   }
 
   private func canvasStack<IntentRail: View>(_ intentRail: IntentRail) -> some View {
-    ZStack {
-      bodySection
-
-      VStack(alignment: .leading, spacing: 0) {
-        header
-        hairline(0.06)
-        Spacer(minLength: 0)
-          .allowsHitTesting(false)
-        hairline(0.05)
-        intentRail
-          .background { OverlayWindowDragRegion() }
+    bodySection
+      .safeAreaInset(edge: .top, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+          header
+          hairline(0.06)
+        }
       }
-    }
+      .safeAreaInset(edge: .bottom, spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+          hairline(0.05)
+          intentRail
+            .background { OverlayWindowDragRegion(identifier: "overlay-dock-drag-region") }
+        }
+      }
   }
 
   /// 1px separator matching the mock's hairline borders.
@@ -115,7 +115,7 @@ struct DictationOverlayView: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
     .modifier(OverlayHeaderChrome(palette: palette))
-    .background { OverlayWindowDragRegion() }
+    .background { OverlayWindowDragRegion(identifier: "overlay-header-drag-region") }
   }
 
   private var fullHeader: some View {
@@ -131,7 +131,9 @@ struct DictationOverlayView: View {
           .foregroundStyle(palette.primaryText.color)
           .allowsHitTesting(false)
       }
-      .allowsHitTesting(false)
+      .overlay {
+        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
+      }
       phaseStatus(text: state.statusText)
 
       if state.mode == .listening || state.mode == .finalizing {
@@ -152,9 +154,14 @@ struct DictationOverlayView: View {
   /// projected phase, real level evidence, and time never collapse vertically.
   private var narrowHeader: some View {
     HStack(spacing: 7) {
-      ModeDot(color: CSColor.terracotta, size: 9)
-        .accessibilityHidden(true)
-      phaseStatus(text: state.compactStatusText)
+      HStack(spacing: 7) {
+        ModeDot(color: CSColor.terracotta, size: 9)
+          .accessibilityHidden(true)
+        phaseStatus(text: state.compactStatusText)
+      }
+      .overlay {
+        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
+      }
       if state.mode == .listening || state.mode == .finalizing {
         chromeWaveform(barCount: 10)
       }
@@ -251,7 +258,7 @@ struct DictationOverlayView: View {
     .padding(.horizontal, 20)
     .padding(.top, 4)
     .padding(.bottom, 10)
-    .background { OverlayWindowDragRegion() }
+    .background { OverlayWindowDragRegion(identifier: "overlay-body-drag-region") }
     // Transcript content must never paint into the footer during live resize.
     .clipped()
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.mode)
@@ -261,8 +268,6 @@ struct DictationOverlayView: View {
     // Transcript is the product. Audio evidence lives in the primary chrome
     // waveform; do not restack a decorative strip above the words.
     transcriptScroll
-      .padding(.top, headerChromeInset)
-      .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Native live transcript: follows the newest words until the user clicks or
@@ -276,6 +281,7 @@ struct DictationOverlayView: View {
         text: state.listeningDisplay,
         appearance: palette.appearance
       )
+      .modifier(OverlayScrollEdgeEffects())
       .overlay(alignment: .bottomTrailing) {
         BlinkingCaret()
           .padding(.trailing, 3)
@@ -353,8 +359,6 @@ struct DictationOverlayView: View {
       alignment: .topLeading
     )
     .clipped()
-    .padding(.top, headerChromeInset)
-    .padding(.bottom, OverlayDockLayout.height)
     .accessibilityLabel("Final transcript")
     .accessibilityValue(state.revisionDraft)
     .accessibilityIdentifier("overlay-transcript-formatted")
@@ -380,8 +384,6 @@ struct DictationOverlayView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
-    .padding(.top, headerChromeInset)
-    .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Terminal outcome for a recording/transcription failure. Unlike a toast, this
@@ -405,8 +407,6 @@ struct DictationOverlayView: View {
       }
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
-    .padding(.top, headerChromeInset)
-    .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Rust supplies every word and classification. The canvas only paints the
@@ -428,8 +428,6 @@ struct DictationOverlayView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
-    .padding(.top, headerChromeInset)
-    .padding(.bottom, OverlayDockLayout.height)
     .accessibilityElement(children: .combine)
     .accessibilityIdentifier("overlay-presentation-status")
   }

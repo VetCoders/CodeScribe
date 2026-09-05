@@ -15,6 +15,7 @@ final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
   var onUserMove: (() -> Void)?
   var onUserResize: (() -> Void)?
   fileprivate var presence: OverlayPresence?
+  private var dragStart: (mouse: NSPoint, frame: NSRect)?
 
   func startPresence() {
     presence?.start()
@@ -27,6 +28,46 @@ final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
   override var canBecomeKey: Bool { allowsKeyForEdit }
   override var canBecomeMain: Bool { false }
   var allowsKeyForEdit = false
+
+  /// A non-activating panel does not turn SwiftUI background hits into window
+  /// motion, so intercept only explicit AppKit drag regions and true container
+  /// gaps outside the hosting view.
+  /// Native transcript descendants and SwiftUI control descendants continue
+  /// through ordinary AppKit dispatch untouched.
+  override func sendEvent(_ event: NSEvent) {
+    if event.type == .leftMouseDown { dragStart = nil }
+    switch event.type {
+    case .leftMouseDown where isWindowDragHit(at: event.locationInWindow):
+      dragStart = (screenPoint(for: event), frame)
+    case .leftMouseDragged where dragStart != nil:
+      guard let dragStart else { return }
+      let current = screenPoint(for: event)
+      setFrameOrigin(
+        NSPoint(
+          x: dragStart.frame.minX + current.x - dragStart.mouse.x,
+          y: dragStart.frame.minY + current.y - dragStart.mouse.y
+        )
+      )
+    case .leftMouseUp where dragStart != nil:
+      dragStart = nil
+    default:
+      super.sendEvent(event)
+    }
+  }
+
+  func isWindowDragHit(at point: NSPoint) -> Bool {
+    guard let contentView, let hit = contentView.hitTest(point) else { return false }
+    return hit is OverlayWindowDragRegionView
+      || hit === contentView
+  }
+
+  private func screenPoint(for event: NSEvent) -> NSPoint {
+    if let point = event.cgEvent?.location {
+      // Quartz is top-left/y-down; AppKit window origins are bottom-left/y-up.
+      return NSPoint(x: point.x, y: -point.y)
+    }
+    return convertPoint(toScreen: event.locationInWindow)
+  }
 
   func windowDidMove(_ notification: Notification) {
     onUserMove?()
@@ -191,9 +232,8 @@ enum DictationOverlayWindow {
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     panel.isFloatingPanel = true
     panel.hidesOnDeactivate = false
-    // Explicit SwiftUI regions own window dragging. This flag remains enabled
-    // for the narrow macOS 14 compatibility view inside those regions only.
-    panel.isMovableByWindowBackground = true
+    // One explicit AppKit path owns dragging on every supported OS version.
+    panel.isMovableByWindowBackground = false
 
     panel.titleVisibility = .hidden
     panel.titlebarAppearsTransparent = true

@@ -339,6 +339,10 @@ final class OverlayState {
   var onRecordingStarted: (() -> Void)?
   var onRecordingStopped: (() -> Void)?
   @ObservationIgnored var onPresentationStatus: (() -> Void)?
+  /// Presentation-only invalidation seam. The window controller may use the
+  /// already-admitted projection to grow its canvas; no transcript bytes leave
+  /// this passive overlay boundary.
+  @ObservationIgnored var onTranscriptPresentationChanged: (() -> Void)?
   /// Content-free success seam. No transcript crosses this callback.
   var onSuccessfulDictation: (() -> Void)?
 
@@ -1454,6 +1458,7 @@ final class OverlayState {
       acousticReceipts: acousticReceipts
     )
     applyProjection(projection)
+    onTranscriptPresentationChanged?()
   }
 
   private func applyProjection(_ projection: OverlayTranscriptProjection) {
