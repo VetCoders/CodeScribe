@@ -18,6 +18,7 @@ struct DictationOverlayView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   @Bindable var state: OverlayState
+  var dockInitiallyExpanded = false
 
   // Geometry constants local to this surface. The window is user-resizable;
   // content fills the frame and never goes narrower than `windowMinWidth`.
@@ -26,28 +27,14 @@ struct DictationOverlayView: View {
   private let windowMinWidth: CGFloat = 320
   private let bodyMinHeight: CGFloat = 130
   private let transcriptMinHeight: CGFloat = 96
+  private let headerChromeInset: CGFloat = 46
   private var palette: OverlayAppearancePalette {
     OverlayAppearancePalette.resolve(colorScheme)
   }
 
   var body: some View {
     OverlayCanvasSurface(palette: palette) {
-      VStack(alignment: .leading, spacing: 0) {
-        header
-        hairline(0.06)
-        bodySection
-        hairline(0.05)
-        footer
-      }
-    }
-    .overlay(alignment: .trailing) {
-      OverlayIntentRail(
-        phase: state.statusText,
-        intents: OverlayIntentRail.projectedIntents(for: state),
-        palette: palette,
-        onIntent: state.relayIntent
-      )
-      .padding(.trailing, CSSpace.sm)
+      sharedChromeContainer
     }
     .csFocusPolicy()
     .frame(minWidth: windowMinWidth, maxWidth: .infinity, maxHeight: .infinity)
@@ -71,6 +58,41 @@ struct DictationOverlayView: View {
     }
   }
 
+  @ViewBuilder
+  private var sharedChromeContainer: some View {
+    if #available(macOS 26.0, *) {
+      GlassEffectContainer(spacing: 0) {
+        canvasStack
+      }
+    } else {
+      canvasStack
+    }
+  }
+
+  private var canvasStack: some View {
+    ZStack {
+      bodySection
+
+      VStack(alignment: .leading, spacing: 0) {
+        header
+        hairline(0.06)
+        Spacer(minLength: 0)
+          .allowsHitTesting(false)
+        hairline(0.05)
+        OverlayIntentRail(
+          phase: state.statusText,
+          intents: OverlayIntentRail.projectedIntents(for: state),
+          palette: palette,
+          footerEngineLabel: state.footerEngineLabel,
+          footerNotice: state.toast,
+          footerEngineDot: footerEngineDot,
+          initiallyExpanded: dockInitiallyExpanded,
+          onIntent: state.relayIntent
+        )
+      }
+    }
+  }
+
   /// 1px separator matching the mock's hairline borders.
   private func hairline(_ alpha: Double) -> some View {
     palette.border.color.opacity(alpha / max(palette.border.alpha, 0.001)).frame(height: 1)
@@ -86,6 +108,7 @@ struct DictationOverlayView: View {
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
+    .modifier(OverlayHeaderChrome(palette: palette))
   }
 
   private var fullHeader: some View {
@@ -224,6 +247,8 @@ struct DictationOverlayView: View {
     // Transcript is the product. Audio evidence lives in the primary chrome
     // waveform; do not restack a decorative strip above the words.
     transcriptScroll
+      .padding(.top, headerChromeInset)
+      .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Native live transcript: follows the newest words until the user clicks or
@@ -256,11 +281,14 @@ struct DictationOverlayView: View {
         .lineSpacing(6)
         .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .topLeading)
+        .padding(.top, headerChromeInset)
+        .padding(.bottom, OverlayDockLayout.height)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .topLeading)
     .accessibilityLabel("Final transcript")
     .accessibilityValue(state.formattedText)
     .accessibilityIdentifier("overlay-transcript-formatted")
+    .modifier(OverlayScrollEdgeEffects())
   }
 
   /// Terminal outcome for a session that captured no usable speech. Replaces
@@ -283,6 +311,8 @@ struct DictationOverlayView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
+    .padding(.top, headerChromeInset)
+    .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Terminal outcome for a recording/transcription failure. Unlike a toast, this
@@ -306,6 +336,8 @@ struct DictationOverlayView: View {
       }
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
+    .padding(.top, headerChromeInset)
+    .padding(.bottom, OverlayDockLayout.height)
   }
 
   /// Rust supplies every word and classification. The canvas only paints the
@@ -327,33 +359,10 @@ struct DictationOverlayView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
+    .padding(.top, headerChromeInset)
+    .padding(.bottom, OverlayDockLayout.height)
     .accessibilityElement(children: .combine)
     .accessibilityIdentifier("overlay-presentation-status")
-  }
-
-  // MARK: Footer
-
-  private var footer: some View {
-    HStack(spacing: 8) {
-      HStack(spacing: 6) {
-        Text("●").foregroundStyle(footerEngineDot)
-        // Product truth: never hardcode "local whisper". Chip = last serving
-        // engine when known, else preference (Apple live default).
-        Text(state.footerEngineLabel).foregroundStyle(palette.mutedText.color)
-        if let toast = state.toast, !toast.isEmpty {
-          Text("·").foregroundStyle(palette.mutedText.color)
-          Text(toast)
-            .foregroundStyle(palette.mutedText.color)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .accessibilityIdentifier("overlay-footer-notice")
-        }
-      }
-      Spacer(minLength: 0)
-    }
-    .csMono(10, .medium)
-    .padding(.horizontal, 16)
-    .padding(.vertical, 7)
   }
 
   private var footerEngineDot: Color {
@@ -361,6 +370,36 @@ struct DictationOverlayView: View {
     if label.contains("apple") { return CSColor.oliveLight }
     if label.contains("whisper") { return CSColor.olive }
     return CSColor.amber
+  }
+}
+
+private struct OverlayHeaderChrome: ViewModifier {
+  let palette: OverlayAppearancePalette
+
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if #available(macOS 26.0, *) {
+      content.glassEffect(
+        .regular,
+        in: RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous)
+      )
+    } else {
+      content.background(
+        palette.surfaceTint.color,
+        in: RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous)
+      )
+    }
+  }
+}
+
+private struct OverlayScrollEdgeEffects: ViewModifier {
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if #available(macOS 26.0, *) {
+      content.scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+    } else {
+      content
+    }
   }
 }
 
@@ -375,6 +414,67 @@ struct DictationOverlayView: View {
       .frame(width: width, height: height)
       .padding(CSSpace.previewInset)
       .background(CSColor.windowWash)
+  }
+
+  @ViewBuilder
+  private func dockPreviewRow(
+    _ title: String,
+    collapsedLight: OverlayState,
+    expandedLight: OverlayState,
+    collapsedDark: OverlayState,
+    expandedDark: OverlayState
+  ) -> some View {
+    Text(title)
+      .font(.headline)
+    overlayPreviewCanvas(width: 320, height: 260) {
+      DictationOverlayView(state: collapsedLight)
+    }
+    .preferredColorScheme(.light)
+    overlayPreviewCanvas(width: 320, height: 260) {
+      DictationOverlayView(state: expandedLight, dockInitiallyExpanded: true)
+    }
+    .preferredColorScheme(.light)
+    overlayPreviewCanvas(width: 320, height: 260) {
+      DictationOverlayView(state: collapsedDark)
+    }
+    .preferredColorScheme(.dark)
+    overlayPreviewCanvas(width: 320, height: 260) {
+      DictationOverlayView(state: expandedDark, dockInitiallyExpanded: true)
+    }
+    .preferredColorScheme(.dark)
+  }
+
+  #Preview("Dock matrix · 320 pt") {
+    ScrollView {
+      VStack(spacing: CSSpace.section) {
+        dockPreviewRow(
+          "Listening",
+          collapsedLight: .previewListening(), expandedLight: .previewListening(),
+          collapsedDark: .previewListening(), expandedDark: .previewListening()
+        )
+        dockPreviewRow(
+          "Finalizing",
+          collapsedLight: .previewTranscribing(), expandedLight: .previewTranscribing(),
+          collapsedDark: .previewTranscribing(), expandedDark: .previewTranscribing()
+        )
+        dockPreviewRow(
+          "Formatted",
+          collapsedLight: .previewFormatted(), expandedLight: .previewFormatted(),
+          collapsedDark: .previewFormatted(), expandedDark: .previewFormatted()
+        )
+        dockPreviewRow(
+          "No speech",
+          collapsedLight: .previewNoSpeech(), expandedLight: .previewNoSpeech(),
+          collapsedDark: .previewNoSpeech(), expandedDark: .previewNoSpeech()
+        )
+        dockPreviewRow(
+          "Error",
+          collapsedLight: .previewError(), expandedLight: .previewError(),
+          collapsedDark: .previewError(), expandedDark: .previewError()
+        )
+      }
+      .padding()
+    }
   }
 
   #Preview("Listening") {
