@@ -772,7 +772,17 @@ impl LocalWhisperEngine {
             }
 
             let overlap_end_secs = covered_until_secs.max(start_sec);
-            merge_chunk_transcripts(&mut merged, transcript, overlap_end_secs)?;
+            let window_segments = transcript.segments.len();
+            let window_chars = transcript.text.chars().count();
+            merge_chunk_transcripts(&mut merged, transcript, overlap_end_secs).with_context(
+                || {
+                    format!(
+                        "long-file window {start_sec:.2}-{end_sec:.2}s \
+                         (overlap_end {overlap_end_secs:.2}s, {window_segments} segments, \
+                         {window_chars} chars)"
+                    )
+                },
+            )?;
             covered_until_secs = covered_until_secs.max(end_sec);
         }
 
