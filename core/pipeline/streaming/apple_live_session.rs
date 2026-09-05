@@ -2179,11 +2179,86 @@ fn admit_ledger_label(
     Some(receipt)
 }
 
+/// Admit only whole-session final-pass segments that fit wholly inside one
+/// material uncovered speech range.
+///
+/// The segment's own PCM range becomes the occurrence. A segment that crosses
+/// a coverage boundary is ambiguous: some of its words may already belong to
+/// a committed Apple occurrence, so admitting its text against the whole gap
+/// would duplicate speech. Such a segment is diagnostic evidence only and the
+/// terminal coverage remains incomplete.
+fn admit_full_pass_gap_segments(
+    state: &mut AppleSealState,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    full_pass: &TailProviderPayload,
+    uncovered_speech_ranges: &[TailSampleRange],
+    threshold_samples: u64,
+    gap_energy: EnergyAdmission,
+) -> usize {
+    let material_gaps = uncovered_speech_ranges
+        .iter()
+        .filter(|range| range.sample_end.saturating_sub(range.sample_start) > threshold_samples)
+        .collect::<Vec<_>>();
+    let mut admitted = 0usize;
+
+    for (generation, segment) in full_pass.segments.iter().enumerate() {
+        let label = segment.text.trim();
+        if label.is_empty() {
+            continue;
+        }
+        let Some(_) = material_gaps
+            .iter()
+            .find(|gap| gap.contains(&segment.range))
+        else {
+            if material_gaps.iter().any(|gap| gap.overlaps(&segment.range)) {
+                let _ = ev_tx.send(EngineEvent::Warning {
+                    code: "seal_coverage_full_pass_segment_straddles_gap".to_string(),
+                    message: format!(
+                        "segment {}..{} crosses a committed/uncovered PCM boundary",
+                        segment.range.sample_start, segment.range.sample_end
+                    ),
+                });
+            }
+            continue;
+        };
+
+        let observation = LedgerObservationIdentity::new(
+            LedgerObservationProducer::Whisper,
+            full_pass.identity.request_id,
+            generation as u64,
+            OccurrenceIdentity::from(&segment.range),
+        );
+        if admit_ledger_label(
+            state,
+            ev_tx,
+            LabelAdmission {
+                observation,
+                label,
+                energy: gap_energy,
+            },
+        )
+        .is_some()
+        {
+            admitted = admitted.saturating_add(1);
+        }
+    }
+
+    if admitted == 0 && !material_gaps.is_empty() {
+        let _ = ev_tx.send(EngineEvent::Warning {
+            code: "seal_coverage_full_pass_gap_unresolved".to_string(),
+            message: "whole-session final pass had no segment wholly contained in a material gap"
+                .to_string(),
+        });
+    }
+    admitted
+}
+
 /// Compare committed occurrence coverage with the existing Silero speech
 /// ledger (or the capture energy ladder when Silero produced no spans), then
-/// offer every material hole to Whisper on its exact PCM range. The
-/// whole-session pass is retained only as comparison evidence; gap text enters
-/// exclusively through `admit_ledger_label` below.
+/// offer timestamped evidence from one context-preserving whole-session
+/// Whisper pass to every material hole. Gap text enters only through exact
+/// segment PCM occurrences; the pass's unscoped rendered string remains
+/// comparison evidence.
 fn repair_terminal_seal_coverage(
     state: &mut AppleSealState,
     ev_tx: &mpsc::UnboundedSender<EngineEvent>,
@@ -2234,7 +2309,7 @@ fn repair_terminal_seal_coverage(
             sample_start: first.sample_start,
             sample_end: last.sample_end,
         });
-    let comparison = full_range.and_then(|range| {
+    let full_pass = full_range.and_then(|range| {
         let window = state
             .audio
             .window_by_samples(range.sample_start, range.sample_end)?;
@@ -2247,12 +2322,7 @@ fn repair_terminal_seal_coverage(
             language: language.map(str::to_owned),
         };
         match InProcessTailProvider.transcribe(&request, &window.samples) {
-            Ok(payload) if !payload.text.trim().is_empty() => {
-                Some(TranscriptComparisonReceipt::new(
-                    apple_text.clone(),
-                    payload.text.trim().to_string(),
-                ))
-            }
+            Ok(payload) if !payload.text.trim().is_empty() => Some(payload),
             Ok(_) => {
                 let _ = ev_tx.send(EngineEvent::Warning {
                     code: "seal_coverage_final_pass_empty".to_string(),
@@ -2269,6 +2339,9 @@ fn repair_terminal_seal_coverage(
             }
         }
     });
+    let comparison = full_pass.as_ref().map(|payload| {
+        TranscriptComparisonReceipt::new(apple_text.clone(), payload.text.trim().to_string())
+    });
 
     state
         .acoustic_ledger
@@ -2283,56 +2356,14 @@ fn repair_terminal_seal_coverage(
         return initial;
     }
 
-    for (ordinal, range) in initial
-        .uncovered_speech_ranges
-        .iter()
-        .filter(|range| range.sample_end.saturating_sub(range.sample_start) > threshold_samples)
-        .cloned()
-        .enumerate()
-    {
-        let Some(window) = state
-            .audio
-            .window_by_samples(range.sample_start, range.sample_end)
-        else {
-            let _ = ev_tx.send(EngineEvent::Warning {
-                code: "seal_coverage_gap_pcm_unavailable".to_string(),
-                message: format!("{}..{}", range.sample_start, range.sample_end),
-            });
-            continue;
-        };
-        let request_id = u64::MAX.saturating_sub(ordinal as u64 + 1);
-        let request = TailProviderRequest {
-            identity: TailRequestIdentity {
-                request_id,
-                range: range.clone(),
-            },
-            sample_rate: state.sample_rate,
-            language: language.map(str::to_owned),
-        };
-        let label = match InProcessTailProvider.transcribe(&request, &window.samples) {
-            Ok(payload) if !payload.text.trim().is_empty() => payload.text.trim().to_string(),
-            Ok(_) => continue,
-            Err(error) => {
-                let _ = ev_tx.send(EngineEvent::Warning {
-                    code: "seal_coverage_gap_recovery_failed".to_string(),
-                    message: format!("{}..{}: {error}", range.sample_start, range.sample_end),
-                });
-                continue;
-            }
-        };
-        let _ = admit_ledger_label(
+    if let Some(full_pass) = full_pass.as_ref() {
+        admit_full_pass_gap_segments(
             state,
             ev_tx,
-            LabelAdmission {
-                observation: LedgerObservationIdentity::new(
-                    LedgerObservationProducer::Whisper,
-                    request_id,
-                    0,
-                    OccurrenceIdentity::from(&range),
-                ),
-                label: &label,
-                energy: EnergyAdmission::QualifyFinalPassGap,
-            },
+            full_pass,
+            &initial.uncovered_speech_ranges,
+            threshold_samples,
+            EnergyAdmission::QualifyFinalPassGap,
         );
     }
 
@@ -3524,6 +3555,117 @@ mod c13a_lifecycle_tests {
             reasoning_text: None,
             status,
         }
+    }
+
+    /// W4-T14 regression reconstructed from the build-755 take. The Apple
+    /// occurrence already owns the phrase before sample 837632. A whole-pass
+    /// Whisper segment that repeats those words crosses that boundary, while
+    /// the novel continuation is pinned wholly inside the uncovered range.
+    /// Only the latter may become a document occurrence.
+    #[test]
+    fn real_take_gap_repair_rejects_straddled_repeat_and_keeps_novel_pcm_segment() {
+        use crate::stt::tail_provider::{
+            TailEvidenceSource, TailEvidenceStability, TailProviderEvidence, TailProviderId,
+            TailTimingQuality,
+        };
+
+        const CAPTURE_END: usize = 1_082_880;
+        let session = "walkaround-755-gap-repro";
+        let (tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut state = state_for_session(session);
+        state.audio.push(&vec![0.25; CAPTURE_END]);
+
+        let apple_occurrence = OccurrenceIdentity::new(session, 1, 694_272, 837_632);
+        stage_pending_occurrence(
+            &mut state,
+            &tx,
+            4,
+            apple_occurrence,
+            "Bo generalnie jest to dużo skuteczniejsze jeśli takie rzeczy są oczywiste w tym przypadku",
+        );
+        let gap = TailSampleRange {
+            session: session.to_string(),
+            capture_epoch: 1,
+            sample_start: 837_632,
+            sample_end: 1_082_880,
+        };
+        let payload = TailProviderPayload {
+            identity: TailRequestIdentity {
+                request_id: u64::MAX,
+                range: TailSampleRange {
+                    session: session.to_string(),
+                    capture_epoch: 1,
+                    sample_start: 694_272,
+                    sample_end: 1_082_880,
+                },
+            },
+            text: "Bo generalnie jest to dużo skuteczniejsze jeśli takie rzeczy są oczywiste w tym przypadku miały jakąś kanwę falsyfikacji"
+                .to_string(),
+            segments: vec![
+                TimedTailSegment {
+                    text: "takie rzeczy są oczywiste w tym przypadku".to_string(),
+                    range: TailSampleRange {
+                        session: session.to_string(),
+                        capture_epoch: 1,
+                        sample_start: 800_000,
+                        sample_end: 880_000,
+                    },
+                },
+                TimedTailSegment {
+                    text: "miały jakąś kanwę falsyfikacji".to_string(),
+                    range: TailSampleRange {
+                        session: session.to_string(),
+                        capture_epoch: 1,
+                        sample_start: 900_000,
+                        sample_end: 1_080_000,
+                    },
+                },
+            ],
+            avg_logprob: Some(-0.2),
+            compression_ratio: Some(1.0),
+            provider_id: TailProviderId::Fake,
+            elapsed_ms: 1,
+            evidence: TailProviderEvidence {
+                source: TailEvidenceSource::Whisper,
+                revision: Some("walkaround-755".to_string()),
+                stability: TailEvidenceStability::Final,
+                timing_quality: TailTimingQuality::Synthetic,
+                avg_logprob: Some(-0.2),
+            },
+        };
+        payload.validate().expect("repro payload must be valid");
+
+        assert_eq!(
+            admit_full_pass_gap_segments(
+                &mut state,
+                &tx,
+                &payload,
+                &[gap],
+                4_000,
+                EnergyAdmission::QualifyFinalPassGap,
+            ),
+            1
+        );
+
+        let rendered = state
+            .acoustic_ledger
+            .lock()
+            .expect("ledger")
+            .rendered_text();
+        assert_eq!(rendered.matches("takie rzeczy").count(), 1, "{rendered}");
+        assert!(rendered.ends_with("miały jakąś kanwę falsyfikacji"));
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            EngineEvent::Warning { code, .. }
+                if code == "seal_coverage_full_pass_segment_straddles_gap"
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            EngineEvent::LedgerMutation { label, .. }
+                if label == "takie rzeczy są oczywiste w tym przypadku"
+        )));
     }
 
     #[test]

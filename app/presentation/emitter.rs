@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_text_events_and_session_close_cannot_change_delivery() {
+    async fn raw_text_lane_failure_and_session_close_cannot_change_delivery() {
         let delivery = Arc::new(Mutex::new("last ledger revision".to_string()));
         let temp = tempfile::tempdir().unwrap();
         let bus_path = temp.path().join("raw-events.jsonl");
@@ -1111,6 +1111,10 @@ mod tests {
             text: "annotation".to_string(),
             kind: AnnotationKind::HesitationPause,
         });
+        emitter.on_event(&EngineEvent::Warning {
+            code: "agent_lane_transport_failed".to_string(),
+            message: "Tool-enabled response failed (ConnectError: gateway unavailable)".to_string(),
+        });
         emitter.on_event(&EngineEvent::SessionFinalised {
             session_id: "session".to_string(),
             layer_summary: LayerSummary::default(),
@@ -1118,6 +1122,7 @@ mod tests {
         emitter.finish().await;
 
         assert_eq!(delivery.lock().await.as_str(), "last ledger revision");
+        assert!(!delivery.lock().await.contains("ConnectError"));
         assert_eq!(projection_count.load(Ordering::SeqCst), 0);
         assert!(std::fs::read_to_string(bus_path).unwrap().is_empty());
     }

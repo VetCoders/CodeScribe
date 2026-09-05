@@ -20,6 +20,7 @@ pub use conversation::{
 };
 pub use history::{
     HistoryEntry,
+    SessionTranscriptArchive,
     TranscriptKind,
     archive_session_take,
     // Voice Drafts API (Mission Control)

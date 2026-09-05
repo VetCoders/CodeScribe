@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 /// Audio containers an archived recording may use: `m4a` normally, `wav` when
 /// encoding failed and the raw copy was kept as a fallback.
 const AUDIO_ARCHIVE_EXTENSIONS: &[&str] = &["m4a", "wav"];
+const NO_SPEECH_HISTORY_TITLE: &str = "(no speech)";
 
 /// A single history entry
 #[derive(Debug, Clone)]
@@ -51,6 +52,35 @@ pub enum TranscriptKind {
     Failed,
 }
 
+/// Transcript outcome accepted by the session archive boundary.
+///
+/// Diagnostics deliberately have their own variant, so a lane or transport
+/// error cannot be confused with committed user speech and written into the
+/// transcript document. `NoSpeech` is the only non-transcript outcome that
+/// creates a visible history row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTranscriptArchive<'a> {
+    /// Reducer-committed user speech.
+    Committed(&'a str),
+    /// A successful take with no committed words.
+    NoSpeech,
+    /// A lane, transport, or seal failure. The diagnostic is never persisted
+    /// as transcript text; its owner reports it through status/log surfaces.
+    Unavailable(&'a str),
+}
+
+impl<'a> SessionTranscriptArchive<'a> {
+    /// Classify a reducer render without letting an empty string masquerade as
+    /// committed speech.
+    pub fn from_committed(text: &'a str) -> Self {
+        if text.trim().is_empty() {
+            Self::NoSpeech
+        } else {
+            Self::Committed(text)
+        }
+    }
+}
+
 impl TranscriptKind {
     /// Filename suffix for this kind. Writes emit these; [`kind_from_suffix`]
     /// reads them back.
@@ -78,6 +108,22 @@ impl TranscriptKind {
                 | TranscriptKind::FormattingFailed
         )
     }
+}
+
+/// Derive product-facing history text from artifact class. Failure payloads
+/// are diagnostics, including legacy rows that may still contain an error
+/// string; their only permitted title is the explicit no-speech sentinel.
+fn history_preview(kind: TranscriptKind, text: &str) -> String {
+    if kind == TranscriptKind::Failed {
+        return NO_SPEECH_HISTORY_TITLE.to_string();
+    }
+    text.trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(60)
+        .collect()
 }
 
 /// Tally of one [`migrate_transcriptions`] pass, dry-run or applied.
@@ -440,8 +486,7 @@ pub fn save_entry_with_timestamp_and_slug(
         }
     }
 
-    // Extract preview (first line, max 60 chars)
-    let preview = text.lines().next().unwrap_or("").chars().take(60).collect();
+    let preview = history_preview(kind, text);
 
     HistoryEntry {
         path,
@@ -520,15 +565,7 @@ pub fn recent_entries(limit: usize) -> Vec<HistoryEntry> {
             .unwrap_or("");
         let (kind, _, _) = split_kind_and_index(stem, TranscriptKind::Raw);
 
-        let preview = fs::read_to_string(&path)
-            .unwrap_or_default()
-            .trim()
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(60)
-            .collect();
+        let preview = history_preview(kind, &fs::read_to_string(&path).unwrap_or_default());
 
         entries.push(HistoryEntry {
             path,
@@ -846,15 +883,46 @@ pub fn save_audio(
 
 /// Put one take — hold or toggle — into the daily transcriptions bag.
 ///
-/// Writes paired `HHMMSS_slug_raw.{m4a,wav}` and `HHMMSS_slug_raw.txt` under
-/// `~/.codescribe/transcriptions/YYYY-MM-DD/`. This is the session archive;
+/// Committed speech writes a paired `*_raw.{m4a,wav}` + `*_raw.txt` under
+/// `~/.codescribe/transcriptions/YYYY-MM-DD/`. No-speech writes a `*_failed`
+/// audio + empty marker with the fixed history title; unavailable lane output
+/// archives audio only and never persists its diagnostic as transcript text.
 /// `sessions/<id>.wav` is demux identity, not a second product bag.
-pub fn archive_session_take(src_path: &Path, transcript: Option<&str>) -> Option<PathBuf> {
-    let now = Local::now();
-    let audio = save_audio(src_path, now, transcript, TranscriptKind::Raw);
-    if let Some(text) = transcript.map(str::trim).filter(|t| !t.is_empty()) {
-        let _ = save_entry_with_timestamp(text, Some(now), TranscriptKind::Raw);
+fn save_session_transcript(
+    transcript: SessionTranscriptArchive<'_>,
+    timestamp: DateTime<Local>,
+) -> Option<HistoryEntry> {
+    match transcript {
+        SessionTranscriptArchive::Committed(text) if !text.trim().is_empty() => Some(
+            save_entry_with_timestamp(text, Some(timestamp), TranscriptKind::Raw),
+        ),
+        SessionTranscriptArchive::Committed(_) | SessionTranscriptArchive::NoSpeech => {
+            Some(save_entry_with_timestamp_and_slug(
+                "",
+                Some(timestamp),
+                TranscriptKind::Failed,
+                Some("no-speech"),
+            ))
+        }
+        SessionTranscriptArchive::Unavailable(_diagnostic) => None,
     }
+}
+
+pub fn archive_session_take(
+    src_path: &Path,
+    transcript: SessionTranscriptArchive<'_>,
+) -> Option<PathBuf> {
+    let now = Local::now();
+    let (audio_slug, audio_kind) = match transcript {
+        SessionTranscriptArchive::Committed(text) if !text.trim().is_empty() => {
+            (Some(text), TranscriptKind::Raw)
+        }
+        SessionTranscriptArchive::Committed(_)
+        | SessionTranscriptArchive::NoSpeech
+        | SessionTranscriptArchive::Unavailable(_) => (None, TranscriptKind::Failed),
+    };
+    let audio = save_audio(src_path, now, audio_slug, audio_kind);
+    let _ = save_session_transcript(transcript, now);
     audio
 }
 
@@ -1084,6 +1152,50 @@ mod tests {
         assert!(label.contains("Hello world"));
     }
 
+    /// A simulated lane failure has no transcript artifact path. The previous
+    /// committed user words remain the copy target, while a legitimate empty
+    /// take gets the one explicit non-speech title.
+    #[test]
+    #[serial]
+    fn session_archive_outcome_keeps_lane_diagnostic_out_of_history_and_copy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _guard = EnvGuard::set_to_temp_dir("CODESCRIBE_DATA_DIR", &tmp);
+        let now = Local::now();
+        let user_words = "To są słowa Foundera";
+        let lane_error = "Tool-enabled response failed (ConnectError: gateway unavailable)";
+
+        let committed =
+            save_session_transcript(SessionTranscriptArchive::Committed(user_words), now)
+                .expect("committed speech must create a history row");
+        assert!(
+            save_session_transcript(
+                SessionTranscriptArchive::Unavailable(lane_error),
+                now + chrono::Duration::seconds(1),
+            )
+            .is_none(),
+            "diagnostics must not create transcript artifacts"
+        );
+        let no_speech = save_session_transcript(
+            SessionTranscriptArchive::NoSpeech,
+            now + chrono::Duration::seconds(2),
+        )
+        .expect("no-speech must create an explicit history row");
+
+        assert_eq!(committed.preview, user_words);
+        assert!(committed.label().contains(user_words));
+        assert_eq!(no_speech.preview, NO_SPEECH_HISTORY_TITLE);
+        assert!(no_speech.label().contains(NO_SPEECH_HISTORY_TITLE));
+
+        let copyable = latest_copyable_entry().expect("last transcript remains available");
+        assert_eq!(copyable.path, committed.path);
+        assert_eq!(fs::read_to_string(&copyable.path).unwrap(), user_words);
+        assert!(recent_entries(8).iter().all(|entry| {
+            !fs::read_to_string(&entry.path)
+                .unwrap_or_default()
+                .contains(lane_error)
+        }));
+    }
+
     /// Shared slug_hint aligns base filenames across raw vs formatted kinds.
     #[test]
     #[serial]
@@ -1140,7 +1252,7 @@ mod tests {
         }));
     }
 
-    /// latest_copyable_entry skips Failed artifacts that latest_entry still surfaces.
+    /// Legacy Failed payloads are never title or copy authority.
     #[test]
     #[serial]
     fn test_latest_copyable_entry_skips_failed_artifacts() {
@@ -1155,7 +1267,7 @@ mod tests {
             Some("usable transcript"),
         );
         let failed = save_entry_with_timestamp_and_slug(
-            "No reliable speech detected",
+            "Tool-enabled response failed (ConnectError: gateway unavailable)",
             Some(now + chrono::Duration::seconds(1)),
             TranscriptKind::Failed,
             Some("no-speech"),
@@ -1164,10 +1276,16 @@ mod tests {
         let latest = latest_entry().expect("latest entry");
         assert_eq!(latest.path, failed.path);
         assert_eq!(latest.kind, TranscriptKind::Failed);
+        assert_eq!(latest.preview, NO_SPEECH_HISTORY_TITLE);
+        assert!(!latest.label().contains("ConnectError"));
 
         let copyable = latest_copyable_entry().expect("latest copyable entry");
         assert_eq!(copyable.path, raw.path);
         assert_eq!(copyable.kind, TranscriptKind::Raw);
+        assert_eq!(
+            fs::read_to_string(copyable.path).unwrap(),
+            "usable transcript"
+        );
     }
 
     /// macOS: save_audio archives to smaller m4a that still decodes near source duration.

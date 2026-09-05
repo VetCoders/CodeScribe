@@ -147,6 +147,12 @@ controller admission / calibration outcome
 `Correction`, `ReplaceRange`, and `InsertAnnotation` events are observation or
 diagnostics. `Stats` and `SessionFinalised` are lifecycle. None can enter Bus
 truth, delivery, history, clipboard, final controller text, or a terminal seal.
+Lane and transport errors remain `Warning` / presentation-status / log
+evidence. The session archive accepts a typed `Committed`, `NoSpeech`, or
+`Unavailable` outcome: only `Committed` writes copyable user text;
+`Unavailable` writes no transcript artifact, and `NoSpeech` has the fixed
+history title `(no speech)`. Diagnostic strings are never history titles or
+"Copy last transcript" candidates.
 
 There is no draft API, draft storage, arbitrary-text `publish_sealed` API, or
 raw-event `DeltaSinkAdapter`. Consumers must observe the authenticated evidence

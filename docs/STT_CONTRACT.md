@@ -106,10 +106,13 @@ takes. They attach `vocabulary=programming` so Polish+tech speech can prefer
 The daily Overlay has no user-invoked full-file transcription action: it renders
 Bus projections and explicit human edits, never raw `transcribeFile` output.
 At terminal coverage time the live engine does run a local, in-process Whisper
-pass over retained PCM. Its whole-session string is comparison evidence only.
-When measured active speech is not covered by committed occurrences, each
-material uncovered PCM range is transcribed separately and can enter the
-document only as a qualified Whisper occurrence through `AcousticLedger`.
+pass over retained PCM. Its whole-session string is comparison evidence only;
+its timestamped segments are the sole terminal gap-repair candidates. A
+candidate enters `AcousticLedger` on its own PCM occurrence only when that
+segment is wholly contained in one material uncovered range. A segment that
+crosses the committed/uncovered boundary is refused instead of being assigned
+to the whole gap, because that assignment can replay words already owned by an
+adjacent Apple occurrence. Coarse or missing timing leaves coverage incomplete.
 
 **Legacy Overlay Format is removed (2026-08-25).** The former raw LLM
 replacement / delivery-style path no longer exists. Automatic formatting is
@@ -198,9 +201,10 @@ Code: `core/config/loader.rs` · `core/stt/mod.rs::selected_engine()` · `reconc
 
 Normal capture ignores legacy final-pass routing and never uploads the
 completed WAV for seal coverage. At stop, the engine compares the Apple-lane
-document with local Whisper over retained PCM, then transcribes only uncovered
-speech ranges for ledger admission. Layered phase tokens (`phase1`…) select live
-refinement; explicit file actions remain separate product surfaces.
+document with one local Whisper pass over retained PCM, then offers only that
+pass's PCM-contained segments for gap admission. It never performs a second,
+context-starved decode of an uncovered slice. Layered phase tokens (`phase1`…)
+select live refinement; explicit file actions remain separate product surfaces.
 
 ---
 
@@ -217,8 +221,10 @@ refinement; explicit file actions remain separate product surfaces.
 **Stop** drains the live recorder/session, calculates occurrence-union coverage
 against the capture energy ladder, and delivers only the committed transcript
 (paste / overlay / agent). A gap over 250 ms blocks terminal truth until local
-Whisper supplies a qualified exact-range occurrence. The comparison pass never
-writes a whole string into the document and never uploads the completed WAV.
+Whisper supplies a qualified segment-range occurrence from the whole-session
+pass. The comparison string never writes into the document, and boundary-
+straddling or coarse evidence cannot close coverage. The completed WAV is never
+uploaded for this decision.
 
 ### 3.2 Settings UI → config
 

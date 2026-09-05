@@ -250,7 +250,7 @@ fn session_audio_path(session_id: &str) -> Option<std::path::PathBuf> {
 fn retain_session_audio(
     session_id: Option<&str>,
     path: &std::path::Path,
-    transcript: Option<&str>,
+    transcript: codescribe_core::state::SessionTranscriptArchive<'_>,
 ) {
     // Daily bag: wav/m4a + txt. Hold and double-tap/toggle share this folder.
     if codescribe_core::state::archive_session_take(path, transcript).is_none() {
@@ -309,7 +309,13 @@ async fn stop_recorder_for_terminal(
                     "terminal transcript refused after a successful capture stop; retaining take audio"
                 );
                 match refusal.audio_path.as_deref() {
-                    Some(path) => retain_session_audio(session_id, path, None),
+                    Some(path) => retain_session_audio(
+                        session_id,
+                        path,
+                        codescribe_core::state::SessionTranscriptArchive::Unavailable(
+                            "terminal seal coverage incomplete",
+                        ),
+                    ),
                     None => warn!("refused take has no audio path to retain"),
                 }
                 Err(anyhow::Error::new(refusal))
@@ -3148,7 +3154,9 @@ impl RecordingController {
                 retain_session_audio(
                     session_id_snapshot.as_deref(),
                     path,
-                    Some(streaming_text.as_str()),
+                    codescribe_core::state::SessionTranscriptArchive::from_committed(
+                        streaming_text.as_str(),
+                    ),
                 );
             }
             phase3_secs = phase3.elapsed().as_secs_f64();
@@ -3320,7 +3328,13 @@ impl RecordingController {
         let (streaming_text, raw_audio_path_opt) = stopped?;
 
         if let Some(path) = raw_audio_path_opt.as_deref() {
-            retain_session_audio(take_id.as_deref(), path, Some(streaming_text.as_str()));
+            retain_session_audio(
+                take_id.as_deref(),
+                path,
+                codescribe_core::state::SessionTranscriptArchive::from_committed(
+                    streaming_text.as_str(),
+                ),
+            );
         }
         let _ = (assistive, hold_mode, force_raw, force_ai);
         Ok(ProcessRecordingOutcome {
