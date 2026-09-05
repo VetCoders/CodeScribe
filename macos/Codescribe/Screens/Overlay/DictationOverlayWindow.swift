@@ -30,10 +30,10 @@ final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
   var allowsKeyForEdit = false
 
   /// A non-activating panel does not turn SwiftUI background hits into window
-  /// motion, so intercept only explicit AppKit drag regions and true container
-  /// gaps outside the hosting view.
-  /// Native transcript descendants and SwiftUI control descendants continue
-  /// through ordinary AppKit dispatch untouched.
+  /// motion, so intercept only explicit AppKit drag regions.
+  /// Native transcript descendants, SwiftUI control descendants and the
+  /// container's own resize band continue through ordinary AppKit dispatch
+  /// untouched.
   override func sendEvent(_ event: NSEvent) {
     if event.type == .leftMouseDown { dragStart = nil }
     switch event.type {
@@ -57,8 +57,11 @@ final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
 
   func isWindowDragHit(at point: NSPoint) -> Bool {
     guard let contentView, let hit = contentView.hitTest(point) else { return false }
+    // `OverlayContentContainer.hitTest` answers with itself only inside the
+    // resize band; that click belongs to its `mouseDown` (edge tracking), so a
+    // container hit is never a drag handle.
+    if hit === contentView { return false }
     return hit is OverlayWindowDragRegionView
-      || hit === contentView
   }
 
   private func screenPoint(for event: NSEvent) -> NSPoint {

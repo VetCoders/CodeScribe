@@ -10,6 +10,60 @@ final class OverlayResizeHitTests: XCTestCase {
     XCTAssertNil(OverlayResizeHit.edge(at: NSPoint(x: 200, y: 150), in: bounds))
   }
 
+  /// The container answers `hitTest` with itself only inside the 16 pt resize
+  /// band, so the panel's drag intercept must never treat that band as a drag
+  /// handle — otherwise `OverlayContentContainer.mouseDown` (edge tracking)
+  /// never receives the click and edge resize is dead. The tracking loop runs
+  /// on `window.nextEvent`, which synthetic events cannot feed, so the witness
+  /// is the routing decision on the real hierarchy, not the tracked frame.
+  @MainActor
+  func testRealOverlayResizeBandIsNotAWindowDragHandle() throws {
+    let state = OverlayState.previewListening()
+    let panel = try XCTUnwrap(
+      DictationOverlayWindow.make(
+        state: state,
+        textScale: TextScaleController(key: "OverlayResizeHitTests.resizeBand.textScale")
+      ) as? FloatingOverlayPanel
+    )
+    defer {
+      panel.orderOut(nil)
+      panel.invalidatePresence()
+    }
+    panel.setContentSize(NSSize(width: 470, height: 280))
+    panel.orderFrontRegardless()
+    let root = try XCTUnwrap(panel.contentView)
+    root.layoutSubtreeIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    root.layoutSubtreeIfNeeded()
+
+    let edgePoints = [
+      ("left-edge", NSPoint(x: 6, y: root.bounds.midY)),
+      ("right-edge", NSPoint(x: root.bounds.maxX - 6, y: root.bounds.midY)),
+      ("bottom-right-corner", NSPoint(x: root.bounds.maxX - 6, y: 6)),
+      ("top-edge", NSPoint(x: root.bounds.midX, y: root.bounds.maxY - 6)),
+    ]
+    for (region, point) in edgePoints {
+      XCTAssertNotNil(
+        OverlayResizeHit.edge(at: point, in: root.bounds),
+        "\(region) is not inside the resize band"
+      )
+      XCTAssertTrue(
+        root.hitTest(point) === root,
+        "\(region): the container must claim the resize band"
+      )
+      let dragHit = panel.isWindowDragHit(at: point)
+      print("W5_T16_RESIZE_BAND region=\(region) point=(\(point.x),\(point.y)) dragHit=\(dragHit)")
+      XCTAssertFalse(
+        dragHit,
+        "\(region): resize band must reach OverlayContentContainer.mouseDown, not the drag intercept"
+      )
+    }
+    XCTAssertTrue(
+      panel.isWindowDragHit(at: NSPoint(x: 28, y: root.bounds.maxY - 22)),
+      "header interior must still be a drag handle"
+    )
+  }
+
   @MainActor
   func testRealOverlayHierarchyRoutesDragControlsAndTranscriptIndependently() throws {
     let state = OverlayState.previewListening()
