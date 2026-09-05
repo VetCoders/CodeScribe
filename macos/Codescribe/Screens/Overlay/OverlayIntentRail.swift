@@ -57,7 +57,13 @@ struct OverlayIntentRail: View {
   }
 
   static func projectedIntents(for state: OverlayState) -> [OverlayIntent] {
-    projectedIntents(
+    if state.revisionCommitPending {
+      return []
+    }
+    if state.isRevisionDraftDirty {
+      return [.commitRevision, .discardRevision, .close]
+    }
+    return projectedIntents(
       phase: state.mode,
       canPaste: state.canPaste,
       canInsert: state.canInsert,
@@ -120,6 +126,8 @@ extension OverlayIntent {
   var accessibilityLabel: String {
     switch self {
     case .finish: "Finish recording"
+    case .commitRevision: "Commit transcript revision"
+    case .discardRevision: "Discard transcript draft"
     case .copy: "Copy transcript"
     case .insertPaste: "Insert transcript"
     case .retranscribe: "Retranscribe recording"
@@ -131,6 +139,8 @@ extension OverlayIntent {
   var accessibilityHint: String {
     switch self {
     case .finish: "Stops capture and requests the final projection"
+    case .commitRevision: "Commits this draft through the transcript ledger"
+    case .discardRevision: "Restores the latest projected transcript"
     case .copy: "Copies the projected transcript"
     case .insertPaste: "Sends the projected transcript to the selected destination"
     case .retranscribe: "Requests another transcription of this recording"
@@ -142,6 +152,8 @@ extension OverlayIntent {
   var systemImage: String {
     switch self {
     case .finish: "stop.circle"
+    case .commitRevision: "checkmark.circle"
+    case .discardRevision: "arrow.uturn.backward.circle"
     case .copy: "doc.on.doc"
     case .insertPaste: "arrow.down.doc"
     case .retranscribe: "arrow.clockwise"

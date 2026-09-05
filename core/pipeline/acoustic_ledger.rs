@@ -38,8 +38,11 @@
 //!   emitted token must carry back to it.
 //! * [`LayerDecisionReceipt`] keeps the whole Apple -> Whisper -> retained-text
 //!   chain inspectable even after the visible label changes.
-//! * [`ObservationFrontier`] and [`LedgerSealReceipt`] decide finality, and
-//!   [`ManualEditReceipt`] is the only supersession a sealed label accepts.
+//! * [`ObservationFrontier`] and [`LedgerSealReceipt`] decide finality;
+//!   [`ManualEditReceipt`] is the only supersession a sealed occurrence label
+//!   accepts, while [`ManualDocumentRevisionReceipt`] authenticates an explicit
+//!   user rewrite of the already-sealed document without inventing a text-to-PCM
+//!   alignment.
 //! * [`OccurrenceDerivation`] refines coverage as provenance, and
 //!   [`OccurrenceComposition`] emits the signed token sequence a reducer reads.
 //!
@@ -413,6 +416,7 @@ pub struct AcousticLedger {
     seals: BTreeMap<OccurrenceIdentity, LedgerSealReceipt>,
     trail: Vec<LayerDecisionReceipt>,
     manual_edits: Vec<ManualEditReceipt>,
+    manual_document_revisions: Vec<ManualDocumentRevisionReceipt>,
     derivations: Vec<OccurrenceDerivation>,
     latest_seal_coverage: Option<SealCoverageReceipt>,
 }
@@ -1054,6 +1058,67 @@ impl AcousticLedger {
     /// Every explicit human supersession, in arrival order.
     pub fn manual_edits(&self) -> &[ManualEditReceipt] {
         &self.manual_edits
+    }
+
+    /// Authenticate one user-authored rewrite of the complete sealed document.
+    ///
+    /// A whole-document edit cannot honestly be divided back into occurrence
+    /// labels without a new word-to-PCM alignment pass. This receipt therefore
+    /// binds the edited bytes to the exact sealed occurrence set and source
+    /// reducer revision, while leaving every acoustic occurrence and token
+    /// receipt immutable. The transcript reducer remains the document author.
+    pub fn record_manual_document_revision(
+        &mut self,
+        session_id: &str,
+        source_revision: u64,
+        revision: u64,
+        rendered_text: &str,
+        source_occurrences: &[OccurrenceIdentity],
+    ) -> Result<ManualDocumentRevisionReceipt, &'static str> {
+        if session_id.is_empty() {
+            return Err("manual_document_session_missing");
+        }
+        if rendered_text.trim().is_empty() {
+            return Err("manual_document_text_empty");
+        }
+        if source_revision.checked_add(1) != Some(revision) {
+            return Err("manual_document_revision_nonconsecutive");
+        }
+        if source_occurrences.is_empty() {
+            return Err("manual_document_occurrences_missing");
+        }
+        if source_occurrences.iter().any(|occurrence| {
+            occurrence.session != session_id
+                || !self.is_qualified(occurrence)
+                || !self.is_sealed(occurrence)
+                || !self.committed.contains_key(occurrence)
+        }) {
+            return Err("manual_document_occurrence_not_sealed");
+        }
+
+        let source_seal_receipts = source_occurrences
+            .iter()
+            .filter_map(|occurrence| self.seal_of(occurrence))
+            .map(|seal| seal.receipt_id.clone())
+            .collect::<Vec<_>>();
+        let ordinal = self.manual_document_revisions.len();
+        let receipt = ManualDocumentRevisionReceipt {
+            receipt_id: format!("user-edit-{session_id}-{source_revision}-{revision}-{ordinal}"),
+            provenance: "user-edit".to_string(),
+            session_id: session_id.to_string(),
+            source_revision,
+            revision,
+            source_occurrences: source_occurrences.to_vec(),
+            source_seal_receipts,
+            rendered_text: rendered_text.to_string(),
+        };
+        self.manual_document_revisions.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    /// Every authenticated whole-document user revision, in arrival order.
+    pub fn manual_document_revisions(&self) -> &[ManualDocumentRevisionReceipt] {
+        &self.manual_document_revisions
     }
 
     /// Record the decision the ledger just took. Called for every observation
@@ -1814,6 +1879,31 @@ pub struct ManualEditReceipt {
     pub label: String,
     /// The human observation that carried the edit.
     pub observation: ObservationIdentity,
+}
+
+/// Provenance for an explicit user rewrite of a complete sealed transcript.
+///
+/// The receipt names every source occurrence and seal but deliberately carries
+/// no fabricated per-word alignment for the replacement text. It is append-only
+/// evidence consumed by the Rust transcript reducer and its Bus projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualDocumentRevisionReceipt {
+    /// Stable identifier copied into each projected acoustic receipt.
+    pub receipt_id: String,
+    /// Stable origin label for quality capture and external observers.
+    pub provenance: String,
+    /// Recording session whose sealed document was revised.
+    pub session_id: String,
+    /// Reducer revision the user actually edited.
+    pub source_revision: u64,
+    /// New reducer revision minted by Rust.
+    pub revision: u64,
+    /// Exact occurrence identities that made up the source document.
+    pub source_occurrences: Vec<OccurrenceIdentity>,
+    /// Seals proving those source occurrences were terminal before the edit.
+    pub source_seal_receipts: Vec<String>,
+    /// Complete user-authored replacement bytes.
+    pub rendered_text: String,
 }
 
 // ---------------------------------------------------------------------------

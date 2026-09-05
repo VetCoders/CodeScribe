@@ -11,5 +11,5 @@ pub mod transcript_bus;
 pub mod transcript_projection;
 
 pub use cli_transcript_lane::CliTranscriptLane;
-pub use emitter::PresentationEmitter;
+pub use emitter::{PresentationEmitter, UserRevisionCommit, UserRevisionIntent};
 pub use transcript_bus::{TranscriptBus, TranscriptMode, TranscriptSession};

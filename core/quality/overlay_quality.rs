@@ -896,8 +896,7 @@ fn record_is_human_lexicon_teach(record: &QualityRecord) -> bool {
         .meta
         .get("edit_provenance")
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        == Some("manual_human")
+        .is_some_and(edit_provenance_value_is_manual)
     {
         return true;
     }
@@ -1211,7 +1210,12 @@ fn overlay_commit_teaches_lexicon(_mode: &str, action: Option<&str>) -> bool {
 }
 
 fn edit_provenance_is_manual(edit_provenance: Option<&str>) -> bool {
-    edit_provenance.map(str::trim) == Some("manual_human")
+    edit_provenance.is_some_and(edit_provenance_value_is_manual)
+}
+
+fn edit_provenance_value_is_manual(provenance: &str) -> bool {
+    let provenance = provenance.trim();
+    provenance == "manual_human" || provenance.starts_with("user-edit-")
 }
 
 /// High-level: save the quality record for the overlay edit AND feed lexicon candidates.
@@ -2059,7 +2063,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn ordinary_manual_overlay_edits_vote_three_times_and_promote_once() {
+    fn ledger_receipted_overlay_edits_vote_three_times_and_promote_once() {
         let temp_dir = tempfile::tempdir().expect("temp");
         let _guard = EnvRestore::capture("CODESCRIBE_DATA_DIR");
         let temp_root = temp_dir.path().canonicalize().unwrap();
@@ -2082,13 +2086,13 @@ mod tests {
             .unwrap()
         };
 
-        let first = commit("copy", Some("manual_human"));
+        let first = commit("revision", Some("user-edit-session-7-8-0"));
         assert_eq!(first.confirmation_progress(), Some((1, 3)));
         assert_eq!(first.pairs_learned, 0);
-        let second = commit("paste", Some("manual_human"));
+        let second = commit("revision", Some("user-edit-session-8-9-1"));
         assert_eq!(second.confirmation_progress(), Some((2, 3)));
         assert_eq!(second.pairs_learned, 0);
-        let third = commit("close", Some("manual_human"));
+        let third = commit("revision", Some("user-edit-session-9-10-2"));
         assert_eq!(third.confirmation_progress(), Some((3, 3)));
         assert_eq!(third.pairs_learned, 1);
 
@@ -2111,14 +2115,14 @@ mod tests {
                 .meta
                 .get("action")
                 .and_then(serde_json::Value::as_str),
-            Some("copy")
+            Some("revision")
         );
         assert_eq!(
             records[0]
                 .meta
                 .get("edit_provenance")
                 .and_then(serde_json::Value::as_str),
-            Some("manual_human")
+            Some("user-edit-session-7-8-0")
         );
     }
 

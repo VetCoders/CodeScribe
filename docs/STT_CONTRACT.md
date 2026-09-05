@@ -292,11 +292,15 @@ canonicalized only by exact whole-word matching in Lexicon/Light+. Stale,
 malformed, unknown, or colliding leases fail open. There is no phonetic/fuzzy
 rewrite: active `Iwo` does not rewrite Polish `piwo`.
 
-Ordinary overlay TextEditor edits carry `edit_provenance=manual_human`
-separately from delivery `action`. The latch is consumed by one quality commit;
-three distinct correction IDs for the same normalized lexical pair expose
-`1/3`, `2/3`, `3/3` and promote exactly once. Formatter, machine file passes, replay,
-bulk, speech-gap, and delivery actions without that latch cast no vote.
+Terminal overlay edits remain local drafts until a compare-and-swap intent
+names the exact source session and reducer revision. Rust authenticates the
+sealed source occurrence set, appends a whole-document receipt with
+`provenance=user-edit`, and emits the next terminal projection; Swift never
+optimistically replaces the committed render. That `user-edit-*` receipt is
+consumed by one quality commit separately from delivery `action`. Three
+distinct correction IDs for the same normalized lexical pair expose `1/3`,
+`2/3`, `3/3` and promote exactly once. Formatter, machine file passes, replay,
+bulk, speech-gap, and delivery actions without that receipt cast no vote.
 
 Dictionary **Teach** is a separate, explicit bulk-promotion command: it mines
 eligible correction-store and proposed rows immediately and therefore bypasses

@@ -2224,6 +2224,13 @@ public protocol CodescribeHotkeysProtocol: AnyObject, Sendable {
     func cancelVoiceTurn(threadId: String)  -> Bool
 
     /**
+     * Commit a terminal overlay draft as a Rust-authored document revision.
+     * The returned value is acknowledgement only; Swift repaints exclusively
+     * from the transcript projection callback emitted by the reducer.
+     */
+    func commitUserRevision(sessionId: String, sourceRevision: UInt64, renderedText: String) async throws  -> CsUserRevisionResult
+
+    /**
      * Copy the tagged transcript to the clipboard without a synthetic paste.
      * Swift calls this when the caret already sits inside Codescribe, where a
      * synthetic Cmd+V would paste the transcript back into the overlay itself.
@@ -2536,6 +2543,28 @@ open func cancelVoiceTurn(threadId: String) -> Bool  {
         FfiConverterString.lower(threadId),$0
     )
 })
+}
+
+    /**
+     * Commit a terminal overlay draft as a Rust-authored document revision.
+     * The returned value is acknowledgement only; Swift repaints exclusively
+     * from the transcript projection callback emitted by the reducer.
+     */
+open func commitUserRevision(sessionId: String, sourceRevision: UInt64, renderedText: String)async throws  -> CsUserRevisionResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribehotkeys_commit_user_revision(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(sessionId),FfiConverterUInt64.lower(sourceRevision),FfiConverterString.lower(renderedText)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCsUserRevisionResult_lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
 }
 
     /**
@@ -11198,6 +11227,74 @@ public func FfiConverterTypeCsTrayToggles_lower(_ value: CsTrayToggles) -> RustB
 
 
 /**
+ * Receipt returned to Swift after Rust has committed a user revision and
+ * synchronously emitted its projection callback.
+ */
+public struct CsUserRevisionResult: Equatable, Hashable {
+    public var sessionId: String
+    public var sourceRevision: UInt64
+    public var revision: UInt64
+    public var renderedText: String
+    public var provenanceReceipt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sessionId: String, sourceRevision: UInt64, revision: UInt64, renderedText: String, provenanceReceipt: String) {
+        self.sessionId = sessionId
+        self.sourceRevision = sourceRevision
+        self.revision = revision
+        self.renderedText = renderedText
+        self.provenanceReceipt = provenanceReceipt
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsUserRevisionResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsUserRevisionResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsUserRevisionResult {
+        return
+            try CsUserRevisionResult(
+                sessionId: FfiConverterString.read(from: &buf),
+                sourceRevision: FfiConverterUInt64.read(from: &buf),
+                revision: FfiConverterUInt64.read(from: &buf),
+                renderedText: FfiConverterString.read(from: &buf),
+                provenanceReceipt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsUserRevisionResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterUInt64.write(value.sourceRevision, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterString.write(value.renderedText, into: &buf)
+        FfiConverterString.write(value.provenanceReceipt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsUserRevisionResult_lift(_ buf: RustBuffer) throws -> CsUserRevisionResult {
+    return try FfiConverterTypeCsUserRevisionResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsUserRevisionResult_lower(_ value: CsUserRevisionResult) -> RustBuffer {
+    return FfiConverterTypeCsUserRevisionResult.lower(value)
+}
+
+
+/**
  * Result of a Voice Lab save: the human revision is persisted whenever this
  * crosses the bridge as `Ok`; learning telemetry never gates the save.
  */
@@ -13610,12 +13707,13 @@ public func audioInputSnapshot()throws  -> CsAudioInputSnapshot  {
  * Persist one overlay correction: the quality record always lands, while lexicon
  * learning is gated by explicit teach action plus the N-correction threshold.
  *
- * Word pairs can be proposed by an explicit Teach gesture or a
- * `manual_human` edit; an auto-format result without that provenance is only
- * evidence. Automatic promotion waits until the same normalized pair reaches
- * the configured correction threshold. The separate Dictionary Teach command
- * is an explicit bulk-promotion override. An unrecognised `formatting_level`
- * is rejected before anything is written.
+ * Word pairs can be proposed by an explicit Teach gesture, a legacy
+ * `manual_human` edit, or a reducer-authenticated `user-edit-*` receipt; an
+ * auto-format result without that provenance is only evidence. Automatic
+ * promotion waits until the same normalized pair reaches the configured
+ * correction threshold. The separate Dictionary Teach command is an explicit
+ * bulk-promotion override. An unrecognised `formatting_level` is rejected
+ * before anything is written.
  *
  * The confidence fields (`avg_logprob`, `speech_pct`, `confidence_flags`) are
  * stored alongside the text so later analysis can correlate corrections with how
@@ -13833,7 +13931,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_func_audio_input_snapshot() != 64324) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_func_commit_overlay_quality_record() != 20526) {
+    if (uniffi_codescribe_ffi_checksum_func_commit_overlay_quality_record() != 16069) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_func_current_serving_verdict() != 14135) {
@@ -14062,6 +14160,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_cancel_voice_turn() != 32656) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_commit_user_revision() != 37560) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_copy_text_tagged() != 1762) {

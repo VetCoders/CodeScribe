@@ -161,12 +161,13 @@ pub struct CsTokenConfidence {
 /// Persist one overlay correction: the quality record always lands, while lexicon
 /// learning is gated by explicit teach action plus the N-correction threshold.
 ///
-/// Word pairs can be proposed by an explicit Teach gesture or a
-/// `manual_human` edit; an auto-format result without that provenance is only
-/// evidence. Automatic promotion waits until the same normalized pair reaches
-/// the configured correction threshold. The separate Dictionary Teach command
-/// is an explicit bulk-promotion override. An unrecognised `formatting_level`
-/// is rejected before anything is written.
+/// Word pairs can be proposed by an explicit Teach gesture, a legacy
+/// `manual_human` edit, or a reducer-authenticated `user-edit-*` receipt; an
+/// auto-format result without that provenance is only evidence. Automatic
+/// promotion waits until the same normalized pair reaches the configured
+/// correction threshold. The separate Dictionary Teach command is an explicit
+/// bulk-promotion override. An unrecognised `formatting_level` is rejected
+/// before anything is written.
 ///
 /// The confidence fields (`avg_logprob`, `speech_pct`, `confidence_flags`) are
 /// stored alongside the text so later analysis can correlate corrections with how

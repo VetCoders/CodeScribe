@@ -77,15 +77,39 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertNil(state.toast)
   }
 
+  func testDirtyRevisionReplacesDeliveryActionsWithCommitOrDiscard() {
+    let state = projectedState(
+      phase: "formatted",
+      text: "ledger text",
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: true,
+      terminal: true
+    )
+
+    state.revisionDraft = "local draft"
+
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.commitRevision, .discardRevision, .close]
+    )
+    XCTAssertEqual(state.formattedText, "ledger text")
+  }
+
   func testEveryIntentHasVoiceOverCopyAndRailReportsProjectedPhase() {
     let intents: [OverlayIntent] = [
-      .finish, .copy, .insertPaste, .retranscribe, .format, .close,
+      .finish, .commitRevision, .discardRevision, .copy, .insertPaste, .retranscribe, .format,
+      .close,
     ]
 
     XCTAssertEqual(
       intents.map(\.accessibilityLabel),
       [
         "Finish recording",
+        "Commit transcript revision",
+        "Discard transcript draft",
         "Copy transcript",
         "Insert transcript",
         "Retranscribe recording",

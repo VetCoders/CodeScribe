@@ -406,23 +406,54 @@ impl TranscriptBus {
                 terminal: false, ..
             } => "record_ledger_seal",
             ReducerAction::RecordSealCoverage { .. } => "seal_coverage",
-            ReducerAction::ApplyManualEdit { .. } => "apply_manual_edit",
+            ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. } => {
+                "apply_manual_edit"
+            }
             ReducerAction::RecordContextMarker { .. } => "record_context_marker",
         };
-        let phase = if reducer_action == "record_ledger_terminal_seal" {
+        let is_user_revision = matches!(&revision.action, ReducerAction::ApplyUserRevision { .. });
+        let phase = if is_user_revision {
+            TranscriptProjectionPhase::Formatted
+        } else if reducer_action == "record_ledger_terminal_seal" {
             TranscriptProjectionPhase::Finalizing
         } else {
             TranscriptProjectionPhase::Listening
         };
-        let availability =
-            self.projection_availability(!revision.rendered_text.trim().is_empty(), true, false);
         let mut writer = self
             .writer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if writer.sealed && !matches!(&revision.action, ReducerAction::ApplyManualEdit { .. }) {
+        let is_manual_edit = matches!(
+            &revision.action,
+            ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. }
+        );
+        if writer.sealed && !is_manual_edit {
             return Vec::new();
         }
+        if writer.ended && !is_user_revision {
+            return Vec::new();
+        }
+        let availability = if is_user_revision {
+            writer
+                .last_projection
+                .as_ref()
+                .map(|projection| TranscriptProjectionAvailability {
+                    can_paste: projection.can_paste,
+                    can_insert: projection.can_insert,
+                    can_copy: !revision.rendered_text.trim().is_empty(),
+                    can_retranscribe: projection.can_retranscribe,
+                    can_format: projection.can_format,
+                })
+                .unwrap_or_else(|| {
+                    self.projection_availability(
+                        !revision.rendered_text.trim().is_empty(),
+                        false,
+                        false,
+                    )
+                })
+        } else {
+            self.projection_availability(!revision.rendered_text.trim().is_empty(), true, false)
+        };
         let mut emitted = Vec::new();
         for (document_index, entry) in revision.entries.iter().enumerate() {
             let Some(serial) = ledger.serial_of(&entry.occurrence) else {
@@ -449,7 +480,7 @@ impl TranscriptBus {
                 can_copy: availability.can_copy,
                 can_retranscribe: availability.can_retranscribe,
                 can_format: availability.can_format,
-                terminal: false,
+                terminal: is_user_revision,
                 acoustic_receipts: vec![Self::project_serial(
                     serial,
                     entry.word_evidence_receipts.clone(),
@@ -659,6 +690,7 @@ impl TranscriptBus {
                 terminal.can_retranscribe = availability.can_retranscribe;
                 terminal.can_format = availability.can_format;
                 terminal.terminal = true;
+                writer.last_projection = Some(terminal.clone());
                 Some(terminal)
             }
             Err(error) => {

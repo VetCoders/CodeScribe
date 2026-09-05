@@ -147,6 +147,7 @@ struct SessionProjectionState {
 pub struct TranscriptProjectionReader {
     pending: Vec<u8>,
     current_session: Option<String>,
+    last_ended_session: Option<String>,
     retired_sessions: HashSet<String>,
     sessions: HashMap<String, SessionProjectionState>,
 }
@@ -161,6 +162,7 @@ impl TranscriptProjectionReader {
     pub fn reset_authority(&mut self) {
         self.pending.clear();
         self.current_session = None;
+        self.last_ended_session = None;
         self.retired_sessions.clear();
         self.sessions.clear();
     }
@@ -225,6 +227,7 @@ impl TranscriptProjectionReader {
             if !self.select_session(&row.session_id) {
                 return None;
             }
+            self.last_ended_session = None;
         } else if self.current_session.as_deref() != Some(row.session_id.as_str()) {
             return None;
         }
@@ -239,6 +242,7 @@ impl TranscriptProjectionReader {
         let last = state.last_evidence.clone();
         self.current_session = None;
         self.retired_sessions.insert(row.session_id.clone());
+        self.last_ended_session = Some(row.session_id.clone());
 
         let has_text = last
             .as_ref()
@@ -307,9 +311,13 @@ impl TranscriptProjectionReader {
     }
 
     fn project_evidence(&mut self, row: EvidenceRow) -> Option<TranscriptProjection> {
-        if !self.select_session(&row.session_id)
-            || !self.accept_sequence(&row.session_id, row.sequence)
-        {
+        let is_terminal_manual_revision = row.reducer_action == "apply_manual_edit" && row.terminal;
+        let selected = if is_terminal_manual_revision {
+            self.select_terminal_manual_revision(&row.session_id)
+        } else {
+            self.select_session(&row.session_id)
+        };
+        if !selected || !self.accept_sequence(&row.session_id, row.sequence) {
             return None;
         }
 
@@ -362,6 +370,16 @@ impl TranscriptProjectionReader {
             self.retired_sessions.insert(previous);
         }
         true
+    }
+
+    /// A user edit is allowed to append to the just-ended session because the
+    /// microphone lifecycle is already closed. It may never displace a newer
+    /// active session, and only the typed terminal manual action can reopen the
+    /// retired projection identity.
+    fn select_terminal_manual_revision(&mut self, session_id: &str) -> bool {
+        self.current_session.is_none()
+            && self.last_ended_session.as_deref() == Some(session_id)
+            && self.retired_sessions.contains(session_id)
     }
 
     fn accept_sequence(&mut self, session_id: &str, sequence: u64) -> bool {
@@ -682,6 +700,82 @@ mod tests {
                 .unwrap()
                 .contains("\"kind\":\"terminal_seal\"")
         );
+    }
+
+    #[test]
+    fn terminal_manual_revision_cannot_displace_a_newer_active_session() {
+        let late_manual = serde_json::json!({
+            "schema": EVIDENCE_SCHEMA,
+            "sequence": 4,
+            "session_id": "old",
+            "reducer_revision": 2,
+            "reducer_action": "apply_manual_edit",
+            "occurrence_session_id": "old",
+            "capture_epoch": 1,
+            "sample_start": 0,
+            "sample_end": 99,
+            "document_index": 0,
+            "rendered_text": "stara ręczna rewizja",
+            "phase": "formatted",
+            "terminal": true
+        })
+        .to_string();
+        let input = [
+            lifecycle("old", 1, "session_started"),
+            evidence("old", 2, 1, "record_ledger_terminal_seal", "stare"),
+            lifecycle("old", 3, "session_ended"),
+            lifecycle("new", 1, "session_started"),
+            evidence("new", 2, 1, "apply_ledger_decision", "nowe"),
+            late_manual,
+        ]
+        .join("\n")
+            + "\n";
+
+        let output = replay(&input);
+        assert_eq!(output.len(), 3);
+        assert!(output.last().unwrap().contains("\"session_id\":\"new\""));
+        assert!(
+            output
+                .last()
+                .unwrap()
+                .contains("\"rendered_text\":\"nowe\"")
+        );
+    }
+
+    #[test]
+    fn terminal_manual_revision_cannot_revive_a_session_older_than_the_last_end() {
+        let late_manual = serde_json::json!({
+            "schema": EVIDENCE_SCHEMA,
+            "sequence": 4,
+            "session_id": "old",
+            "reducer_revision": 2,
+            "reducer_action": "apply_manual_edit",
+            "occurrence_session_id": "old",
+            "capture_epoch": 1,
+            "sample_start": 0,
+            "sample_end": 99,
+            "document_index": 0,
+            "rendered_text": "stara ręczna rewizja",
+            "phase": "formatted",
+            "terminal": true
+        })
+        .to_string();
+        let input = [
+            lifecycle("old", 1, "session_started"),
+            evidence("old", 2, 1, "record_ledger_terminal_seal", "stare"),
+            lifecycle("old", 3, "session_ended"),
+            lifecycle("new", 1, "session_started"),
+            evidence("new", 2, 1, "apply_ledger_decision", "nowe"),
+            lifecycle("new", 3, "session_ended"),
+            late_manual,
+        ]
+        .join("\n")
+            + "\n";
+
+        let output = replay(&input);
+        assert_eq!(output.len(), 4);
+        assert!(output.last().unwrap().contains("\"session_id\":\"new\""));
+        assert!(output.last().unwrap().contains("\"terminal\":true"));
     }
 
     #[test]

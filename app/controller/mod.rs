@@ -54,7 +54,10 @@ pub use types::{HotkeyAction, HotkeyInput, HotkeyType, State};
 
 use crate::presentation::status_projection::PresentationStatusProjection;
 use crate::presentation::transcript_bus::TranscriptSessionEndReason;
-use crate::presentation::{PresentationEmitter, TranscriptBus, TranscriptMode, TranscriptSession};
+use crate::presentation::{
+    PresentationEmitter, TranscriptBus, TranscriptMode, TranscriptSession, UserRevisionCommit,
+    UserRevisionIntent,
+};
 use anyhow::{Context, Result};
 use codescribe_core::pipeline::contracts::EngineEvent;
 use std::sync::Arc;
@@ -211,9 +214,18 @@ impl HoldStartAbort {
 struct HoldStartSession {
     session_id: Arc<RwLock<Option<String>>>,
     active_transcript_bus: Arc<RwLock<Option<Arc<TranscriptBus>>>>,
+    active_presentation: Arc<RwLock<Option<Arc<PresentationEmitter>>>>,
     assistive_context: Arc<RwLock<Option<AssistiveContext>>>,
     pre_overlay_frontmost_app: Arc<RwLock<Option<String>>>,
     event_broadcast: broadcast::Sender<IpcEvent>,
+}
+
+/// The recorder-facing fanout plus the retained reducer authority behind it.
+/// Naming this boundary keeps structural inspection exact while both handles
+/// continue to refer to one `PresentationEmitter` instance.
+struct RecordingEventPipeline {
+    event_sink: Arc<dyn codescribe_core::pipeline::contracts::EventSink>,
+    presentation: Arc<PresentationEmitter>,
 }
 
 /// Safe filename fragment for a controller session id. Rejects path
@@ -409,6 +421,10 @@ pub struct RecordingController {
     /// mutable drafts through it, but only the stop controller publishes the
     /// immutable product seal after every automatic stage completes.
     active_transcript_bus: Arc<RwLock<Option<Arc<TranscriptBus>>>>,
+    /// Retained after microphone teardown so a terminal overlay edit can enter
+    /// the exact reducer/ledger pair that authored the visible projection.
+    /// Replaced atomically when the next take installs its own authority.
+    active_presentation: Arc<RwLock<Option<Arc<PresentationEmitter>>>>,
 
     /// Task handle for delayed hold-start (800ms default)
     hold_start_task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -617,6 +633,7 @@ impl RecordingController {
             force_ai_mode: Arc::new(RwLock::new(false)),
             session_id: Arc::new(RwLock::new(None)),
             active_transcript_bus: Arc::new(RwLock::new(None)),
+            active_presentation: Arc::new(RwLock::new(None)),
             hold_start_task: Arc::new(Mutex::new(None)),
             hold_start_generation: Arc::new(AtomicU64::new(0)),
             start_transition_in_flight: Arc::new(AtomicBool::new(false)),
@@ -645,6 +662,34 @@ impl RecordingController {
     /// Get current state
     pub async fn current_state(&self) -> State {
         *self.state.read().await
+    }
+
+    /// Commit an overlay edit through the retained terminal reducer. The
+    /// session/revision pair is checked in Rust; text never selects authority.
+    pub async fn apply_user_revision_from_overlay(
+        &self,
+        session_id: String,
+        source_revision: u64,
+        rendered_text: String,
+    ) -> Result<UserRevisionCommit> {
+        if self.current_state().await != State::Idle {
+            return Err(anyhow::anyhow!(
+                "transcript revision refused while recording is active"
+            ));
+        }
+        let presentation = self
+            .active_presentation
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no terminal transcript revision authority"))?;
+        presentation
+            .apply_user_revision(UserRevisionIntent {
+                session_id,
+                source_revision,
+                rendered_text,
+            })
+            .map_err(anyhow::Error::new)
     }
 
     /// Forward one host sleep/wake boundary to the active recording session.
@@ -1486,6 +1531,7 @@ impl RecordingController {
             &session.event_broadcast,
         )
         .await;
+        *session.active_presentation.write().await = None;
         *session.session_id.write().await = None;
         *session.assistive_context.write().await = None;
         *session.pre_overlay_frontmost_app.write().await = None;
@@ -1497,6 +1543,7 @@ impl RecordingController {
     /// failed start leaves nothing behind for the next hotkey press.
     async fn reset_session_after_start_failure(&self, context: &str) {
         warn!("{context}: resetting controller flags after failed start");
+        *self.active_presentation.write().await = None;
         *self.pre_overlay_frontmost_app.write().await = None;
         self.reset_session_fields().await;
         set_assistive_session(false);
@@ -1650,7 +1697,7 @@ impl RecordingController {
         acoustic_ledger: Option<
             Arc<std::sync::Mutex<codescribe_core::pipeline::acoustic_ledger::AcousticLedger>>,
         >,
-    ) -> Arc<dyn codescribe_core::pipeline::contracts::EventSink> {
+    ) -> RecordingEventPipeline {
         let delta_sink = preview_deltas_enabled.then(|| {
             Arc::new(helpers::RoutingDeltaSink)
                 as Arc<dyn codescribe_core::pipeline::contracts::DeltaSink>
@@ -1661,20 +1708,25 @@ impl RecordingController {
                 Self::broadcast_transcript_projection(&projection_broadcast, event);
             },
         );
-        let pe: Arc<dyn codescribe_core::pipeline::contracts::EventSink> =
-            Arc::new(PresentationEmitter::new_with_authority(
-                transcript_buffer,
-                delta_sink,
-                None,
-                transcript_bus,
-                acoustic_ledger,
-                Some(projection_callback),
-            ));
+        let presentation = Arc::new(PresentationEmitter::new_with_authority(
+            transcript_buffer,
+            delta_sink,
+            None,
+            transcript_bus,
+            acoustic_ledger,
+            Some(projection_callback),
+        ));
+        let presentation_sink: Arc<dyn codescribe_core::pipeline::contracts::EventSink> =
+            presentation.clone();
         let ipc_sink: Arc<dyn codescribe_core::pipeline::contracts::EventSink> =
             Arc::new(helpers::IpcBroadcastSink::new(event_broadcast));
-        Arc::new(codescribe_core::pipeline::sinks::FanoutEventSink::new(
-            vec![pe, ipc_sink],
-        ))
+        let event_sink = Arc::new(codescribe_core::pipeline::sinks::FanoutEventSink::new(
+            vec![presentation_sink, ipc_sink],
+        ));
+        RecordingEventPipeline {
+            event_sink,
+            presentation,
+        }
     }
 
     /// Send the sole typed transcript projection over the existing IPC event.
@@ -1737,16 +1789,18 @@ impl RecordingController {
         preview_deltas_enabled: bool,
         event_broadcast: broadcast::Sender<IpcEvent>,
         transcript_bus: Option<Arc<TranscriptBus>>,
-    ) {
+    ) -> Arc<PresentationEmitter> {
         Self::configure_level_broadcast(recorder, event_broadcast.clone());
         let acoustic_ledger = recorder.acoustic_ledger_handle();
-        recorder.set_event_sink(Some(Self::build_recording_event_sink(
+        let pipeline = Self::build_recording_event_sink(
             recorder.transcript_buffer_handle(),
             preview_deltas_enabled,
             event_broadcast,
             transcript_bus,
             acoustic_ledger,
-        )));
+        );
+        recorder.set_event_sink(Some(pipeline.event_sink));
+        pipeline.presentation
     }
 
     /// Wire level metering and the event sink for a toggle / hands-off session,
@@ -1757,7 +1811,7 @@ impl RecordingController {
         _flush_voice_chat_on_vad_end: bool,
         event_broadcast: broadcast::Sender<IpcEvent>,
         transcript_bus: Option<Arc<TranscriptBus>>,
-    ) {
+    ) -> Arc<PresentationEmitter> {
         // Hands-off is ONE continuous recorder session (ADR 2026-05-28 Faza 1).
         // Normal hands-off uses cumulative SessionRendered deltas in the transcription overlay.
         //
@@ -1767,13 +1821,15 @@ impl RecordingController {
         // into the same bubble, or previews and finals will duplicate.
         Self::configure_level_broadcast(recorder, event_broadcast.clone());
         let acoustic_ledger = recorder.acoustic_ledger_handle();
-        recorder.set_event_sink(Some(Self::build_recording_event_sink(
+        let pipeline = Self::build_recording_event_sink(
             recorder.transcript_buffer_handle(),
             preview_deltas_enabled,
             event_broadcast,
             transcript_bus,
             acoustic_ledger,
-        )));
+        );
+        recorder.set_event_sink(Some(pipeline.event_sink));
+        pipeline.presentation
     }
 
     /// Handle hotkey event - main entry point for state machine
@@ -2502,6 +2558,7 @@ impl RecordingController {
         let hold_session = HoldStartSession {
             session_id: Arc::clone(&self.session_id),
             active_transcript_bus: Arc::clone(&self.active_transcript_bus),
+            active_presentation: Arc::clone(&self.active_presentation),
             assistive_context: Arc::clone(&self.assistive_context),
             pre_overlay_frontmost_app: Arc::clone(&self.pre_overlay_frontmost_app),
             event_broadcast: event_broadcast.clone(),
@@ -2702,12 +2759,13 @@ impl RecordingController {
 
             // Runtime pipeline is always event-based. Hold mode has no utterance callback;
             // text is finalized on key-up in `finish_recording`.
-            Self::configure_hold_event_sink(
+            let presentation = Self::configure_hold_event_sink(
                 rec,
                 is_assistive || overlay_enabled,
                 event_broadcast.clone(),
                 transcript_bus.clone(),
             );
+            *hold_session.active_presentation.write().await = Some(presentation);
             if !cfg!(test) {
                 let language_hint = language.whisper_hint().map(str::to_string);
                 // Audio-first cold start: do not preflight Whisper here. The
@@ -2721,12 +2779,13 @@ impl RecordingController {
                             warn!("Hold-start stale-recorder recovery failed: {stop_err}");
                         }
                         Self::clear_recorder_callbacks(rec);
-                        Self::configure_hold_event_sink(
+                        let presentation = Self::configure_hold_event_sink(
                             rec,
                             is_assistive || overlay_enabled,
                             event_broadcast.clone(),
                             transcript_bus.clone(),
                         );
+                        *hold_session.active_presentation.write().await = Some(presentation);
                         let retry_result = rec.start_event_session(language_hint).await;
                         if let Err(retry_err) = retry_result {
                             error!("Failed to start recorder after recovery: {retry_err}");
@@ -2958,13 +3017,14 @@ impl RecordingController {
         .map(Arc::new);
 
         // Runtime pipeline is always event-based.
-        Self::configure_toggle_event_sink(
+        let presentation = Self::configure_toggle_event_sink(
             recorder,
             overlay_enabled,
             is_assistive,
             self.event_broadcast.clone(),
             transcript_bus.clone(),
         );
+        *self.active_presentation.write().await = Some(presentation);
         // Skip actual audio stream in tests (no CoreAudio device needed)
         let language_hint = language.whisper_hint().map(str::to_string);
         // Audio-first cold start: do not preflight Whisper here. The recorder
@@ -2978,13 +3038,14 @@ impl RecordingController {
                     warn!("Toggle stale-recorder recovery failed: {stop_err}");
                 }
                 Self::clear_recorder_callbacks(recorder);
-                Self::configure_toggle_event_sink(
+                let presentation = Self::configure_toggle_event_sink(
                     recorder,
                     overlay_enabled,
                     is_assistive,
                     self.event_broadcast.clone(),
                     transcript_bus.clone(),
                 );
+                *self.active_presentation.write().await = Some(presentation);
                 if let Err(retry_err) = recorder.start_event_session(language_hint).await {
                     drop(recorder_guard);
                     self.reset_session_after_start_failure("Toggle-start retry")
@@ -3340,6 +3401,7 @@ impl RecordingController {
 
     /// Internal helper to reset all state variables
     async fn reset_state(&self) {
+        *self.active_presentation.write().await = None;
         *self.pre_overlay_frontmost_app.write().await = None;
         self.reset_session_fields().await;
 
