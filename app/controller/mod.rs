@@ -59,6 +59,8 @@ use crate::presentation::{
     UserRevisionIntent,
 };
 use anyhow::{Context, Result};
+use codescribe_core::llm::ai_formatting::format_text_with_status_for_policy;
+use codescribe_core::pipeline::acoustic_ledger::DocumentRevisionProvenance;
 use codescribe_core::pipeline::contracts::EngineEvent;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -694,7 +696,58 @@ impl RecordingController {
                 session_id,
                 source_revision,
                 rendered_text,
+                provenance: DocumentRevisionProvenance::UserEdit,
             })
+            .map_err(anyhow::Error::new)
+    }
+
+    /// Format the exact retained terminal document through the production
+    /// postprocess lane, then commit only an applied result through the same
+    /// ledger CAS + projection corridor as an explicit user edit.
+    pub async fn apply_formatter_revision_from_overlay(
+        &self,
+        session_id: String,
+        source_revision: u64,
+    ) -> Result<UserRevisionCommit> {
+        if self.current_state().await != State::Idle {
+            return Err(anyhow::anyhow!(
+                "formatter revision refused while recording is active"
+            ));
+        }
+        let presentation = self
+            .active_presentation
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no terminal transcript revision authority"))?;
+        let source = presentation
+            .terminal_revision_source(&session_id, source_revision)
+            .map_err(anyhow::Error::new)?;
+        let runtime_settings = self.runtime_settings_arc().await;
+        let language = runtime_settings.values().whisper_language;
+        let result = format_text_with_status_for_policy(
+            &source,
+            language.whisper_hint(),
+            runtime_settings.as_ref(),
+        )
+        .await;
+        let _serial_guard = self.serial_lock.lock().await;
+        if self.current_state().await != State::Idle {
+            return Err(anyhow::anyhow!(
+                "formatter result refused because a recording became active"
+            ));
+        }
+        let current_presentation = self
+            .active_presentation
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("terminal transcript authority changed"))?;
+        if !Arc::ptr_eq(&presentation, &current_presentation) {
+            return Err(anyhow::anyhow!("terminal transcript authority changed"));
+        }
+        presentation
+            .apply_formatter_revision(session_id, source_revision, result)
             .map_err(anyhow::Error::new)
     }
 

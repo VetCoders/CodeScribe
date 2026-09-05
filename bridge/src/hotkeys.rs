@@ -889,6 +889,30 @@ impl CodescribeHotkeys {
         .await?
     }
 
+    /// Format one exact terminal reducer revision through the production Rust
+    /// formatter and commit the applied result as a provenance-bearing ledger
+    /// revision. Failure is returned to Swift without publishing any evidence.
+    pub async fn commit_formatter_revision(
+        &self,
+        session_id: String,
+        source_revision: u64,
+    ) -> Result<CsUserRevisionResult, CsError> {
+        application_runtime::run(async move {
+            let controller =
+                current_controller(&shared_controller()).ok_or_else(|| CsError::Recording {
+                    msg: "no recording controller for formatter revision".to_string(),
+                })?;
+            controller
+                .apply_formatter_revision_from_overlay(session_id, source_revision)
+                .await
+                .map(CsUserRevisionResult::from)
+                .map_err(|error| CsError::Recording {
+                    msg: error.to_string(),
+                })
+        })
+        .await?
+    }
+
     /// Forward a macOS sleep/wake boundary to the active recorder, if any.
     ///
     /// Querying this surface never constructs the shared controller. The host

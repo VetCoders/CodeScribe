@@ -84,6 +84,9 @@ protocol DictationEngine: AnyObject {
   func commitUserRevision(
     sessionId: String, sourceRevision: UInt64, renderedText: String
   ) async throws -> CsUserRevisionResult
+  func commitFormatterRevision(
+    sessionId: String, sourceRevision: UInt64
+  ) async throws -> CsUserRevisionResult
   func isRecording() async -> Bool
   func initModel() async throws
   func isModelLoaded() -> Bool
@@ -176,6 +179,7 @@ final class OverlayState {
   var revisionDraft = ""
   private(set) var revision: UInt64 = 0
   private(set) var revisionCommitPending = false
+  private(set) var formatterCommitPending = false
   private(set) var revisionCommitError: String?
   private(set) var userRevisionProvenance: String?
   private(set) var canPaste = false
@@ -684,13 +688,52 @@ final class OverlayState {
   }
 
   private func relayFormatIntent() {
-    // The current product FFI exposes formatter availability but no command
-    // that can publish a new occurrence-authenticated projection. Refuse
-    // visibly instead of reviving the removed Swift text-authority bypass.
-    presentActionFailure(
-      "Formatting is not connected to the transcript reducer",
-      notice: "format unavailable"
-    )
+    guard mode == .formatted, terminal, canFormat, !isRevisionDraftDirty,
+      !revisionCommitPending, !formatterCommitPending
+    else { return }
+    guard let projection = latestTranscriptProjection, let engine else {
+      revisionCommitError = "Transcript formatter authority is unavailable"
+      showFooterNotice("format unavailable")
+      return
+    }
+    formatterCommitPending = true
+    revisionCommitError = nil
+    pendingRevisionSessionId = projection.sessionId
+    pendingRevisionSource = projection.reducerRevision
+    cancelAutoHide()
+    showFooterNotice("formatting…", persists: true)
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        let receipt = try await engine.commitFormatterRevision(
+          sessionId: projection.sessionId,
+          sourceRevision: projection.reducerRevision
+        )
+        guard receipt.sessionId == projection.sessionId,
+          receipt.sourceRevision == projection.reducerRevision,
+          receipt.revision > receipt.sourceRevision,
+          !receipt.renderedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          receipt.provenanceReceipt.hasPrefix("formatter-")
+        else {
+          formatterCommitPending = false
+          pendingRevisionSessionId = nil
+          pendingRevisionSource = nil
+          revisionCommitError = "Formatter revision receipt was inconsistent"
+          showFooterNotice("format failed")
+          restartAutoHideCountdown()
+          return
+        }
+        // Projection can arrive before acknowledgement. It is still the only
+        // path that may repaint `formattedText` or the local editor draft.
+      } catch {
+        formatterCommitPending = false
+        pendingRevisionSessionId = nil
+        pendingRevisionSource = nil
+        revisionCommitError = "Couldn't format transcript: \(error)"
+        showFooterNotice("format failed")
+        restartAutoHideCountdown()
+      }
+    }
   }
 
   private func presentActionFailure(_ message: String, notice: String) {
@@ -974,7 +1017,7 @@ final class OverlayState {
   func discardRevisionDraft() {
     revisionFocusCommitTask?.cancel()
     revisionFocusCommitTask = nil
-    guard !revisionCommitPending else { return }
+    guard !revisionCommitPending, !formatterCommitPending else { return }
     revisionDraft = formattedText
     revisionCommitError = nil
     if terminal { restartAutoHideCountdown() }
@@ -986,7 +1029,9 @@ final class OverlayState {
   func commitRevisionDraft() {
     revisionFocusCommitTask?.cancel()
     revisionFocusCommitTask = nil
-    guard mode == .formatted, terminal, isRevisionDraftDirty, !revisionCommitPending else {
+    guard mode == .formatted, terminal, isRevisionDraftDirty, !revisionCommitPending,
+      !formatterCommitPending
+    else {
       return
     }
     let proposed = revisionDraft
@@ -1423,6 +1468,9 @@ final class OverlayState {
     let revisionReceipt = projection.acousticReceipts
       .compactMap(\.manualEditReceipt)
       .first(where: { $0.hasPrefix("user-edit-") })
+    let formatterReceipt = projection.acousticReceipts
+      .compactMap(\.manualEditReceipt)
+      .first(where: { $0.hasPrefix("formatter-") })
     let completesPendingRevision =
       revisionCommitPending
       && projection.reducerAction == "apply_manual_edit"
@@ -1430,6 +1478,13 @@ final class OverlayState {
       && projection.sessionId == pendingRevisionSessionId
       && projection.reducerRevision > (pendingRevisionSource ?? UInt64.max)
       && revisionReceipt != nil
+    let completesPendingFormatter =
+      formatterCommitPending
+      && projection.reducerAction == "apply_manual_edit"
+      && projection.terminal
+      && projection.sessionId == pendingRevisionSessionId
+      && projection.reducerRevision > (pendingRevisionSource ?? UInt64.max)
+      && formatterReceipt != nil
     let signalsFirstSuccessfulTerminal =
       !terminal && projection.terminal && projection.phase == .formatted
     if projection.terminal {
@@ -1459,6 +1514,7 @@ final class OverlayState {
       qualityCapturedProvenance = nil
       userRevisionProvenance = nil
       revisionCommitPending = false
+      formatterCommitPending = false
       pendingRevisionSessionId = nil
       pendingRevisionSource = nil
       revisionCommitError = nil
@@ -1471,6 +1527,13 @@ final class OverlayState {
       revisionCommitError = nil
       userRevisionProvenance = revisionReceipt
       revisionDraft = projection.renderedText
+    } else if completesPendingFormatter {
+      formatterCommitPending = false
+      pendingRevisionSessionId = nil
+      pendingRevisionSource = nil
+      revisionCommitError = nil
+      revisionDraft = projection.renderedText
+      showFooterNotice("formatted")
     } else if !draftWasDirty || isNewSession {
       revisionDraft = projection.renderedText
     }
@@ -1686,6 +1749,14 @@ final class ControllerDictationEngine: DictationEngine {
       renderedText: renderedText
     )
   }
+  func commitFormatterRevision(
+    sessionId: String, sourceRevision: UInt64
+  ) async throws -> CsUserRevisionResult {
+    try await hotkeys.commitFormatterRevision(
+      sessionId: sessionId,
+      sourceRevision: sourceRevision
+    )
+  }
   func isRecording() async -> Bool {
     await hotkeys.isRecording()
   }
@@ -1796,6 +1867,17 @@ final class DictationListener: CsTranscriptionListener {
         revision: sourceRevision + 1,
         renderedText: renderedText,
         provenanceReceipt: "user-edit-preview"
+      )
+    }
+    func commitFormatterRevision(
+      sessionId: String, sourceRevision: UInt64
+    ) async throws -> CsUserRevisionResult {
+      CsUserRevisionResult(
+        sessionId: sessionId,
+        sourceRevision: sourceRevision,
+        revision: sourceRevision + 1,
+        renderedText: "Formatted preview",
+        provenanceReceipt: "formatter-preview"
       )
     }
     func isRecording() async -> Bool { false }

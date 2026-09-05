@@ -116,7 +116,7 @@ a seal. `seal_coverage` is emitted before terminal finality. A terminal
 `LedgerSeal` reducer action marks the writer sealed only when the latest
 coverage is not incomplete. No arbitrary string can close committed Bus truth.
 
-### Terminal user revisions
+### Terminal document revisions
 
 The formatted canvas may hold a local, visibly uncommitted edit draft. Commit
 sends `session_id + source_revision + rendered_text` across FFI; it does not
@@ -133,6 +133,15 @@ buffer. It may follow `session_ended` because microphone lifecycle is already
 closed. Replay accepts that terminal revision only for the just-ended session;
 once a newer session is active, an older edit cannot displace it. Esc, Discard,
 and Close delete only the local draft and write no ledger or Bus revision.
+
+The Format dock command is the sibling route, not a second reducer. Rust reads
+the exact current terminal document under the same `session_id +
+source_revision` CAS, runs `format_text_with_status_for_policy`, and admits only
+an `Applied` result through `TranscriptReducer::apply_user_revision`. Its
+`ManualDocumentRevisionReceipt` uses `provenance=formatter` and a
+`formatter-*` receipt; the resulting Bus projection is the only canvas repaint.
+`Failed`, `Skipped`, and `AiNoop` results return a visible refusal to Swift and
+append no ledger, Bus, history, delivery-buffer, or Copy-last state.
 
 Controller-authenticated context captures enter the same presentation reducer
 as `RecordContextMarker` actions (`record_context_marker` on the Bus). The

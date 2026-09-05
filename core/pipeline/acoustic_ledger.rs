@@ -1060,7 +1060,7 @@ impl AcousticLedger {
         &self.manual_edits
     }
 
-    /// Authenticate one user-authored rewrite of the complete sealed document.
+    /// Authenticate one provenance-bearing rewrite of the complete sealed document.
     ///
     /// A whole-document edit cannot honestly be divided back into occurrence
     /// labels without a new word-to-PCM alignment pass. This receipt therefore
@@ -1074,6 +1074,7 @@ impl AcousticLedger {
         revision: u64,
         rendered_text: &str,
         source_occurrences: &[OccurrenceIdentity],
+        provenance: DocumentRevisionProvenance,
     ) -> Result<ManualDocumentRevisionReceipt, &'static str> {
         if session_id.is_empty() {
             return Err("manual_document_session_missing");
@@ -1103,8 +1104,11 @@ impl AcousticLedger {
             .collect::<Vec<_>>();
         let ordinal = self.manual_document_revisions.len();
         let receipt = ManualDocumentRevisionReceipt {
-            receipt_id: format!("user-edit-{session_id}-{source_revision}-{revision}-{ordinal}"),
-            provenance: "user-edit".to_string(),
+            receipt_id: format!(
+                "{}-{session_id}-{source_revision}-{revision}-{ordinal}",
+                provenance.as_str()
+            ),
+            provenance: provenance.as_str().to_string(),
             session_id: session_id.to_string(),
             source_revision,
             revision,
@@ -1881,7 +1885,27 @@ pub struct ManualEditReceipt {
     pub observation: ObservationIdentity,
 }
 
-/// Provenance for an explicit user rewrite of a complete sealed transcript.
+/// Authenticated origin of a whole-document revision.
+///
+/// Both routes enter the same ledger + reducer corridor. The origin remains
+/// explicit so a formatter result can never masquerade as a human correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentRevisionProvenance {
+    UserEdit,
+    Formatter,
+}
+
+impl DocumentRevisionProvenance {
+    /// Stable spelling used by ledger receipts and Bus consumers.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UserEdit => "user-edit",
+            Self::Formatter => "formatter",
+        }
+    }
+}
+
+/// Provenance for an explicit rewrite of a complete sealed transcript.
 ///
 /// The receipt names every source occurrence and seal but deliberately carries
 /// no fabricated per-word alignment for the replacement text. It is append-only

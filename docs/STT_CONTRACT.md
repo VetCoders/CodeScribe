@@ -119,6 +119,13 @@ replacement / delivery-style path no longer exists. Automatic formatting is
 only the occurrence-bound observer described below; HQ compare remains Whisper
 file vs raw Apple, never vs formatted text.
 
+**Terminal format command:** the overlay sends only the current session and
+reducer revision. Rust reads the current committed document, invokes the one
+production formatting policy pipeline, and commits an applied result through
+the ledger-backed revision corridor with `formatter` provenance. Provider
+failure, disabled/short-text skip, and unchanged output are refusals: they must
+remain visible UI errors and must never become transcript history or Copy-last.
+
 **Dictionary helper (everyone, 2026-08-17):** Settings → Dictionary Retranscribe
 is an explicit file surface on the row's archived `<stem>_raw.{m4a,wav,flac}`.
 Helper engine follows `speech.engine.asr_mode`: `local_power` → `hq:` (same

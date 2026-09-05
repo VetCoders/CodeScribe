@@ -8,10 +8,36 @@ import XCTest
 private final class OverlayIntentBoundaryEngine: DictationEngine {
   var onTranscribeFile: (() -> Void)?
   var receivedTranscribePath: String?
+  var onFormatter: (() -> Void)?
+  var formatterRequests: [(sessionId: String, sourceRevision: UInt64)] = []
 
   func setListener(_ listener: CsTranscriptionListener) {}
   func startRecording(language: CsLanguage?) async throws {}
   func stopRecording() async throws -> String { "" }
+  func commitUserRevision(
+    sessionId: String, sourceRevision: UInt64, renderedText: String
+  ) async throws -> CsUserRevisionResult {
+    return CsUserRevisionResult(
+      sessionId: sessionId,
+      sourceRevision: sourceRevision,
+      revision: sourceRevision + 1,
+      renderedText: renderedText,
+      provenanceReceipt: "user-edit-intent-boundary"
+    )
+  }
+  func commitFormatterRevision(
+    sessionId: String, sourceRevision: UInt64
+  ) async throws -> CsUserRevisionResult {
+    formatterRequests.append((sessionId, sourceRevision))
+    onFormatter?()
+    return CsUserRevisionResult(
+      sessionId: sessionId,
+      sourceRevision: sourceRevision,
+      revision: sourceRevision + 1,
+      renderedText: "formatted",
+      provenanceReceipt: "formatter-intent-boundary"
+    )
+  }
   func isRecording() async -> Bool { false }
   func initModel() async throws {}
   func isModelLoaded() -> Bool { true }
@@ -79,7 +105,7 @@ final class OverlayIntentRailTests: XCTestCase {
     }
   }
 
-  func testDispatchUsesProductionStateRouteAndLeavesProjectionUntouched() {
+  func testDispatchUsesProductionStateRouteAndLeavesProjectionUntouched() async {
     let state = projectedState(
       phase: "formatted",
       text: "final",
@@ -90,6 +116,10 @@ final class OverlayIntentRailTests: XCTestCase {
       canFormat: true,
       terminal: true
     )
+    let engine = OverlayIntentBoundaryEngine()
+    state.engine = engine
+    let requested = expectation(description: "format intent reached production boundary")
+    engine.onFormatter = { requested.fulfill() }
     let rail = OverlayIntentRail(
       phase: state.statusText,
       intents: OverlayIntentRail.projectedIntents(for: state),
@@ -98,6 +128,7 @@ final class OverlayIntentRailTests: XCTestCase {
     )
 
     rail.dispatch(.format)
+    await fulfillment(of: [requested], timeout: 1)
 
     XCTAssertEqual(state.mode, .formatted)
     XCTAssertEqual(state.formattedText, "final")
@@ -108,8 +139,11 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertTrue(state.canRetranscribe)
     XCTAssertTrue(state.canFormat)
     XCTAssertTrue(state.terminal)
-    XCTAssertEqual(state.toast, "format unavailable")
-    XCTAssertEqual(state.errorMessage, "Formatting is not connected to the transcript reducer")
+    XCTAssertEqual(engine.formatterRequests.count, 1)
+    XCTAssertEqual(engine.formatterRequests[0].sessionId, "intent-rail-fixture")
+    XCTAssertEqual(engine.formatterRequests[0].sourceRevision, 1)
+    XCTAssertTrue(state.formatterCommitPending, "FFI acknowledgement is not projection")
+    XCTAssertNil(state.revisionCommitError)
   }
 
   func testCollapsedDockHasOnlyHandleAndExpandedDockSwapsInProjection() {

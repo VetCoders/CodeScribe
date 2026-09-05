@@ -215,7 +215,7 @@ struct OverlayIntentRail: View {
   }
 
   static func projectedIntents(for state: OverlayState) -> [OverlayIntent] {
-    if state.revisionCommitPending {
+    if state.revisionCommitPending || state.formatterCommitPending {
       return []
     }
     if state.isRevisionDraftDirty {

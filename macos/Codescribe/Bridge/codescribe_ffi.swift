@@ -2224,6 +2224,13 @@ public protocol CodescribeHotkeysProtocol: AnyObject, Sendable {
     func cancelVoiceTurn(threadId: String)  -> Bool
 
     /**
+     * Format one exact terminal reducer revision through the production Rust
+     * formatter and commit the applied result as a provenance-bearing ledger
+     * revision. Failure is returned to Swift without publishing any evidence.
+     */
+    func commitFormatterRevision(sessionId: String, sourceRevision: UInt64) async throws  -> CsUserRevisionResult
+
+    /**
      * Commit a terminal overlay draft as a Rust-authored document revision.
      * The returned value is acknowledgement only; Swift repaints exclusively
      * from the transcript projection callback emitted by the reducer.
@@ -2543,6 +2550,28 @@ open func cancelVoiceTurn(threadId: String) -> Bool  {
         FfiConverterString.lower(threadId),$0
     )
 })
+}
+
+    /**
+     * Format one exact terminal reducer revision through the production Rust
+     * formatter and commit the applied result as a provenance-bearing ledger
+     * revision. Failure is returned to Swift without publishing any evidence.
+     */
+open func commitFormatterRevision(sessionId: String, sourceRevision: UInt64)async throws  -> CsUserRevisionResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribehotkeys_commit_formatter_revision(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(sessionId),FfiConverterUInt64.lower(sourceRevision)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCsUserRevisionResult_lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
 }
 
     /**
@@ -14160,6 +14189,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_cancel_voice_turn() != 32656) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_commit_formatter_revision() != 59971) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_commit_user_revision() != 37560) {

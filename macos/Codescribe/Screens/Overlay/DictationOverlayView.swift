@@ -286,7 +286,11 @@ struct DictationOverlayView: View {
   private var formattedBody: some View {
     VStack(alignment: .leading, spacing: CSSpace.sm) {
       HStack(spacing: CSSpace.xs) {
-        if state.revisionCommitPending {
+        if state.formatterCommitPending {
+          ProgressView()
+            .controlSize(.small)
+          Text("Formatting revision…")
+        } else if state.revisionCommitPending {
           ProgressView()
             .controlSize(.small)
           Text("Committing revision…")
@@ -316,7 +320,7 @@ struct DictationOverlayView: View {
       .lineSpacing(6)
       .lineLimit(3...12)
       .focused($transcriptEditorFocused)
-      .disabled(state.revisionCommitPending)
+      .disabled(state.revisionCommitPending || state.formatterCommitPending)
       .accessibilityLabel("Final transcript revision draft")
       .accessibilityHint("Edits stay local until committed to the transcript ledger")
       .accessibilityIdentifier("overlay-transcript-editor")
@@ -340,7 +344,11 @@ struct DictationOverlayView: View {
           .accessibilityIdentifier("overlay-revision-error")
       }
     }
-    .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .topLeading)
+    .frame(
+      maxWidth: .infinity, minHeight: bodyMinHeight, maxHeight: .infinity,
+      alignment: .topLeading
+    )
+    .clipped()
     .padding(.top, headerChromeInset)
     .padding(.bottom, OverlayDockLayout.height)
     .accessibilityLabel("Final transcript")

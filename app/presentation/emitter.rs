@@ -9,11 +9,12 @@
 
 use std::{collections::BTreeMap, io::Write as _, sync::Arc};
 
+use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
 use codescribe_core::llm::inline_format::{LabelProposalDisposition, OccurrenceLabelProposal};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, LedgerSealReceipt, ManualDocumentRevisionReceipt,
-    MutationReceipt, ObservationIdentity, ObservationProducer, OccurrenceIdentity,
-    SealCoverageReceipt, SealCoverageStatus, TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, DocumentRevisionProvenance, LedgerSealReceipt,
+    ManualDocumentRevisionReceipt, MutationReceipt, ObservationIdentity, ObservationProducer,
+    OccurrenceIdentity, SealCoverageReceipt, SealCoverageStatus, TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
 use tokio::sync::Mutex;
@@ -130,6 +131,7 @@ pub struct UserRevisionIntent {
     pub session_id: String,
     pub source_revision: u64,
     pub rendered_text: String,
+    pub provenance: DocumentRevisionProvenance,
 }
 
 /// Rust-authored acknowledgement for one committed user revision. Swift uses
@@ -155,6 +157,9 @@ pub enum UserRevisionRefusal {
     RevisionExhausted,
     LedgerRefusal(&'static str),
     AuthorityUnavailable,
+    FormatterFailed,
+    FormatterUnavailable,
+    FormatterNoop,
 }
 
 impl std::fmt::Display for UserRevisionRefusal {
@@ -176,6 +181,11 @@ impl std::fmt::Display for UserRevisionRefusal {
             Self::AuthorityUnavailable => {
                 formatter.write_str("transcript revision authority unavailable")
             }
+            Self::FormatterFailed => formatter.write_str("formatter gateway failed"),
+            Self::FormatterUnavailable => {
+                formatter.write_str("formatter is unavailable for the current policy or text")
+            }
+            Self::FormatterNoop => formatter.write_str("formatter returned unchanged text"),
         }
     }
 }
@@ -366,29 +376,8 @@ impl TranscriptReducer {
         if intent.rendered_text.trim().is_empty() {
             return Err(UserRevisionRefusal::EmptyText);
         }
-        if self.document_by_occurrence.is_empty() {
-            return Err(UserRevisionRefusal::NoCommittedDocument);
-        }
-        if !self.terminal {
-            return Err(UserRevisionRefusal::NotTerminal);
-        }
-        if intent.source_revision != self.revision {
-            return Err(UserRevisionRefusal::StaleRevision {
-                expected: self.revision,
-                actual: intent.source_revision,
-            });
-        }
-        let source_occurrences = self
-            .document_by_occurrence
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        if source_occurrences
-            .iter()
-            .any(|occurrence| occurrence.session != intent.session_id)
-        {
-            return Err(UserRevisionRefusal::SessionMismatch);
-        }
+        let source_occurrences =
+            self.authenticated_revision_occurrences(&intent.session_id, intent.source_revision)?;
         if self.committed_rendered_text() == intent.rendered_text {
             return Err(UserRevisionRefusal::Unchanged);
         }
@@ -403,11 +392,55 @@ impl TranscriptReducer {
                 revision,
                 &intent.rendered_text,
                 &source_occurrences,
+                intent.provenance,
             )
             .map_err(UserRevisionRefusal::LedgerRefusal)?;
         self.manual_rendered_text = Some(intent.rendered_text.clone());
         self.manual_document_revision_receipt = Some(receipt.receipt_id.clone());
         Ok(self.revision_for_action(ReducerAction::ApplyUserRevision { receipt }))
+    }
+
+    fn authenticated_revision_occurrences(
+        &self,
+        session_id: &str,
+        source_revision: u64,
+    ) -> Result<Vec<OccurrenceIdentity>, UserRevisionRefusal> {
+        if self.document_by_occurrence.is_empty() {
+            return Err(UserRevisionRefusal::NoCommittedDocument);
+        }
+        if !self.terminal {
+            return Err(UserRevisionRefusal::NotTerminal);
+        }
+        if source_revision != self.revision {
+            return Err(UserRevisionRefusal::StaleRevision {
+                expected: self.revision,
+                actual: source_revision,
+            });
+        }
+        let source_occurrences = self
+            .document_by_occurrence
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if source_occurrences
+            .iter()
+            .any(|occurrence| occurrence.session != session_id)
+        {
+            return Err(UserRevisionRefusal::SessionMismatch);
+        }
+        Ok(source_occurrences)
+    }
+
+    /// Return the exact current terminal document after authenticating the
+    /// session/revision compare-and-swap boundary. This is read-only formatter
+    /// input and cannot mint a ledger or Bus event.
+    pub fn terminal_revision_source(
+        &self,
+        session_id: &str,
+        source_revision: u64,
+    ) -> Result<String, UserRevisionRefusal> {
+        self.authenticated_revision_occurrences(session_id, source_revision)?;
+        Ok(self.committed_rendered_text())
     }
 
     /// Open terminal review only after the engine lifecycle has finished. This
@@ -782,6 +815,43 @@ impl PresentationEmitter {
             provenance_receipt: receipt.receipt_id.clone(),
         })
     }
+
+    /// Authenticate formatter input without mutating reducer, ledger, Bus, or
+    /// delivery state. The controller feeds these exact bytes into the one
+    /// production formatter pipeline and retains the source revision as CAS.
+    pub fn terminal_revision_source(
+        &self,
+        session_id: &str,
+        source_revision: u64,
+    ) -> Result<String, UserRevisionRefusal> {
+        self.session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_revision_source(session_id, source_revision)
+    }
+
+    /// Admit only a successful formatter result into the existing revision
+    /// corridor. Failure, skipped policy, and healthy no-op are visible
+    /// refusals and therefore mint no ledger/history/Copy-last evidence.
+    pub fn apply_formatter_revision(
+        &self,
+        session_id: String,
+        source_revision: u64,
+        result: AiFormatResult,
+    ) -> Result<UserRevisionCommit, UserRevisionRefusal> {
+        let rendered_text = match result.status {
+            AiFormatStatus::Applied => result.text,
+            AiFormatStatus::Failed => return Err(UserRevisionRefusal::FormatterFailed),
+            AiFormatStatus::Skipped => return Err(UserRevisionRefusal::FormatterUnavailable),
+            AiFormatStatus::AiNoop => return Err(UserRevisionRefusal::FormatterNoop),
+        };
+        self.apply_user_revision(UserRevisionIntent {
+            session_id,
+            source_revision,
+            rendered_text,
+            provenance: DocumentRevisionProvenance::Formatter,
+        })
+    }
 }
 
 impl Drop for PresentationEmitter {
@@ -1052,10 +1122,11 @@ mod tests {
         TranscriptSessionEndReason,
     };
     use crate::presentation::transcript_projection::TranscriptProjectionReader;
+    use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
     use codescribe_core::llm::inline_format::{LabelProposalDisposition, OccurrenceLabelProposal};
     use codescribe_core::pipeline::acoustic_ledger::{
-        AcousticEvidence, AcousticLedger, EnergyCalibration, ObservationIdentity,
-        ObservationProducer, OccurrenceIdentity,
+        AcousticEvidence, AcousticLedger, DocumentRevisionProvenance, EnergyCalibration,
+        ObservationIdentity, ObservationProducer, OccurrenceIdentity,
     };
     use codescribe_core::pipeline::contracts::{
         AnnotationKind, DeltaSink, EngineEvent, EventSink, LayerSource, LayerSummary,
@@ -1382,6 +1453,7 @@ mod tests {
                 session_id: "revision-session".to_string(),
                 source_revision: terminal.reducer_revision,
                 rendered_text: "Tekst poprawiony przez użytkownika".to_string(),
+                provenance: DocumentRevisionProvenance::UserEdit,
             })
             .expect("current terminal revision intent must commit");
         assert_eq!(commit.revision, terminal.reducer_revision + 1);
@@ -1391,6 +1463,7 @@ mod tests {
             session_id: "revision-session".to_string(),
             source_revision: terminal.reducer_revision,
             rendered_text: "Spóźniona edycja".to_string(),
+            provenance: DocumentRevisionProvenance::UserEdit,
         });
         assert!(matches!(
             stale,
@@ -1443,6 +1516,150 @@ mod tests {
         assert_eq!(replayed_revision.reducer_action, "apply_manual_edit");
         assert_eq!(replayed_revision.rendered_text, commit.rendered_text);
         assert!(replayed_revision.terminal);
+    }
+
+    /// I4m effect witness: a failed formatter result cannot touch ledger, Bus,
+    /// projection, or delivery. An applied result then mints formatter
+    /// provenance and repaints only through the committed projection callback.
+    #[tokio::test]
+    async fn terminal_formatter_revision_commits_effect_and_failure_is_pure() {
+        let delivery = Arc::new(Mutex::new(String::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let bus_path = temp.path().join("formatter-revision.jsonl");
+        let bus = Arc::new(
+            TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: "formatter-session".to_string(),
+                    mode: TranscriptMode::Dictation,
+                    has_latched_target: true,
+                    latched_target_is_self: false,
+                },
+                bus_path.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let occurrence = OccurrenceIdentity::new("formatter-session", 5, 0, 16_000);
+        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
+        let mutation = {
+            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+            let mutation = admitted_mutation(
+                &mut ledger,
+                occurrence.clone(),
+                1,
+                "to jest tekst wymagający formatowania",
+            );
+            ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+            mutation
+        };
+        let projected = Arc::new(StdMutex::new(Vec::new()));
+        let projected_for_callback = Arc::clone(&projected);
+        bus.publish_started();
+        let mut emitter = PresentationEmitter::new_with_authority(
+            Arc::clone(&delivery),
+            None,
+            None,
+            Some(Arc::clone(&bus)),
+            Some(Arc::clone(&ledger)),
+            Some(Arc::new(move |event| {
+                projected_for_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event.clone());
+            })),
+        );
+        emitter.on_event(&mutation);
+        let terminal_seal = ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .seal_terminal("formatter-session", 5)
+            .expect("closed qualified occurrence must produce terminal seal");
+        emitter.on_event(&EngineEvent::LedgerSeal {
+            receipt: terminal_seal,
+        });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
+        emitter.on_event(&EngineEvent::SessionFinalised {
+            session_id: "formatter-session".to_string(),
+            layer_summary: LayerSummary::default(),
+        });
+
+        let source = emitter
+            .terminal_revision_source("formatter-session", terminal.reducer_revision)
+            .expect("current terminal source");
+        let bus_before_failure = std::fs::read(&bus_path).unwrap();
+        let delivery_before_failure = delivery.lock().await.clone();
+        let projection_count_before_failure = projected
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
+        let failure = emitter.apply_formatter_revision(
+            "formatter-session".to_string(),
+            terminal.reducer_revision,
+            AiFormatResult {
+                text: source.clone(),
+                reasoning_text: None,
+                status: AiFormatStatus::Failed,
+            },
+        );
+        assert_eq!(failure, Err(UserRevisionRefusal::FormatterFailed));
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .manual_document_revisions()
+                .is_empty()
+        );
+        assert_eq!(std::fs::read(&bus_path).unwrap(), bus_before_failure);
+        assert_eq!(
+            projected
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len(),
+            projection_count_before_failure
+        );
+        assert_eq!(*delivery.lock().await, delivery_before_failure);
+
+        let formatted = "To jest tekst wymagający formatowania.".to_string();
+        let commit = emitter
+            .apply_formatter_revision(
+                "formatter-session".to_string(),
+                terminal.reducer_revision,
+                AiFormatResult {
+                    text: formatted.clone(),
+                    reasoning_text: None,
+                    status: AiFormatStatus::Applied,
+                },
+            )
+            .expect("applied formatter result must enter revision corridor");
+        assert_eq!(commit.rendered_text, formatted);
+        assert!(commit.provenance_receipt.starts_with("formatter-"));
+
+        emitter.finish().await;
+        assert_eq!(delivery.lock().await.as_str(), formatted);
+        let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(ledger.manual_document_revisions().len(), 1);
+        assert_eq!(
+            ledger.manual_document_revisions()[0].provenance,
+            "formatter"
+        );
+        drop(ledger);
+        let projected = projected.lock().unwrap_or_else(|error| error.into_inner());
+        let revision_projection = projected
+            .iter()
+            .rev()
+            .find(|event| event.reducer_revision == commit.revision)
+            .expect("formatter revision projection callback");
+        assert_eq!(revision_projection.reducer_action, "apply_manual_edit");
+        assert_eq!(revision_projection.rendered_text, formatted);
+        assert_eq!(
+            revision_projection.acoustic_receipts[0]
+                .manual_edit_receipt
+                .as_deref(),
+            Some(commit.provenance_receipt.as_str())
+        );
     }
 
     #[test]

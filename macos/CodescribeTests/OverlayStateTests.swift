@@ -15,6 +15,11 @@ private final class OverlayStateTestEngine: DictationEngine {
     let renderedText: String
   }
 
+  struct FormatterRequest: Equatable {
+    let sessionId: String
+    let sourceRevision: UInt64
+  }
+
   var pastedText: String?
   var pasteCallCount = 0
   var pasteOutcome: CsPasteOutcome = .pasted
@@ -41,6 +46,10 @@ private final class OverlayStateTestEngine: DictationEngine {
   var onAssistiveSend: (() -> Void)?
   var revisionRequests: [RevisionRequest] = []
   var onRevision: (() -> Void)?
+  var formatterRequests: [FormatterRequest] = []
+  var formatterRenderedText = "Tekst sformatowany."
+  var formatterShouldFail = false
+  var onFormatter: (() -> Void)?
 
   func setListener(_ listener: CsTranscriptionListener) {}
   func startRecording(language: CsLanguage?) async throws {}
@@ -62,6 +71,26 @@ private final class OverlayStateTestEngine: DictationEngine {
       revision: sourceRevision + 1,
       renderedText: renderedText,
       provenanceReceipt: "user-edit-test-\(sourceRevision + 1)"
+    )
+  }
+  func commitFormatterRevision(
+    sessionId: String, sourceRevision: UInt64
+  ) async throws -> CsUserRevisionResult {
+    formatterRequests.append(
+      FormatterRequest(sessionId: sessionId, sourceRevision: sourceRevision)
+    )
+    onFormatter?()
+    if formatterShouldFail {
+      throw NSError(
+        domain: "OverlayStateTestFormatter", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "gateway unavailable"])
+    }
+    return CsUserRevisionResult(
+      sessionId: sessionId,
+      sourceRevision: sourceRevision,
+      revision: sourceRevision + 1,
+      renderedText: formatterRenderedText,
+      provenanceReceipt: "formatter-test-\(sourceRevision + 1)"
     )
   }
   func isRecording() async -> Bool { false }
@@ -959,6 +988,63 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertEqual(engine.pastedText, "Tekst poprawiony")
   }
 
+  func testFormatCommitsOnlyThroughFormatterProjectionAndFailureStaysVisible() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText(
+      "tekst bazowy do formatowania",
+      to: state,
+      canCopy: true,
+      canFormat: true,
+      terminal: true,
+      sessionId: "formatter-session",
+      reducerRevision: 11
+    )
+    let requested = expectation(description: "formatter intent reached Rust bridge")
+    engine.onFormatter = { requested.fulfill() }
+
+    state.relayIntent(.format)
+    await fulfillment(of: [requested], timeout: 1)
+
+    XCTAssertEqual(
+      engine.formatterRequests,
+      [OverlayStateTestEngine.FormatterRequest(sessionId: "formatter-session", sourceRevision: 11)]
+    )
+    XCTAssertEqual(state.formattedText, "tekst bazowy do formatowania")
+    XCTAssertTrue(state.formatterCommitPending)
+    XCTAssertTrue(OverlayIntentRail.projectedIntents(for: state).isEmpty)
+
+    projectText(
+      engine.formatterRenderedText,
+      to: state,
+      canCopy: true,
+      canFormat: true,
+      terminal: true,
+      sessionId: "formatter-session",
+      reducerRevision: 12,
+      reducerAction: "apply_manual_edit",
+      manualEditReceipt: "formatter-formatter-session-11-12-0"
+    )
+
+    XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
+    XCTAssertEqual(state.revisionDraft, engine.formatterRenderedText)
+    XCTAssertFalse(state.formatterCommitPending)
+    XCTAssertNil(state.revisionCommitError)
+    XCTAssertNil(state.userRevisionProvenance, "formatter is not a human correction")
+
+    engine.formatterShouldFail = true
+    let refused = expectation(description: "second formatter request was refused")
+    engine.onFormatter = { refused.fulfill() }
+    state.relayIntent(.format)
+    await fulfillment(of: [refused], timeout: 1)
+    await Task.yield()
+
+    XCTAssertFalse(state.formatterCommitPending)
+    XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
+    XCTAssertTrue(state.revisionCommitError?.contains("gateway unavailable") == true)
+  }
+
   func testDiscardAndCloseCancelDraftWithoutCreatingRevision() async {
     let state = OverlayState()
     let engine = OverlayStateTestEngine()
@@ -1381,14 +1467,16 @@ final class OverlayStateTests: XCTestCase {
     try png.write(to: dest)
     XCTAssertGreaterThan(png.count, 800)
 
-    // Slim chrome: the bottom action layer is gone. Measure the empty center of
-    // the footer — excluding its truthful engine label on the left and the
-    // developer-power mark on the right. Bright glyphs in this corridor mean
-    // the transcript escaped its clipped body. A small allowance covers
-    // antialiased footer/border pixels; a real escape produces hundreds.
+    // Measure an empty right-hand footer corridor, away from the engine label,
+    // the centered live-wire dock handle, and the developer-power mark. Work
+    // in logical coordinates, then scale into the Retina bitmap: the previous
+    // raw x=140 range accidentally crossed `local apple` at 2x. Bright glyphs
+    // here mean the transcript escaped its clipped body.
+    let scaleX = CGFloat(bitmap.pixelsWide) / size.width
+    let scaleY = CGFloat(bitmap.pixelsHigh) / size.height
     var leakedBrightPixels = 0
-    for x in 140..<500 {
-      for y in 6..<28 {
+    for x in Int(390 * scaleX)..<Int(520 * scaleX) {
+      for y in Int(6 * scaleY)..<Int(28 * scaleY) {
         guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
           continue
         }
@@ -1400,7 +1488,7 @@ final class OverlayStateTests: XCTestCase {
       }
     }
     XCTAssertLessThan(
-      leakedBrightPixels, 20,
+      leakedBrightPixels, Int(20 * scaleX * scaleY),
       "formatted transcript painted into the footer band"
     )
   }
