@@ -51,6 +51,15 @@ absence is the ordinary path and executes the original commands unchanged.
 Using `--no-verify` is forbidden: a hook/policy conflict is a defect to report,
 not an alternate commit path.
 
+The marker outranks the hook. While the marker declares a gate deferred, a
+commit must never be withheld because that gate would run or fail: under
+embargo the commit is the recovery point, and the deferred gate has no vote
+until the close. If a repository has no wrapper for a deferred gate yet, derive
+the same `SKIP` value by hand from the marker list, state it in the commit body,
+and file the missing wrapper as a W0 defect — the fix follows the commit, it is
+not its precondition. Holding work uncommitted "until the hooks are green" is
+the inversion this document exists to prevent.
+
 ## Verify the policy
 
 Run:
