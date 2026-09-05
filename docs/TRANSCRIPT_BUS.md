@@ -135,8 +135,7 @@ once a newer session is active, an older edit cannot displace it. Esc, Discard,
 and Close delete only the local draft and write no ledger or Bus revision.
 
 The Format dock command is the sibling route, not a second reducer. Rust reads
-the exact current terminal document under the same `session_id +
-source_revision` CAS, runs `format_text_with_status_for_policy`, and admits only
+the exact current terminal document under the same `session_id + source_revision` CAS, runs `format_text_with_status_for_policy`, and admits only
 an `Applied` result through `TranscriptReducer::apply_user_revision`. Its
 `ManualDocumentRevisionReceipt` uses `provenance=formatter` and a
 `formatter-*` receipt; the resulting Bus projection is the only canvas repaint.
