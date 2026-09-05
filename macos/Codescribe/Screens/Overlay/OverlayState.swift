@@ -166,6 +166,56 @@ enum OverlayListenerEvent: Sendable {
   case error(String)
 }
 
+/// A value-only callback adapter. Its immutable continuation is Sendable, so
+/// the class needs no unchecked promise about actor isolation.
+final class DictationListener: CsTranscriptionListener {
+  private let continuation: AsyncStream<OverlayListenerEvent>.Continuation
+
+  init(continuation: AsyncStream<OverlayListenerEvent>.Continuation) {
+    self.continuation = continuation
+  }
+
+  func onTranscriptProjection(event: CsTranscriptProjectionEvent) {
+    continuation.yield(.transcriptProjection(event))
+  }
+
+  func onPresentationStatus(event: CsPresentationStatusEvent) {
+    continuation.yield(.presentationStatus(event))
+  }
+
+  func onRecordingPreparing() {
+    continuation.yield(.recordingPreparing)
+  }
+  func onRecordingStarted() {
+    continuation.yield(.recordingStarted)
+  }
+  func onRecordingStopped() {
+    continuation.yield(.recordingStopped)
+  }
+  func onRecordingFinalising() {
+    continuation.yield(.recordingFinalising)
+  }
+  func onSessionFinalised(sessionId: String, layerSummary: CsLayerSummary) {
+    continuation.yield(.sessionFinalised)
+  }
+  func onVadActive(active: Bool) {
+    continuation.yield(.vadActive(active))
+  }
+  func onAudioLevel(rms: Float) {
+    continuation.yield(.audioLevel(rms))
+  }
+  func onNoSpeech(reason: String) {
+    // Route the reason into the dedicated no-speech OUTCOME (a persistent
+    // body + Close), not a transient toast that fades and leaves an empty
+    // editable FINAL behind. `applyNoSpeech` maps the reason to a user-facing
+    // notice (genuine silence vs. quality-gate rejection).
+    continuation.yield(.noSpeech(reason))
+  }
+  func onError(message: String) {
+    continuation.yield(.error(message))
+  }
+}
+
 @MainActor
 @Observable
 final class OverlayState {
@@ -659,7 +709,42 @@ final class OverlayState {
   }
 
   private func relayInsertPasteIntent() {
-    pasteToPreviousApp()
+    if engine == nil {
+      presentActionFailure("Insert needs the recording engine", notice: "insert unavailable")
+    }
+    guard let engine else { return }
+    captureQualityIfEdited(action: "paste")
+    cancelAutoHide()
+    showFooterNotice("inserting…", persists: true)
+    let text = activeText
+    let shouldDefer = insertCaretInCodescribeProbe()
+    Task { @MainActor in
+      defer { self.restartAutoHideCountdown() }
+      do {
+        let result: CsPasteResult
+        if shouldDefer {
+          result = try await engine.deferText(text: text)
+        } else {
+          result = try await engine.pasteText(text: text)
+        }
+        switch result.outcome {
+        case .deferredInsertArmed:
+          let shortcut = result.deferredInsertShortcut ?? "⌘⌥V"
+          self.showFooterNotice(shortcut, persists: true)
+        case .copiedToClipboard:
+          self.showFooterNotice("copied")
+        case .accessibilityPermissionNeeded:
+          self.showFooterNotice("no ax")
+        case .pasted:
+          self.showFooterNotice("inserted")
+        case .noop:
+          self.showFooterNotice("no insert")
+        }
+      } catch {
+        self.errorMessage = "Couldn't paste transcript: \(error)"
+        self.showFooterNotice("no paste")
+      }
+    }
   }
 
   private func relayRetranscribeIntent() {
@@ -683,55 +768,6 @@ final class OverlayState {
       } catch {
         self.presentActionFailure(
           "Couldn't retranscribe recording: \(error)", notice: "retranscribe failed")
-      }
-    }
-  }
-
-  private func relayFormatIntent() {
-    guard mode == .formatted, terminal, canFormat, !isRevisionDraftDirty,
-      !revisionCommitPending, !formatterCommitPending
-    else { return }
-    guard let projection = latestTranscriptProjection, let engine else {
-      revisionCommitError = "Transcript formatter authority is unavailable"
-      showFooterNotice("format unavailable")
-      return
-    }
-    formatterCommitPending = true
-    revisionCommitError = nil
-    pendingRevisionSessionId = projection.sessionId
-    pendingRevisionSource = projection.reducerRevision
-    cancelAutoHide()
-    showFooterNotice("formatting…", persists: true)
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      do {
-        let receipt = try await engine.commitFormatterRevision(
-          sessionId: projection.sessionId,
-          sourceRevision: projection.reducerRevision
-        )
-        guard receipt.sessionId == projection.sessionId,
-          receipt.sourceRevision == projection.reducerRevision,
-          receipt.revision > receipt.sourceRevision,
-          !receipt.renderedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-          receipt.provenanceReceipt.hasPrefix("formatter-")
-        else {
-          formatterCommitPending = false
-          pendingRevisionSessionId = nil
-          pendingRevisionSource = nil
-          revisionCommitError = "Formatter revision receipt was inconsistent"
-          showFooterNotice("format failed")
-          restartAutoHideCountdown()
-          return
-        }
-        // Projection can arrive before acknowledgement. It is still the only
-        // path that may repaint `formattedText` or the local editor draft.
-      } catch {
-        formatterCommitPending = false
-        pendingRevisionSessionId = nil
-        pendingRevisionSource = nil
-        revisionCommitError = "Couldn't format transcript: \(error)"
-        showFooterNotice("format failed")
-        restartAutoHideCountdown()
       }
     }
   }
@@ -767,47 +803,7 @@ final class OverlayState {
   }
 
   func pasteToPreviousApp() {
-    guard let engine else {
-      presentActionFailure("Insert needs the recording engine", notice: "insert unavailable")
-      return
-    }
-    captureQualityIfEdited(action: "paste")
-    // Do not let the previous deadline fire while the async delivery is in
-    // flight. A successful or failed attempt gets a fresh full countdown.
-    cancelAutoHide()
-    showFooterNotice("inserting…", persists: true)
-    let text = activeText
-    Task { @MainActor in
-      defer { self.restartAutoHideCountdown() }
-      do {
-        let result: CsPasteResult
-        if self.insertCaretInCodescribeProbe() {
-          // The caret sits inside Codescribe (e.g. the overlay's own
-          // editable FINAL) — a synthetic Cmd+V would paste the
-          // transcript right back into the overlay. Arm the in-memory
-          // Paste Here slot without touching the user's clipboard.
-          result = try await engine.deferText(text: text)
-        } else {
-          result = try await engine.pasteText(text: text)
-        }
-        switch result.outcome {
-        case .deferredInsertArmed:
-          let shortcut = result.deferredInsertShortcut ?? "⌘⌥V"
-          self.showFooterNotice(shortcut, persists: true)
-        case .copiedToClipboard:
-          self.showFooterNotice("copied")
-        case .accessibilityPermissionNeeded:
-          self.showFooterNotice("no ax")
-        case .pasted:
-          self.showFooterNotice("inserted")
-        case .noop:
-          self.showFooterNotice("no insert")
-        }
-      } catch {
-        self.errorMessage = "Couldn't paste transcript: \(error)"
-        self.showFooterNotice("no paste")
-      }
-    }
+    relayInsertPasteIntent()
   }
 
   /// Whisper a short footer chip next to `local apple`. Never a floating pill
@@ -1557,6 +1553,55 @@ final class OverlayState {
     }
   }
 
+  private func relayFormatIntent() {
+    guard mode == .formatted, terminal, canFormat, !isRevisionDraftDirty,
+      !revisionCommitPending, !formatterCommitPending
+    else { return }
+    guard let projection = latestTranscriptProjection, let engine else {
+      revisionCommitError = "Transcript formatter authority is unavailable"
+      showFooterNotice("format unavailable")
+      return
+    }
+    formatterCommitPending = true
+    revisionCommitError = nil
+    pendingRevisionSessionId = projection.sessionId
+    pendingRevisionSource = projection.reducerRevision
+    cancelAutoHide()
+    showFooterNotice("formatting…", persists: true)
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        let receipt = try await engine.commitFormatterRevision(
+          sessionId: projection.sessionId,
+          sourceRevision: projection.reducerRevision
+        )
+        guard receipt.sessionId == projection.sessionId,
+          receipt.sourceRevision == projection.reducerRevision,
+          receipt.revision > receipt.sourceRevision,
+          !receipt.renderedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          receipt.provenanceReceipt.hasPrefix("formatter-")
+        else {
+          formatterCommitPending = false
+          pendingRevisionSessionId = nil
+          pendingRevisionSource = nil
+          revisionCommitError = "Formatter revision receipt was inconsistent"
+          showFooterNotice("format failed")
+          restartAutoHideCountdown()
+          return
+        }
+        // Projection can arrive before acknowledgement. It is still the only
+        // path that may repaint `formattedText` or the local editor draft.
+      } catch {
+        formatterCommitPending = false
+        pendingRevisionSessionId = nil
+        pendingRevisionSource = nil
+        revisionCommitError = "Couldn't format transcript: \(error)"
+        showFooterNotice("format failed")
+        restartAutoHideCountdown()
+      }
+    }
+  }
+
   func applySessionFinalised() {
     guard !finalized else { return }
     markTranscriptActivity()
@@ -1795,58 +1840,6 @@ final class ControllerDictationEngine: DictationEngine {
   }
   func transcribeFile(path: String) async throws -> CsTranscription {
     try await hotkeys.transcribeFile(path: path)
-  }
-}
-
-// MARK: - Listener bridge (Rust callbacks → ordered stream → main actor)
-
-/// A value-only callback adapter. Its immutable continuation is Sendable, so
-/// the class needs no unchecked promise about actor isolation.
-final class DictationListener: CsTranscriptionListener {
-  private let continuation: AsyncStream<OverlayListenerEvent>.Continuation
-
-  init(continuation: AsyncStream<OverlayListenerEvent>.Continuation) {
-    self.continuation = continuation
-  }
-
-  func onTranscriptProjection(event: CsTranscriptProjectionEvent) {
-    continuation.yield(.transcriptProjection(event))
-  }
-
-  func onPresentationStatus(event: CsPresentationStatusEvent) {
-    continuation.yield(.presentationStatus(event))
-  }
-
-  func onRecordingPreparing() {
-    continuation.yield(.recordingPreparing)
-  }
-  func onRecordingStarted() {
-    continuation.yield(.recordingStarted)
-  }
-  func onRecordingStopped() {
-    continuation.yield(.recordingStopped)
-  }
-  func onRecordingFinalising() {
-    continuation.yield(.recordingFinalising)
-  }
-  func onSessionFinalised(sessionId: String, layerSummary: CsLayerSummary) {
-    continuation.yield(.sessionFinalised)
-  }
-  func onVadActive(active: Bool) {
-    continuation.yield(.vadActive(active))
-  }
-  func onAudioLevel(rms: Float) {
-    continuation.yield(.audioLevel(rms))
-  }
-  func onNoSpeech(reason: String) {
-    // Route the reason into the dedicated no-speech OUTCOME (a persistent
-    // body + Close), not a transient toast that fades and leaves an empty
-    // editable FINAL behind. `applyNoSpeech` maps the reason to a user-facing
-    // notice (genuine silence vs. quality-gate rejection).
-    continuation.yield(.noSpeech(reason))
-  }
-  func onError(message: String) {
-    continuation.yield(.error(message))
   }
 }
 

@@ -35,7 +35,18 @@ struct DictationOverlayView: View {
 
   var body: some View {
     OverlayCanvasSurface(palette: palette) {
-      sharedChromeContainer
+      sharedChromeContainer(
+        OverlayIntentRail(
+          phase: state.statusText,
+          intents: OverlayIntentRail.projectedIntents(for: state),
+          palette: palette,
+          footerEngineLabel: state.footerEngineLabel,
+          footerNotice: state.toast,
+          footerEngineDot: footerEngineDot,
+          initiallyExpanded: dockInitiallyExpanded,
+          onIntent: state.relayIntent
+        )
+      )
     }
     .csFocusPolicy()
     .frame(minWidth: windowMinWidth, maxWidth: .infinity, maxHeight: .infinity)
@@ -60,17 +71,19 @@ struct DictationOverlayView: View {
   }
 
   @ViewBuilder
-  private var sharedChromeContainer: some View {
+  private func sharedChromeContainer<IntentRail: View>(
+    _ intentRail: IntentRail
+  ) -> some View {
     if #available(macOS 26.0, *) {
       GlassEffectContainer(spacing: 0) {
-        canvasStack
+        canvasStack(intentRail)
       }
     } else {
-      canvasStack
+      canvasStack(intentRail)
     }
   }
 
-  private var canvasStack: some View {
+  private func canvasStack<IntentRail: View>(_ intentRail: IntentRail) -> some View {
     ZStack {
       bodySection
 
@@ -80,17 +93,8 @@ struct DictationOverlayView: View {
         Spacer(minLength: 0)
           .allowsHitTesting(false)
         hairline(0.05)
-        OverlayIntentRail(
-          phase: state.statusText,
-          intents: OverlayIntentRail.projectedIntents(for: state),
-          palette: palette,
-          footerEngineLabel: state.footerEngineLabel,
-          footerNotice: state.toast,
-          footerEngineDot: footerEngineDot,
-          initiallyExpanded: dockInitiallyExpanded,
-          onIntent: state.relayIntent
-        )
-        .background { OverlayWindowDragRegion() }
+        intentRail
+          .background { OverlayWindowDragRegion() }
       }
     }
   }

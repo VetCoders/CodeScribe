@@ -91,8 +91,41 @@ struct OverlayIntentRail: View {
     OverlayDockSurface(palette: palette) {
       ZStack {
         if interaction.isExpanded {
-          expandedToolbar
-            .transition(reduceMotion ? .identity : .opacity)
+          HStack(spacing: CSSpace.xs) {
+            OverlayDockButton(
+              title: "Hide overlay actions",
+              systemImage: "chevron.down",
+              hint: "Collapses the overlay action toolbar",
+              identifier: "overlay-intent-dock-collapse",
+              palette: palette,
+              action: collapse
+            )
+
+            ForEach(intents, id: \.self) { intent in
+              if intent == .close {
+                Spacer(minLength: CSSpace.xxs)
+                footerNoticeText
+                Divider()
+                  .frame(height: CSSpace.lg)
+                  .overlay(palette.border.color)
+                  .padding(.horizontal, 2)
+                  .accessibilityHidden(true)
+              }
+              OverlayDockButton(
+                title: intent.accessibilityLabel,
+                systemImage: intent.systemImage,
+                hint: intent.accessibilityHint,
+                identifier: "overlay-intent-\(intent.rawValue)",
+                palette: palette
+              ) {
+                dispatch(intent)
+              }
+            }
+          }
+          .padding(.horizontal, CSSpace.sm)
+          .buttonStyle(.plain)
+          .onHover(perform: setHovering)
+          .transition(reduceMotion ? .identity : .opacity)
         } else {
           collapsedFooter
             .transition(reduceMotion ? .identity : .opacity)
@@ -154,38 +187,6 @@ struct OverlayIntentRail: View {
     }
   }
 
-  private var expandedToolbar: some View {
-    HStack(spacing: CSSpace.xs) {
-      OverlayDockButton(
-        title: "Hide overlay actions",
-        systemImage: "chevron.down",
-        hint: "Collapses the overlay action toolbar",
-        identifier: "overlay-intent-dock-collapse",
-        palette: palette,
-        action: collapse
-      )
-
-      ForEach(nonCloseIntents, id: \.self) { intent in
-        intentButton(intent)
-      }
-
-      Spacer(minLength: CSSpace.xxs)
-      footerNoticeText
-
-      if intents.contains(.close) {
-        Divider()
-          .frame(height: CSSpace.lg)
-          .overlay(palette.border.color)
-          .padding(.horizontal, 2)
-          .accessibilityHidden(true)
-        intentButton(.close)
-      }
-    }
-    .padding(.horizontal, CSSpace.sm)
-    .buttonStyle(.plain)
-    .onHover(perform: setHovering)
-  }
-
   @ViewBuilder
   private var footerNoticeText: some View {
     if let footerNotice, !footerNotice.isEmpty {
@@ -195,22 +196,6 @@ struct OverlayIntentRail: View {
         .lineLimit(1)
         .truncationMode(.tail)
         .accessibilityIdentifier("overlay-footer-notice")
-    }
-  }
-
-  private var nonCloseIntents: [OverlayIntent] {
-    intents.filter { $0 != .close }
-  }
-
-  private func intentButton(_ intent: OverlayIntent) -> some View {
-    OverlayDockButton(
-      title: intent.accessibilityLabel,
-      systemImage: intent.systemImage,
-      hint: intent.accessibilityHint,
-      identifier: "overlay-intent-\(intent.rawValue)",
-      palette: palette
-    ) {
-      dispatch(intent)
     }
   }
 
