@@ -89,6 +89,7 @@ struct DictationOverlayView: View {
           initiallyExpanded: dockInitiallyExpanded,
           onIntent: state.relayIntent
         )
+        .background { OverlayWindowDragRegion() }
       }
     }
   }
@@ -109,6 +110,7 @@ struct DictationOverlayView: View {
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
     .modifier(OverlayHeaderChrome(palette: palette))
+    .background { OverlayWindowDragRegion() }
   }
 
   private var fullHeader: some View {
@@ -124,6 +126,7 @@ struct DictationOverlayView: View {
           .foregroundStyle(palette.primaryText.color)
           .allowsHitTesting(false)
       }
+      .allowsHitTesting(false)
       phaseStatus(text: state.statusText)
 
       if state.mode == .listening || state.mode == .finalizing {
@@ -133,6 +136,9 @@ struct DictationOverlayView: View {
       Spacer(minLength: 4)
 
       sessionTimer
+        .allowsHitTesting(false)
+
+      OverlayPlacementMenu(state: state, palette: palette)
     }
     .fixedSize(horizontal: true, vertical: false)
   }
@@ -149,6 +155,8 @@ struct DictationOverlayView: View {
       }
       Spacer(minLength: 0)
       sessionTimer
+        .allowsHitTesting(false)
+      OverlayPlacementMenu(state: state, palette: palette)
     }
     .fixedSize(horizontal: true, vertical: false)
   }
@@ -238,6 +246,7 @@ struct DictationOverlayView: View {
     .padding(.horizontal, 20)
     .padding(.top, 4)
     .padding(.bottom, 10)
+    .background { OverlayWindowDragRegion() }
     // Transcript content must never paint into the footer during live resize.
     .clipped()
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.mode)

@@ -1,8 +1,7 @@
 import SwiftUI
 
-/// Appearance-aware physical sheet. The drag view is the last background
-/// layer, behind controls and text selection but across every inert point of
-/// the canvas.
+/// Appearance-aware physical sheet. Window interaction is owned by explicit
+/// inert regions in `DictationOverlayView`, not by a full-sheet AppKit layer.
 struct OverlayCanvasSurface<Content: View>: View {
   let palette: OverlayAppearancePalette
   @ViewBuilder let content: Content
@@ -13,7 +12,6 @@ struct OverlayCanvasSurface<Content: View>: View {
         ZStack {
           Rectangle().fill(.ultraThinMaterial)
           Rectangle().fill(palette.surfaceTint.color)
-          OverlayDragHandle()
         }
       }
       .clipShape(RoundedRectangle(cornerRadius: CSRadius.window, style: .continuous))
