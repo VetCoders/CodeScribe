@@ -93,16 +93,16 @@ contains:
 
 The projection contract is one snapshot, not a bag of Swift inputs:
 
-| Field                               | Source of truth                                                                                                                                                                                           |
-| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reducer_revision`, `rendered_text` | Exact committed reducer revision                                                                                                                                                                          |
-| `phase`                             | `listening` for open book revisions, `finalizing` after a terminal ledger seal, then `formatted` or `no_speech` from `session_ended` plus the last committed render; failed/superseded starts are `error` |
-| `can_paste`                         | The delivery throne selects `ClipboardPaste`, a latched target exists, and the take has ended                                                                                                             |
-| `can_insert`                        | The delivery throne selects `ClipboardPaste` or `DeferredInsert`, and the take has ended                                                                                                                  |
-| `can_copy`                          | The committed render is non-empty                                                                                                                                                                         |
-| `can_retranscribe`                  | The session WAV exists and the take has ended                                                                                                                                                             |
-| `can_format`                        | The take has ended and the committed render is non-empty                                                                                                                                                  |
-| `terminal`                          | The controller's unique `session_ended` transition was processed                                                                                                                                          |
+| Field                               | Source of truth                                                                                                                                                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reducer_revision`, `rendered_text` | Exact committed reducer revision                                                                                                                                                                                                                        |
+| `phase`                             | `listening` for open book revisions, `finalizing` after a terminal ledger seal, then `formatted` or `no_speech` from `session_ended` plus the last committed render; a terminal user revision remains `formatted`; failed/superseded starts are `error` |
+| `can_paste`                         | The delivery throne selects `ClipboardPaste`, a latched target exists, and the take has ended                                                                                                                                                           |
+| `can_insert`                        | The delivery throne selects `ClipboardPaste` or `DeferredInsert`, and the take has ended                                                                                                                                                                |
+| `can_copy`                          | The committed render is non-empty                                                                                                                                                                                                                       |
+| `can_retranscribe`                  | The session WAV exists and the take has ended                                                                                                                                                                                                           |
+| `can_format`                        | The take has ended and the committed render is non-empty                                                                                                                                                                                                |
+| `terminal`                          | The controller's unique `session_ended` transition was processed; later authenticated user revisions preserve terminal state                                                                                                                            |
 
 `resolve_delivery_route(OverlayInsert, ...)` remains the only destination
 decision. The projection layer queries its result; it does not create another
@@ -115,6 +115,24 @@ occurrence, choose a label, infer identity, perform text-tail matching, or mint
 a seal. `seal_coverage` is emitted before terminal finality. A terminal
 `LedgerSeal` reducer action marks the writer sealed only when the latest
 coverage is not incomplete. No arbitrary string can close committed Bus truth.
+
+### Terminal user revisions
+
+The formatted canvas may hold a local, visibly uncommitted edit draft. Commit
+sends `session_id + source_revision + rendered_text` across FFI; it does not
+paint Swift state. `TranscriptReducer::apply_user_revision` accepts only the
+exact current terminal revision, and `AcousticLedger` appends a
+`ManualDocumentRevisionReceipt` with `provenance=user-edit`, the source
+occurrence/seal set, and the replacement bytes. A whole-document edit does not
+invent new word-to-PCM alignment or rewrite any source acoustic receipt.
+
+Rust then emits a new terminal `apply_manual_edit` evidence projection. The
+projection carries the ledger's `user-edit-*` receipt in each source occurrence
+row and is the only event that replaces the formatted canvas and delivery
+buffer. It may follow `session_ended` because microphone lifecycle is already
+closed. Replay accepts that terminal revision only for the just-ended session;
+once a newer session is active, an older edit cannot displace it. Esc, Discard,
+and Close delete only the local draft and write no ledger or Bus revision.
 
 Controller-authenticated context captures enter the same presentation reducer
 as `RecordContextMarker` actions (`record_context_marker` on the Bus). The
@@ -129,6 +147,7 @@ insert, pad, retain, or replay marker text.
 OccurrenceIdentity + AcousticLedger receipts
   → TranscriptReducer.document_by_occurrence
   + controller-authenticated context markers
+  + terminal user revision receipt (source session + reducer revision)
   → TranscriptRevision
   → TranscriptBus::publish_revision
   → CsTranscriptProjectionEvent
@@ -154,9 +173,10 @@ evidence. The session archive accepts a typed `Committed`, `NoSpeech`, or
 history title `(no speech)`. Diagnostic strings are never history titles or
 "Copy last transcript" candidates.
 
-There is no draft API, draft storage, arbitrary-text `publish_sealed` API, or
-raw-event `DeltaSinkAdapter`. Consumers must observe the authenticated evidence
-projection rather than reduce engine text themselves.
+There is no Bus draft API, reducer draft storage, arbitrary-text
+`publish_sealed` API, or raw-event `DeltaSinkAdapter`. The overlay's editor
+state is ephemeral and cannot reach delivery. Consumers must observe the
+authenticated evidence projection rather than reduce engine text themselves.
 
 ## Consumer contract
 

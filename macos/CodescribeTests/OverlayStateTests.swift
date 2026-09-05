@@ -9,6 +9,12 @@ import XCTest
 
 @MainActor
 private final class OverlayStateTestEngine: DictationEngine {
+  struct RevisionRequest: Equatable {
+    let sessionId: String
+    let sourceRevision: UInt64
+    let renderedText: String
+  }
+
   var pastedText: String?
   var pasteCallCount = 0
   var pasteOutcome: CsPasteOutcome = .pasted
@@ -33,10 +39,31 @@ private final class OverlayStateTestEngine: DictationEngine {
   var sentAssistiveTexts: [String] = []
   var assistiveSendResult = true
   var onAssistiveSend: (() -> Void)?
+  var revisionRequests: [RevisionRequest] = []
+  var onRevision: (() -> Void)?
 
   func setListener(_ listener: CsTranscriptionListener) {}
   func startRecording(language: CsLanguage?) async throws {}
   func stopRecording() async throws -> String { "" }
+  func commitUserRevision(
+    sessionId: String, sourceRevision: UInt64, renderedText: String
+  ) async throws -> CsUserRevisionResult {
+    revisionRequests.append(
+      RevisionRequest(
+        sessionId: sessionId,
+        sourceRevision: sourceRevision,
+        renderedText: renderedText
+      )
+    )
+    onRevision?()
+    return CsUserRevisionResult(
+      sessionId: sessionId,
+      sourceRevision: sourceRevision,
+      revision: sourceRevision + 1,
+      renderedText: renderedText,
+      provenanceReceipt: "user-edit-test-\(sourceRevision + 1)"
+    )
+  }
   func isRecording() async -> Bool { false }
   func initModel() async throws {}
   func isModelLoaded() -> Bool { true }
@@ -151,7 +178,11 @@ final class OverlayStateTests: XCTestCase {
     canRetranscribe: Bool = false,
     canFormat: Bool = false,
     terminal: Bool = false,
-    includesWordEvidence: Bool = true
+    includesWordEvidence: Bool = true,
+    sessionId: String = "overlay-state-tests",
+    reducerRevision: UInt64? = nil,
+    reducerAction: String? = nil,
+    manualEditReceipt: String? = nil
   ) {
     nextProjectionSequence += 1
     let sequence = nextProjectionSequence
@@ -161,7 +192,7 @@ final class OverlayStateTests: XCTestCase {
     let receipt = CsProjectedAcousticReceipt(
       acousticSerialVersion: 1,
       acousticSerial: "test-acoustic-\(sequence)",
-      sessionId: "overlay-state-tests",
+      sessionId: sessionId,
       captureEpoch: 1,
       sampleStart: sampleStart,
       sampleEnd: sampleEnd,
@@ -175,20 +206,21 @@ final class OverlayStateTests: XCTestCase {
       wordEvidenceReceipts: includesWordEvidence ? ["test-word-evidence-\(sequence)"] : [],
       layerDecisionReceipts: ["test-layer-decision-\(sequence)"],
       sealReceipt: terminal ? "test-seal-\(sequence)" : nil,
-      manualEditReceipt: nil
+      manualEditReceipt: manualEditReceipt
     )
     state.applyTranscriptProjection(
       CsTranscriptProjectionEvent(
         schema: "codescribe.transcript_projection.v1",
         sequence: sequence,
         emittedAt: "2026-08-25T00:00:00Z",
-        sessionId: "overlay-state-tests",
+        sessionId: sessionId,
         mode: mode,
-        reducerRevision: sequence,
-        reducerAction: terminal
-          ? "record_ledger_terminal_seal"
-          : "record_ledger_projection",
-        occurrenceSessionId: "overlay-state-tests",
+        reducerRevision: reducerRevision ?? sequence,
+        reducerAction: reducerAction
+          ?? (terminal
+            ? "record_ledger_terminal_seal"
+            : "record_ledger_projection"),
+        occurrenceSessionId: sessionId,
         captureEpoch: 1,
         sampleStart: sampleStart,
         sampleEnd: sampleEnd,
@@ -858,6 +890,94 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertTrue(state.terminal)
     XCTAssertEqual(state.toast, "no ax")
     XCTAssertNil(state.errorMessage)
+  }
+
+  func testUserEditCommitsOnlyThroughReturnedRustProjection() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText(
+      "Tekst bazowy",
+      to: state,
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      terminal: true,
+      sessionId: "revision-session",
+      reducerRevision: 7
+    )
+    state.revisionDraft = "Tekst poprawiony"
+    let requested = expectation(description: "revision intent reached Rust bridge")
+    engine.onRevision = { requested.fulfill() }
+
+    state.relayIntent(.commitRevision)
+    await fulfillment(of: [requested], timeout: 1)
+
+    XCTAssertEqual(
+      engine.revisionRequests,
+      [
+        OverlayStateTestEngine.RevisionRequest(
+          sessionId: "revision-session",
+          sourceRevision: 7,
+          renderedText: "Tekst poprawiony"
+        )
+      ]
+    )
+    XCTAssertEqual(state.formattedText, "Tekst bazowy", "FFI acknowledgement is not projection")
+    XCTAssertEqual(state.revision, 7)
+    XCTAssertTrue(state.revisionCommitPending)
+
+    projectText(
+      "Tekst poprawiony",
+      to: state,
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      terminal: true,
+      sessionId: "revision-session",
+      reducerRevision: 8,
+      reducerAction: "apply_manual_edit",
+      manualEditReceipt: "user-edit-revision-session-7-8-1"
+    )
+
+    XCTAssertEqual(state.formattedText, "Tekst poprawiony")
+    XCTAssertEqual(state.revisionDraft, "Tekst poprawiony")
+    XCTAssertEqual(state.revision, 8)
+    XCTAssertFalse(state.revisionCommitPending)
+    XCTAssertEqual(state.userRevisionProvenance, "user-edit-revision-session-7-8-1")
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.insertPaste, .copy, .close],
+      "delivery actions return only after the new ledger projection"
+    )
+
+    state.insertCaretInCodescribeProbe = { false }
+    let pasted = expectation(description: "new revision reached delivery")
+    engine.onPaste = { pasted.fulfill() }
+    state.relayIntent(.insertPaste)
+    await fulfillment(of: [pasted], timeout: 1)
+    XCTAssertEqual(engine.pastedText, "Tekst poprawiony")
+  }
+
+  func testDiscardAndCloseCancelDraftWithoutCreatingRevision() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText("Ledger text", to: state, terminal: true, reducerRevision: 3)
+
+    state.revisionDraft = "Focus-exit draft"
+    state.scheduleRevisionCommitAfterFocusExit()
+    state.discardRevisionDraft()
+    await Task.yield()
+    XCTAssertEqual(state.revisionDraft, "Ledger text")
+    XCTAssertTrue(engine.revisionRequests.isEmpty, "discard must cancel deferred focus commit")
+
+    state.revisionDraft = "Close draft"
+    state.close()
+    await Task.yield()
+    XCTAssertEqual(state.formattedText, "Ledger text")
+    XCTAssertEqual(state.revisionDraft, "Ledger text")
+    XCTAssertTrue(engine.revisionRequests.isEmpty, "close must not create a document revision")
   }
 
   func testCloseIsImmediateAndAgentButtonUsesControllerDelivery() async {

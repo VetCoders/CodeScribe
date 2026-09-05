@@ -11,9 +11,9 @@ use std::{collections::BTreeMap, io::Write as _, sync::Arc};
 
 use codescribe_core::llm::inline_format::{LabelProposalDisposition, OccurrenceLabelProposal};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, LedgerSealReceipt, MutationReceipt, ObservationIdentity,
-    ObservationProducer, OccurrenceIdentity, SealCoverageReceipt, SealCoverageStatus,
-    TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, LedgerSealReceipt, ManualDocumentRevisionReceipt,
+    MutationReceipt, ObservationIdentity, ObservationProducer, OccurrenceIdentity,
+    SealCoverageReceipt, SealCoverageStatus, TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
 use tokio::sync::Mutex;
@@ -94,6 +94,9 @@ pub enum ReducerAction {
     ApplyManualEdit {
         entry: TranscriptDocumentEntry,
     },
+    ApplyUserRevision {
+        receipt: ManualDocumentRevisionReceipt,
+    },
     RecordContextMarker {
         position: usize,
         label: String,
@@ -118,6 +121,67 @@ pub struct TranscriptRevision {
     pub comparison: Option<TranscriptComparisonReceipt>,
 }
 
+/// A UI request to replace one exact terminal reducer revision.
+///
+/// The source session and revision form the compare-and-swap boundary. Text is
+/// payload only: it never identifies the document or an acoustic occurrence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRevisionIntent {
+    pub session_id: String,
+    pub source_revision: u64,
+    pub rendered_text: String,
+}
+
+/// Rust-authored acknowledgement for one committed user revision. Swift uses
+/// this only as request status; visible text still arrives through projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRevisionCommit {
+    pub session_id: String,
+    pub source_revision: u64,
+    pub revision: u64,
+    pub rendered_text: String,
+    pub provenance_receipt: String,
+}
+
+/// Typed refusal reasons for a stale or unauthenticated revision request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserRevisionRefusal {
+    EmptyText,
+    NoCommittedDocument,
+    NotTerminal,
+    SessionMismatch,
+    StaleRevision { expected: u64, actual: u64 },
+    Unchanged,
+    RevisionExhausted,
+    LedgerRefusal(&'static str),
+    AuthorityUnavailable,
+}
+
+impl std::fmt::Display for UserRevisionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyText => formatter.write_str("user revision text is empty"),
+            Self::NoCommittedDocument => formatter.write_str("no committed transcript document"),
+            Self::NotTerminal => formatter.write_str("transcript is not terminal"),
+            Self::SessionMismatch => formatter.write_str("user revision session does not match"),
+            Self::StaleRevision { expected, actual } => write!(
+                formatter,
+                "stale user revision: source {actual}, current {expected}"
+            ),
+            Self::Unchanged => formatter.write_str("user revision is unchanged"),
+            Self::RevisionExhausted => formatter.write_str("transcript revision counter exhausted"),
+            Self::LedgerRefusal(reason) => {
+                write!(formatter, "ledger refused user revision: {reason}")
+            }
+            Self::AuthorityUnavailable => {
+                formatter.write_str("transcript revision authority unavailable")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UserRevisionRefusal {}
+
 /// The one committed Rust document plus explicitly non-authoritative UI paint.
 /// Only `document_by_occurrence` can produce a committed revision. The preview
 /// field is volatile, has no occurrence identity, and is discarded at terminal
@@ -132,6 +196,9 @@ pub struct TranscriptReducer {
     latest_seal_coverage: Option<SealCoverageReceipt>,
     latest_comparison: Option<TranscriptComparisonReceipt>,
     context_markers: Vec<DocumentContextMarker>,
+    manual_rendered_text: Option<String>,
+    manual_document_revision_receipt: Option<String>,
+    terminal: bool,
 }
 
 /// Trim a fragment's outer edges. Interior whitespace and newlines survive —
@@ -170,11 +237,16 @@ impl TranscriptReducer {
 
     fn revision_for_action(&mut self, action: ReducerAction) -> TranscriptRevision {
         self.revision = self.revision.saturating_add(1);
-        let entries = self
+        let mut entries = self
             .document_by_occurrence
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        if let Some(receipt) = &self.manual_document_revision_receipt {
+            for entry in &mut entries {
+                entry.manual_edit_receipt = Some(receipt.clone());
+            }
+        }
         let rendered_text = self.committed_rendered_text();
         TranscriptRevision {
             schema: "codescribe.transcript-revision.v1".to_string(),
@@ -209,6 +281,8 @@ impl TranscriptReducer {
         if trail.is_empty() || composition.tokens.is_empty() {
             return None;
         }
+        self.manual_rendered_text = None;
+        self.manual_document_revision_receipt = None;
         let entry = TranscriptDocumentEntry {
             occurrence: observation.occurrence.clone(),
             label: ledger.text_of(&observation.occurrence)?.to_string(),
@@ -270,11 +344,78 @@ impl TranscriptReducer {
             }
         }
         let occurrence = receipt.sealed_occurrences.first()?.clone();
+        let terminal = !receipt.is_occurrence_seal();
+        if terminal {
+            self.terminal = true;
+        }
         Some(self.revision_for_action(ReducerAction::RecordLedgerSeal {
             occurrence,
             seal_receipt: receipt.receipt_id.clone(),
             terminal: !receipt.is_occurrence_seal(),
         }))
+    }
+
+    /// Commit a whole-document user edit without fabricating per-word acoustic
+    /// ownership. The ledger authenticates the exact sealed source occurrence
+    /// set, then this reducer mints the only new document revision.
+    pub fn apply_user_revision(
+        &mut self,
+        ledger: &mut AcousticLedger,
+        intent: &UserRevisionIntent,
+    ) -> Result<TranscriptRevision, UserRevisionRefusal> {
+        if intent.rendered_text.trim().is_empty() {
+            return Err(UserRevisionRefusal::EmptyText);
+        }
+        if self.document_by_occurrence.is_empty() {
+            return Err(UserRevisionRefusal::NoCommittedDocument);
+        }
+        if !self.terminal {
+            return Err(UserRevisionRefusal::NotTerminal);
+        }
+        if intent.source_revision != self.revision {
+            return Err(UserRevisionRefusal::StaleRevision {
+                expected: self.revision,
+                actual: intent.source_revision,
+            });
+        }
+        let source_occurrences = self
+            .document_by_occurrence
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if source_occurrences
+            .iter()
+            .any(|occurrence| occurrence.session != intent.session_id)
+        {
+            return Err(UserRevisionRefusal::SessionMismatch);
+        }
+        if self.committed_rendered_text() == intent.rendered_text {
+            return Err(UserRevisionRefusal::Unchanged);
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(UserRevisionRefusal::RevisionExhausted)?;
+        let receipt = ledger
+            .record_manual_document_revision(
+                &intent.session_id,
+                intent.source_revision,
+                revision,
+                &intent.rendered_text,
+                &source_occurrences,
+            )
+            .map_err(UserRevisionRefusal::LedgerRefusal)?;
+        self.manual_rendered_text = Some(intent.rendered_text.clone());
+        self.manual_document_revision_receipt = Some(receipt.receipt_id.clone());
+        Ok(self.revision_for_action(ReducerAction::ApplyUserRevision { receipt }))
+    }
+
+    /// Open terminal review only after the engine lifecycle has finished. This
+    /// carries no text and mints no reducer revision; it closes the one-
+    /// occurrence ambiguity where a whole-session seal has the same physical
+    /// coverage shape as its sole occurrence seal.
+    fn mark_terminal_lifecycle(&mut self) {
+        self.terminal = true;
     }
 
     /// Record ledger-computed session coverage without changing a single
@@ -378,6 +519,9 @@ impl TranscriptReducer {
     }
 
     fn committed_rendered_text(&self) -> String {
+        if let Some(text) = &self.manual_rendered_text {
+            return text.clone();
+        }
         let rendered = self
             .document_by_occurrence
             .values()
@@ -598,6 +742,46 @@ impl PresentationEmitter {
         }
         self.send_cmd(EmitterCmd::PublishCommittedRevision(revision.rendered_text));
     }
+
+    /// Accept one explicit overlay revision intent against the retained terminal
+    /// reducer. The acknowledgement carries no authority to Swift: projection is
+    /// emitted first, and only that callback may repaint the canvas.
+    pub fn apply_user_revision(
+        &self,
+        intent: UserRevisionIntent,
+    ) -> Result<UserRevisionCommit, UserRevisionRefusal> {
+        let ledger = self
+            .acoustic_ledger
+            .as_ref()
+            .ok_or(UserRevisionRefusal::AuthorityUnavailable)?;
+        let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+        let revision = self
+            .session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .apply_user_revision(&mut ledger, &intent)?;
+        if let Some(bus) = &self.transcript_bus {
+            let events = bus.publish_revision(&revision, &ledger);
+            if let Some(callback) = &self.projection_callback {
+                for event in &events {
+                    callback(event);
+                }
+            }
+        }
+        self.send_cmd(EmitterCmd::PublishCommittedRevision(
+            revision.rendered_text.clone(),
+        ));
+        let ReducerAction::ApplyUserRevision { receipt } = &revision.action else {
+            unreachable!("apply_user_revision must mint an ApplyUserRevision action")
+        };
+        Ok(UserRevisionCommit {
+            session_id: receipt.session_id.clone(),
+            source_revision: receipt.source_revision,
+            revision: revision.revision,
+            rendered_text: revision.rendered_text,
+            provenance_receipt: receipt.receipt_id.clone(),
+        })
+    }
 }
 
 impl Drop for PresentationEmitter {
@@ -787,6 +971,7 @@ impl EventSink for PresentationEmitter {
             EngineEvent::NoSpeech { reason } => {
                 let canonical_text = {
                     let mut state = self.session_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.mark_terminal_lifecycle();
                     state.clear_ephemeral_preview();
                     state.committed_rendered_text()
                 };
@@ -836,9 +1021,10 @@ impl EventSink for PresentationEmitter {
                     state.committed_rendered_text()
                 };
                 self.send_cmd(EmitterCmd::PaintEphemeralPreview(canonical_text));
-                // Stats is the last event from transcription_session.
-                // Finish through the ordered channel after all revisions.
-                self.send_cmd(EmitterCmd::Finish);
+                // Capture is over, but terminal presentation authority stays
+                // alive for an explicit overlay revision. The controller
+                // replaces or drops it at the next take; `finish()` is for an
+                // owner that truly retires the presentation.
             }
             EngineEvent::Warning { code, message } => {
                 tracing::warn!("Engine warning [{}]: {}", code, message);
@@ -846,11 +1032,11 @@ impl EventSink for PresentationEmitter {
             EngineEvent::SessionFinalised { .. } => {
                 let canonical_text = {
                     let mut state = self.session_state.lock().unwrap_or_else(|e| e.into_inner());
+                    state.mark_terminal_lifecycle();
                     state.clear_ephemeral_preview();
                     state.committed_rendered_text()
                 };
                 self.send_cmd(EmitterCmd::PaintEphemeralPreview(canonical_text));
-                self.send_cmd(EmitterCmd::Finish);
             }
         }
     }
@@ -860,7 +1046,7 @@ impl EventSink for PresentationEmitter {
 /// does not compile or execute them under the W2 embargo.
 #[cfg(test)]
 mod tests {
-    use super::{PresentationEmitter, TranscriptReducer};
+    use super::{PresentationEmitter, TranscriptReducer, UserRevisionIntent, UserRevisionRefusal};
     use crate::presentation::transcript_bus::{
         TranscriptBus, TranscriptMode, TranscriptProjectionPhase, TranscriptSession,
         TranscriptSessionEndReason,
@@ -1125,6 +1311,138 @@ mod tests {
         assert!(!delivery.lock().await.contains("ConnectError"));
         assert_eq!(projection_count.load(Ordering::SeqCst), 0);
         assert!(std::fs::read_to_string(bus_path).unwrap().is_empty());
+    }
+
+    /// Effect witness for W4-T15: the request names a session/revision rather
+    /// than text identity, Rust mints the next document revision and a
+    /// `user-edit` ledger receipt, the Bus persists it after microphone
+    /// lifecycle end, and replay returns the same terminal bytes.
+    #[tokio::test]
+    async fn terminal_user_revision_is_ledger_stamped_and_replayable() {
+        let delivery = Arc::new(Mutex::new(String::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let bus_path = temp.path().join("user-revision.jsonl");
+        let bus = Arc::new(
+            TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: "revision-session".to_string(),
+                    mode: TranscriptMode::Dictation,
+                    has_latched_target: true,
+                    latched_target_is_self: false,
+                },
+                bus_path.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let occurrence = OccurrenceIdentity::new("revision-session", 4, 0, 16_000);
+        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
+        let mutation = {
+            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+            let mutation = admitted_mutation(&mut ledger, occurrence.clone(), 1, "Tekst bazowy");
+            ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+            mutation
+        };
+        let projected = Arc::new(StdMutex::new(Vec::new()));
+        let projected_for_callback = Arc::clone(&projected);
+        bus.publish_started();
+        let mut emitter = PresentationEmitter::new_with_authority(
+            Arc::clone(&delivery),
+            None,
+            None,
+            Some(Arc::clone(&bus)),
+            Some(Arc::clone(&ledger)),
+            Some(Arc::new(move |event| {
+                projected_for_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event.clone());
+            })),
+        );
+        emitter.on_event(&mutation);
+        let terminal_seal = ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .seal_terminal("revision-session", 4)
+            .expect("closed qualified occurrence must produce terminal seal");
+        emitter.on_event(&EngineEvent::LedgerSeal {
+            receipt: terminal_seal,
+        });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
+        emitter.on_event(&EngineEvent::SessionFinalised {
+            session_id: "revision-session".to_string(),
+            layer_summary: LayerSummary::default(),
+        });
+
+        let commit = emitter
+            .apply_user_revision(UserRevisionIntent {
+                session_id: "revision-session".to_string(),
+                source_revision: terminal.reducer_revision,
+                rendered_text: "Tekst poprawiony przez użytkownika".to_string(),
+            })
+            .expect("current terminal revision intent must commit");
+        assert_eq!(commit.revision, terminal.reducer_revision + 1);
+        assert_eq!(commit.rendered_text, "Tekst poprawiony przez użytkownika");
+        assert!(commit.provenance_receipt.starts_with("user-edit-"));
+        let stale = emitter.apply_user_revision(UserRevisionIntent {
+            session_id: "revision-session".to_string(),
+            source_revision: terminal.reducer_revision,
+            rendered_text: "Spóźniona edycja".to_string(),
+        });
+        assert!(matches!(
+            stale,
+            Err(UserRevisionRefusal::StaleRevision { .. })
+        ));
+
+        emitter.finish().await;
+        assert_eq!(
+            delivery.lock().await.as_str(),
+            "Tekst poprawiony przez użytkownika"
+        );
+        let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(ledger.manual_document_revisions().len(), 1);
+        let receipt = &ledger.manual_document_revisions()[0];
+        assert_eq!(receipt.provenance, "user-edit");
+        assert_eq!(receipt.rendered_text, commit.rendered_text);
+        assert_eq!(receipt.source_occurrences, vec![occurrence]);
+        drop(ledger);
+
+        let projected = projected.lock().unwrap_or_else(|error| error.into_inner());
+        let revision_projection = projected
+            .iter()
+            .rev()
+            .find(|event| event.reducer_revision == commit.revision)
+            .expect("user revision projection callback");
+        assert_eq!(revision_projection.reducer_action, "apply_manual_edit");
+        assert_eq!(
+            revision_projection.phase,
+            TranscriptProjectionPhase::Formatted
+        );
+        assert!(revision_projection.terminal);
+        assert_eq!(revision_projection.rendered_text, commit.rendered_text);
+        assert_eq!(
+            revision_projection.acoustic_receipts[0]
+                .manual_edit_receipt
+                .as_deref(),
+            Some(commit.provenance_receipt.as_str())
+        );
+        drop(projected);
+
+        let bus_bytes = std::fs::read(bus_path).unwrap();
+        let mut reader = TranscriptProjectionReader::new();
+        let replay = reader
+            .push_bytes(&bus_bytes)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("revision Bus bytes must replay");
+        let replayed_revision = replay.last().expect("replayed user revision");
+        assert_eq!(replayed_revision.reducer_revision, commit.revision);
+        assert_eq!(replayed_revision.reducer_action, "apply_manual_edit");
+        assert_eq!(replayed_revision.rendered_text, commit.rendered_text);
+        assert!(replayed_revision.terminal);
     }
 
     #[test]

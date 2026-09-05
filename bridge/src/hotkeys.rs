@@ -864,6 +864,31 @@ impl CodescribeHotkeys {
         .await?
     }
 
+    /// Commit a terminal overlay draft as a Rust-authored document revision.
+    /// The returned value is acknowledgement only; Swift repaints exclusively
+    /// from the transcript projection callback emitted by the reducer.
+    pub async fn commit_user_revision(
+        &self,
+        session_id: String,
+        source_revision: u64,
+        rendered_text: String,
+    ) -> Result<CsUserRevisionResult, CsError> {
+        application_runtime::run(async move {
+            let controller =
+                current_controller(&shared_controller()).ok_or_else(|| CsError::Recording {
+                    msg: "no recording controller for transcript revision".to_string(),
+                })?;
+            controller
+                .apply_user_revision_from_overlay(session_id, source_revision, rendered_text)
+                .await
+                .map(CsUserRevisionResult::from)
+                .map_err(|error| CsError::Recording {
+                    msg: error.to_string(),
+                })
+        })
+        .await?
+    }
+
     /// Forward a macOS sleep/wake boundary to the active recorder, if any.
     ///
     /// Querying this surface never constructs the shared controller. The host
@@ -1074,6 +1099,29 @@ pub struct CsPasteResult {
     pub frontmost_app_name: Option<String>,
     pub deferred_insert_shortcut: Option<String>,
     pub deferred_insert_failure: Option<String>,
+}
+
+/// Receipt returned to Swift after Rust has committed a user revision and
+/// synchronously emitted its projection callback.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CsUserRevisionResult {
+    pub session_id: String,
+    pub source_revision: u64,
+    pub revision: u64,
+    pub rendered_text: String,
+    pub provenance_receipt: String,
+}
+
+impl From<codescribe::presentation::emitter::UserRevisionCommit> for CsUserRevisionResult {
+    fn from(value: codescribe::presentation::emitter::UserRevisionCommit) -> Self {
+        Self {
+            session_id: value.session_id,
+            source_revision: value.source_revision,
+            revision: value.revision,
+            rendered_text: value.rendered_text,
+            provenance_receipt: value.provenance_receipt,
+        }
+    }
 }
 
 impl From<codescribe::controller::OverlayPasteResult> for CsPasteResult {

@@ -17,6 +17,7 @@ import SwiftUI
 struct DictationOverlayView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
+  @FocusState private var transcriptEditorFocused: Bool
   @Bindable var state: OverlayState
   var dockInitiallyExpanded = false
 
@@ -283,21 +284,68 @@ struct DictationOverlayView: View {
   }
 
   private var formattedBody: some View {
-    ScrollView {
-      Text(state.formattedText)
-        .csFont(19, .medium)
-        .foregroundStyle(palette.primaryText.color)
-        .lineSpacing(6)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-        .padding(.top, headerChromeInset)
-        .padding(.bottom, OverlayDockLayout.height)
+    VStack(alignment: .leading, spacing: CSSpace.sm) {
+      HStack(spacing: CSSpace.xs) {
+        if state.revisionCommitPending {
+          ProgressView()
+            .controlSize(.small)
+          Text("Committing revision…")
+        } else if state.isRevisionDraftDirty {
+          Image(systemName: "pencil.line")
+          Text("Draft · not committed")
+        } else {
+          Image(systemName: "checkmark.seal")
+          Text("Ledger projection")
+        }
+      }
+      .csMono(10, .semibold)
+      .foregroundStyle(
+        state.isRevisionDraftDirty ? CSColor.terracotta : palette.mutedText.color
+      )
+      .accessibilityElement(children: .combine)
+      .accessibilityIdentifier("overlay-revision-status")
+
+      TextField(
+        "Edit final transcript",
+        text: $state.revisionDraft,
+        axis: .vertical
+      )
+      .textFieldStyle(.plain)
+      .csFont(19, .medium)
+      .foregroundStyle(palette.primaryText.color)
+      .lineSpacing(6)
+      .lineLimit(3...12)
+      .focused($transcriptEditorFocused)
+      .disabled(state.revisionCommitPending)
+      .accessibilityLabel("Final transcript revision draft")
+      .accessibilityHint("Edits stay local until committed to the transcript ledger")
+      .accessibilityIdentifier("overlay-transcript-editor")
+      .onChange(of: state.revisionDraft) { _, _ in
+        state.noteRevisionDraftActivity()
+      }
+      .onChange(of: transcriptEditorFocused) { wasFocused, isFocused in
+        if wasFocused && !isFocused {
+          state.scheduleRevisionCommitAfterFocusExit()
+        }
+      }
+      .onExitCommand {
+        state.discardRevisionDraft()
+        transcriptEditorFocused = false
+      }
+
+      if let error = state.revisionCommitError {
+        Label(error, systemImage: "exclamationmark.triangle")
+          .csMono(10, .medium)
+          .foregroundStyle(CSColor.terracotta)
+          .accessibilityIdentifier("overlay-revision-error")
+      }
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .topLeading)
+    .padding(.top, headerChromeInset)
+    .padding(.bottom, OverlayDockLayout.height)
     .accessibilityLabel("Final transcript")
-    .accessibilityValue(state.formattedText)
+    .accessibilityValue(state.revisionDraft)
     .accessibilityIdentifier("overlay-transcript-formatted")
-    .modifier(OverlayScrollEdgeEffects())
   }
 
   /// Terminal outcome for a session that captured no usable speech. Replaces
