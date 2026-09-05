@@ -820,7 +820,7 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertTrue(state.canRetranscribe)
     XCTAssertTrue(state.canFormat)
     XCTAssertTrue(state.terminal)
-    XCTAssertNil(state.toast)
+    XCTAssertEqual(state.toast, "copied")
   }
 
   func testRailInsertRelaysToControllerWithoutOptimisticProjectionMutation() async {
@@ -856,7 +856,7 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertTrue(state.canRetranscribe)
     XCTAssertTrue(state.canFormat)
     XCTAssertTrue(state.terminal)
-    XCTAssertNil(state.toast)
+    XCTAssertEqual(state.toast, "no ax")
     XCTAssertNil(state.errorMessage)
   }
 

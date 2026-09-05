@@ -91,7 +91,12 @@ protocol DictationEngine: AnyObject {
   func copyTaggedTranscript(text: String) async throws
   func pasteTargetAppName() async -> String?
   func sendAssistiveTranscript(text: String) async throws -> Bool
+  func lastSessionAudioPath() -> String?
   func transcribeFile(path: String) async throws -> CsTranscription
+}
+
+extension DictationEngine {
+  func lastSessionAudioPath() -> String? { nil }
 }
 
 struct OverlayPolicySnapshot: Equatable {
@@ -241,10 +246,6 @@ final class OverlayState {
   /// Handoff to the agent surface — wired by the orchestrator (routes the text
   /// into AgentChat, which streams it through `CodescribeAgent.streamReply`).
   var onSendToAgent: ((String) -> Void)?
-  /// W3-T8 replaces this seam with the Rust-backed retranscribe/format intent
-  /// path. Keeping the two commands observable now lets W2 prove click routing
-  /// without inventing local execution or another IPC channel.
-  @ObservationIgnored var onDeferredBackendIntent: ((OverlayIntent) -> Void)?
   /// Dismiss the floating window — wired by the orchestrator.
   var onClose: (() -> Void)?
   var onRecordingPreparing: (() -> Void)?
@@ -582,40 +583,73 @@ final class OverlayState {
       relayCopyIntent()
     case .insertPaste:
       relayInsertPasteIntent()
-    case .retranscribe, .format:
-      onDeferredBackendIntent?(intent)
+    case .retranscribe:
+      relayRetranscribeIntent()
+    case .format:
+      relayFormatIntent()
     case .close:
       close()
     }
   }
 
   private func relayCopyIntent() {
-    guard let engine else { return }
+    guard let engine else {
+      presentActionFailure("Copy needs the recording engine", notice: "copy unavailable")
+      return
+    }
     let text = activeText
     Task { @MainActor in
       do {
         try await engine.copyTaggedTranscript(text: text)
+        self.showFooterNotice("copied")
       } catch {
-        NSLog("Overlay copy intent failed: \(error)")
+        self.presentActionFailure("Couldn't copy transcript: \(error)", notice: "copy failed")
       }
     }
   }
 
   private func relayInsertPasteIntent() {
-    guard let engine else { return }
-    let text = activeText
-    let shouldDefer = insertCaretInCodescribeProbe()
+    pasteToPreviousApp()
+  }
+
+  private func relayRetranscribeIntent() {
+    guard let engine else {
+      presentActionFailure(
+        "Retranscription needs the recording engine", notice: "retranscribe unavailable")
+      return
+    }
+    guard let path = engine.lastSessionAudioPath() else {
+      presentActionFailure(
+        "The previous recording is no longer available", notice: "no recording")
+      return
+    }
+    showFooterNotice("retranscribing…", persists: true)
     Task { @MainActor in
       do {
-        if shouldDefer {
-          _ = try await engine.deferText(text: text)
-        } else {
-          _ = try await engine.pasteText(text: text)
-        }
+        // The file pass proves the product FFI route. Its returned candidate
+        // deliberately does not overwrite reducer-owned transcript truth.
+        _ = try await engine.transcribeFile(path: path)
+        self.showFooterNotice("retranscribed")
       } catch {
-        NSLog("Overlay insert intent failed: \(error)")
+        self.presentActionFailure(
+          "Couldn't retranscribe recording: \(error)", notice: "retranscribe failed")
       }
     }
+  }
+
+  private func relayFormatIntent() {
+    // The current product FFI exposes formatter availability but no command
+    // that can publish a new occurrence-authenticated projection. Refuse
+    // visibly instead of reviving the removed Swift text-authority bypass.
+    presentActionFailure(
+      "Formatting is not connected to the transcript reducer",
+      notice: "format unavailable"
+    )
+  }
+
+  private func presentActionFailure(_ message: String, notice: String) {
+    errorMessage = message
+    showFooterNotice(notice)
   }
 
   func copyToPasteboard(_ pasteboard: NSPasteboard = .general) {
@@ -644,34 +678,41 @@ final class OverlayState {
   }
 
   func pasteToPreviousApp() {
+    guard let engine else {
+      presentActionFailure("Insert needs the recording engine", notice: "insert unavailable")
+      return
+    }
     captureQualityIfEdited(action: "paste")
     // Do not let the previous deadline fire while the async delivery is in
     // flight. A successful or failed attempt gets a fresh full countdown.
     cancelAutoHide()
+    showFooterNotice("inserting…", persists: true)
     let text = activeText
     Task { @MainActor in
       defer { self.restartAutoHideCountdown() }
       do {
-        let result: CsPasteResult?
+        let result: CsPasteResult
         if self.insertCaretInCodescribeProbe() {
           // The caret sits inside Codescribe (e.g. the overlay's own
           // editable FINAL) — a synthetic Cmd+V would paste the
           // transcript right back into the overlay. Arm the in-memory
           // Paste Here slot without touching the user's clipboard.
-          result = try await engine?.deferText(text: text)
+          result = try await engine.deferText(text: text)
         } else {
-          result = try await engine?.pasteText(text: text)
+          result = try await engine.pasteText(text: text)
         }
-        switch result?.outcome {
+        switch result.outcome {
         case .deferredInsertArmed:
-          let shortcut = result?.deferredInsertShortcut ?? "⌘⌥V"
+          let shortcut = result.deferredInsertShortcut ?? "⌘⌥V"
           self.showFooterNotice(shortcut, persists: true)
         case .copiedToClipboard:
           self.showFooterNotice("copied")
         case .accessibilityPermissionNeeded:
           self.showFooterNotice("no ax")
-        case .pasted, .noop, nil:
-          break
+        case .pasted:
+          self.showFooterNotice("inserted")
+        case .noop:
+          self.showFooterNotice("no insert")
         }
       } catch {
         self.errorMessage = "Couldn't paste transcript: \(error)"
@@ -1410,18 +1451,30 @@ final class OverlayState {
     return s
   }
 
+  /// Seeded view model for the terminal error phase.
+  static func previewError() -> OverlayState {
+    let s = OverlayState()
+    s.applyProjection(
+      previewProjection("", phase: .error, terminal: true)
+    )
+    s.errorMessage = "The transcription engine could not finish this take."
+    return s
+  }
+
   private static func previewProjection(
     _ renderedText: String,
     phase: OverlayMode,
     terminal: Bool
   ) -> OverlayTranscriptProjection {
-    OverlayTranscriptProjection(
+    let isFormatted = phase == .formatted
+    return OverlayTranscriptProjection(
       schema: "preview", sequence: 1, emittedAt: "preview", sessionId: "preview", mode: "dictation",
       phase: phase, reducerRevision: 1, reducerAction: "preview_fixture",
       occurrenceSessionId: "preview",
       captureEpoch: 0, sampleStart: 0, sampleEnd: 0, documentIndex: 0, label: renderedText,
-      renderedText: renderedText, canPaste: false, canInsert: false,
-      canCopy: !renderedText.isEmpty, canRetranscribe: terminal, canFormat: !terminal,
+      renderedText: renderedText, canPaste: isFormatted, canInsert: isFormatted,
+      canCopy: !renderedText.isEmpty, canRetranscribe: phase == .noSpeech || isFormatted,
+      canFormat: isFormatted,
       terminal: terminal, acousticReceipts: [])
   }
 }
@@ -1475,6 +1528,9 @@ final class ControllerDictationEngine: DictationEngine {
   }
   func sendAssistiveTranscript(text: String) async throws -> Bool {
     try await hotkeys.sendAssistiveTranscript(text: text)
+  }
+  func lastSessionAudioPath() -> String? {
+    hotkeys.lastSessionAudioPath()
   }
   func transcribeFile(path: String) async throws -> CsTranscription {
     try await hotkeys.transcribeFile(path: path)
