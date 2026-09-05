@@ -217,15 +217,17 @@ format prompts.
 The `codescribe` binary is a first-class client of the same bus. It never opens
 a second microphone.
 
-| Need                                              | Command                        |
-| ------------------------------------------------- | ------------------------------ |
-| Watch a take as it is spoken                      | `codescribe transcribe live`   |
-| The last completed transcript, on stdout          | `codescribe transcribe last`   |
-| A file through the product pipeline, onto the bus | `codescribe transcribe <file>` |
+| Need                                             | Command                                  |
+| ------------------------------------------------ | ---------------------------------------- |
+| Watch a take as it is spoken                     | `codescribe transcribe live`             |
+| The last completed transcript, on stdout         | `codescribe transcribe last`             |
+| Files through the product pipeline, onto the bus | `codescribe transcribe <files...>`       |
+| Right-click transcription from Finder            | `scripts/install-finder-quick-action.sh` |
 
-`transcribe live` dispatches on `schema`, so it hears both families, and prints
-only what changed — a reducer replacement is reported on stderr by character
-offset instead of reprinting the whole document. `transcribe last` prints the
+`transcribe live` dispatches on `schema`, so it hears both families. The
+default is a human canvas view printing only what changed — appended suffixes
+on the open line, `⟲ rev N` for a reducer rewrite, `⏺ sealed` blocks per take;
+`--json` keeps the raw projection JSONL for machine consumers. `transcribe last` prints the
 words and nothing else, with **no trailing newline**: pasted into a prompt a
 newline is Enter.
 

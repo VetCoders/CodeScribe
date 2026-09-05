@@ -214,7 +214,12 @@ Hold and toggle/double-tap both land in the same daily bag
 `~/.codescribe/transcriptions/YYYY-MM-DD/` (paired m4a/wav + txt). The agent
 follower is a session observer of that bag, not a second archive.
 
-`codescribe transcribe live` uses the shared Rust projection reader and writes
+`codescribe transcribe live` uses the shared Rust projection reader. The
+default stdout is the human canvas view: an extending revision appends only
+its suffix to the open line, a non-extending reducer rewrite closes the line
+and marks `⟲ rev N` with the full new render, and a terminal seal closes the
+take as a permanent `⏺ sealed` block carrying the session, revision, and PCM
+sample range. `--json` switches to the machine contract:
 `codescribe.transcript-projection.v1` JSONL to stdout. Every output row is an
 exact full `rendered_text` snapshot with `kind=live_revision|terminal_seal` and
 the source session, sequence, reducer revision/action, occurrence coordinates,

@@ -15,10 +15,14 @@
 //! - default        = the DELIVERY: one shaped transcript on stdout.
 //! - `--stream` = the LIVE CANVAS view: per-segment text flushed to stdout
 //!   as decoding progresses through the file.
-//! - `transcribe live` = follow the app-owned clean transcript bus and flush
-//!   newly created utterance drafts to stdout one line at a time. Revisions and
-//!   the final product seal remain explicit bus events. It never opens a
-//!   second microphone or reconstructs text from UI previews.
+//! - `transcribe live` = follow the app-owned clean transcript bus. The default
+//!   is the human canvas view: drafts append to the open line, a reducer
+//!   rewrite is marked `⟲ rev N`, and a terminal seal closes the take as a
+//!   permanent block. `--json` keeps the raw projection JSONL for machine
+//!   consumers. It never opens a second microphone or reconstructs text from
+//!   UI previews.
+//! - multiple FILES transcribe sequentially; per-file headers go to stderr so
+//!   stdout stays clean transcript text.
 //!
 //! Provenance goes to stderr, GUI-truth style, so stdout stays pipeable.
 //! The old `daemon` mode is gone on purpose: the SwiftUI app owns runtime.
@@ -38,10 +42,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Transcribe a file or follow the app-owned live transcript bus
+    /// Transcribe files or follow the app-owned live transcript bus
     Transcribe {
-        /// Path to the audio file (omit when using `transcribe live`)
-        file: Option<std::path::PathBuf>,
+        /// Audio files to transcribe in order (omit when using `transcribe live`)
+        files: Vec<std::path::PathBuf>,
         /// File language; live accepts it for compatibility but app settings own capture
         #[arg(short, long, global = true)]
         language: Option<String>,
@@ -51,6 +55,9 @@ enum Command {
         /// Print only; do not publish this verdict onto the transcript bus
         #[arg(long)]
         no_bus: bool,
+        /// Live: raw projection JSONL for machine consumers instead of the human view
+        #[arg(long)]
+        json: bool,
         #[command(subcommand)]
         mode: Option<TranscribeMode>,
     },
@@ -69,37 +76,137 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Transcribe {
-            file,
+            files,
             language,
             stream,
             no_bus,
+            json,
             mode,
         } => match mode {
             Some(TranscribeMode::Live) => {
                 anyhow::ensure!(
-                    file.is_none() && !stream,
+                    files.is_empty() && !stream,
                     "`transcribe live` does not accept a file or --stream"
                 );
-                transcribe_live(language)
+                transcribe_live(language, json)
             }
             Some(TranscribeMode::Last) => {
                 anyhow::ensure!(
-                    file.is_none() && !stream,
-                    "`transcribe last` does not accept a file or --stream"
+                    files.is_empty() && !stream && !json,
+                    "`transcribe last` does not accept a file, --stream or --json"
                 );
                 transcribe_last()
             }
             None => {
-                let file = file.ok_or_else(|| {
-                    anyhow::anyhow!("missing <FILE> (or use `codescribe transcribe live`)")
-                })?;
-                transcribe(&file, language.as_deref(), stream, !no_bus)
+                anyhow::ensure!(
+                    !json,
+                    "--json belongs to `transcribe live`; file mode already prints plain text"
+                );
+                anyhow::ensure!(
+                    !files.is_empty(),
+                    "missing <FILES> (or use `codescribe transcribe live`)"
+                );
+                transcribe_batch(&files, language.as_deref(), stream, !no_bus)
             }
         },
     }
 }
 
-fn transcribe_live(language: Option<String>) -> anyhow::Result<()> {
+/// Transcribe files in order. One failing file reports on stderr and the batch
+/// continues; the exit code stays non-zero so scripts still see the failure.
+fn transcribe_batch(
+    files: &[std::path::PathBuf],
+    language: Option<&str>,
+    stream: bool,
+    publish_bus: bool,
+) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if files.len() > 1 {
+            eprintln!(
+                "--- file {}/{}: {} ---",
+                index + 1,
+                files.len(),
+                file.display()
+            );
+            if index > 0 {
+                // Batch stdout stays parseable: one blank line between transcripts.
+                println!();
+            }
+        }
+        if let Err(error) = transcribe(file, language, stream, publish_bus) {
+            eprintln!("FAILED {}: {error:#}", file.display());
+            failures.push(file.display().to_string());
+        }
+    }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "{} of {} files failed: {}",
+        failures.len(),
+        files.len(),
+        failures.join(", ")
+    );
+    Ok(())
+}
+
+/// What the human view already has on the open terminal line, so the next
+/// projection can be rendered as a delta instead of a full reprint.
+#[derive(Debug, Default)]
+struct LiveHumanView {
+    /// Session and full rendered text of the line currently left open.
+    open_line: Option<(String, String)>,
+}
+
+impl LiveHumanView {
+    /// Exact bytes to write for one projection. Appends leave the line open;
+    /// a revision that is not a pure extension closes it and marks `⟲ rev N`;
+    /// a terminal seal closes the take as a permanent block. No cursor moves —
+    /// works identically in tmux, zellij, and a bare tty.
+    fn render(
+        &mut self,
+        projection: &codescribe::presentation::transcript_projection::TranscriptProjection,
+    ) -> String {
+        use codescribe::presentation::transcript_projection::TranscriptProjectionKind;
+
+        let session = projection.session_id.as_str();
+        let text = projection.rendered_text.as_str();
+        match projection.kind {
+            TranscriptProjectionKind::LiveRevision => match self.open_line.take() {
+                Some((open_session, previous)) if open_session == session => {
+                    if let Some(appended) = text.strip_prefix(previous.as_str()) {
+                        self.open_line = Some((open_session, text.to_string()));
+                        appended.to_string()
+                    } else {
+                        self.open_line = Some((open_session, text.to_string()));
+                        format!("\n⟲ rev {}: {text}", projection.reducer_revision)
+                    }
+                }
+                interrupted => {
+                    // None = fresh canvas; Some(other session) = close that line first.
+                    let prefix = if interrupted.is_some() { "\n" } else { "" };
+                    self.open_line = Some((session.to_string(), text.to_string()));
+                    format!("{prefix}{text}")
+                }
+            },
+            TranscriptProjectionKind::TerminalSeal => {
+                let newline = if self.open_line.take().is_some() {
+                    "\n"
+                } else {
+                    ""
+                };
+                format!(
+                    "{newline}⏺ sealed · session {} · rev {} · samples {}..{}\n{text}\n\n",
+                    &session[..8.min(session.len())],
+                    projection.reducer_revision,
+                    projection.sample_start,
+                    projection.sample_end,
+                )
+            }
+        }
+    }
+}
+
+fn transcribe_live(language: Option<String>, json: bool) -> anyhow::Result<()> {
     use codescribe::presentation::transcript_bus::transcript_bus_path;
     use codescribe::presentation::transcript_projection::{
         TranscriptBusFileWake, TranscriptProjectionReader,
@@ -125,8 +232,16 @@ fn transcribe_live(language: Option<String>) -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
+    let mut human_view = (!json).then(LiveHumanView::default);
+
     runtime.block_on(async move {
-        eprintln!("codescribe live: app transcript bus -> full projection JSONL stdout");
+        if json {
+            eprintln!("codescribe live: app transcript bus -> full projection JSONL stdout");
+        } else {
+            eprintln!(
+                "codescribe live: canvas view (drafts append, ⟲ marks a rewrite, ⏺ seals a take); --json for raw projections"
+            );
+        }
         eprintln!("bus={} start=end stop=Ctrl-C", path.display());
         eprintln!(
             "language_hint={} owner=Codescribe.app",
@@ -177,11 +292,20 @@ fn transcribe_live(language: Option<String>) -> anyhow::Result<()> {
             file.read_to_end(&mut chunk)?;
             offset = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
             if !chunk.is_empty() {
-                let (lines, errors) = live_projection_lines(&mut reader, &chunk)?;
+                let (projections, errors) = live_projections(&mut reader, &chunk);
                 let stdout = std::io::stdout();
                 let mut out = stdout.lock();
-                for line in lines {
-                    writeln!(out, "{line}")?;
+                match human_view.as_mut() {
+                    Some(view) => {
+                        for projection in &projections {
+                            write!(out, "{}", view.render(projection))?;
+                        }
+                    }
+                    None => {
+                        for projection in &projections {
+                            writeln!(out, "{}", projection.normalized_json()?)?;
+                        }
+                    }
                 }
                 for error in errors {
                     eprintln!("codescribe live: unreadable bus line: {error}");
@@ -192,18 +316,34 @@ fn transcribe_live(language: Option<String>) -> anyhow::Result<()> {
     })
 }
 
+fn live_projections(
+    reader: &mut codescribe::presentation::transcript_projection::TranscriptProjectionReader,
+    bytes: &[u8],
+) -> (
+    Vec<codescribe::presentation::transcript_projection::TranscriptProjection>,
+    Vec<String>,
+) {
+    let mut projections = Vec::new();
+    let mut errors = Vec::new();
+    for result in reader.push_bytes(bytes) {
+        match result {
+            Ok(projection) => projections.push(projection),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    (projections, errors)
+}
+
+#[cfg(test)]
 fn live_projection_lines(
     reader: &mut codescribe::presentation::transcript_projection::TranscriptProjectionReader,
     bytes: &[u8],
 ) -> Result<(Vec<String>, Vec<String>), serde_json::Error> {
-    let mut lines = Vec::new();
-    let mut errors = Vec::new();
-    for result in reader.push_bytes(bytes) {
-        match result {
-            Ok(projection) => lines.push(projection.normalized_json()?),
-            Err(error) => errors.push(error.to_string()),
-        }
-    }
+    let (projections, errors) = live_projections(reader, bytes);
+    let lines = projections
+        .iter()
+        .map(|projection| projection.normalized_json())
+        .collect::<Result<Vec<_>, _>>()?;
     Ok((lines, errors))
 }
 
@@ -432,14 +572,130 @@ mod tests {
         let cli = Cli::try_parse_from(["codescribe", "transcribe", "live", "--language", "pl"])
             .expect("live command should parse");
         let Command::Transcribe {
-            file,
+            files,
             language,
             mode,
             ..
         } = cli.command;
-        assert!(file.is_none());
+        assert!(files.is_empty());
         assert_eq!(language.as_deref(), Some("pl"));
         assert!(matches!(mode, Some(TranscribeMode::Live)));
+    }
+
+    /// Founder 2026-09-05: "to też naturalne, że powinno przejść" — a batch of
+    /// wavs on the command line is the natural CLI shape, not an error.
+    #[test]
+    fn multiple_files_parse_as_a_batch_not_an_error() {
+        let cli = Cli::try_parse_from(["codescribe", "transcribe", "a.wav", "b.wav", "c.wav"])
+            .expect("multi-file should parse");
+        let Command::Transcribe { files, mode, .. } = cli.command;
+        assert_eq!(files.len(), 3);
+        assert!(mode.is_none());
+    }
+
+    fn projection(
+        kind: codescribe::presentation::transcript_projection::TranscriptProjectionKind,
+        session: &str,
+        revision: u64,
+        text: &str,
+    ) -> codescribe::presentation::transcript_projection::TranscriptProjection {
+        codescribe::presentation::transcript_projection::TranscriptProjection {
+            schema: codescribe::presentation::transcript_projection::PROJECTION_SCHEMA,
+            kind,
+            session_id: session.to_string(),
+            sequence: revision,
+            reducer_revision: revision,
+            reducer_action: "apply_ledger_decision".into(),
+            occurrence_session_id: session.to_string(),
+            capture_epoch: 1,
+            sample_start: 100,
+            sample_end: 900,
+            document_index: 0,
+            rendered_text: text.to_string(),
+            phase: Default::default(),
+            can_paste: false,
+            can_insert: false,
+            can_copy: false,
+            can_retranscribe: false,
+            can_format: false,
+            terminal: false,
+        }
+    }
+
+    /// The human canvas prints only what changed: an extending revision appends
+    /// the suffix to the open line instead of reprinting the whole document.
+    #[test]
+    fn human_view_appends_only_the_delta_of_an_extending_revision() {
+        use codescribe::presentation::transcript_projection::TranscriptProjectionKind;
+        let mut view = LiveHumanView::default();
+        let first = view.render(&projection(
+            TranscriptProjectionKind::LiveRevision,
+            "sess-a",
+            1,
+            "alfa",
+        ));
+        let second = view.render(&projection(
+            TranscriptProjectionKind::LiveRevision,
+            "sess-a",
+            2,
+            "alfa beta",
+        ));
+        assert_eq!(first, "alfa");
+        assert_eq!(second, " beta");
+    }
+
+    /// A reducer rewrite is not an append: the canvas closes the stale line and
+    /// marks the replacement explicitly instead of printing a duplicate.
+    #[test]
+    fn human_view_marks_a_rewrite_instead_of_duplicating_text() {
+        use codescribe::presentation::transcript_projection::TranscriptProjectionKind;
+        let mut view = LiveHumanView::default();
+        view.render(&projection(
+            TranscriptProjectionKind::LiveRevision,
+            "sess-a",
+            1,
+            "alfa bety",
+        ));
+        let rewrite = view.render(&projection(
+            TranscriptProjectionKind::LiveRevision,
+            "sess-a",
+            2,
+            "alfa beta gamma",
+        ));
+        assert_eq!(rewrite, "\n⟲ rev 2: alfa beta gamma");
+    }
+
+    /// The seal closes the open draft line and prints a permanent block; a seal
+    /// with no open line does not start with a stray newline.
+    #[test]
+    fn human_view_seal_closes_the_take_as_a_permanent_block() {
+        use codescribe::presentation::transcript_projection::TranscriptProjectionKind;
+        let mut view = LiveHumanView::default();
+        view.render(&projection(
+            TranscriptProjectionKind::LiveRevision,
+            "sess-abcdef",
+            1,
+            "alfa",
+        ));
+        let sealed = view.render(&projection(
+            TranscriptProjectionKind::TerminalSeal,
+            "sess-abcdef",
+            3,
+            "alfa beta",
+        ));
+        assert_eq!(
+            sealed,
+            "\n⏺ sealed · session sess-abc · rev 3 · samples 100..900\nalfa beta\n\n"
+        );
+
+        let mut cold = LiveHumanView::default();
+        let cold_seal = cold.render(&projection(
+            TranscriptProjectionKind::TerminalSeal,
+            "sess-x",
+            1,
+            "solo",
+        ));
+        assert!(!cold_seal.starts_with('\n'));
     }
 
     #[test]
