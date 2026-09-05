@@ -1327,7 +1327,7 @@ final class OverlayStateTests: XCTestCase {
     }
   }
 
-  func testCanvasSourceHasNoDeliveryOrPlacementChrome() throws {
+  func testCanvasKeepsProjectedActionsAndDiscretePlacementChrome() throws {
     let macosDir = URL(fileURLWithPath: #filePath)
       .deletingLastPathComponent()
       .deletingLastPathComponent()
@@ -1339,9 +1339,9 @@ final class OverlayStateTests: XCTestCase {
     let splitPath = overlayDir.appendingPathComponent("OverlaySplitPrimaryAction.swift").path
 
     XCTAssertFalse(FileManager.default.fileExists(atPath: splitPath))
-    XCTAssertFalse(overlaySource.contains("Menu {"))
     XCTAssertFalse(overlaySource.contains("overlay-auto-paste"))
-    XCTAssertFalse(overlaySource.contains("overlay-placement-menu"))
+    XCTAssertTrue(overlaySource.contains("OverlayPlacementMenu"))
+    XCTAssertFalse(overlaySource.contains("private var placementMenu"))
     XCTAssertFalse(overlaySource.contains("performPrimaryAction"))
     XCTAssertTrue(overlaySource.contains("OverlayIntentRail"))
     XCTAssertFalse(

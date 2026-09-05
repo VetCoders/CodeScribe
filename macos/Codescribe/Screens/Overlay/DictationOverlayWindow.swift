@@ -110,7 +110,7 @@ enum DictationOverlayWindow {
   /// lines) without the old action-layer mass. Width floor (320) is unchanged.
   static let minSize = NSSize(width: 320, height: 260)
   /// First-launch content size (no persisted value yet). LANDSCAPE rectangle —
-  /// operator spec: the resting state is a horizontal bar (waveform + a few
+  /// Founder spec: the resting state is a horizontal bar (waveform + a few
   /// transcript lines), never a portrait column. Resizing persists, so users
   /// who prefer a tall panel drag it once and keep it.
   static let defaultSize = NSSize(width: 470, height: 280)
@@ -191,9 +191,8 @@ enum DictationOverlayWindow {
     panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
     panel.isFloatingPanel = true
     panel.hidesOnDeactivate = false
-    // The SwiftUI surface places `OverlayDragHandle` behind the complete sheet.
-    // Controls and the native transcript sit above that layer and retain their
-    // own clicks; every inert point reaches a view whose mouseDown moves this panel.
+    // Explicit SwiftUI regions own window dragging. This flag remains enabled
+    // for the narrow macOS 14 compatibility view inside those regions only.
     panel.isMovableByWindowBackground = true
 
     panel.titleVisibility = .hidden
@@ -362,9 +361,9 @@ final class OverlayPresence {
 }
 
 /// Geometry for a fat resize band on a borderless panel. AppKit's own strip
-/// is one or two pixels; this is the operator-visible target (macOS 15+).
+/// is one or two pixels; this is a forgiving visible-surface target (macOS 15+).
 enum OverlayResizeHit: Sendable {
-  static let band: CGFloat = 12
+  static let band: CGFloat = 16
 
   enum Edge: Sendable, Equatable {
     case left, right, top, bottom
@@ -485,23 +484,6 @@ enum OverlayResizeHit: Sendable {
       window.setFrame(frame, display: true)
     }
   }
-}
-
-/// Full-sheet background hit target: the view itself moves the window.
-/// Interactive siblings (the intent rail and transcript editor) sit above it
-/// and keep their clicks/selection through ordinary AppKit hit-test ordering.
-struct OverlayDragHandle: NSViewRepresentable {
-  func makeNSView(context: Context) -> OverlayDragHandleView {
-    OverlayDragHandleView()
-  }
-
-  func updateNSView(_ nsView: OverlayDragHandleView, context: Context) {}
-}
-
-final class OverlayDragHandleView: NSView {
-  override var mouseDownCanMoveWindow: Bool { true }
-  override var isOpaque: Bool { false }
-  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// The overlay becomes key only while the user is editing the transcript.

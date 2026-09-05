@@ -235,6 +235,28 @@ final class OverlayState {
   /// Wired by the orchestrator: re-derive the visible panel's origin now.
   var onPlacementChanged: (() -> Void)?
 
+  /// A menu selection is an immediate positioning command, including when the
+  /// user chooses the already-selected anchor to leave Free motion.
+  func selectPlacementAnchor(_ anchor: OverlayAnchor) {
+    if placementAnchor != anchor {
+      placementAnchor = anchor
+    } else if freeMotion {
+      freeMotion = false
+    } else {
+      onPlacementChanged?()
+    }
+  }
+
+  /// Free motion starts from the panel's current/restored origin; subsequent
+  /// windowDidMove callbacks persist every user drag.
+  func selectFreeMotion() {
+    if freeMotion {
+      onPlacementChanged?()
+    } else {
+      freeMotion = true
+    }
+  }
+
   // MARK: Injected collaborators (all optional so #Preview renders standalone)
   /// The recording core. Injected by the orchestrator. Do NOT instantiate here.
   var engine: DictationEngine?
