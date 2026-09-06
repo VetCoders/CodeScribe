@@ -29,8 +29,17 @@ static INIT: Once = Once::new();
 /// file sink at runtime, including integration tests where this library is
 /// compiled without `cfg(test)`; they retain the stderr subscriber.
 pub fn init_logging() {
+    init_logging_with_default_filter("info");
+}
+
+/// Same subscriber as [`init_logging`], with the caller's default filter when
+/// neither `RUST_LOG` nor `LOG_LEVEL` is set. The CLI uses `warn`: a file
+/// transcript that lost a span must say so on stderr without drowning the
+/// user in `info` chatter, and without the CLI silently dropping every engine
+/// warning (it installed no subscriber at all before 2026-09-06).
+pub fn init_logging_with_default_filter(default_filter: &str) {
     INIT.call_once(|| {
-        init_tracing();
+        init_tracing(default_filter);
         install_panic_hook();
     });
 }
@@ -38,16 +47,16 @@ pub fn init_logging() {
 /// Build and install the subscriber: a stderr layer always, plus a file layer
 /// when the log file can be opened. An unopenable log file degrades to
 /// stderr-only rather than losing tracing altogether.
-fn init_tracing() {
+fn init_tracing(default_filter: &str) {
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{EnvFilter, fmt};
 
-    // Prefer `RUST_LOG`, fall back to legacy `LOG_LEVEL`.
+    // Prefer `RUST_LOG`, fall back to legacy `LOG_LEVEL`, then the caller's default.
     let filter = match env::var("RUST_LOG") {
         Ok(v) => v,
         Err(_) => match env::var("LOG_LEVEL") {
             Ok(v) => v.to_lowercase(),
-            Err(_) => "info".to_string(),
+            Err(_) => default_filter.to_string(),
         },
     };
 

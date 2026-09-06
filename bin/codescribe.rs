@@ -73,6 +73,10 @@ enum TranscribeMode {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Engine warnings (a refused long-file span, a degraded lane) are the
+    // CLI's only way to say "this transcript is missing something"; they go
+    // to stderr, so `transcribe last` stdout stays verbatim for the widget.
+    codescribe::logging::init_logging_with_default_filter("warn");
     let cli = Cli::parse();
     match cli.command {
         Command::Transcribe {
