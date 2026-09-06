@@ -705,6 +705,10 @@ impl LocalWhisperEngine {
     ///
     /// File transcription passes its existing Silero result here so window
     /// planning does not add a second VAD run to the stop-path budget.
+    ///
+    /// A window that decodes words but no closed timestamp span is retried as
+    /// halves up to `SEGMENTLESS_WINDOW_MAX_SPLITS` times (quarters of the
+    /// planned window) and then refused on its own; the file continues.
     fn transcribe_long_with_language_segments_using_silences(
         &mut self,
         audio: &[f32],
@@ -744,8 +748,18 @@ impl LocalWhisperEngine {
         let mut logprob_sum = 0.0_f32;
         let mut logprob_count = 0_u32;
         let mut worst_compression = 0.0_f32;
+        let mut refused_windows = 0_u32;
 
-        for (start_sec, end_sec) in windows {
+        // Time-ordered work stack: a window whose decode carries words but no
+        // closed timestamp span (a runaway decode never emits the closing
+        // clock token) is re-tried as two halves before it is refused.
+        let mut pending: Vec<(f32, f32, u8)> = windows
+            .into_iter()
+            .rev()
+            .map(|(start_sec, end_sec)| (start_sec, end_sec, 0_u8))
+            .collect();
+
+        while let Some((start_sec, end_sec, splits)) = pending.pop() {
             let start = ((start_sec * 16_000.0).round() as usize).min(samples.len());
             let end = ((end_sec * 16_000.0).round() as usize).min(samples.len());
             if end <= start {
@@ -753,6 +767,41 @@ impl LocalWhisperEngine {
             }
             let chunk = &samples[start..end];
             let mut transcript = self.transcribe_samples_16k_raw(chunk, language, debug_tokens)?;
+
+            // `merge_chunk_transcripts` refuses words without timestamp
+            // provenance by contract. That refusal is the WINDOW's verdict,
+            // not the file's: retry shorter, then drop the window and keep
+            // `covered_until_secs` where it was so the neighbour's overlap
+            // re-describes as much of the hole as it can.
+            if transcript.segments.is_empty() && !transcript.text.trim().is_empty() {
+                let window_chars = transcript.text.chars().count();
+                if splits < SEGMENTLESS_WINDOW_MAX_SPLITS
+                    && end_sec - start_sec >= SEGMENTLESS_WINDOW_MIN_SPLIT_SECS
+                {
+                    let mid_sec = (start_sec + end_sec) / 2.0;
+                    tracing::warn!(
+                        window_start = start_sec,
+                        window_end = end_sec,
+                        chars = window_chars,
+                        split = splits + 1,
+                        "long-file window decoded words without a closed timestamp span; \
+                         retrying as two halves"
+                    );
+                    pending.push((mid_sec, end_sec, splits + 1));
+                    pending.push((start_sec, mid_sec, splits + 1));
+                    continue;
+                }
+                refused_windows += 1;
+                tracing::warn!(
+                    window_start = start_sec,
+                    window_end = end_sec,
+                    chars = window_chars,
+                    refused_windows,
+                    "long-file window refused: words without timestamp provenance \
+                     after retries; this span is missing from the transcript"
+                );
+                continue;
+            }
 
             if let Some(lp) = transcript.avg_logprob {
                 logprob_sum += lp;
@@ -784,6 +833,15 @@ impl LocalWhisperEngine {
                 },
             )?;
             covered_until_secs = covered_until_secs.max(end_sec);
+        }
+
+        if refused_windows > 0 {
+            tracing::warn!(
+                refused_windows,
+                total_secs,
+                "long-file transcript assembled with refused windows; \
+                 the missing spans are logged above"
+            );
         }
 
         Ok(RawTranscript {
@@ -1894,6 +1952,15 @@ pub(crate) fn silence_spans_from_vad_probabilities(
     }
     spans
 }
+
+/// How many times a long-file window may be halved after decoding words
+/// without a closed timestamp span (2 = down to quarters of the planned
+/// window) before that span is refused and the file continues without it.
+const SEGMENTLESS_WINDOW_MAX_SPLITS: u8 = 2;
+
+/// Windows shorter than this are not split further; a runaway decode on
+/// two seconds of audio is refused outright.
+const SEGMENTLESS_WINDOW_MIN_SPLIT_SECS: f32 = 2.0;
 
 /// Merge the next window's transcript onto the accumulated one, deduplicating
 /// the overlap REGION by segment time instead of by text.
