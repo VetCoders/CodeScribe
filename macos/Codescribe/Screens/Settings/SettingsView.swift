@@ -182,7 +182,7 @@ struct SettingsView: View {
           case .shortcuts:
             ShortcutsPanel(model: model)
           case .providers:
-            KeysPanel(model: model)
+            ProvidersPanel(model: model)
           case .agent:
             AgentPanel(model: model)
           case .prompts:

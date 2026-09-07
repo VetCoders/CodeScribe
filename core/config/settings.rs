@@ -29,7 +29,9 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::llm::provider::{ProviderKind, WireFamily};
+use crate::llm::provider::{
+    CustomProvider, ProviderError, ProviderKind, ProviderRef, ResolvedProvider, WireFamily,
+};
 use crate::pipeline::acoustic_ledger::EnergyCalibration;
 
 use super::energy_calibration::{
@@ -209,16 +211,20 @@ pub struct UserSettings {
     pub sound_volume: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub formatting_level: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_endpoint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_assistive_endpoint: Option<String>,
+    /// Assistive lane model; `None` ⇒ the provider's default (vendor) or
+    /// "no model selected" (custom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_assistive_model: Option<String>,
+    /// Assistive lane provider reference (`ProviderRef` spelling); `None` ⇒ OpenAI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_assistive_provider: Option<String>,
+    /// Formatting lane provider reference (`ProviderRef` spelling); `None` ⇒ OpenAI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_formatting_provider: Option<String>,
+    /// Operator-defined providers (`providers.custom[]` on disk). Vendor
+    /// endpoints are pinned in code and never appear here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub llm_custom_providers: Vec<CustomProvider>,
     /// Optional override for the OpenAI OAuth client id (non-secret app identity).
     /// `None` falls through to env, then the shipped Codex CLI public app id
     /// (see `NOTICE`). Env `CODESCRIBE_OPENAI_OAUTH_CLIENT_ID` is the dev fallback.
@@ -257,8 +263,6 @@ pub struct UserSettings {
     pub deferred_insert_shortcut: Option<String>,
 
     // ── Promoted from .env (settings.json is now source of truth) ──
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub llm_formatting_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_formatting_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,10 +522,17 @@ impl SettingsSnapshotValidation {
     }
 }
 
+/// Outcome of [`UserSettings::remove_custom_provider`]: the row that was
+/// removed and the lanes that pointed at it (now reset to the default vendor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedCustomProvider {
+    pub provider: CustomProvider,
+    pub lanes_reset: Vec<RuntimeLlmLaneKind>,
+}
+
 /// Stable identity of one resolved LLM lane inside the immutable settings throne.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeLlmLaneKind {
-    Main,
     Formatting,
     Assistive,
 }
@@ -529,7 +540,6 @@ pub enum RuntimeLlmLaneKind {
 impl RuntimeLlmLaneKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Main => "main",
             Self::Formatting => "formatting",
             Self::Assistive => "assistive",
         }
@@ -596,15 +606,14 @@ impl fmt::Debug for RuntimeLlmCredential {
     }
 }
 
-/// One fully resolved LLM lane. Endpoint, model, provider, and account identity
-/// are immutable. Only the secret behind that account is refreshed at the
-/// explicit request boundary through [`RuntimeLlmCredential::request_api_key`].
+/// One fully resolved LLM lane. Provider (reference, wire, endpoint), model,
+/// and account identity are immutable. Only the secret behind that account is
+/// refreshed at the explicit request boundary through
+/// [`RuntimeLlmCredential::request_api_key`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLlmLane {
     lane: RuntimeLlmLaneKind,
-    provider: ProviderKind,
-    wire_family: WireFamily,
-    endpoint: String,
+    provider: ResolvedProvider,
     model: String,
     credential: RuntimeLlmCredential,
     available: bool,
@@ -614,8 +623,7 @@ pub struct RuntimeLlmLane {
 impl RuntimeLlmLane {
     pub(super) fn seal(
         lane: RuntimeLlmLaneKind,
-        provider: ProviderKind,
-        endpoint: String,
+        provider: ResolvedProvider,
         model: String,
         credential: RuntimeLlmCredential,
         available: bool,
@@ -624,8 +632,6 @@ impl RuntimeLlmLane {
         Self {
             lane,
             provider,
-            wire_family: provider.wire_family(),
-            endpoint,
             model,
             credential,
             available,
@@ -637,16 +643,27 @@ impl RuntimeLlmLane {
         self.lane
     }
 
-    pub const fn provider(&self) -> ProviderKind {
-        self.provider
+    /// The provider this lane points at: a vendor or `custom:<id>`.
+    pub fn provider(&self) -> &ProviderRef {
+        &self.provider.reference
+    }
+
+    /// Picker label of the provider (vendor display name or custom row name).
+    pub fn provider_display_name(&self) -> &str {
+        &self.provider.display_name
+    }
+
+    /// The vendor, when the provider is one; `None` for a Custom provider.
+    pub fn vendor(&self) -> Option<ProviderKind> {
+        self.provider.reference.vendor()
     }
 
     pub const fn wire_family(&self) -> WireFamily {
-        self.wire_family
+        self.provider.wire
     }
 
     pub fn endpoint(&self) -> &str {
-        &self.endpoint
+        &self.provider.endpoint
     }
 
     pub fn model(&self) -> &str {
@@ -661,12 +678,18 @@ impl RuntimeLlmLane {
         self.available
     }
 
+    /// Whether `model` may receive image input on this lane (§B.2): vendor
+    /// capability policy, permissive for Custom providers.
+    pub fn supports_vision(&self, model: &str) -> bool {
+        self.provider.supports_vision(model)
+    }
+
     /// Whether a request can be sent under the credential truth that exists
     /// now, rather than only under the truth observed when this lane was sealed.
     pub fn request_available(&self) -> bool {
         self.credential.account_auth()
             || self.credential.request_api_key().is_some()
-            || !ProviderKind::endpoint_requires_api_key(&self.endpoint)
+            || !self.provider.key_required
     }
 
     pub fn unavailable_reason(&self) -> Option<&str> {
@@ -677,9 +700,9 @@ impl RuntimeLlmLane {
         format!(
             "{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
             self.lane.as_str(),
-            self.provider.as_str(),
-            self.wire_family,
-            self.endpoint,
+            self.provider.reference,
+            self.provider.wire,
+            self.provider.endpoint,
             self.model,
             self.credential.key_account,
             self.credential.api_key.is_some(),
@@ -692,22 +715,15 @@ impl RuntimeLlmLane {
 /// The complete LLM part set sealed exactly once by the settings loader.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeLlmLanes {
-    main: RuntimeLlmLane,
     formatting: RuntimeLlmLane,
     assistive: RuntimeLlmLane,
 }
 
 impl RuntimeLlmLanes {
-    pub(super) fn seal(
-        main: RuntimeLlmLane,
-        formatting: RuntimeLlmLane,
-        assistive: RuntimeLlmLane,
-    ) -> Self {
-        debug_assert_eq!(main.lane(), RuntimeLlmLaneKind::Main);
+    pub(super) fn seal(formatting: RuntimeLlmLane, assistive: RuntimeLlmLane) -> Self {
         debug_assert_eq!(formatting.lane(), RuntimeLlmLaneKind::Formatting);
         debug_assert_eq!(assistive.lane(), RuntimeLlmLaneKind::Assistive);
         Self {
-            main,
             formatting,
             assistive,
         }
@@ -715,14 +731,9 @@ impl RuntimeLlmLanes {
 
     pub fn lane(&self, lane: RuntimeLlmLaneKind) -> &RuntimeLlmLane {
         match lane {
-            RuntimeLlmLaneKind::Main => &self.main,
             RuntimeLlmLaneKind::Formatting => &self.formatting,
             RuntimeLlmLaneKind::Assistive => &self.assistive,
         }
-    }
-
-    pub fn main(&self) -> &RuntimeLlmLane {
-        &self.main
     }
 
     pub fn formatting(&self) -> &RuntimeLlmLane {
@@ -735,8 +746,7 @@ impl RuntimeLlmLanes {
 
     pub(super) fn digest_material(&self) -> String {
         format!(
-            "{}\n{}\n{}",
-            self.main.digest_material(),
+            "{}\n{}",
             self.formatting.digest_material(),
             self.assistive.digest_material(),
         )
@@ -1168,6 +1178,17 @@ struct SettingsV2 {
     /// Agent runtime preferences (tool permissions gateway, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<AgentV2>,
+    /// Operator-defined LLM providers; vendors are pinned in code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    providers: Option<ProvidersV2>,
+}
+
+/// `providers` section: `custom[]` rows, each `{id, name, wire, endpoint}`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct ProvidersV2 {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    custom: Vec<CustomProvider>,
 }
 
 /// `agent` section. Written only when at least one of its parts is present, so
@@ -1251,12 +1272,8 @@ struct SpeechV2 {
     assistive: Option<AssistiveV2>,
     #[serde(skip_serializing_if = "Option::is_none")]
     emission: Option<EmissionV2>,
-    // De-ghosted (2026-05-30): base/default LLM endpoint + model (distinct from the
-    // formatting/assistive overrides). Previously dropped on V2 round-trip.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_endpoint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_model: Option<String>,
+    // Legacy `llm_endpoint` / `llm_model` (shared lane fallback) are read only
+    // by the one-shot migration in `load_unlocked` and never written back.
 }
 
 /// Which recognizer runs and how. `mode` is the legacy local/cloud switch;
@@ -1308,8 +1325,7 @@ pub(crate) fn normalize_stt_engine(value: &str) -> Option<String> {
 }
 
 /// LLM post-processing of the transcript: whether it runs, how aggressively,
-/// and against which endpoint. The endpoint/model here override the base
-/// `speech.llm_*` pair for the formatting lane only.
+/// and on which provider + model. Legacy `llm_endpoint` is migration-only.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct FormattingV2 {
@@ -1322,23 +1338,21 @@ struct FormattingV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    llm_endpoint: Option<String>,
+    llm_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     llm_model: Option<String>,
 }
 
-/// The assistive lane's own provider triple. Separate from formatting so the
-/// two lanes can run on different models — and so a key written for one lane
-/// cannot quietly serve the other.
+/// The assistive lane's own provider + model. Separate from formatting so the
+/// two lanes can run on different providers. Legacy `llm_endpoint` is
+/// migration-only.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct AssistiveV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
-    llm_endpoint: Option<String>,
+    provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     llm_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<String>,
 }
 
 /// Pacing of text as it lands in the target app: buffering delay, typing
@@ -1490,14 +1504,12 @@ pub const PROMOTED_SETTINGS_KEYS: &[&str] = &[
     "RESTORE_CLIPBOARD",
     "RESTORE_CLIPBOARD_DELAY_MS",
     "CODESCRIBE_DEFERRED_INSERT_SHORTCUT",
-    // LLM endpoints
-    "LLM_ENDPOINT",
-    "LLM_MODEL",
-    "LLM_ASSISTIVE_ENDPOINT",
-    "LLM_ASSISTIVE_MODEL",
-    "LLM_ASSISTIVE_PROVIDER",
-    "LLM_FORMATTING_ENDPOINT",
+    // LLM lanes: provider reference + model per lane. Endpoints are not
+    // settings — vendors pin them in code, custom rows carry their own.
+    "LLM_FORMATTING_PROVIDER",
     "LLM_FORMATTING_MODEL",
+    "LLM_ASSISTIVE_PROVIDER",
+    "LLM_ASSISTIVE_MODEL",
     // Account-login OAuth client ids — non-secret app identities, so they live
     // in settings.json (NOT the Keychain); env stays the dev fallback.
     "LLM_OPENAI_OAUTH_CLIENT_ID",
@@ -1601,13 +1613,12 @@ impl UserSettings {
                         .as_deref()
                         .and_then(|value| FormattingPolicy::parse(value).ok())
                         .map(|policy| policy.as_str().to_string()),
-                    llm_endpoint: self.llm_formatting_endpoint.clone(),
+                    llm_provider: self.llm_formatting_provider.clone(),
                     llm_model: self.llm_formatting_model.clone(),
                 }),
                 assistive: Some(AssistiveV2 {
-                    llm_endpoint: self.llm_assistive_endpoint.clone(),
-                    llm_model: self.llm_assistive_model.clone(),
                     provider: self.llm_assistive_provider.clone(),
+                    llm_model: self.llm_assistive_model.clone(),
                 }),
                 emission: Some(EmissionV2 {
                     buffer_delay_ms: self.buffer_delay_ms,
@@ -1615,8 +1626,6 @@ impl UserSettings {
                     emit_words_max: self.emit_words_max,
                     interim_cadence_sec: self.buffered_interim_sec,
                 }),
-                llm_endpoint: self.llm_endpoint.clone(),
-                llm_model: self.llm_model.clone(),
             }),
             audio: Some(AudioV2 {
                 input_device_id: self.audio_input_device.clone(),
@@ -1662,6 +1671,9 @@ impl UserSettings {
                     capabilities,
                 }),
             },
+            providers: (!self.llm_custom_providers.is_empty()).then(|| ProvidersV2 {
+                custom: self.llm_custom_providers.clone(),
+            }),
         }
     }
 
@@ -1741,13 +1753,16 @@ impl UserSettings {
                 .and_then(|f| f.level.as_deref())
                 .and_then(|value| FormattingPolicy::parse(value).ok())
                 .map(|policy| policy.as_str().to_string()),
-            llm_endpoint: v2.speech.as_ref().and_then(|s| s.llm_endpoint.clone()),
-            llm_model: v2.speech.as_ref().and_then(|s| s.llm_model.clone()),
-            llm_assistive_endpoint: v2
+            llm_formatting_provider: v2
                 .speech
                 .as_ref()
-                .and_then(|s| s.assistive.as_ref())
-                .and_then(|a| a.llm_endpoint.clone()),
+                .and_then(|s| s.formatting.as_ref())
+                .and_then(|f| f.llm_provider.clone()),
+            llm_custom_providers: v2
+                .providers
+                .as_ref()
+                .map(|p| p.custom.clone())
+                .unwrap_or_default(),
             llm_assistive_model: v2
                 .speech
                 .as_ref()
@@ -1779,11 +1794,6 @@ impl UserSettings {
                 .interaction
                 .as_ref()
                 .and_then(|interaction| interaction.restore_clipboard_delay_ms),
-            llm_formatting_endpoint: v2
-                .speech
-                .as_ref()
-                .and_then(|s| s.formatting.as_ref())
-                .and_then(|f| f.llm_endpoint.clone()),
             llm_formatting_model: v2
                 .speech
                 .as_ref()
@@ -2030,6 +2040,7 @@ impl UserSettings {
         match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
                 Ok(value) => {
+                    let value_for_legacy = value.clone();
                     if value.get("schema_version").is_some() {
                         match serde_json::from_value::<SettingsV2>(value) {
                             Ok(v2) => {
@@ -2038,7 +2049,12 @@ impl UserSettings {
                                     return Self::default();
                                 }
                                 debug!("Loaded settings V2 from {}", path.display());
-                                Self::from_v2(v2)
+                                let mut settings = Self::from_v2(v2);
+                                Self::migrate_legacy_llm_lanes_once(
+                                    &value_for_legacy,
+                                    &mut settings,
+                                );
+                                settings
                             }
                             Err(e) => {
                                 warn!("Failed to parse settings V2 at {}: {e}", path.display());
@@ -2063,7 +2079,12 @@ impl UserSettings {
                                         backup_path.display()
                                     );
                                 }
-                                Self::from_v2(v1.to_v2())
+                                let mut settings = Self::from_v2(v1.to_v2());
+                                Self::migrate_legacy_llm_lanes_once(
+                                    &value_for_legacy,
+                                    &mut settings,
+                                );
+                                settings
                             }
                             Err(e) => {
                                 debug!("Failed to parse {}: {e}, using defaults", path.display());
@@ -2085,6 +2106,97 @@ impl UserSettings {
                 Self::default()
             }
         }
+    }
+
+    /// Run the one-shot legacy LLM lane migration when the raw document still
+    /// carries endpoint fields, persist the new shape, and queue the key moves
+    /// for the loader's Keychain step. Idempotent: the saved file has no legacy
+    /// fields, so the next load finds nothing to migrate.
+    fn migrate_legacy_llm_lanes_once(raw: &serde_json::Value, settings: &mut Self) {
+        let legacy = super::llm_migration::SpeechV2Legacy::from_json(raw);
+        if !legacy.needs_migration() {
+            return;
+        }
+        let moves = super::llm_migration::migrate_legacy_llm_lanes(&legacy, settings);
+        match settings.save_unlocked() {
+            // Hand back exactly what the next load will read: `to_v2` normalizes
+            // on the way out (mode bindings and friends), so the first post-migration
+            // load must not differ from the second.
+            Ok(()) => info!(
+                "Migrated legacy LLM lane fields to the provider registry (formatting={:?}, assistive={:?}, custom_rows={})",
+                settings.llm_formatting_provider,
+                settings.llm_assistive_provider,
+                settings.llm_custom_providers.len()
+            ),
+            Err(error) => warn!("Failed to persist migrated LLM lanes: {error}"),
+        }
+        *settings = Self::from_v2(settings.to_v2());
+        super::llm_migration::queue_key_moves(moves);
+    }
+
+    /// Add a Custom provider row. The id is derived from the name and must be
+    /// unique across existing rows.
+    pub fn add_custom_provider(&mut self, row: CustomProvider) -> Result<(), ProviderError> {
+        if self
+            .llm_custom_providers
+            .iter()
+            .any(|existing| existing.id == row.id)
+        {
+            return Err(ProviderError::DuplicateId(row.id));
+        }
+        self.llm_custom_providers.push(row);
+        Ok(())
+    }
+
+    /// Update a Custom provider in place. The id (and so the Keychain account
+    /// and every lane pointer) is immutable; the new endpoint is validated and
+    /// normalized for `wire` exactly as on creation.
+    pub fn update_custom_provider(
+        &mut self,
+        id: &str,
+        name: &str,
+        wire: WireFamily,
+        endpoint: &str,
+    ) -> Result<CustomProvider, ProviderError> {
+        let validated = CustomProvider::new(name, wire, endpoint)?;
+        let row = self
+            .llm_custom_providers
+            .iter_mut()
+            .find(|row| row.id == id)
+            .ok_or_else(|| ProviderError::UnknownProvider(id.to_string()))?;
+        row.name = validated.name;
+        row.wire = validated.wire;
+        row.endpoint = validated.endpoint;
+        Ok(row.clone())
+    }
+
+    /// Remove a Custom provider row. Lanes pointing at it are reset to `None`
+    /// (the loader then falls back to the default vendor) and reported, so the
+    /// caller can also drop the row's Keychain account.
+    pub fn remove_custom_provider(
+        &mut self,
+        id: &str,
+    ) -> Result<RemovedCustomProvider, ProviderError> {
+        let index = self
+            .llm_custom_providers
+            .iter()
+            .position(|row| row.id == id)
+            .ok_or_else(|| ProviderError::UnknownProvider(id.to_string()))?;
+        let provider = self.llm_custom_providers.remove(index);
+        let pointer = ProviderRef::Custom(provider.id.clone()).as_string();
+        let mut lanes_reset = Vec::new();
+        if self.llm_formatting_provider.as_deref() == Some(pointer.as_str()) {
+            self.llm_formatting_provider = None;
+            lanes_reset.push(RuntimeLlmLaneKind::Formatting);
+        }
+        if self.llm_assistive_provider.as_deref() == Some(pointer.as_str()) {
+            self.llm_assistive_provider = None;
+            lanes_reset.push(RuntimeLlmLaneKind::Assistive);
+        }
+        Ok(RemovedCustomProvider {
+            provider,
+            lanes_reset,
+        })
     }
 
     /// Persists current settings to disk as pretty-printed JSON.
@@ -2294,11 +2406,9 @@ impl UserSettings {
         let before = self.clone();
         match key {
             "WHISPER_LANGUAGE" => self.whisper_language = Some(value.to_owned()),
-            "LLM_ENDPOINT" => self.llm_endpoint = Some(value.to_owned()),
-            "LLM_MODEL" => self.llm_model = Some(value.to_owned()),
-            "LLM_ASSISTIVE_ENDPOINT" => self.llm_assistive_endpoint = Some(value.to_owned()),
             "LLM_ASSISTIVE_MODEL" => self.llm_assistive_model = Some(value.to_owned()),
             "LLM_ASSISTIVE_PROVIDER" => self.llm_assistive_provider = Some(value.to_owned()),
+            "LLM_FORMATTING_PROVIDER" => self.llm_formatting_provider = Some(value.to_owned()),
             "LLM_OPENAI_OAUTH_CLIENT_ID" => {
                 // Empty clears back to the shipped Codex CLI public app id.
                 let trimmed = value.trim();
@@ -2332,7 +2442,6 @@ impl UserSettings {
                 }
             }
             "TRANSCRIPT_TAG_TEMPLATE" => self.transcript_tag_template = Some(value.to_owned()),
-            "LLM_FORMATTING_ENDPOINT" => self.llm_formatting_endpoint = Some(value.to_owned()),
             "LLM_FORMATTING_MODEL" => self.llm_formatting_model = Some(value.to_owned()),
             "LOCAL_MODEL" => self.local_model = Some(value.to_owned()),
             "STT_ENDPOINT" => self.stt_endpoint = Some(value.to_owned()),
@@ -2997,8 +3106,16 @@ mod tests {
             quick_notes_save_only: Some(true),
             agent_enter_sends: Some(false),
             whisper_model: Some("whisper-large-v3-turbo".to_string()),
-            llm_endpoint: Some("https://api.example/v1/responses".to_string()),
-            llm_model: Some("gpt-4.1".to_string()),
+            llm_formatting_provider: Some("custom:my-local".to_string()),
+            llm_formatting_model: Some("gpt-4.1".to_string()),
+            llm_custom_providers: vec![
+                crate::llm::provider::CustomProvider::new(
+                    "my.local",
+                    crate::llm::provider::WireFamily::OpenAiResponses,
+                    "https://my.local:8080/v1",
+                )
+                .expect("valid custom row"),
+            ],
             ..Default::default()
         };
         settings.save().expect("save settings");
@@ -3012,10 +3129,172 @@ mod tests {
             Some("whisper-large-v3-turbo")
         );
         assert_eq!(
-            loaded.llm_endpoint.as_deref(),
-            Some("https://api.example/v1/responses")
+            loaded.llm_formatting_provider.as_deref(),
+            Some("custom:my-local")
         );
-        assert_eq!(loaded.llm_model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(loaded.llm_formatting_model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(loaded.llm_custom_providers.len(), 1);
+        assert_eq!(
+            loaded.llm_custom_providers[0].endpoint,
+            "https://my.local:8080/v1/responses"
+        );
+    }
+
+    /// §F witness (name kept from the plan): a legacy settings.json whose lanes
+    /// sit on the Libraxis host under an `openai-responses` label migrates once
+    /// on load. Per §B.3 the Libraxis host is a vendor, so both lanes land on
+    /// `libraxis-responses` with zero custom rows; an unknown host (`my.local`)
+    /// becomes the one Custom row. The written file carries no legacy field and
+    /// a second load changes nothing.
+    #[test]
+    #[serial]
+    fn legacy_libraxis_under_openai_migrates_to_custom_row() {
+        let _tmp = setup_isolated_data_dir();
+        let path = UserSettings::settings_path();
+        let legacy = serde_json::json!({
+            "schema_version": 3,
+            "speech": {
+                "llm_endpoint": "https://api.libraxis.com/v1/responses",
+                "llm_model": "buddy",
+                "formatting": { "level": "smart", "llm_model": "buddy" },
+                "assistive": {
+                    "llm_endpoint": "https://api.libraxis.com/v1/responses",
+                    "llm_model": "buddy",
+                    "provider": "openai-responses"
+                }
+            }
+        });
+        fs::write(&path, legacy.to_string()).expect("seed legacy settings");
+
+        let loaded = UserSettings::load();
+        assert_eq!(
+            loaded.llm_formatting_provider.as_deref(),
+            Some("libraxis-responses")
+        );
+        assert_eq!(loaded.llm_formatting_model.as_deref(), Some("buddy"));
+        assert_eq!(
+            loaded.llm_assistive_provider.as_deref(),
+            Some("libraxis-responses")
+        );
+        assert_eq!(loaded.llm_assistive_model.as_deref(), Some("buddy"));
+        assert!(loaded.llm_custom_providers.is_empty());
+        assert_eq!(loaded.formatting_level.as_deref(), Some("smart"));
+
+        let written = fs::read_to_string(&path).expect("read migrated settings");
+        let written_json: serde_json::Value =
+            serde_json::from_str(&written).expect("parse migrated settings");
+        for pointer in [
+            "/speech/llm_endpoint",
+            "/speech/llm_model",
+            "/speech/assistive/llm_endpoint",
+            "/speech/formatting/llm_endpoint",
+        ] {
+            assert!(
+                written_json.pointer(pointer).is_none(),
+                "legacy field written back: {pointer}"
+            );
+        }
+        assert_eq!(
+            written_json
+                .pointer("/speech/formatting/llm_provider")
+                .and_then(serde_json::Value::as_str),
+            Some("libraxis-responses")
+        );
+        assert_eq!(
+            super::super::llm_migration::take_key_moves().len(),
+            3,
+            "three legacy key moves queued for the loader"
+        );
+
+        // Second load: same settings, no rewrite, no key moves.
+        let again = UserSettings::load();
+        assert_eq!(again, loaded);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read settings after second load"),
+            written
+        );
+        assert!(super::super::llm_migration::take_key_moves().is_empty());
+
+        // Unknown host on the assistive lane → one Custom row.
+        let self_hosted = serde_json::json!({
+            "schema_version": 3,
+            "speech": {
+                "assistive": {
+                    "llm_endpoint": "https://my.local:8080/v1/responses",
+                    "llm_model": "qwen",
+                    "provider": "openai-responses"
+                }
+            }
+        });
+        fs::write(&path, self_hosted.to_string()).expect("seed self-hosted settings");
+        let loaded = UserSettings::load();
+        assert_eq!(
+            loaded.llm_assistive_provider.as_deref(),
+            Some("custom:my-local")
+        );
+        assert_eq!(loaded.llm_custom_providers.len(), 1);
+        assert_eq!(loaded.llm_custom_providers[0].name, "my.local");
+        let written_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("parse");
+        assert_eq!(
+            written_json
+                .pointer("/providers/custom/0/id")
+                .and_then(serde_json::Value::as_str),
+            Some("my-local")
+        );
+        let _ = super::super::llm_migration::take_key_moves();
+    }
+
+    /// Custom rows: duplicate ids are refused, the id survives an update, and
+    /// removing a row resets the lanes that pointed at it.
+    #[test]
+    fn custom_provider_crud_keeps_ids_and_resets_lanes_on_remove() {
+        use crate::llm::provider::{CustomProvider, ProviderError, WireFamily};
+        let mut settings = UserSettings::default();
+        let row = CustomProvider::new(
+            "My Local",
+            WireFamily::OpenAiResponses,
+            "http://my.local:8080/v1",
+        )
+        .expect("valid row");
+        settings
+            .add_custom_provider(row.clone())
+            .expect("first add");
+        assert_eq!(
+            settings.add_custom_provider(row.clone()),
+            Err(ProviderError::DuplicateId("my-local".to_string()))
+        );
+
+        let updated = settings
+            .update_custom_provider(
+                "my-local",
+                "Renamed Box",
+                WireFamily::AnthropicMessages,
+                "https://box.example/v1",
+            )
+            .expect("update");
+        assert_eq!(updated.id, "my-local", "id is immutable");
+        assert_eq!(updated.name, "Renamed Box");
+        assert_eq!(updated.endpoint, "https://box.example/v1/messages");
+        assert_eq!(
+            settings.update_custom_provider("nope", "x", WireFamily::OpenAiResponses, "http://h"),
+            Err(ProviderError::UnknownProvider("nope".to_string()))
+        );
+
+        settings.llm_formatting_provider = Some("custom:my-local".to_string());
+        settings.llm_assistive_provider = Some("openai-responses".to_string());
+        let removed = settings.remove_custom_provider("my-local").expect("remove");
+        assert_eq!(removed.provider.id, "my-local");
+        assert_eq!(
+            removed.lanes_reset,
+            vec![super::RuntimeLlmLaneKind::Formatting]
+        );
+        assert_eq!(settings.llm_formatting_provider, None);
+        assert_eq!(
+            settings.llm_assistive_provider.as_deref(),
+            Some("openai-responses")
+        );
+        assert!(settings.llm_custom_providers.is_empty());
     }
 
     /// The STT selector keys survive the `speech.engine` round-trip, and the

@@ -595,13 +595,6 @@ pub struct Config {
     #[serde(default = "default_stt_initial_prompt_enabled")]
     pub stt_initial_prompt_enabled: bool,
 
-    /// Full LLM endpoint URL (default: https://api.openai.com/v1/responses)
-    #[serde(default = "default_llm_endpoint_option")]
-    pub llm_endpoint: Option<String>,
-
-    /// API key for cloud LLM providers
-    pub llm_api_key: Option<String>,
-
     /// API key for cloud STT providers used on the committed verdict path
     pub stt_api_key: Option<String>,
 
@@ -670,8 +663,6 @@ impl Default for Config {
             local_model: default_local_model(),
             stt_endpoint: None,
             stt_initial_prompt_enabled: default_stt_initial_prompt_enabled(),
-            llm_endpoint: Some(default_llm_endpoint()),
-            llm_api_key: None,
             stt_api_key: None,
             restore_clipboard: default_restore_clipboard(),
             restore_clipboard_delay_ms: default_restore_clipboard_delay_ms(),
@@ -708,7 +699,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::{Config, DeferredInsertShortcut, ShortcutBinding};
-    use crate::config::DEFAULT_OPENAI_RESPONSES_ENDPOINT;
 
     /// Legacy shortcut aliases must fail parse so old broken names do not resurrect.
     #[test]
@@ -772,15 +762,6 @@ mod tests {
         assert_eq!("cmd".parse(), Ok(HoldArmModifier::Cmd));
         assert_eq!("command".parse(), Ok(HoldArmModifier::Cmd));
         assert!("nope".parse::<HoldArmModifier>().is_err());
-    }
-
-    /// Default LLM endpoint is the OpenAI Responses URL, not chat/completions.
-    #[test]
-    fn default_config_uses_openai_responses_endpoint() {
-        assert_eq!(
-            Config::default().llm_endpoint.as_deref(),
-            Some(DEFAULT_OPENAI_RESPONSES_ENDPOINT)
-        );
     }
 
     /// Default disables Whisper initial_prompt (WER collapse guard, W2-F).

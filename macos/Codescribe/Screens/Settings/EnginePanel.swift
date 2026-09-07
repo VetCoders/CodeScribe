@@ -567,8 +567,14 @@ struct EnginePanel: View {
       )
       .font(CSFont.ui(11.5, .medium))
       .foregroundStyle(model.cloudConsentGranted ? CSColor.oliveLight : CSColor.amber)
-      SttEndpointRow(
+      SettingsUrlRow(
+        title: "Live WSS socket",
+        keyLabel: "STT_ENDPOINT",
         current: model.sttEndpoint,
+        placeholder: "https://…",
+        help:
+          "Live Cloud Layer-1 WebSocket mapper (Libraxis multipart URL → wss://…/v1/audio/transcribe). Not a secret — the API key stays in the Keychain on Providers. Clearing restores the provider default.",
+        unsetLabel: "provider default",
         onSave: { model.setSttEndpoint($0) }
       )
       SettingsUrlRow(

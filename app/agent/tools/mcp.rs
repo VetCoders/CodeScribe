@@ -30,7 +30,6 @@ use codescribe_core::config::RuntimeSettingsSnapshot;
 use codescribe_core::config::settings::{
     DEFAULT_AGENT_WORKSPACE_ROOT, normalize_agent_workspace_roots,
 };
-use codescribe_core::llm::provider::ProviderKind;
 use codescribe_core::mcp::{McpClient, McpConfigFile, McpServerConfig, McpTool};
 use tracing::{info, warn};
 
@@ -284,7 +283,7 @@ pub fn probe_core_readiness(runtime_settings: &RuntimeSettingsSnapshot) -> CoreR
     let configured_workspace_roots = configured_workspace_roots(runtime_settings);
     let tool_workspace_roots = super::workspace::configured_roots();
     assemble_core_readiness(
-        assistive_lane.provider(),
+        assistive_lane.provider_display_name().to_string(),
         assistive_lane.credential().key_account().to_string(),
         assistive_lane.request_available(),
         configured_workspace_roots,
@@ -311,7 +310,7 @@ fn configured_workspace_roots(runtime_settings: &RuntimeSettingsSnapshot) -> Vec
 /// tools by building a throwaway registry. Shared by the live probe and its
 /// test variant so both count tools the same way.
 fn assemble_core_readiness(
-    provider: ProviderKind,
+    provider_label: String,
     key_env_key: String,
     key_set: bool,
     configured_workspace_roots: Vec<String>,
@@ -322,7 +321,7 @@ fn assemble_core_readiness(
     let native_tool_count = registry.definitions().len();
 
     CoreReadiness {
-        provider_label: provider.display_name().to_string(),
+        provider_label,
         key_env_key,
         key_set,
         native_tool_count,
@@ -1587,7 +1586,7 @@ mod tests {
     fn core_ready() -> CoreReadiness {
         CoreReadiness {
             provider_label: "OpenAI (Responses)".to_string(),
-            key_env_key: "LLM_ASSISTIVE_API_KEY".to_string(),
+            key_env_key: "LLM_OPENAI_API_KEY".to_string(),
             key_set: true,
             native_tool_count: 10,
             configured_workspace_roots: vec!["~/Git".to_string()],
@@ -1704,7 +1703,7 @@ mod tests {
         let provider = find_row(&report, "Provider:");
         assert_eq!(provider.tone, McpRowTone::Bad);
         assert!(
-            provider.value.contains("LLM_ASSISTIVE_API_KEY"),
+            provider.value.contains("LLM_OPENAI_API_KEY"),
             "provider row should name the missing key account, got: {}",
             provider.value
         );

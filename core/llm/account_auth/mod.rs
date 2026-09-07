@@ -522,7 +522,7 @@ fn responses_probe_endpoint(provider: ProviderKind) -> Option<String> {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| crate::config::DEFAULT_OPENAI_RESPONSES_ENDPOINT.to_string()),
+                .unwrap_or_else(|| ProviderKind::OpenAiResponses.endpoint().to_string()),
         ),
         _ => None,
     }
@@ -1115,14 +1115,22 @@ mod tests {
     /// or fail loudly. A silent `UnsupportedProvider` on a provider the picker
     /// offers is a dead sign-in button with no explanation.
     #[test]
-    fn every_selectable_provider_has_an_oauth_row() {
-        use crate::llm::provider::ALL_PROVIDERS;
-        for provider in ALL_PROVIDERS {
+    fn every_oauth_row_names_a_selectable_provider() {
+        // OAuth is optional per vendor (Libraxis is key-only): every OAuth row must
+        // point at a selectable vendor, and a vendor without a row still resolves.
+        use crate::llm::provider::{ALL_PROVIDERS, ProviderKind, ProviderRef, ProviderRegistry};
+        for row in PROVIDER_OAUTH_REGISTRY {
             assert!(
-                provider_oauth_config(provider).is_ok(),
-                "{provider} is selectable but has no OAuth row"
+                ALL_PROVIDERS.contains(&row.provider),
+                "{} has an OAuth row but is not selectable",
+                row.provider
             );
         }
+        let libraxis = ProviderRegistry::new(Vec::new())
+            .resolve(&ProviderRef::Vendor(ProviderKind::LibraxisResponses))
+            .expect("Libraxis resolves without an OAuth row");
+        assert_eq!(libraxis.oauth_vendor, None);
+        assert!(libraxis.key_required);
     }
 
     /// Client-id resolution reads the row's own accessor, so each provider sees

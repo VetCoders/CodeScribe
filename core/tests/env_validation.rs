@@ -61,30 +61,6 @@ fn missing_required_envs(config: &Config) -> Vec<&'static str> {
         }
     }
 
-    if config.ai_formatting_enabled {
-        let has_endpoint = std::env::var("LLM_FORMATTING_ENDPOINT")
-            .ok()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        if !has_endpoint {
-            missing.push("LLM_FORMATTING_ENDPOINT");
-        }
-        let has_model = std::env::var("LLM_FORMATTING_MODEL")
-            .ok()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        if !has_model {
-            missing.push("LLM_FORMATTING_MODEL");
-        }
-        let has_key = std::env::var("LLM_FORMATTING_API_KEY")
-            .ok()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        if !has_key {
-            missing.push("LLM_FORMATTING_API_KEY");
-        }
-    }
-
     if std::env::var("CODESCRIBE_NO_EMBED").is_ok()
         && std::env::var("CODESCRIBE_MODEL_PATH").is_err()
     {
@@ -104,25 +80,6 @@ fn env_precedence_stt_endpoint() {
     cfg.load_from_env();
 
     assert_eq!(cfg.stt_endpoint.as_deref(), Some("https://example.com/stt"));
-}
-
-#[test]
-#[serial]
-fn env_ignores_legacy_llm_host() {
-    let _g1 = EnvGuard::set("LLM_HOST", "http://llm-host");
-    let _g2 = EnvGuard::set("OLLAMA_HOST", "http://ollama-host");
-    let _g3 = EnvGuard::unset("LLM_ENDPOINT");
-
-    // Isolate the env loader contract: the runtime default endpoint is covered
-    // by Config::load()/Config::default() tests, while legacy host envs should
-    // not populate an otherwise-empty llm_endpoint.
-    let mut cfg = Config {
-        llm_endpoint: None,
-        ..Default::default()
-    };
-    cfg.load_from_env();
-
-    assert!(cfg.llm_endpoint.is_none());
 }
 
 #[test]
@@ -158,45 +115,26 @@ fn loopback_cloud_stt_does_not_require_api_key() {
 }
 
 #[test]
-#[serial]
-fn required_llm_key_when_ai_enabled() {
-    let _g1 = EnvGuard::set("AI_FORMATTING_ENABLED", "1");
-    let _g2 = EnvGuard::unset("LLM_FORMATTING_API_KEY");
-
-    let mut cfg = Config::default();
-    cfg.load_from_env();
-
-    let missing = missing_required_envs(&cfg);
-    assert!(missing.contains(&"LLM_FORMATTING_API_KEY"));
-}
-
-#[test]
-#[serial]
-fn required_llm_endpoint_and_model_when_ai_enabled() {
-    let _g1 = EnvGuard::set("AI_FORMATTING_ENABLED", "1");
-    let _g2 = EnvGuard::unset("LLM_FORMATTING_ENDPOINT");
-    let _g3 = EnvGuard::unset("LLM_FORMATTING_MODEL");
-
-    let mut cfg = Config::default();
-    cfg.load_from_env();
-
-    let missing = missing_required_envs(&cfg);
-    assert!(missing.contains(&"LLM_FORMATTING_ENDPOINT"));
-    assert!(missing.contains(&"LLM_FORMATTING_MODEL"));
-}
-
-#[test]
-fn default_env_does_not_reference_internal_formatting_host() {
+fn default_env_carries_no_llm_endpoint_or_key_rows() {
     let default_env = include_str!("../config/default_env.txt");
 
     assert!(
         !default_env.contains("dragon:"),
         "default_env must not ship internal-only hosts"
     );
-    assert!(
-        default_env.contains("LLM_FORMATTING_ENDPOINT=https://"),
-        "default formatting endpoint should be a public https URL"
-    );
+    for retired in [
+        "LLM_ENDPOINT=",
+        "LLM_FORMATTING_ENDPOINT=",
+        "LLM_ASSISTIVE_ENDPOINT=",
+        "LLM_API_KEY=",
+        "LLM_FORMATTING_API_KEY=",
+        "LLM_ASSISTIVE_API_KEY=",
+    ] {
+        assert!(
+            !default_env.contains(retired),
+            "{retired} is provider-owned now and must not be seeded from .env"
+        );
+    }
 }
 
 #[test]

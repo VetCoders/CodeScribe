@@ -2,10 +2,9 @@
 # Generated automatically - edit with care
 
 # === Secrets ===
+# LLM keys live in Settings › Providers (Keychain: LLM_<VENDOR>_API_KEY,
+# LLM_CUSTOM_<ID>_API_KEY); vendor endpoints are pinned in the provider registry.
 STT_API_KEY=vista-
-# LLM_API_KEY=sk-proj-
-LLM_ASSISTIVE_API_KEY=
-LLM_FORMATTING_API_KEY=
 
 # === Core mode ===
 USE_LOCAL_STT=1
@@ -68,10 +67,8 @@ ASSISTIVE_CONTEXT_MAX_CHARS=20000
 #
 # PDF attachments: OCR language hint (used when OCR is needed; prefers offline tools)
 CODESCRIBE_ATTACH_PDF_OCR_LANG=pol+eng
-LLM_ASSISTIVE_ENDPOINT=https://api.openai.com/v1/responses
 LLM_ASSISTIVE_MODEL=gpt-5.5
 # LLM_ASSISTIVE_TEMPERATURE=0.2
-LLM_FORMATTING_ENDPOINT=https://api.openai.com/v1/responses
 LLM_FORMATTING_MODEL=gpt-4.1
 LLM_FORMATTING_TEMPERATURE=0.1
 LLM_USE_STREAMING=1

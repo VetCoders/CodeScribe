@@ -14,7 +14,7 @@ use std::str::FromStr;
 use std::sync::{Mutex, Once, OnceLock};
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use codescribe_core::config::keychain::{KEYCHAIN_ACCOUNTS, delete_key, save_key};
+use codescribe_core::config::keychain::{self, KEYCHAIN_ACCOUNTS, delete_key, save_key};
 use codescribe_core::config::settings::normalize_agent_workspace_roots;
 use codescribe_core::config::{
     AppDataResetGuard, Config, DEFAULT_ASSISTIVE_PROMPT, DEFAULT_FORMATTING_PROMPT,
@@ -30,7 +30,9 @@ use codescribe_core::llm::key_liveness::{
 use codescribe_core::llm::model_discovery::{
     ModelDiscoveryStatus, discover_models as discover_provider_models,
 };
-use codescribe_core::llm::provider::{ALL_PROVIDERS, ProviderKind};
+use codescribe_core::llm::provider::{
+    CustomProvider, ProviderKind, ProviderRef, ProviderRegistry, ResolvedProvider, WireFamily,
+};
 use directories::BaseDirs;
 
 use crate::{CsError, CsLanguage, application_runtime};
@@ -127,8 +129,6 @@ pub struct CsSettings {
     /// on stop; Settings no longer exposes Always/Smart/Off. Persist `off`
     /// if a value must still be written.
     pub final_pass_mode: Option<String>,
-    // ── LLM backend (base) ──
-    pub llm_endpoint: Option<String>,
     // ── Clipboard ──
     pub restore_clipboard: bool,
     pub restore_clipboard_delay_ms: u64,
@@ -136,16 +136,12 @@ pub struct CsSettings {
     pub start_at_login: bool,
     pub agent_enter_sends: bool,
     pub dump_audio_logs: bool,
-    // ── Env-only knobs (not Config struct fields; read after load) ──
-    pub llm_model: Option<String>,
-    pub llm_formatting_endpoint: Option<String>,
+    // ── Persisted lane selection and engine settings ──
+    /// Lane = full ProviderRef (vendor ID or `custom:<slug>`) + model; provider first.
+    pub llm_formatting_provider: Option<String>,
     pub llm_formatting_model: Option<String>,
-    pub llm_assistive_endpoint: Option<String>,
-    pub llm_assistive_model: Option<String>,
-    /// Assistive/agent-lane provider identity (`LLM_ASSISTIVE_PROVIDER`):
-    /// `"openai-responses"` | `"anthropic-messages"`. Written back via
-    /// `update_config` with the same key; drives `create_default_provider`.
     pub llm_assistive_provider: Option<String>,
+    pub llm_assistive_model: Option<String>,
     pub formatting_level: Option<String>,
     pub whisper_model: Option<String>,
     /// Layered incremental transcription phase (`CODESCRIBE_LAYERED_TRANSCRIPTION`):
@@ -184,7 +180,6 @@ impl CsSettings {
     fn from_runtime_snapshot(runtime: &RuntimeSettingsSnapshot) -> Self {
         let config = runtime.values();
         let settings = runtime.user_settings();
-        let main = runtime.llm_lanes().main();
         let formatting = runtime.llm_lanes().formatting();
         let assistive = runtime.llm_lanes().assistive();
         let mut agent_workspace_roots = normalize_agent_workspace_roots(
@@ -231,7 +226,6 @@ impl CsSettings {
             stt_endpoint: config.stt_endpoint.clone(),
             stt_engine: setting_string(settings.stt_engine.clone()),
             final_pass_mode: setting_string(settings.final_pass_mode.clone()),
-            llm_endpoint: config.llm_endpoint.clone(),
             restore_clipboard: config.restore_clipboard,
             restore_clipboard_delay_ms: config.restore_clipboard_delay_ms,
             start_at_login: config.start_at_login,
@@ -240,18 +234,14 @@ impl CsSettings {
             // Editable Settings fields prefer persisted intent from the same
             // seal so a fresh UI write is visible; sealed lanes fill gaps when
             // the operator has no persisted row yet.
-            llm_model: setting_string(settings.llm_model.clone())
-                .or_else(|| Some(main.model().to_string())),
-            llm_formatting_endpoint: setting_string(settings.llm_formatting_endpoint.clone())
-                .or_else(|| Some(formatting.endpoint().to_string())),
+            llm_formatting_provider: setting_string(settings.llm_formatting_provider.clone())
+                .or_else(|| Some(formatting.provider().as_string())),
             llm_formatting_model: setting_string(settings.llm_formatting_model.clone())
                 .or_else(|| Some(formatting.model().to_string())),
-            llm_assistive_endpoint: setting_string(settings.llm_assistive_endpoint.clone())
-                .or_else(|| Some(assistive.endpoint().to_string())),
             llm_assistive_model: setting_string(settings.llm_assistive_model.clone())
                 .or_else(|| Some(assistive.model().to_string())),
             llm_assistive_provider: setting_string(settings.llm_assistive_provider.clone())
-                .or_else(|| Some(assistive.provider().as_str().to_string())),
+                .or_else(|| Some(assistive.provider().as_string())),
             formatting_level: Some(runtime.formatting_policy().as_str().to_string()),
             whisper_model: setting_string(settings.whisper_model.clone()),
             layered_transcription: setting_string(settings.layered_transcription.clone()),
@@ -331,18 +321,11 @@ fn formatting_prompt_kind(level: &str) -> Result<PromptKind, CsError> {
 /// account env var or Keychain account is present and non-empty.
 #[derive(uniffi::Record)]
 pub struct CsKeyStatus {
-    pub llm_api_key_set: bool,
-    pub stt_api_key_set: bool,
-    pub llm_formatting_api_key_set: bool,
-    pub llm_assistive_api_key_set: bool,
-    /// Anthropic assistive-lane key (`LLM_ANTHROPIC_API_KEY`) — separate from the
-    /// OpenAI assistive key so both providers can be configured at once.
-    pub llm_anthropic_api_key_set: bool,
-    /// xAI assistive-lane key (`LLM_XAI_API_KEY`). Present for the same reason
-    /// as the Anthropic field: the Keys panel lists a row per Keychain account
-    /// and reads its indicator from this record, so an account without a field
-    /// here renders as permanently "not set" even after the operator saves it.
+    pub llm_libraxis_api_key_set: bool,
+    pub llm_openai_api_key_set: bool,
     pub llm_xai_api_key_set: bool,
+    pub llm_anthropic_api_key_set: bool,
+    pub stt_api_key_set: bool,
     pub github_token_set: bool,
 }
 
@@ -393,43 +376,41 @@ pub struct CsModelDiscovery {
     pub models: Vec<CsModelOption>,
 }
 
-/// One assistive/agent-lane provider option: canonical id, label, the Keychain
-/// account holding its key (+ whether that key is present), and its model
-/// catalog. Provider identity is static; models are discovered by
-/// `discover_models` from the live provider API using the user's key.
+/// Provider identity and credential presence; never a returned secret.
 #[derive(uniffi::Record)]
 pub struct CsProviderOption {
-    /// `LLM_ASSISTIVE_PROVIDER` value: `"openai-responses"` | `"anthropic-messages"`.
     pub id: String,
+    pub kind: String,
     pub display_name: String,
-    /// Keychain account for this provider's assistive key.
+    pub wire: String,
+    pub endpoint: String,
     pub api_key_account: String,
-    /// True when that key is present (mirrors `CsKeyStatus`, keyed per provider).
     pub api_key_set: bool,
-    /// True when provider-account tokens are stored for this provider.
+    pub key_required: bool,
     pub account_signed_in: bool,
-    /// True when the account-login flow can start. OpenAI and xAI ship public
-    /// desktop client ids (see `NOTICE`); operator settings/env still override.
-    /// Anthropic stays gated until the operator pastes a registration.
     pub account_login_enabled: bool,
-    /// Human-readable account status ("signed in as <email>", "not signed in",
-    /// or "awaiting app registration"). Never contains secrets.
     pub account_status_message: String,
-    /// Resolved OAuth client id (settings → env → shipped default). Non-secret
-    /// app identity. The Keys panel no longer surfaces this for editing by
-    /// default; advanced override still goes through settings keys.
     pub oauth_client_id: Option<String>,
-    /// Always empty for live Settings; retained for bridge compatibility with
-    /// older Swift bindings and preview seed objects.
-    pub models: Vec<CsModelOption>,
+}
+
+/// Input-only secret: consumed into the Keychain bundle, never returned.
+#[derive(uniffi::Record)]
+pub struct CsCustomProviderDraft {
+    pub name: String,
+    pub wire: String,
+    pub endpoint: String,
+    pub api_key: Option<String>,
+}
+
+#[derive(uniffi::Record)]
+pub struct CsCustomProviderRemoval {
+    pub id: String,
+    pub lanes_reset: Vec<CsLlmLane>,
 }
 
 /// Stable lane identity used by the secret-free runtime lane projection.
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsLlmLane {
-    /// Shared fallback lane configured by `LLM_ENDPOINT` / `LLM_MODEL`. Not a
-    /// runtime lane of its own — it backs the other two when they are unset.
-    Main,
     /// Automatic post-dictation formatting lane.
     Formatting,
     /// Assistive/agent lane (act-on-selection and voice chat).
@@ -441,7 +422,6 @@ impl From<CsLlmLane> for RuntimeLlmLaneKind {
     /// `RuntimeLlmLaneKind` itself never has to be exported to Swift.
     fn from(value: CsLlmLane) -> Self {
         match value {
-            CsLlmLane::Main => Self::Main,
             CsLlmLane::Formatting => Self::Formatting,
             CsLlmLane::Assistive => Self::Assistive,
         }
@@ -454,6 +434,8 @@ impl From<CsLlmLane> for RuntimeLlmLaneKind {
 pub struct CsRuntimeLlmLane {
     pub lane: CsLlmLane,
     pub provider_id: String,
+    pub provider_display_name: String,
+    pub wire: String,
     pub endpoint: String,
     pub model: String,
     pub key_account: String,
@@ -468,11 +450,12 @@ impl From<&RuntimeLlmLane> for CsRuntimeLlmLane {
     fn from(value: &RuntimeLlmLane) -> Self {
         Self {
             lane: match value.lane() {
-                RuntimeLlmLaneKind::Main => CsLlmLane::Main,
                 RuntimeLlmLaneKind::Formatting => CsLlmLane::Formatting,
                 RuntimeLlmLaneKind::Assistive => CsLlmLane::Assistive,
             },
-            provider_id: value.provider().as_str().to_string(),
+            provider_id: value.provider().as_string(),
+            provider_display_name: value.provider_display_name().to_string(),
+            wire: value.wire_family().as_str().to_string(),
             endpoint: value.endpoint().to_string(),
             model: value.model().to_string(),
             key_account: value.credential().key_account().to_string(),
@@ -681,6 +664,7 @@ impl CodescribeConfig {
     /// power-user keys → `.env`. Runtime readers reload persisted snapshots
     /// instead of mutating the process env.
     pub fn update_config(&self, key: String, value: String) -> Result<(), CsError> {
+        validate_provider_setting(&key, &value)?;
         Config::load()
             .save_to_env(&key, &value)
             .map_err(|error| CsError::Config {
@@ -727,6 +711,9 @@ impl CodescribeConfig {
     /// Batch variant of `update_config` (`save_to_env_many`) — one settings.json
     /// write and one `.env` rewrite for the whole batch.
     pub fn update_config_many(&self, entries: Vec<CsConfigEntry>) -> Result<(), CsError> {
+        for entry in &entries {
+            validate_provider_setting(&entry.key, &entry.value)?;
+        }
         let pairs: Vec<(&str, &str)> = entries
             .iter()
             .map(|entry| (entry.key.as_str(), entry.value.as_str()))
@@ -747,68 +734,88 @@ impl CodescribeConfig {
         Config::config_dir().to_string_lossy().to_string()
     }
 
-    /// Canonical normalization for OpenAI Responses endpoints.
-    /// Strips known suffixes (/v1/responses, /chat/completions, /completions, /v1)
-    /// and forces the /v1/responses tail through the pure provider registry;
-    /// Swift SettingsViewModel delegates here to eliminate duplication (P2-05).
-    pub fn normalize_openai_responses_endpoint(&self, endpoint: String) -> String {
-        ProviderKind::OpenAiResponses.normalize_endpoint(&endpoint)
-    }
-
-    /// Presence booleans for every Keychain-backed API key.
     pub fn key_status(&self) -> CsKeyStatus {
-        // This endpoint is explicitly about keys, so it may prompt. Construction
-        // of SettingsViewModel/TrayViewModel should remain prompt-free.
-        let runtime_settings = Config::load_runtime_snapshot()
-            .expect("canonical runtime settings must load for key status");
         CsKeyStatus {
-            llm_api_key_set: key_present("LLM_API_KEY", &runtime_settings),
-            stt_api_key_set: key_present("STT_API_KEY", &runtime_settings),
-            llm_formatting_api_key_set: key_present("LLM_FORMATTING_API_KEY", &runtime_settings),
-            llm_assistive_api_key_set: key_present("LLM_ASSISTIVE_API_KEY", &runtime_settings),
-            llm_anthropic_api_key_set: key_present("LLM_ANTHROPIC_API_KEY", &runtime_settings),
-            llm_xai_api_key_set: key_present("LLM_XAI_API_KEY", &runtime_settings),
-            github_token_set: key_present("GITHUB_TOKEN", &runtime_settings),
+            llm_libraxis_api_key_set: keychain::key_present("LLM_LIBRAXIS_API_KEY"),
+            llm_openai_api_key_set: keychain::key_present("LLM_OPENAI_API_KEY"),
+            llm_xai_api_key_set: keychain::key_present("LLM_XAI_API_KEY"),
+            llm_anthropic_api_key_set: keychain::key_present("LLM_ANTHROPIC_API_KEY"),
+            stt_api_key_set: keychain::key_present("STT_API_KEY"),
+            github_token_set: keychain::key_present("GITHUB_TOKEN"),
         }
     }
 
-    /// Probe one Keychain-backed API key account with a single cheap provider
-    /// request. Blocking by design: Swift calls this from a background queue.
-    /// The secret never crosses FFI; this method reads env/Keychain internally.
     pub fn test_api_key(&self, account: String) -> Result<CsApiKeyProbeResult, CsError> {
         ensure_known_account(&account)?;
-        let runtime_settings = Config::load_runtime_snapshot()?;
-        Ok(probe_api_key_liveness(&account, &runtime_settings).into())
+        let provider = ProviderRegistry::from_settings(&UserSettings::load())
+            .all()
+            .into_iter()
+            .find(|provider| provider.key_account == account);
+        Ok(probe_api_key_liveness(&account, provider.as_ref()).into())
     }
 
-    /// Assistive/agent-lane provider catalog with per-provider key presence.
-    /// Model lists are intentionally empty here: Settings must call
-    /// `discover_models` so dropdown options come from the provider's live API,
-    /// not a static fallback.
     pub fn available_providers(&self) -> Vec<CsProviderOption> {
-        let runtime_settings = Config::load_runtime_snapshot()
-            .expect("canonical runtime settings must load for provider catalog");
-        ALL_PROVIDERS
-            .iter()
-            .map(|kind| {
-                let account = kind.api_key_env_key().to_string();
-                let account_status = account_auth::account_status(*kind);
-                CsProviderOption {
-                    id: kind.as_str().to_string(),
-                    display_name: kind.display_name().to_string(),
-                    api_key_set: key_present(&account, &runtime_settings),
-                    api_key_account: account,
-                    account_signed_in: account_status.signed_in,
-                    account_login_enabled: account_status.client_id_configured,
-                    account_status_message: account_status.message,
-                    // Resolved id (including shipped defaults) for diagnostics;
-                    // the Keys panel hides the field by default. Per-provider
-                    // settings keys are used if an advanced override is saved.
-                    oauth_client_id: account_auth::client_id_for_provider(*kind).ok(),
-                    models: Vec::new(),
-                }
-            })
+        ProviderRegistry::from_settings(&UserSettings::load())
+            .all()
+            .into_iter()
+            .map(provider_option)
             .collect()
+    }
+
+    pub fn add_custom_provider(
+        &self,
+        draft: CsCustomProviderDraft,
+    ) -> Result<CsProviderOption, CsError> {
+        let wire = parse_wire(&draft.wire)?;
+        let row =
+            CustomProvider::new(&draft.name, wire, &draft.endpoint).map_err(provider_error)?;
+        let mut settings = UserSettings::load();
+        settings
+            .add_custom_provider(row.clone())
+            .map_err(provider_error)?;
+        persist_custom_provider(&settings, &row, draft.api_key)
+    }
+
+    pub fn update_custom_provider(
+        &self,
+        id: String,
+        draft: CsCustomProviderDraft,
+    ) -> Result<CsProviderOption, CsError> {
+        let mut settings = UserSettings::load();
+        let row = settings
+            .update_custom_provider(&id, &draft.name, parse_wire(&draft.wire)?, &draft.endpoint)
+            .map_err(provider_error)?;
+        persist_custom_provider(&settings, &row, draft.api_key)
+    }
+
+    pub fn remove_custom_provider(&self, id: String) -> Result<CsCustomProviderRemoval, CsError> {
+        let mut settings = UserSettings::load();
+        let removed = settings
+            .remove_custom_provider(&id)
+            .map_err(provider_error)?;
+        // Delete first: a failed Keychain write must leave the row addressable for retry.
+        delete_key(&removed.provider.key_account()).map_err(provider_error)?;
+        settings.save().map_err(provider_error)?;
+        crate::hotkeys::refresh_live_controller_config();
+        Ok(CsCustomProviderRemoval {
+            id: removed.provider.id,
+            lanes_reset: removed
+                .lanes_reset
+                .into_iter()
+                .map(|lane| match lane {
+                    RuntimeLlmLaneKind::Formatting => CsLlmLane::Formatting,
+                    RuntimeLlmLaneKind::Assistive => CsLlmLane::Assistive,
+                })
+                .collect(),
+        })
+    }
+
+    pub fn set_lane_provider(&self, lane: CsLlmLane, provider_id: String) -> Result<(), CsError> {
+        let key = match lane {
+            CsLlmLane::Formatting => "LLM_FORMATTING_PROVIDER",
+            CsLlmLane::Assistive => "LLM_ASSISTIVE_PROVIDER",
+        };
+        self.update_config(key.to_string(), provider_id)
     }
 
     /// Start provider-account login for the selected provider.
@@ -1003,7 +1010,7 @@ impl CodescribeConfig {
     /// Missing key is returned as a typed status, not as a thrown bridge error,
     /// so Settings can render "Add API key to discover models" inline.
     pub fn discover_models(&self, provider_id: String) -> CsModelDiscovery {
-        let requested_provider = match ProviderKind::from_str(&provider_id) {
+        let provider = match resolve_catalog_provider(&UserSettings::load(), &provider_id) {
             Ok(provider) => provider,
             Err(error) => {
                 return CsModelDiscovery {
@@ -1014,39 +1021,15 @@ impl CodescribeConfig {
                 };
             }
         };
-
-        let runtime_settings = match Config::load_runtime_snapshot() {
-            Ok(runtime_settings) => runtime_settings,
-            Err(error) => {
-                return CsModelDiscovery {
-                    provider_id,
-                    status: "error".to_string(),
-                    message: Some(error.to_string()),
-                    models: Vec::new(),
-                };
-            }
-        };
-        let assistive_lane = runtime_settings.llm_lanes().assistive();
-        if requested_provider != assistive_lane.provider() {
-            return CsModelDiscovery {
-                provider_id,
-                status: "error".to_string(),
-                message: Some(
-                    "Selected provider is not the provider sealed for the assistive lane"
-                        .to_string(),
-                ),
-                models: Vec::new(),
-            };
-        }
-
-        match discover_provider_models(assistive_lane) {
+        let api_key = keychain::cached_runtime_key(&provider.key_account);
+        match discover_provider_models(&provider, api_key.as_deref()) {
             Ok(result) => {
                 let (status, message) = match result.status {
                     ModelDiscoveryStatus::Fresh => ("fresh".to_string(), None),
                     ModelDiscoveryStatus::Cached { reason } => ("cached".to_string(), Some(reason)),
                 };
                 CsModelDiscovery {
-                    provider_id: result.provider.as_str().to_string(),
+                    provider_id: result.provider.as_string(),
                     status,
                     message,
                     models: result
@@ -1060,13 +1043,13 @@ impl CodescribeConfig {
                 }
             }
             Err(error) => {
-                let status = if error.code() == "no_key" {
+                let status = if provider.key_required && error.code() == "no_key" {
                     "no_key"
                 } else {
                     "error"
                 };
                 CsModelDiscovery {
-                    provider_id: error.provider().as_str().to_string(),
+                    provider_id: error.provider().as_string(),
                     status: status.to_string(),
                     message: Some(error.message()),
                     models: Vec::new(),
@@ -1075,9 +1058,8 @@ impl CodescribeConfig {
         }
     }
 
-    /// Canonical list of Keychain account names (`KEYCHAIN_ACCOUNTS`).
-    pub fn key_accounts(&self) -> Vec<String> {
-        KEYCHAIN_ACCOUNTS.iter().map(|a| a.to_string()).collect()
+    pub fn service_key_accounts(&self) -> Vec<String> {
+        ["STT_API_KEY", "GITHUB_TOKEN"].map(str::to_string).to_vec()
     }
 
     /// Store an API key in the Keychain. `account` must be a known
@@ -1098,6 +1080,7 @@ impl CodescribeConfig {
         delete_key(&account).map_err(|error| CsError::Config {
             msg: error.to_string(),
         })?;
+        crate::hotkeys::refresh_live_controller_config();
         Ok(())
     }
 
@@ -1583,7 +1566,8 @@ fn agent_reset_paths() -> Vec<PathBuf> {
 
 fn agent_secret_accounts() -> &'static [&'static str] {
     &[
-        "LLM_ASSISTIVE_API_KEY",
+        "LLM_LIBRAXIS_API_KEY",
+        "LLM_OPENAI_API_KEY",
         "LLM_ANTHROPIC_API_KEY",
         "LLM_XAI_API_KEY",
         account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT,
@@ -1613,10 +1597,10 @@ fn agent_connector_secret_accounts() -> anyhow::Result<Vec<String>> {
 /// dictation, formatting, audio and hotkey rows are intentionally absent.
 fn agent_env_keys() -> &'static [&'static str] {
     &[
-        "LLM_ASSISTIVE_ENDPOINT",
         "LLM_ASSISTIVE_MODEL",
         "LLM_ASSISTIVE_PROVIDER",
-        "LLM_ASSISTIVE_API_KEY",
+        "LLM_LIBRAXIS_API_KEY",
+        "LLM_OPENAI_API_KEY",
         "LLM_ANTHROPIC_API_KEY",
         "LLM_XAI_API_KEY",
         "LLM_OPENAI_ACCOUNT_TOKENS",
@@ -2200,22 +2184,81 @@ fn setting_string(value: Option<String>) -> Option<String> {
     value.and_then(non_empty)
 }
 
-/// Secret-presence projection from one loader result. LLM accounts are matched
-/// only against the three sealed lanes; non-LLM control-plane accounts retain
-/// their dedicated settings lookup.
-fn key_present(account: &str, runtime_settings: &RuntimeSettingsSnapshot) -> bool {
-    let lanes = runtime_settings.llm_lanes();
-    for lane in [lanes.main(), lanes.formatting(), lanes.assistive()] {
-        if lane.credential().key_account() == account {
-            return lane.credential().api_key().is_some();
-        }
+fn provider_error(error: impl std::fmt::Display) -> CsError {
+    CsError::Config {
+        msg: error.to_string(),
     }
+}
 
-    match account {
-        "STT_API_KEY" => runtime_settings.values().stt_api_key.is_some(),
-        "GITHUB_TOKEN" => codescribe_core::config::keychain::runtime_key(account).is_some(),
-        _ => false,
+fn parse_wire(wire: &str) -> Result<WireFamily, CsError> {
+    WireFamily::parse(wire).ok_or_else(|| provider_error("unknown provider wire"))
+}
+
+fn resolve_catalog_provider(
+    settings: &UserSettings,
+    id: &str,
+) -> Result<ResolvedProvider, CsError> {
+    ProviderRef::parse(id)
+        .and_then(|reference| ProviderRegistry::from_settings(settings).resolve(&reference))
+        .ok_or_else(|| provider_error(format!("unknown provider: {id}")))
+}
+
+fn provider_option(provider: ResolvedProvider) -> CsProviderOption {
+    let status = provider.oauth_vendor.map(account_auth::account_status);
+    CsProviderOption {
+        id: provider.reference.as_string(),
+        kind: if provider.reference.custom_id().is_some() {
+            "custom"
+        } else {
+            "vendor"
+        }
+        .to_string(),
+        display_name: provider.display_name,
+        wire: provider.wire.as_str().to_string(),
+        endpoint: provider.endpoint,
+        api_key_set: keychain::key_present(&provider.key_account),
+        api_key_account: provider.key_account,
+        key_required: provider.key_required,
+        account_signed_in: status.as_ref().is_some_and(|status| status.signed_in),
+        account_login_enabled: status
+            .as_ref()
+            .is_some_and(|status| status.client_id_configured),
+        account_status_message: status.map(|status| status.message).unwrap_or_default(),
+        oauth_client_id: provider
+            .oauth_vendor
+            .and_then(|vendor| account_auth::client_id_for_provider(vendor).ok()),
     }
+}
+
+fn persist_custom_provider(
+    settings: &UserSettings,
+    row: &CustomProvider,
+    secret: Option<String>,
+) -> Result<CsProviderOption, CsError> {
+    // Persist the addressable row first; failed key writes can be retried through set_api_key.
+    settings.save().map_err(provider_error)?;
+    let result = secret
+        .map(|secret| save_key(&row.key_account(), &secret))
+        .transpose();
+    crate::hotkeys::refresh_live_controller_config();
+    result.map_err(provider_error)?;
+    Ok(provider_option(resolve_catalog_provider(
+        settings,
+        &ProviderRef::Custom(row.id.clone()).as_string(),
+    )?))
+}
+
+fn validate_provider_setting(key: &str, value: &str) -> Result<(), CsError> {
+    if key.starts_with("LLM_") && key.ends_with("_ENDPOINT") {
+        return Err(provider_error("removed: endpoints live on providers"));
+    }
+    if key == "LLM_MODEL" {
+        return Err(provider_error("removed: models live on lanes"));
+    }
+    if matches!(key, "LLM_FORMATTING_PROVIDER" | "LLM_ASSISTIVE_PROVIDER") {
+        resolve_catalog_provider(&UserSettings::load(), value)?;
+    }
+    Ok(())
 }
 
 /// One in-flight account login — either a loopback callback server (OpenAI)
@@ -2329,7 +2372,7 @@ mod api_key_probe_tests {
     #[test]
     fn bridge_probe_result_preserves_the_endpoint_used_by_core() {
         let result = CsApiKeyProbeResult::from(ApiKeyLivenessResult {
-            account: "LLM_ASSISTIVE_API_KEY".to_string(),
+            account: "LLM_OPENAI_API_KEY".to_string(),
             status: ApiKeyLivenessStatus::Invalid,
             message: "provider rejected this key".to_string(),
             probed_endpoint: Some("https://api.libraxis.cloud/v1/responses".to_string()),
@@ -2344,7 +2387,7 @@ mod api_key_probe_tests {
 
 /// Reject unknown Keychain accounts before touching the Keychain.
 fn ensure_known_account(account: &str) -> Result<(), CsError> {
-    if KEYCHAIN_ACCOUNTS.contains(&account) {
+    if keychain::is_known_account(account) {
         Ok(())
     } else {
         Err(CsError::Config {
@@ -2479,10 +2522,9 @@ mod reset_tests {
     #[test]
     fn agent_reset_secret_scope_excludes_stt_and_non_agent_keys() {
         let accounts = agent_secret_accounts();
-        assert!(accounts.contains(&"LLM_ASSISTIVE_API_KEY"));
+        assert!(accounts.contains(&"LLM_OPENAI_API_KEY"));
         assert!(accounts.contains(&"LLM_OPENAI_ACCOUNT_TOKENS"));
         assert!(!accounts.contains(&"STT_API_KEY"));
-        assert!(!accounts.contains(&"LLM_API_KEY"));
         assert!(!accounts.contains(&"GITHUB_TOKEN"));
     }
 
@@ -2957,6 +2999,155 @@ mod settings_snapshot_tests {
         ))
     }
 
+    fn custom_draft(name: &str, endpoint: &str) -> super::CsCustomProviderDraft {
+        super::CsCustomProviderDraft {
+            name: name.into(),
+            wire: "responses".into(),
+            endpoint: endpoint.into(),
+            api_key: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn remove_custom_provider_resets_lanes_and_deletes_key() {
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let config = CodescribeConfig::new();
+        let mut draft = custom_draft("Remove witness", "http://localhost:8080");
+        draft.api_key = Some("fixture-key".into());
+        let row = config.add_custom_provider(draft).unwrap();
+        assert!(row.api_key_set);
+        for lane in [super::CsLlmLane::Formatting, super::CsLlmLane::Assistive] {
+            config.set_lane_provider(lane, row.id.clone()).unwrap();
+        }
+        let removed = config
+            .remove_custom_provider("remove-witness".into())
+            .unwrap();
+        assert_eq!(removed.id, "remove-witness");
+        assert_eq!(
+            removed.lanes_reset,
+            [super::CsLlmLane::Formatting, super::CsLlmLane::Assistive]
+        );
+        assert!(super::keychain::cached_runtime_key(&row.api_key_account).is_none());
+        let settings = UserSettings::load();
+        assert!(settings.llm_custom_providers.is_empty());
+        assert!(settings.llm_formatting_provider.is_none());
+        assert!(settings.llm_assistive_provider.is_none());
+        assert!(!config.available_providers().iter().any(|p| p.id == row.id));
+    }
+
+    #[test]
+    #[serial]
+    fn discover_models_accepts_custom_provider() {
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let config = CodescribeConfig::new();
+        let row = config
+            .add_custom_provider(custom_draft(
+                "Discovery witness",
+                &format!("http://{}", listener.local_addr().unwrap()),
+            ))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(pair) => break pair,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("discovery request did not arrive: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let len = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..len]).to_lowercase();
+            assert!(request.starts_with("get /v1/models "));
+            assert!(!request.contains("authorization:"));
+            let body = r#"{"data":[{"id":"fixture-model"}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let result = config.discover_models(row.id.clone());
+        server.join().unwrap();
+        assert_eq!(result.provider_id, row.id);
+        assert_eq!(result.status, "fresh", "{:?}", result.message);
+        assert_eq!(result.models[0].id, "fixture-model");
+    }
+
+    #[test]
+    #[serial]
+    fn update_custom_provider_preserves_slug_and_key() {
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let config = CodescribeConfig::new();
+        let mut draft = custom_draft("Update witness", "http://localhost:8080");
+        draft.api_key = Some("fixture-key".into());
+        let original = config.add_custom_provider(draft).unwrap();
+        let mut draft = custom_draft("Renamed", "http://localhost:9090");
+        draft.wire = "messages".into();
+        let updated = config
+            .update_custom_provider("update-witness".into(), draft)
+            .unwrap();
+        assert_eq!(updated.id, original.id);
+        assert_eq!(updated.api_key_account, original.api_key_account);
+        assert!(updated.api_key_set);
+        assert_eq!(updated.endpoint, "http://localhost:9090/v1/messages");
+        assert_eq!(updated.display_name, "Renamed");
+        config
+            .remove_custom_provider("update-witness".into())
+            .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn provider_catalog_validates_lanes_and_exposes_service_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let config = CodescribeConfig::new();
+        assert_eq!(
+            config.service_key_accounts(),
+            ["STT_API_KEY", "GITHUB_TOKEN"]
+        );
+        assert_eq!(config.available_providers().len(), 4);
+        assert!(
+            config
+                .available_providers()
+                .iter()
+                .all(|p| p.kind == "vendor" && p.key_required)
+        );
+        assert!(
+            config
+                .set_lane_provider(super::CsLlmLane::Formatting, "custom:missing".into())
+                .is_err()
+        );
+        config
+            .set_lane_provider(super::CsLlmLane::Formatting, "xai-responses".into())
+            .unwrap();
+        assert_eq!(
+            UserSettings::load().llm_formatting_provider.as_deref(),
+            Some("xai-responses")
+        );
+        assert!(
+            config
+                .update_config("LLM_ENDPOINT".into(), "http://localhost".into())
+                .is_err()
+        );
+        assert_eq!(
+            config.discover_models("custom:missing".into()).status,
+            "error"
+        );
+    }
+
     /// The assistive provider is a promoted key: a Settings write must land in
     /// settings.json (which survives a reinstall) and must NOT be mirrored into
     /// the `.env` power-user store, or the two would drift apart.
@@ -3091,30 +3282,33 @@ mod settings_snapshot_tests {
     }
 
     /// Promoted keys read settings.json before process env. Launch-time
-    /// bootstrap can leave a stale `LLM_MODEL` in the environment; if env won,
+    /// bootstrap can leave a stale `LLM_FORMATTING_MODEL` in the environment; if env won,
     /// a fresh UI write would appear to save and then silently revert.
     #[test]
     #[serial]
     fn load_settings_prefers_persisted_model_over_stale_process_env() {
-        let root = scratch("llm_model");
+        let root = scratch("formatting_model");
         std::fs::create_dir_all(&root).unwrap();
 
         let previous_data_dir = std::env::var("CODESCRIBE_DATA_DIR").ok();
-        let previous_model = std::env::var("LLM_MODEL").ok();
+        let previous_model = std::env::var("LLM_FORMATTING_MODEL").ok();
         // SAFETY: serialized test body; no background workers are started.
         unsafe {
             std::env::set_var("CODESCRIBE_DATA_DIR", &root);
-            std::env::set_var("LLM_MODEL", "stale-bootstrap-model");
+            std::env::set_var("LLM_FORMATTING_MODEL", "stale-bootstrap-model");
         }
 
         let settings = UserSettings {
-            llm_model: Some("fresh-runtime-model".to_string()),
+            llm_formatting_model: Some("fresh-runtime-model".to_string()),
             ..Default::default()
         };
         settings.save().unwrap();
 
         let snapshot = CodescribeConfig::new().load_settings();
-        assert_eq!(snapshot.llm_model.as_deref(), Some("fresh-runtime-model"));
+        assert_eq!(
+            snapshot.llm_formatting_model.as_deref(),
+            Some("fresh-runtime-model")
+        );
 
         // SAFETY: restore prior env, same serialized single-thread context.
         unsafe {
@@ -3123,8 +3317,8 @@ mod settings_snapshot_tests {
                 None => std::env::remove_var("CODESCRIBE_DATA_DIR"),
             }
             match previous_model {
-                Some(value) => std::env::set_var("LLM_MODEL", value),
-                None => std::env::remove_var("LLM_MODEL"),
+                Some(value) => std::env::set_var("LLM_FORMATTING_MODEL", value),
+                None => std::env::remove_var("LLM_FORMATTING_MODEL"),
             }
         }
         let _ = remove_path_without_following_symlinks(&root);
@@ -3268,9 +3462,9 @@ mod settings_snapshot_tests {
         );
         // Persisted intent from the same seal wins over ambient process env.
         assert_eq!(
-            projected.llm_model,
-            setting_string(runtime.user_settings().llm_model.clone())
-                .or_else(|| Some(runtime.llm_lanes().main().model().to_string()))
+            projected.llm_formatting_model,
+            setting_string(runtime.user_settings().llm_formatting_model.clone())
+                .or_else(|| Some(runtime.llm_lanes().formatting().model().to_string()))
         );
     }
 }

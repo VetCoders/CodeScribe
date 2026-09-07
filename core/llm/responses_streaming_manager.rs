@@ -1774,6 +1774,49 @@ mod tests {
         mock.assert_async().await;
     }
 
+    /// The Libraxis gateway emits extra `response.route.queued|waiting|terminal`
+    /// events and `event:` lines (live capture 2026-09-07, §B.3). The parser
+    /// must ignore them and still deliver the text, the response id, and a
+    /// clean completion — the fixture is the raw stream, byte for byte.
+    #[tokio::test]
+    async fn responses_stream_tolerates_libraxis_route_events() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/responses")
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(include_str!(
+                "vendors/fixtures/libraxis_responses_sse_live_2026-09-07.txt"
+            ))
+            .create_async()
+            .await;
+        let endpoint = format!("{}/v1/responses", server.url());
+        let client = Client::new();
+        let manager = ResponsesStreamingManager::new(
+            &client,
+            &endpoint,
+            "test-key",
+            StreamCallbacks {
+                assistant: None,
+                reasoning: None,
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+
+        let output = manager
+            .stream(&json!({"model": "buddy", "stream": true}))
+            .await
+            .expect("gateway route events must not break the stream");
+
+        assert_eq!(output.assistant_text, "pong");
+        assert_eq!(
+            output.response_id.as_deref(),
+            Some("resp_5e0ec282055e4cffb8c27b9c4a901550")
+        );
+        mock.assert_async().await;
+    }
+
     /// Named SSE `error` events bail with the provider code/message, not empty-content.
     #[tokio::test]
     async fn stream_bails_with_specific_sse_error_event() {

@@ -225,9 +225,8 @@ async fn formatting_off_bypasses_llm() {
         .expect(0)
         .create_async()
         .await;
-    let _endpoint = EnvGuard::set("LLM_FORMATTING_ENDPOINT", server.url());
     let _model = EnvGuard::set("LLM_FORMATTING_MODEL", "test-model");
-    let _key = EnvGuard::set("LLM_FORMATTING_API_KEY", "test-key");
+    let _key = EnvGuard::set("LLM_OPENAI_API_KEY", "test-key");
     let _policy = EnvGuard::unset("FORMATTING_LEVEL");
     Config::default()
         .save_to_env("FORMATTING_LEVEL", FormattingPolicy::Off.as_str())

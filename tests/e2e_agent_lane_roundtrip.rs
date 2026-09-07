@@ -9,12 +9,13 @@
 //! ```
 //!
 //! This is the regression net for the "I can't reach the model yet" loop: the
-//! lane must resolve from CURRENT settings (lane_truth), a key-optional local
-//! endpoint must stream without auth headers, and the turn must finish cleanly.
+//! lane must resolve from CURRENT settings (lane_truth), a key-optional Custom
+//! provider must stream without auth headers, and the turn must finish cleanly.
 
 use codescribe::agent::create_default_provider;
 use codescribe_core::agent::{AgentEvent, ContentBlock, Message, Role, StreamOptions};
-use codescribe_core::config::Config;
+use codescribe_core::config::{Config, UserSettings};
+use codescribe_core::llm::provider::{CustomProvider, WireFamily};
 use mockito::Matcher;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -58,10 +59,17 @@ async fn assistive_lane_answers_one_single_shot_turn() {
         data_dir.path().to_string_lossy().as_ref(),
     );
     let _disable_keychain = EnvGuard::set("CODESCRIBE_DISABLE_KEYCHAIN", "1");
-    let _provider = EnvGuard::set("LLM_ASSISTIVE_PROVIDER", "openai-responses");
-    let _endpoint = EnvGuard::set("LLM_ASSISTIVE_ENDPOINT", &endpoint);
-    let _model = EnvGuard::set("LLM_ASSISTIVE_MODEL", "fixture-model");
-    let _api_key = EnvGuard::remove("LLM_ASSISTIVE_API_KEY");
+    let _provider = EnvGuard::remove("LLM_ASSISTIVE_PROVIDER");
+    let _model = EnvGuard::remove("LLM_ASSISTIVE_MODEL");
+    // The mock host is a Custom provider row (no key required); the lane
+    // points at it through settings.json, the same path the Settings UI takes.
+    let row = CustomProvider::new("Fixture Box", WireFamily::OpenAiResponses, &endpoint)
+        .expect("valid custom row");
+    let mut settings = UserSettings::default();
+    settings.add_custom_provider(row).expect("add custom row");
+    settings.llm_assistive_provider = Some("custom:fixture-box".to_string());
+    settings.llm_assistive_model = Some("fixture-model".to_string());
+    settings.save().expect("persist lane settings");
     let _attempt_timeout = EnvGuard::set("CODESCRIBE_AI_ATTEMPT_TIMEOUT_MS", "2000");
     let _chunk_timeout = EnvGuard::set("CODESCRIBE_AI_INTER_CHUNK_TIMEOUT_MS", "2000");
 

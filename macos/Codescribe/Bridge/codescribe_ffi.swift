@@ -1169,17 +1169,13 @@ public func FfiConverterTypeCodescribeAgentStatus_lower(_ value: CodescribeAgent
  */
 public protocol CodescribeConfigProtocol: AnyObject, Sendable {
 
+    func addCustomProvider(draft: CsCustomProviderDraft) throws  -> CsProviderOption
+
     /**
      * Content plus provenance/path for the assistive prompt editor.
      */
     func assistivePromptSnapshot()  -> CsPromptSnapshot
 
-    /**
-     * Assistive/agent-lane provider catalog with per-provider key presence.
-     * Model lists are intentionally empty here: Settings must call
-     * `discover_models` so dropdown options come from the provider's live API,
-     * not a static fallback.
-     */
     func availableProviders()  -> [CsProviderOption]
 
     /**
@@ -1259,14 +1255,6 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      */
     func getFormattingPrompt()  -> String
 
-    /**
-     * Canonical list of Keychain account names (`KEYCHAIN_ACCOUNTS`).
-     */
-    func keyAccounts()  -> [String]
-
-    /**
-     * Presence booleans for every Keychain-backed API key.
-     */
     func keyStatus()  -> CsKeyStatus
 
     /**
@@ -1285,14 +1273,6 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
     func markOnboardingDone()
 
     /**
-     * Canonical normalization for OpenAI Responses endpoints.
-     * Strips known suffixes (/v1/responses, /chat/completions, /completions, /v1)
-     * and forces the /v1/responses tail through the pure provider registry;
-     * Swift SettingsViewModel delegates here to eliminate duplication (P2-05).
-     */
-    func normalizeOpenaiResponsesEndpoint(endpoint: String)  -> String
-
-    /**
      * First-run operating lane chosen during onboarding (`"basic"` /
      * `"agentic"`), or `None` when not yet chosen.
      */
@@ -1304,6 +1284,8 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      * exists yet, so a fresh install starts at the top.
      */
     func onboardingProgress()  -> UInt32
+
+    func removeCustomProvider(id: String) throws  -> CsCustomProviderRemoval
 
     /**
      * Reset only durable Agent state. Conversations and tool/MCP files are
@@ -1373,6 +1355,8 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      */
     func saveOnboardingProgress(step: UInt32)
 
+    func serviceKeyAccounts()  -> [String]
+
     /**
      * Store an API key in the Keychain. `account` must be a known
      * `KEYCHAIN_ACCOUNTS` entry. The secret is never echoed back.
@@ -1406,6 +1390,8 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      * Save one explicit formatting policy prompt through the shared owner.
      */
     func setFormattingPromptForLevel(level: String, content: String) throws
+
+    func setLaneProvider(lane: CsLlmLane, providerId: String) throws
 
     /**
      * Toggle Notes Mode as one explicit two-key operation. Notes Mode means
@@ -1447,11 +1433,6 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      */
     func startAccountLogin(providerId: String) throws  -> CsAccountLoginResult
 
-    /**
-     * Probe one Keychain-backed API key account with a single cheap provider
-     * request. Blocking by design: Swift calls this from a background queue.
-     * The secret never crosses FFI; this method reads env/Keychain internally.
-     */
     func testApiKey(account: String) throws  -> CsApiKeyProbeResult
 
     /**
@@ -1474,6 +1455,8 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      * write and one `.env` rewrite for the whole batch.
      */
     func updateConfigMany(entries: [CsConfigEntry]) throws
+
+    func updateCustomProvider(id: String, draft: CsCustomProviderDraft) throws  -> CsProviderOption
 
 }
 /**
@@ -1544,6 +1527,15 @@ public convenience init() {
 
 
 
+open func addCustomProvider(draft: CsCustomProviderDraft)throws  -> CsProviderOption  {
+    return try  FfiConverterTypeCsProviderOption_lift(try rustCallWithError(FfiConverterTypeCsError_lift) {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_add_custom_provider(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeCsCustomProviderDraft_lower(draft),$0
+    )
+})
+}
+
     /**
      * Content plus provenance/path for the assistive prompt editor.
      */
@@ -1555,12 +1547,6 @@ open func assistivePromptSnapshot() -> CsPromptSnapshot  {
 })
 }
 
-    /**
-     * Assistive/agent-lane provider catalog with per-provider key presence.
-     * Model lists are intentionally empty here: Settings must call
-     * `discover_models` so dropdown options come from the provider's live API,
-     * not a static fallback.
-     */
 open func availableProviders() -> [CsProviderOption]  {
     return try!  FfiConverterSequenceTypeCsProviderOption.lift(try! rustCall() {
     uniffi_codescribe_ffi_fn_method_codescribeconfig_available_providers(
@@ -1720,20 +1706,6 @@ open func getFormattingPrompt() -> String  {
 })
 }
 
-    /**
-     * Canonical list of Keychain account names (`KEYCHAIN_ACCOUNTS`).
-     */
-open func keyAccounts() -> [String]  {
-    return try!  FfiConverterSequenceString.lift(try! rustCall() {
-    uniffi_codescribe_ffi_fn_method_codescribeconfig_key_accounts(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-
-    /**
-     * Presence booleans for every Keychain-backed API key.
-     */
 open func keyStatus() -> CsKeyStatus  {
     return try!  FfiConverterTypeCsKeyStatus_lift(try! rustCall() {
     uniffi_codescribe_ffi_fn_method_codescribeconfig_key_status(
@@ -1769,21 +1741,6 @@ open func markOnboardingDone()  {try! rustCall() {
 }
 
     /**
-     * Canonical normalization for OpenAI Responses endpoints.
-     * Strips known suffixes (/v1/responses, /chat/completions, /completions, /v1)
-     * and forces the /v1/responses tail through the pure provider registry;
-     * Swift SettingsViewModel delegates here to eliminate duplication (P2-05).
-     */
-open func normalizeOpenaiResponsesEndpoint(endpoint: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_codescribe_ffi_fn_method_codescribeconfig_normalize_openai_responses_endpoint(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(endpoint),$0
-    )
-})
-}
-
-    /**
      * First-run operating lane chosen during onboarding (`"basic"` /
      * `"agentic"`), or `None` when not yet chosen.
      */
@@ -1804,6 +1761,15 @@ open func onboardingProgress() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_codescribe_ffi_fn_method_codescribeconfig_onboarding_progress(
             self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+open func removeCustomProvider(id: String)throws  -> CsCustomProviderRemoval  {
+    return try  FfiConverterTypeCsCustomProviderRemoval_lift(try rustCallWithError(FfiConverterTypeCsError_lift) {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_remove_custom_provider(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),$0
     )
 })
 }
@@ -1932,6 +1898,14 @@ open func saveOnboardingProgress(step: UInt32)  {try! rustCall() {
 }
 }
 
+open func serviceKeyAccounts() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_service_key_accounts(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
     /**
      * Store an API key in the Keychain. `account` must be a known
      * `KEYCHAIN_ACCOUNTS` entry. The secret is never echoed back.
@@ -2002,6 +1976,15 @@ open func setFormattingPromptForLevel(level: String, content: String)throws   {t
             self.uniffiCloneHandle(),
         FfiConverterString.lower(level),
         FfiConverterString.lower(content),$0
+    )
+}
+}
+
+open func setLaneProvider(lane: CsLlmLane, providerId: String)throws   {try rustCallWithError(FfiConverterTypeCsError_lift) {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_set_lane_provider(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeCsLlmLane_lower(lane),
+        FfiConverterString.lower(providerId),$0
     )
 }
 }
@@ -2077,11 +2060,6 @@ open func startAccountLogin(providerId: String)throws  -> CsAccountLoginResult  
 })
 }
 
-    /**
-     * Probe one Keychain-backed API key account with a single cheap provider
-     * request. Blocking by design: Swift calls this from a background queue.
-     * The secret never crosses FFI; this method reads env/Keychain internally.
-     */
 open func testApiKey(account: String)throws  -> CsApiKeyProbeResult  {
     return try  FfiConverterTypeCsApiKeyProbeResult_lift(try rustCallWithError(FfiConverterTypeCsError_lift) {
     uniffi_codescribe_ffi_fn_method_codescribeconfig_test_api_key(
@@ -2129,6 +2107,16 @@ open func updateConfigMany(entries: [CsConfigEntry])throws   {try rustCallWithEr
         FfiConverterSequenceTypeCsConfigEntry.lower(entries),$0
     )
 }
+}
+
+open func updateCustomProvider(id: String, draft: CsCustomProviderDraft)throws  -> CsProviderOption  {
+    return try  FfiConverterTypeCsProviderOption_lift(try rustCallWithError(FfiConverterTypeCsError_lift) {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_update_custom_provider(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterTypeCsCustomProviderDraft_lower(draft),$0
+    )
+})
 }
 
 
@@ -7378,6 +7366,121 @@ public func FfiConverterTypeCsConfigEntry_lower(_ value: CsConfigEntry) -> RustB
 
 
 /**
+ * Input-only secret: consumed into the Keychain bundle, never returned.
+ */
+public struct CsCustomProviderDraft: Equatable, Hashable {
+    public var name: String
+    public var wire: String
+    public var endpoint: String
+    public var apiKey: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, wire: String, endpoint: String, apiKey: String?) {
+        self.name = name
+        self.wire = wire
+        self.endpoint = endpoint
+        self.apiKey = apiKey
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsCustomProviderDraft: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsCustomProviderDraft: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsCustomProviderDraft {
+        return
+            try CsCustomProviderDraft(
+                name: FfiConverterString.read(from: &buf),
+                wire: FfiConverterString.read(from: &buf),
+                endpoint: FfiConverterString.read(from: &buf),
+                apiKey: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsCustomProviderDraft, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.wire, into: &buf)
+        FfiConverterString.write(value.endpoint, into: &buf)
+        FfiConverterOptionString.write(value.apiKey, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCustomProviderDraft_lift(_ buf: RustBuffer) throws -> CsCustomProviderDraft {
+    return try FfiConverterTypeCsCustomProviderDraft.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCustomProviderDraft_lower(_ value: CsCustomProviderDraft) -> RustBuffer {
+    return FfiConverterTypeCsCustomProviderDraft.lower(value)
+}
+
+
+public struct CsCustomProviderRemoval: Equatable, Hashable {
+    public var id: String
+    public var lanesReset: [CsLlmLane]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, lanesReset: [CsLlmLane]) {
+        self.id = id
+        self.lanesReset = lanesReset
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsCustomProviderRemoval: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsCustomProviderRemoval: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsCustomProviderRemoval {
+        return
+            try CsCustomProviderRemoval(
+                id: FfiConverterString.read(from: &buf),
+                lanesReset: FfiConverterSequenceTypeCsLlmLane.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsCustomProviderRemoval, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterSequenceTypeCsLlmLane.write(value.lanesReset, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCustomProviderRemoval_lift(_ buf: RustBuffer) throws -> CsCustomProviderRemoval {
+    return try FfiConverterTypeCsCustomProviderRemoval.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCustomProviderRemoval_lower(_ value: CsCustomProviderRemoval) -> RustBuffer {
+    return FfiConverterTypeCsCustomProviderRemoval.lower(value)
+}
+
+
+/**
  * Result of Dictionary "Teach" — promote corrections + proposed into live lexicon.
  */
 public struct CsDictionaryTeachResult: Equatable, Hashable {
@@ -7655,43 +7758,21 @@ public func FfiConverterTypeCsHotkeyConflict_lower(_ value: CsHotkeyConflict) ->
  * account env var or Keychain account is present and non-empty.
  */
 public struct CsKeyStatus: Equatable, Hashable {
-    public var llmApiKeySet: Bool
-    public var sttApiKeySet: Bool
-    public var llmFormattingApiKeySet: Bool
-    public var llmAssistiveApiKeySet: Bool
-    /**
-     * Anthropic assistive-lane key (`LLM_ANTHROPIC_API_KEY`) — separate from the
-     * OpenAI assistive key so both providers can be configured at once.
-     */
-    public var llmAnthropicApiKeySet: Bool
-    /**
-     * xAI assistive-lane key (`LLM_XAI_API_KEY`). Present for the same reason
-     * as the Anthropic field: the Keys panel lists a row per Keychain account
-     * and reads its indicator from this record, so an account without a field
-     * here renders as permanently "not set" even after the operator saves it.
-     */
+    public var llmLibraxisApiKeySet: Bool
+    public var llmOpenaiApiKeySet: Bool
     public var llmXaiApiKeySet: Bool
+    public var llmAnthropicApiKeySet: Bool
+    public var sttApiKeySet: Bool
     public var githubTokenSet: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(llmApiKeySet: Bool, sttApiKeySet: Bool, llmFormattingApiKeySet: Bool, llmAssistiveApiKeySet: Bool,
-        /**
-         * Anthropic assistive-lane key (`LLM_ANTHROPIC_API_KEY`) — separate from the
-         * OpenAI assistive key so both providers can be configured at once.
-         */llmAnthropicApiKeySet: Bool,
-        /**
-         * xAI assistive-lane key (`LLM_XAI_API_KEY`). Present for the same reason
-         * as the Anthropic field: the Keys panel lists a row per Keychain account
-         * and reads its indicator from this record, so an account without a field
-         * here renders as permanently "not set" even after the operator saves it.
-         */llmXaiApiKeySet: Bool, githubTokenSet: Bool) {
-        self.llmApiKeySet = llmApiKeySet
-        self.sttApiKeySet = sttApiKeySet
-        self.llmFormattingApiKeySet = llmFormattingApiKeySet
-        self.llmAssistiveApiKeySet = llmAssistiveApiKeySet
-        self.llmAnthropicApiKeySet = llmAnthropicApiKeySet
+    public init(llmLibraxisApiKeySet: Bool, llmOpenaiApiKeySet: Bool, llmXaiApiKeySet: Bool, llmAnthropicApiKeySet: Bool, sttApiKeySet: Bool, githubTokenSet: Bool) {
+        self.llmLibraxisApiKeySet = llmLibraxisApiKeySet
+        self.llmOpenaiApiKeySet = llmOpenaiApiKeySet
         self.llmXaiApiKeySet = llmXaiApiKeySet
+        self.llmAnthropicApiKeySet = llmAnthropicApiKeySet
+        self.sttApiKeySet = sttApiKeySet
         self.githubTokenSet = githubTokenSet
     }
 
@@ -7709,23 +7790,21 @@ public struct FfiConverterTypeCsKeyStatus: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsKeyStatus {
         return
             try CsKeyStatus(
-                llmApiKeySet: FfiConverterBool.read(from: &buf),
-                sttApiKeySet: FfiConverterBool.read(from: &buf),
-                llmFormattingApiKeySet: FfiConverterBool.read(from: &buf),
-                llmAssistiveApiKeySet: FfiConverterBool.read(from: &buf),
-                llmAnthropicApiKeySet: FfiConverterBool.read(from: &buf),
+                llmLibraxisApiKeySet: FfiConverterBool.read(from: &buf),
+                llmOpenaiApiKeySet: FfiConverterBool.read(from: &buf),
                 llmXaiApiKeySet: FfiConverterBool.read(from: &buf),
+                llmAnthropicApiKeySet: FfiConverterBool.read(from: &buf),
+                sttApiKeySet: FfiConverterBool.read(from: &buf),
                 githubTokenSet: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: CsKeyStatus, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.llmApiKeySet, into: &buf)
-        FfiConverterBool.write(value.sttApiKeySet, into: &buf)
-        FfiConverterBool.write(value.llmFormattingApiKeySet, into: &buf)
-        FfiConverterBool.write(value.llmAssistiveApiKeySet, into: &buf)
-        FfiConverterBool.write(value.llmAnthropicApiKeySet, into: &buf)
+        FfiConverterBool.write(value.llmLibraxisApiKeySet, into: &buf)
+        FfiConverterBool.write(value.llmOpenaiApiKeySet, into: &buf)
         FfiConverterBool.write(value.llmXaiApiKeySet, into: &buf)
+        FfiConverterBool.write(value.llmAnthropicApiKeySet, into: &buf)
+        FfiConverterBool.write(value.sttApiKeySet, into: &buf)
         FfiConverterBool.write(value.githubTokenSet, into: &buf)
     }
 }
@@ -9178,94 +9257,37 @@ public func FfiConverterTypeCsPromptSnapshot_lower(_ value: CsPromptSnapshot) ->
 
 
 /**
- * One assistive/agent-lane provider option: canonical id, label, the Keychain
- * account holding its key (+ whether that key is present), and its model
- * catalog. Provider identity is static; models are discovered by
- * `discover_models` from the live provider API using the user's key.
+ * Provider identity and credential presence; never a returned secret.
  */
 public struct CsProviderOption: Equatable, Hashable {
-    /**
-     * `LLM_ASSISTIVE_PROVIDER` value: `"openai-responses"` | `"anthropic-messages"`.
-     */
     public var id: String
+    public var kind: String
     public var displayName: String
-    /**
-     * Keychain account for this provider's assistive key.
-     */
+    public var wire: String
+    public var endpoint: String
     public var apiKeyAccount: String
-    /**
-     * True when that key is present (mirrors `CsKeyStatus`, keyed per provider).
-     */
     public var apiKeySet: Bool
-    /**
-     * True when provider-account tokens are stored for this provider.
-     */
+    public var keyRequired: Bool
     public var accountSignedIn: Bool
-    /**
-     * True when the account-login flow can start. OpenAI and xAI ship public
-     * desktop client ids (see `NOTICE`); operator settings/env still override.
-     * Anthropic stays gated until the operator pastes a registration.
-     */
     public var accountLoginEnabled: Bool
-    /**
-     * Human-readable account status ("signed in as <email>", "not signed in",
-     * or "awaiting app registration"). Never contains secrets.
-     */
     public var accountStatusMessage: String
-    /**
-     * Resolved OAuth client id (settings → env → shipped default). Non-secret
-     * app identity. The Keys panel no longer surfaces this for editing by
-     * default; advanced override still goes through settings keys.
-     */
     public var oauthClientId: String?
-    /**
-     * Always empty for live Settings; retained for bridge compatibility with
-     * older Swift bindings and preview seed objects.
-     */
-    public var models: [CsModelOption]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(
-        /**
-         * `LLM_ASSISTIVE_PROVIDER` value: `"openai-responses"` | `"anthropic-messages"`.
-         */id: String, displayName: String,
-        /**
-         * Keychain account for this provider's assistive key.
-         */apiKeyAccount: String,
-        /**
-         * True when that key is present (mirrors `CsKeyStatus`, keyed per provider).
-         */apiKeySet: Bool,
-        /**
-         * True when provider-account tokens are stored for this provider.
-         */accountSignedIn: Bool,
-        /**
-         * True when the account-login flow can start. OpenAI and xAI ship public
-         * desktop client ids (see `NOTICE`); operator settings/env still override.
-         * Anthropic stays gated until the operator pastes a registration.
-         */accountLoginEnabled: Bool,
-        /**
-         * Human-readable account status ("signed in as <email>", "not signed in",
-         * or "awaiting app registration"). Never contains secrets.
-         */accountStatusMessage: String,
-        /**
-         * Resolved OAuth client id (settings → env → shipped default). Non-secret
-         * app identity. The Keys panel no longer surfaces this for editing by
-         * default; advanced override still goes through settings keys.
-         */oauthClientId: String?,
-        /**
-         * Always empty for live Settings; retained for bridge compatibility with
-         * older Swift bindings and preview seed objects.
-         */models: [CsModelOption]) {
+    public init(id: String, kind: String, displayName: String, wire: String, endpoint: String, apiKeyAccount: String, apiKeySet: Bool, keyRequired: Bool, accountSignedIn: Bool, accountLoginEnabled: Bool, accountStatusMessage: String, oauthClientId: String?) {
         self.id = id
+        self.kind = kind
         self.displayName = displayName
+        self.wire = wire
+        self.endpoint = endpoint
         self.apiKeyAccount = apiKeyAccount
         self.apiKeySet = apiKeySet
+        self.keyRequired = keyRequired
         self.accountSignedIn = accountSignedIn
         self.accountLoginEnabled = accountLoginEnabled
         self.accountStatusMessage = accountStatusMessage
         self.oauthClientId = oauthClientId
-        self.models = models
     }
 
 
@@ -9283,27 +9305,33 @@ public struct FfiConverterTypeCsProviderOption: FfiConverterRustBuffer {
         return
             try CsProviderOption(
                 id: FfiConverterString.read(from: &buf),
+                kind: FfiConverterString.read(from: &buf),
                 displayName: FfiConverterString.read(from: &buf),
+                wire: FfiConverterString.read(from: &buf),
+                endpoint: FfiConverterString.read(from: &buf),
                 apiKeyAccount: FfiConverterString.read(from: &buf),
                 apiKeySet: FfiConverterBool.read(from: &buf),
+                keyRequired: FfiConverterBool.read(from: &buf),
                 accountSignedIn: FfiConverterBool.read(from: &buf),
                 accountLoginEnabled: FfiConverterBool.read(from: &buf),
                 accountStatusMessage: FfiConverterString.read(from: &buf),
-                oauthClientId: FfiConverterOptionString.read(from: &buf),
-                models: FfiConverterSequenceTypeCsModelOption.read(from: &buf)
+                oauthClientId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
     public static func write(_ value: CsProviderOption, into buf: inout [UInt8]) {
         FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.kind, into: &buf)
         FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterString.write(value.wire, into: &buf)
+        FfiConverterString.write(value.endpoint, into: &buf)
         FfiConverterString.write(value.apiKeyAccount, into: &buf)
         FfiConverterBool.write(value.apiKeySet, into: &buf)
+        FfiConverterBool.write(value.keyRequired, into: &buf)
         FfiConverterBool.write(value.accountSignedIn, into: &buf)
         FfiConverterBool.write(value.accountLoginEnabled, into: &buf)
         FfiConverterString.write(value.accountStatusMessage, into: &buf)
         FfiConverterOptionString.write(value.oauthClientId, into: &buf)
-        FfiConverterSequenceTypeCsModelOption.write(value.models, into: &buf)
     }
 }
 
@@ -9578,6 +9606,8 @@ public func FfiConverterTypeCsResetPreview_lower(_ value: CsResetPreview) -> Rus
 public struct CsRuntimeLlmLane: Equatable, Hashable {
     public var lane: CsLlmLane
     public var providerId: String
+    public var providerDisplayName: String
+    public var wire: String
     public var endpoint: String
     public var model: String
     public var keyAccount: String
@@ -9588,9 +9618,11 @@ public struct CsRuntimeLlmLane: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(lane: CsLlmLane, providerId: String, endpoint: String, model: String, keyAccount: String, keyPresent: Bool, accountAuth: Bool, available: Bool, unavailableReason: String?) {
+    public init(lane: CsLlmLane, providerId: String, providerDisplayName: String, wire: String, endpoint: String, model: String, keyAccount: String, keyPresent: Bool, accountAuth: Bool, available: Bool, unavailableReason: String?) {
         self.lane = lane
         self.providerId = providerId
+        self.providerDisplayName = providerDisplayName
+        self.wire = wire
         self.endpoint = endpoint
         self.model = model
         self.keyAccount = keyAccount
@@ -9616,6 +9648,8 @@ public struct FfiConverterTypeCsRuntimeLlmLane: FfiConverterRustBuffer {
             try CsRuntimeLlmLane(
                 lane: FfiConverterTypeCsLlmLane.read(from: &buf),
                 providerId: FfiConverterString.read(from: &buf),
+                providerDisplayName: FfiConverterString.read(from: &buf),
+                wire: FfiConverterString.read(from: &buf),
                 endpoint: FfiConverterString.read(from: &buf),
                 model: FfiConverterString.read(from: &buf),
                 keyAccount: FfiConverterString.read(from: &buf),
@@ -9629,6 +9663,8 @@ public struct FfiConverterTypeCsRuntimeLlmLane: FfiConverterRustBuffer {
     public static func write(_ value: CsRuntimeLlmLane, into buf: inout [UInt8]) {
         FfiConverterTypeCsLlmLane.write(value.lane, into: &buf)
         FfiConverterString.write(value.providerId, into: &buf)
+        FfiConverterString.write(value.providerDisplayName, into: &buf)
+        FfiConverterString.write(value.wire, into: &buf)
         FfiConverterString.write(value.endpoint, into: &buf)
         FfiConverterString.write(value.model, into: &buf)
         FfiConverterString.write(value.keyAccount, into: &buf)
@@ -9723,23 +9759,18 @@ public struct CsSettings: Equatable, Hashable {
      * if a value must still be written.
      */
     public var finalPassMode: String?
-    public var llmEndpoint: String?
     public var restoreClipboard: Bool
     public var restoreClipboardDelayMs: UInt64
     public var startAtLogin: Bool
     public var agentEnterSends: Bool
     public var dumpAudioLogs: Bool
-    public var llmModel: String?
-    public var llmFormattingEndpoint: String?
-    public var llmFormattingModel: String?
-    public var llmAssistiveEndpoint: String?
-    public var llmAssistiveModel: String?
     /**
-     * Assistive/agent-lane provider identity (`LLM_ASSISTIVE_PROVIDER`):
-     * `"openai-responses"` | `"anthropic-messages"`. Written back via
-     * `update_config` with the same key; drives `create_default_provider`.
+     * Lane = full ProviderRef (vendor ID or `custom:<slug>`) + model; provider first.
      */
+    public var llmFormattingProvider: String?
+    public var llmFormattingModel: String?
     public var llmAssistiveProvider: String?
+    public var llmAssistiveModel: String?
     public var formattingLevel: String?
     public var whisperModel: String?
     /**
@@ -9804,12 +9835,10 @@ public struct CsSettings: Equatable, Hashable {
          * Legacy stop-file-pass token (`FINAL_PASS_MODE`). Runtime ignores it
          * on stop; Settings no longer exposes Always/Smart/Off. Persist `off`
          * if a value must still be written.
-         */finalPassMode: String?, llmEndpoint: String?, restoreClipboard: Bool, restoreClipboardDelayMs: UInt64, startAtLogin: Bool, agentEnterSends: Bool, dumpAudioLogs: Bool, llmModel: String?, llmFormattingEndpoint: String?, llmFormattingModel: String?, llmAssistiveEndpoint: String?, llmAssistiveModel: String?,
+         */finalPassMode: String?, restoreClipboard: Bool, restoreClipboardDelayMs: UInt64, startAtLogin: Bool, agentEnterSends: Bool, dumpAudioLogs: Bool,
         /**
-         * Assistive/agent-lane provider identity (`LLM_ASSISTIVE_PROVIDER`):
-         * `"openai-responses"` | `"anthropic-messages"`. Written back via
-         * `update_config` with the same key; drives `create_default_provider`.
-         */llmAssistiveProvider: String?, formattingLevel: String?, whisperModel: String?,
+         * Lane = full ProviderRef (vendor ID or `custom:<slug>`) + model; provider first.
+         */llmFormattingProvider: String?, llmFormattingModel: String?, llmAssistiveProvider: String?, llmAssistiveModel: String?, formattingLevel: String?, whisperModel: String?,
         /**
          * Layered incremental transcription phase (`CODESCRIBE_LAYERED_TRANSCRIPTION`):
          * `"phase1"` | `"off"` (anything non-phase means OFF). Written back via
@@ -9870,18 +9899,15 @@ public struct CsSettings: Equatable, Hashable {
         self.sttEndpoint = sttEndpoint
         self.sttEngine = sttEngine
         self.finalPassMode = finalPassMode
-        self.llmEndpoint = llmEndpoint
         self.restoreClipboard = restoreClipboard
         self.restoreClipboardDelayMs = restoreClipboardDelayMs
         self.startAtLogin = startAtLogin
         self.agentEnterSends = agentEnterSends
         self.dumpAudioLogs = dumpAudioLogs
-        self.llmModel = llmModel
-        self.llmFormattingEndpoint = llmFormattingEndpoint
+        self.llmFormattingProvider = llmFormattingProvider
         self.llmFormattingModel = llmFormattingModel
-        self.llmAssistiveEndpoint = llmAssistiveEndpoint
-        self.llmAssistiveModel = llmAssistiveModel
         self.llmAssistiveProvider = llmAssistiveProvider
+        self.llmAssistiveModel = llmAssistiveModel
         self.formattingLevel = formattingLevel
         self.whisperModel = whisperModel
         self.layeredTranscription = layeredTranscription
@@ -9945,18 +9971,15 @@ public struct FfiConverterTypeCsSettings: FfiConverterRustBuffer {
                 sttEndpoint: FfiConverterOptionString.read(from: &buf),
                 sttEngine: FfiConverterOptionString.read(from: &buf),
                 finalPassMode: FfiConverterOptionString.read(from: &buf),
-                llmEndpoint: FfiConverterOptionString.read(from: &buf),
                 restoreClipboard: FfiConverterBool.read(from: &buf),
                 restoreClipboardDelayMs: FfiConverterUInt64.read(from: &buf),
                 startAtLogin: FfiConverterBool.read(from: &buf),
                 agentEnterSends: FfiConverterBool.read(from: &buf),
                 dumpAudioLogs: FfiConverterBool.read(from: &buf),
-                llmModel: FfiConverterOptionString.read(from: &buf),
-                llmFormattingEndpoint: FfiConverterOptionString.read(from: &buf),
+                llmFormattingProvider: FfiConverterOptionString.read(from: &buf),
                 llmFormattingModel: FfiConverterOptionString.read(from: &buf),
-                llmAssistiveEndpoint: FfiConverterOptionString.read(from: &buf),
-                llmAssistiveModel: FfiConverterOptionString.read(from: &buf),
                 llmAssistiveProvider: FfiConverterOptionString.read(from: &buf),
+                llmAssistiveModel: FfiConverterOptionString.read(from: &buf),
                 formattingLevel: FfiConverterOptionString.read(from: &buf),
                 whisperModel: FfiConverterOptionString.read(from: &buf),
                 layeredTranscription: FfiConverterOptionString.read(from: &buf),
@@ -10008,18 +10031,15 @@ public struct FfiConverterTypeCsSettings: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.sttEndpoint, into: &buf)
         FfiConverterOptionString.write(value.sttEngine, into: &buf)
         FfiConverterOptionString.write(value.finalPassMode, into: &buf)
-        FfiConverterOptionString.write(value.llmEndpoint, into: &buf)
         FfiConverterBool.write(value.restoreClipboard, into: &buf)
         FfiConverterUInt64.write(value.restoreClipboardDelayMs, into: &buf)
         FfiConverterBool.write(value.startAtLogin, into: &buf)
         FfiConverterBool.write(value.agentEnterSends, into: &buf)
         FfiConverterBool.write(value.dumpAudioLogs, into: &buf)
-        FfiConverterOptionString.write(value.llmModel, into: &buf)
-        FfiConverterOptionString.write(value.llmFormattingEndpoint, into: &buf)
+        FfiConverterOptionString.write(value.llmFormattingProvider, into: &buf)
         FfiConverterOptionString.write(value.llmFormattingModel, into: &buf)
-        FfiConverterOptionString.write(value.llmAssistiveEndpoint, into: &buf)
-        FfiConverterOptionString.write(value.llmAssistiveModel, into: &buf)
         FfiConverterOptionString.write(value.llmAssistiveProvider, into: &buf)
+        FfiConverterOptionString.write(value.llmAssistiveModel, into: &buf)
         FfiConverterOptionString.write(value.formattingLevel, into: &buf)
         FfiConverterOptionString.write(value.whisperModel, into: &buf)
         FfiConverterOptionString.write(value.layeredTranscription, into: &buf)
@@ -12067,11 +12087,6 @@ public func FfiConverterTypeCsLicenseState_lower(_ value: CsLicenseState) -> Rus
 public enum CsLlmLane: Equatable, Hashable {
 
     /**
-     * Shared fallback lane configured by `LLM_ENDPOINT` / `LLM_MODEL`. Not a
-     * runtime lane of its own — it backs the other two when they are unset.
-     */
-    case main
-    /**
      * Automatic post-dictation formatting lane.
      */
     case formatting
@@ -12098,11 +12113,9 @@ public struct FfiConverterTypeCsLlmLane: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        case 1: return .main
+        case 1: return .formatting
 
-        case 2: return .formatting
-
-        case 3: return .assistive
+        case 2: return .assistive
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -12112,16 +12125,12 @@ public struct FfiConverterTypeCsLlmLane: FfiConverterRustBuffer {
         switch value {
 
 
-        case .main:
+        case .formatting:
             writeInt(&buf, Int32(1))
 
 
-        case .formatting:
-            writeInt(&buf, Int32(2))
-
-
         case .assistive:
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(2))
 
         }
     }
@@ -13664,6 +13673,31 @@ fileprivate struct FfiConverterSequenceTypeCsToolGrant: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCsLlmLane: FfiConverterRustBuffer {
+    typealias SwiftType = [CsLlmLane]
+
+    public static func write(_ value: [CsLlmLane], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCsLlmLane.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CsLlmLane] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CsLlmLane]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCsLlmLane.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_WAKE: Int8 = 1
 
@@ -14041,10 +14075,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeagentstatus_mcp_status() != 53810) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_add_custom_provider() != 10707) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_assistive_prompt_snapshot() != 35584) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_available_providers() != 37871) {
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_available_providers() != 906) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_await_account_login() != 4855) {
@@ -14083,10 +14120,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_get_formatting_prompt() != 56109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_key_accounts() != 23103) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_key_status() != 32281) {
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_key_status() != 48273) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_load_settings() != 21744) {
@@ -14095,13 +14129,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_mark_onboarding_done() != 62013) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_normalize_openai_responses_endpoint() != 58157) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_onboarding_mode() != 10234) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_onboarding_progress() != 28580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_remove_custom_provider() != 11187) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_reset_agent_data() != 41646) {
@@ -14134,6 +14168,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_save_onboarding_progress() != 8525) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_service_key_accounts() != 57254) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_set_api_key() != 6827) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14152,6 +14189,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_set_formatting_prompt_for_level() != 64021) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_set_lane_provider() != 7010) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_set_notes_mode() != 60930) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14167,7 +14207,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_start_account_login() != 23026) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_test_api_key() != 58988) {
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_test_api_key() != 41767) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_tray_toggles() != 33834) {
@@ -14177,6 +14217,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_update_config_many() != 23821) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_update_custom_provider() != 2582) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_admission_readiness() != 59942) {
