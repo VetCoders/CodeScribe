@@ -137,11 +137,11 @@ pub struct CsSettings {
     pub agent_enter_sends: bool,
     pub dump_audio_logs: bool,
     // ── Persisted lane selection and engine settings ──
+    /// Lane = full ProviderRef (vendor ID or `custom:<slug>`) + model; provider first.
     pub llm_formatting_provider: Option<String>,
     pub llm_formatting_model: Option<String>,
-    pub llm_assistive_model: Option<String>,
-    /// Full ProviderRef: vendor ID or `custom:<slug>`.
     pub llm_assistive_provider: Option<String>,
+    pub llm_assistive_model: Option<String>,
     pub formatting_level: Option<String>,
     pub whisper_model: Option<String>,
     /// Layered incremental transcription phase (`CODESCRIBE_LAYERED_TRANSCRIPTION`):

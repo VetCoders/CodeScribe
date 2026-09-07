@@ -692,12 +692,16 @@ enum LLMLane: String, CaseIterable, Identifiable {
 
   var modelKey: String { self == .assistive ? "LLM_ASSISTIVE_MODEL" : "LLM_FORMATTING_MODEL" }
 
+  // Spelled out as `if` on purpose: the ternary over two key-path literals
+  // crashes the type checker ("failed to produce diagnostic", Xcode 27).
   var providerPath: WritableKeyPath<CsSettings, String?> {
-    self == .assistive ? \CsSettings.llmAssistiveProvider : \CsSettings.llmFormattingProvider
+    if self == .assistive { return \CsSettings.llmAssistiveProvider }
+    return \CsSettings.llmFormattingProvider
   }
 
   var modelPath: WritableKeyPath<CsSettings, String?> {
-    self == .assistive ? \CsSettings.llmAssistiveModel : \CsSettings.llmFormattingModel
+    if self == .assistive { return \CsSettings.llmAssistiveModel }
+    return \CsSettings.llmFormattingModel
   }
 }
 
