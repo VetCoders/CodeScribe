@@ -194,20 +194,21 @@ const ANTHROPIC_IDENTITY: ProviderIdentity = ProviderIdentity {
 
 /// Every vendor row, in picker order.
 const PROVIDER_REGISTRY: [ProviderIdentity; 4] = [
+    LIBRAXIS_IDENTITY,
     OPENAI_IDENTITY,
     XAI_IDENTITY,
     ANTHROPIC_IDENTITY,
-    LIBRAXIS_IDENTITY,
 ];
 
-/// Every vendor handle, in picker order: OpenAI, xAI, Anthropic, Libraxis.
-/// Picker order is I1's call (one constant); the lane default stays OpenAI
-/// (`ProviderKind::default`).
+/// Every vendor handle, in picker order: Libraxis, OpenAI, xAI, Anthropic.
+/// Libraxis earned the first slot on a live two-part witness at integration
+/// (2026-09-07 18:16Z: `GET /v1/models` 200 with 8 aliases, one Responses call
+/// completed); the lane default stays OpenAI (`ProviderKind::default`).
 pub const ALL_PROVIDERS: [ProviderKind; 4] = [
+    ProviderKind::LibraxisResponses,
     ProviderKind::OpenAiResponses,
     ProviderKind::XaiResponses,
     ProviderKind::AnthropicMessages,
-    ProviderKind::LibraxisResponses,
 ];
 
 impl ProviderKind {
@@ -828,10 +829,10 @@ mod tests {
         assert_eq!(
             ALL_PROVIDERS,
             [
+                ProviderKind::LibraxisResponses,
                 ProviderKind::OpenAiResponses,
                 ProviderKind::XaiResponses,
                 ProviderKind::AnthropicMessages,
-                ProviderKind::LibraxisResponses,
             ]
         );
     }
@@ -1030,10 +1031,10 @@ mod tests {
                 .map(|p| p.reference.as_string())
                 .collect::<Vec<_>>(),
             [
+                "libraxis-responses",
                 "openai-responses",
                 "xai-responses",
                 "anthropic-messages",
-                "libraxis-responses",
                 "custom:api-libraxis-com",
             ]
         );

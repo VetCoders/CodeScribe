@@ -26,10 +26,10 @@ const BUNDLE_ACCOUNT: &str = "codescribe_keychain_bundle_v1";
 /// records live in the same bundle but are read from it directly, never from
 /// env.
 pub const KEYCHAIN_ACCOUNTS: &[&str] = &[
+    "LLM_LIBRAXIS_API_KEY",
     "LLM_OPENAI_API_KEY",
     "LLM_XAI_API_KEY",
     "LLM_ANTHROPIC_API_KEY",
-    "LLM_LIBRAXIS_API_KEY",
     "STT_API_KEY",
     "GITHUB_TOKEN",
 ];
@@ -576,10 +576,10 @@ mod tests {
         assert_eq!(
             KEYCHAIN_ACCOUNTS,
             &[
+                "LLM_LIBRAXIS_API_KEY",
                 "LLM_OPENAI_API_KEY",
                 "LLM_XAI_API_KEY",
                 "LLM_ANTHROPIC_API_KEY",
-                "LLM_LIBRAXIS_API_KEY",
                 "STT_API_KEY",
                 "GITHUB_TOKEN",
             ]

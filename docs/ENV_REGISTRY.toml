@@ -243,12 +243,40 @@ reload = "hot"
 category = "llm"
 description = "Shared OpenAI model fallback for LLM lanes"
 
+[vars.LLM_LIBRAXIS_API_KEY]
+default = ""
+type = "secret"
+reload = "hot"
+category = "llm"
+description = "Libraxis vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+
+[vars.LLM_OPENAI_API_KEY]
+default = ""
+type = "secret"
+reload = "hot"
+category = "llm"
+description = "OpenAI vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+
+[vars.LLM_XAI_API_KEY]
+default = ""
+type = "secret"
+reload = "hot"
+category = "llm"
+description = "xAI vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+
+[vars.LLM_ANTHROPIC_API_KEY]
+default = ""
+type = "secret"
+reload = "hot"
+category = "llm"
+description = "Anthropic vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+
 [vars.LLM_API_KEY]
 default = ""
 type = "secret"
 reload = "hot"
 category = "llm"
-description = "Shared/main OpenAI API key account; prefer Settings / macOS Keychain"
+description = "RETIRED alias of LLM_OPENAI_API_KEY (warned, removed after 2026-10-15)"
 
 [vars.LLM_FORMATTING_ENDPOINT]
 default = ""
@@ -276,7 +304,7 @@ default = ""
 type = "secret"
 reload = "hot"
 category = "llm"
-description = "Formatting-lane OpenAI API key account; prefer Settings / macOS Keychain"
+description = "RETIRED alias of LLM_OPENAI_API_KEY (warned, removed after 2026-10-15); lanes select a provider, keys live per provider"
 
 [vars.LLM_ASSISTIVE_ENDPOINT]
 default = ""
@@ -304,7 +332,7 @@ default = ""
 type = "secret"
 reload = "hot"
 category = "llm"
-description = "Assistive OpenAI API key account; prefer Settings / macOS Keychain"
+description = "RETIRED alias of LLM_OPENAI_API_KEY (warned, removed after 2026-10-15); lanes select a provider, keys live per provider"
 
 [vars.LLM_ANTHROPIC_API_KEY]
 default = ""
