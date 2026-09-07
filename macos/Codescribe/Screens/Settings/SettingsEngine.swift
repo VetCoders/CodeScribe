@@ -52,8 +52,7 @@ protocol SettingsEngine {
 
   // Keychain-backed API keys — presence booleans only, secrets never read back
   func keyStatus() -> CsKeyStatus
-  /// Non-provider Keychain accounts (STT, GitHub). Provider accounts come from
-  /// `availableProviders()` — one per vendor and per custom row.
+  /// Non-provider Keychain accounts (STT, GitHub); provider accounts ride on `CsProviderOption`.
   func serviceKeyAccounts() -> [String]
   func setApiKey(account: String, secret: String) throws
   func clearApiKey(account: String) throws
@@ -61,7 +60,6 @@ protocol SettingsEngine {
   func testApiKeyAsync(account: String) async throws -> CsApiKeyProbeResult
 
   // Provider registry (vendors + custom rows), lane binding, model discovery.
-  // Validation lives in the core (`ProviderError` → `CsError`); Swift shows it.
   func availableProviders() -> [CsProviderOption]
   func addCustomProvider(draft: CsCustomProviderDraft) throws -> CsProviderOption
   func updateCustomProvider(id: String, draft: CsCustomProviderDraft) throws -> CsProviderOption
@@ -467,10 +465,9 @@ struct MockSettingsEngine: SettingsEngine {
   }
 }
 
-/// Mock-side stand-in for the core registry's custom CRUD + lane bindings.
-/// Reference-typed so the value-typed `MockSettingsEngine` observes its own
-/// writes. Validation mirrors only what the tests read (blank name, bad scheme,
-/// unknown provider); the real rules live in `core/llm/provider.rs`.
+/// Mock-side stand-in for the core registry's custom CRUD + lane bindings —
+/// reference-typed so the value-typed engine observes its own writes. Validation
+/// covers only what tests read; the real rules live in `core/llm/provider.rs`.
 @MainActor
 final class MockProviderStore {
   enum Failure: Error, Equatable {
@@ -793,9 +790,8 @@ extension CsApiKeyProbeResult {
 }
 
 extension CsProviderOption {
-  /// Registry row shape shared by the vendor seed and the mock custom store.
-  /// Vendors require a key; custom hosts are key-optional. Only OAuth vendors
-  /// (OpenAI + xAI ship public desktop client ids, NOTICE) can be "not signed in".
+  /// Row shape shared by the vendor seed and the mock custom store. Vendors
+  /// require a key; custom hosts are key-optional; `login` marks OAuth vendors.
   static func row(
     id: String, kind: String, name: String, wire: String, endpoint: String, account: String,
     keySet: Bool = false, login: Bool = false

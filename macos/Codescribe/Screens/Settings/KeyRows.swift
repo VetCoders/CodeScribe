@@ -62,19 +62,9 @@ struct SettingsSaveButton: View {
 
 /// Neutral chip button (Test / Remove / Sign out / Edit): surface fill, hairline.
 struct SettingsChipButton<Label: View>: View {
-  let enabled: Bool
+  var enabled: Bool = true
   let action: () -> Void
-  @ViewBuilder var label: () -> Label
-
-  init(
-    enabled: Bool = true,
-    action: @escaping () -> Void,
-    @ViewBuilder label: @escaping () -> Label
-  ) {
-    self.enabled = enabled
-    self.action = action
-    self.label = label
-  }
+  let label: () -> Label
 
   var body: some View {
     Button(action: action) {
@@ -96,36 +86,13 @@ struct SettingsChipButton<Label: View>: View {
 }
 
 extension SettingsChipButton where Label == Text {
-  /// Text-only chip (the former `AccountActionButton`).
+  /// Text-only chip.
   init(_ title: String, tint: Color, enabled: Bool = true, action: @escaping () -> Void) {
     self.init(enabled: enabled, action: action) {
       Text(title)
         .font(CSFont.ui(11.5, .semibold))
         .foregroundStyle(enabled ? tint : CSColor.textFaint)
     }
-  }
-}
-
-/// Card wrapper with a presence-tinted fill (green when set, red/grey when not).
-private struct SettingsPresenceCard: ViewModifier {
-  let accent: Color
-  func body(content: Content) -> some View {
-    content
-      .padding(.horizontal, 15)
-      .padding(.vertical, 13)
-      .background(
-        RoundedRectangle(cornerRadius: 11, style: .continuous).fill(accent.opacity(0.06))
-      )
-      .overlay(
-        RoundedRectangle(cornerRadius: 11, style: .continuous)
-          .strokeBorder(accent.opacity(0.18), lineWidth: 1)
-      )
-  }
-}
-
-extension View {
-  func settingsPresenceCard(_ accent: Color) -> some View {
-    modifier(SettingsPresenceCard(accent: accent))
   }
 }
 
@@ -266,13 +233,35 @@ struct KeyRow: View {
         .accessibilityLabel("Clear \(label)")
       }
     }
-    .settingsPresenceCard(accent)
+    // Presence-tinted card: green when set, red (required) / grey (optional) when not.
+    .padding(.horizontal, 15)
+    .padding(.vertical, 13)
+    .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(accent.opacity(0.06)))
+    .overlay(
+      RoundedRectangle(cornerRadius: 11, style: .continuous)
+        .strokeBorder(accent.opacity(0.18), lineWidth: 1)
+    )
   }
 
   private func save() {
     guard !draft.isEmpty else { return }
     onSave(draft)
     draft = ""
+  }
+}
+
+extension KeyRow {
+  /// Row wired to the view-model's save / clear / test for one account.
+  init(
+    model: SettingsViewModel, account: String, label: String, isSet: Bool, optional: Bool = false
+  ) {
+    self.init(
+      account: account, label: label, isSet: isSet, optional: optional,
+      probeResult: model.keyProbeResults[account],
+      probePending: model.keyProbePending.contains(account),
+      onSave: { model.saveKey(account: account, secret: $0) },
+      onClear: { model.clearKey(account: account) },
+      onTest: { model.testKey(account: account) })
   }
 }
 
@@ -403,9 +392,6 @@ struct AccountLoginRow: View {
         .help(provider.accountStatusMessage)
         .accessibilityLabel("Sign in with \(accountBrand)")
       }
-
-      // Which credential the assistive lane actually sends (account wins over
-      // key) is stated on Agent › Request lanes, next to the resolved model.
 
       // Client id is a non-secret public app identity. OpenAI + xAI ship
       // defaults (NOTICE); operators almost never need to paste one, so the

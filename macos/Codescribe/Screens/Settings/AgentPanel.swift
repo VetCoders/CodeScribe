@@ -171,14 +171,7 @@ struct LLMLanesSection: View {
       .foregroundStyle(CSColor.textMutedAlt)
 
       if let notice = model.laneResetNotice {
-        HStack(spacing: 8) {
-          Circle().fill(CSColor.amber).frame(width: 7, height: 7)
-          Text(notice)
-            .font(CSFont.mono(11, .medium))
-            .foregroundStyle(CSColor.amber)
-            .lineLimit(2)
-        }
-        .accessibilityIdentifier("lanes-reset-notice")
+        LaneResetNotice(text: notice)
       }
 
       ForEach(LLMLane.allCases) { lane in
@@ -200,11 +193,6 @@ private struct LLMLaneEditor: View {
   @State private var modelDraft = ""
 
   private var laneModel: LLMLaneModel { model.llmLane(lane) }
-
-  private var currentModelLabel: String {
-    laneModel.modelOptions.first { $0.id == laneModel.resolvedModel }?.displayName
-      ?? laneModel.resolvedModel
-  }
 
   private var discoveryDotColor: Color {
     switch laneModel.discovery.status {
@@ -256,15 +244,11 @@ private struct LLMLaneEditor: View {
 
       SettingsControlRow(title: "Model", subtitle: lane.modelKey) {
         VStack(alignment: .trailing, spacing: 8) {
-          if laneModel.discovery.status == "loading" {
-            HStack(spacing: 7) {
-              ProgressView().controlSize(.small)
-              Text("Discovering models…")
-                .font(CSFont.mono(10.5, .medium))
-                .foregroundStyle(CSColor.textFaint)
-            }
-            .accessibilityLabel("Discovering \(lane.title) models")
-          } else if laneModel.usesDiscoveredPicker {
+          // Discovery state ("discovering…", cached, failed) is the footer line below.
+          if laneModel.usesDiscoveredPicker {
+            let current =
+              laneModel.modelOptions.first { $0.id == laneModel.resolvedModel }?.displayName
+              ?? laneModel.resolvedModel
             Menu {
               ForEach(laneModel.modelOptions, id: \.id) { option in
                 Button {
@@ -278,12 +262,12 @@ private struct LLMLaneEditor: View {
                 }
               }
             } label: {
-              SettingsMenuLabel(text: currentModelLabel)
+              SettingsMenuLabel(text: current)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .accessibilityLabel("\(lane.title) model")
-            .accessibilityValue(currentModelLabel)
+            .accessibilityValue(current)
           }
 
           // Always present: custom hosts may publish no list, and a name the

@@ -1639,11 +1639,9 @@ final class SettingsViewModel: ObservableObject {
     )
   }
 
-  /// Bind a lane to a provider (vendor id or `custom:<id>`). The bridge
-  /// validates against the registry and persists `LLM_<LANE>_PROVIDER`. The
-  /// stored model belonged to the previous provider, so it is cleared here —
-  /// the provider default (or "no model selected" for custom) is the honest
-  /// state until the operator picks one. My choice, not contract (T3 report).
+  /// Bind a lane to a provider (vendor id or `custom:<id>`); the bridge validates
+  /// and persists `LLM_<LANE>_PROVIDER`. The stored model belonged to the previous
+  /// provider, so it is cleared (integrator decision, W1-T3R).
   func setLaneProvider(_ providerId: String, for lane: LLMLane) {
     guard let engine else { return }
     do {
@@ -2268,9 +2266,7 @@ final class SettingsViewModel: ObservableObject {
 
   // MARK: - Keys (Keychain-backed; secrets never read back)
 
-  /// Friendly labels for the static Keychain accounts (vendor + service keys).
-  /// Custom-provider accounts (`LLM_CUSTOM_<ID>_API_KEY`) render as "API key"
-  /// under their own card, so they never reach this switch.
+  /// Labels for the static Keychain accounts; custom rows render "API key" on their card.
   static func keyLabel(for account: String) -> String {
     switch account {
     case "LLM_LIBRAXIS_API_KEY": return "Libraxis API key"
@@ -2285,30 +2281,27 @@ final class SettingsViewModel: ObservableObject {
 
   // MARK: - Provider registry (Settings › Providers)
 
-  /// Factory-pinned vendors in picker order (OpenAI, xAI, Anthropic).
+  /// Factory-pinned vendors in registry order.
   var vendorProviders: [CsProviderOption] { providers.filter { $0.kind == "vendor" } }
 
-  /// Operator-defined rows (`custom:<id>`), unbounded — "10 providers" is fine.
+  /// Operator-defined rows (`custom:<id>`), unbounded.
   var customProviders: [CsProviderOption] { providers.filter { $0.kind == "custom" } }
 
   /// Non-provider Keychain accounts (STT, GitHub).
   var serviceKeyAccounts: [String] { engine?.serviceKeyAccounts() ?? [] }
 
-  /// Availability dot for the lane picker: credential present (key or
-  /// account) or a key-optional host → green; vendor without a key → red.
+  /// Lane-picker dot: credential present or key-optional host → green; else red.
   static func availabilityTint(for provider: CsProviderOption) -> Color {
     provider.apiKeySet || provider.accountSignedIn || !provider.keyRequired
       ? CSColor.oliveLight : CSColor.terracottaLight
   }
 
-  /// Bridge rows are addressed by the custom slug; the picker id carries the
-  /// `custom:` prefix. Accept both (CONTRACT_GAP in the T3 report).
+  /// Bridge rows take the bare slug; the picker id carries the `custom:` prefix (§D 17:55Z).
   private static func customRowId(_ providerId: String) -> String {
     providerId.hasPrefix("custom:") ? String(providerId.dropFirst("custom:".count)) : providerId
   }
 
-  /// Validation (slug, scheme, duplicate id) is the bridge's — the thrown
-  /// error is the form's message, not a modal `lastError`.
+  /// Validation is the bridge's; the thrown error is the form's message, not a modal.
   func addCustomProvider(_ draft: CsCustomProviderDraft) throws {
     guard let engine else { return }
     _ = try engine.addCustomProvider(draft: draft)
@@ -2322,8 +2315,7 @@ final class SettingsViewModel: ObservableObject {
     refreshModelDiscovery(providerId: id)
   }
 
-  /// Removes the row and its Keychain key. Lanes that pointed at it come back
-  /// as `lanesReset`; the note is shown on both Providers and Request lanes.
+  /// Removes the row and its key; lanes that pointed at it come back as `lanesReset`.
   func removeCustomProvider(id: String) {
     guard let engine else { return }
     do {
@@ -2377,8 +2369,7 @@ final class SettingsViewModel: ObservableObject {
     }
   }
 
-  /// A key changed hands: the provider owning that account may now list (or
-  /// stop listing) models.
+  /// A key changed hands: the provider owning that account may list differently now.
   private func refreshDiscovery(forAccount account: String) {
     guard let provider = providers.first(where: { $0.apiKeyAccount == account }) else { return }
     refreshModelDiscovery(providerId: provider.id)
@@ -2491,8 +2482,7 @@ final class SettingsViewModel: ObservableObject {
     refreshAgentStatus()
   }
 
-  /// Re-run discovery for one provider (vendor or custom): the lane editor's
-  /// Refresh button and every key/provider mutation route through here.
+  /// Re-run discovery for one provider (vendor or custom).
   func refreshModelDiscovery(providerId: String) {
     refreshModelDiscoveries(providerIds: [providerId])
   }

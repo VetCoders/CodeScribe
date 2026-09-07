@@ -38,7 +38,7 @@ struct ProvidersPanel: View {
         .padding(.top, CSSpace.section)
       VStack(spacing: 8) {
         ForEach(model.vendorProviders, id: \.id) { provider in
-          VendorProviderCard(model: model, provider: provider)
+          ProviderCard(model: model, provider: provider)
         }
       }
       .padding(.top, CSSpace.control)
@@ -85,8 +85,8 @@ enum CustomProviderFormTarget: Identifiable {
 
 /// A lane lost its provider (custom row removed) and fell back to the default
 /// vendor. Rendered on Providers (where the removal happened) and on Request
-/// lanes (where the effect is), until the next refresh.
-private struct LaneResetNotice: View {
+/// lanes (where the effect is), until the next lane edit.
+struct LaneResetNotice: View {
   let text: String
 
   var body: some View {
@@ -97,67 +97,28 @@ private struct LaneResetNotice: View {
         .foregroundStyle(CSColor.amber)
         .lineLimit(2)
     }
-    .accessibilityIdentifier("providers-lane-reset-notice")
+    .accessibilityIdentifier("lane-reset-notice")
   }
 }
 
-// MARK: - Shared pieces
+// MARK: - Provider card (vendor and custom share one shell)
 
-/// "Responses" / "Messages" capsule — the one thing a vendor and a custom
-/// provider always declare.
-struct ProviderWireChip: View {
-  let wire: String
-
-  private var label: String {
-    switch wire {
-    case "messages": return "Messages"
-    case "responses": return "Responses"
-    default: return wire
-    }
-  }
-
-  var body: some View {
-    Text(label)
-      .font(CSFont.mono(10, .semibold))
-      .foregroundStyle(CSColor.textMutedAlt)
-      .padding(.horizontal, 7)
-      .padding(.vertical, 3)
-      .background(Capsule().fill(CSColor.surfaceRaised(0.05)))
-      .overlay(Capsule().strokeBorder(CSColor.hairline(0.1), lineWidth: 1))
-      .accessibilityLabel("\(label) wire")
-  }
-}
-
-/// Read-only endpoint line. Selectable for copy, never editable here.
-struct ProviderEndpointLine: View {
-  let label: String
-  let endpoint: String
-
-  var body: some View {
-    HStack(spacing: 8) {
-      Text(label)
-        .font(CSFont.mono(10, .medium))
-        .foregroundStyle(CSColor.textFaint)
-      Text(endpoint)
-        .font(CSFont.mono(11.5, .medium))
-        .foregroundStyle(CSColor.textBodyAlt)
-        .lineLimit(1)
-        .truncationMode(.middle)
-        .textSelection(.enabled)
-      Spacer(minLength: 0)
-    }
-    .accessibilityElement(children: .combine)
-    .accessibilityLabel("\(label) \(endpoint)")
-  }
-}
-
-// MARK: - Vendor card
-
-/// Factory-pinned vendor: name, wire, read-only endpoint, key, OAuth account.
+/// One registry row: name, wire, read-only endpoint (selectable, never edited
+/// here), key row. A vendor adds its OAuth account row; a custom row adds
+/// Edit / Remove — the endpoint moves only through `CustomProviderForm`.
 /// There is no endpoint setter on the view-model for a vendor — by design.
-struct VendorProviderCard: View {
+struct ProviderCard: View {
   @ObservedObject var model: SettingsViewModel
   let provider: CsProviderOption
+  var onEdit: (() -> Void)?
+
+  @State private var confirmRemove = false
+
+  private var isCustom: Bool { provider.kind == "custom" }
+  /// "Responses" / "Messages" — the one thing every provider declares.
+  private var wireLabel: String {
+    ["responses": "Responses", "messages": "Messages"][provider.wire] ?? provider.wire
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
@@ -165,12 +126,41 @@ struct VendorProviderCard: View {
         Text(provider.displayName)
           .font(CSFont.ui(14.5, .bold))
           .foregroundStyle(CSColor.textHigh)
-        ProviderWireChip(wire: provider.wire)
+        Text(wireLabel)
+          .font(CSFont.mono(10, .semibold))
+          .foregroundStyle(CSColor.textMutedAlt)
+          .padding(.horizontal, 7)
+          .padding(.vertical, 3)
+          .background(Capsule().fill(CSColor.surfaceRaised(0.05)))
+          .overlay(Capsule().strokeBorder(CSColor.hairline(0.1), lineWidth: 1))
+          .accessibilityLabel("\(wireLabel) wire")
+        Spacer(minLength: 0)
+        if isCustom {
+          SettingsChipButton("Edit", tint: CSColor.textMutedAlt) { onEdit?() }
+            .accessibilityLabel("Edit custom provider \(provider.displayName)")
+          SettingsChipButton("Remove", tint: CSColor.terracottaLight) { confirmRemove = true }
+            .accessibilityLabel("Remove custom provider \(provider.displayName)")
+        }
+      }
+      HStack(spacing: 8) {
+        Text(isCustom ? "endpoint" : "factory endpoint")
+          .font(CSFont.mono(10, .medium))
+          .foregroundStyle(CSColor.textFaint)
+        Text(provider.endpoint)
+          .font(CSFont.mono(11.5, .medium))
+          .foregroundStyle(CSColor.textBodyAlt)
+          .lineLimit(1)
+          .truncationMode(.middle)
+          .textSelection(.enabled)
         Spacer(minLength: 0)
       }
-      ProviderEndpointLine(label: "factory endpoint", endpoint: provider.endpoint)
-      ProviderKeyRow(model: model, provider: provider)
-      if provider.accountLoginEnabled || provider.accountSignedIn {
+      .accessibilityElement(children: .combine)
+      .accessibilityLabel("endpoint \(provider.endpoint)")
+      // Custom hosts are key-optional: an absent key there is neutral, not an error.
+      KeyRow(
+        model: model, account: provider.apiKeyAccount, label: "API key",
+        isSet: provider.apiKeySet, optional: !provider.keyRequired)
+      if !isCustom, provider.accountLoginEnabled || provider.accountSignedIn {
         AccountLoginRow(
           provider: provider,
           loginPending: model.accountLoginPending.contains(provider.id),
@@ -183,29 +173,21 @@ struct VendorProviderCard: View {
     }
     .csSettingsCard()
     .accessibilityElement(children: .contain)
-    .accessibilityLabel("\(provider.displayName) provider")
-  }
-}
-
-/// `KeyRow` bound to a provider's Keychain account. Custom hosts are
-/// key-optional: an absent key there is neutral, not an error.
-private struct ProviderKeyRow: View {
-  @ObservedObject var model: SettingsViewModel
-  let provider: CsProviderOption
-
-  var body: some View {
-    let account = provider.apiKeyAccount
-    KeyRow(
-      account: account,
-      label: "API key",
-      isSet: provider.apiKeySet,
-      optional: !provider.keyRequired,
-      probeResult: model.keyProbeResults[account],
-      probePending: model.keyProbePending.contains(account),
-      onSave: { model.saveKey(account: account, secret: $0) },
-      onClear: { model.clearKey(account: account) },
-      onTest: { model.testKey(account: account) }
-    )
+    .accessibilityLabel("\(provider.displayName) \(isCustom ? "custom provider" : "provider")")
+    .confirmationDialog(
+      "Remove \(provider.displayName)?",
+      isPresented: $confirmRemove,
+      titleVisibility: .visible
+    ) {
+      Button("Remove provider and its key", role: .destructive) {
+        model.removeCustomProvider(id: provider.id)
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "Deletes the provider row and its API key from the Keychain. Any request lane using it falls back to the default vendor."
+      )
+    }
   }
 }
 
@@ -246,54 +228,11 @@ struct CustomProvidersSection: View {
       } else {
         VStack(spacing: 8) {
           ForEach(model.customProviders, id: \.id) { provider in
-            CustomProviderCard(model: model, provider: provider, onEdit: { onEdit(provider) })
+            ProviderCard(model: model, provider: provider, onEdit: { onEdit(provider) })
           }
         }
         .padding(.top, 12)
       }
-    }
-  }
-}
-
-struct CustomProviderCard: View {
-  @ObservedObject var model: SettingsViewModel
-  let provider: CsProviderOption
-  let onEdit: () -> Void
-
-  @State private var confirmRemove = false
-
-  var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      HStack(spacing: 10) {
-        Text(provider.displayName)
-          .font(CSFont.ui(14.5, .bold))
-          .foregroundStyle(CSColor.textHigh)
-        ProviderWireChip(wire: provider.wire)
-        Spacer(minLength: 0)
-        SettingsChipButton("Edit", tint: CSColor.textMutedAlt, action: onEdit)
-          .accessibilityLabel("Edit custom provider \(provider.displayName)")
-        SettingsChipButton("Remove", tint: CSColor.terracottaLight) { confirmRemove = true }
-          .accessibilityLabel("Remove custom provider \(provider.displayName)")
-      }
-      ProviderEndpointLine(label: "endpoint", endpoint: provider.endpoint)
-      ProviderKeyRow(model: model, provider: provider)
-    }
-    .csSettingsCard()
-    .accessibilityElement(children: .contain)
-    .accessibilityLabel("\(provider.displayName) custom provider")
-    .confirmationDialog(
-      "Remove \(provider.displayName)?",
-      isPresented: $confirmRemove,
-      titleVisibility: .visible
-    ) {
-      Button("Remove provider and its key", role: .destructive) {
-        model.removeCustomProvider(id: provider.id)
-      }
-      Button("Cancel", role: .cancel) {}
-    } message: {
-      Text(
-        "Deletes the provider row and its API key from the Keychain. Any request lane using it falls back to the default vendor."
-      )
     }
   }
 }
@@ -330,12 +269,9 @@ struct CustomProviderForm: View {
         .font(CSFont.ui(20, .bold))
         .tracking(-0.3)
         .foregroundStyle(CSColor.textHigh)
-      Text(
-        "Any host that speaks the OpenAI Responses or Anthropic Messages wire. The endpoint is normalized to the wire's canonical path on save."
-      )
-      .font(CSFont.ui(11.5))
-      .lineSpacing(2)
-      .foregroundStyle(CSColor.textMutedAlt)
+      Text("The endpoint is normalized to the wire's canonical path on save.")
+        .font(CSFont.ui(11.5))
+        .foregroundStyle(CSColor.textMutedAlt)
 
       field("Name") {
         TextField("e.g. Libraxis", text: $name)
@@ -452,15 +388,8 @@ struct ServiceKeysSection: View {
       VStack(spacing: 8) {
         ForEach(model.serviceKeyAccounts, id: \.self) { account in
           KeyRow(
-            account: account,
-            label: SettingsViewModel.keyLabel(for: account),
-            isSet: model.keyStatus.isSet(account: account),
-            probeResult: model.keyProbeResults[account],
-            probePending: model.keyProbePending.contains(account),
-            onSave: { model.saveKey(account: account, secret: $0) },
-            onClear: { model.clearKey(account: account) },
-            onTest: { model.testKey(account: account) }
-          )
+            model: model, account: account, label: SettingsViewModel.keyLabel(for: account),
+            isSet: model.keyStatus.isSet(account: account))
         }
       }
       .padding(.top, 12)
