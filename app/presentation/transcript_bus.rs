@@ -409,12 +409,18 @@ impl TranscriptBus {
             ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. } => {
                 "apply_manual_edit"
             }
+            ReducerAction::ApplyFinalPassDocument { .. } => "apply_final_pass_document",
             ReducerAction::RecordContextMarker { .. } => "record_context_marker",
         };
         let is_user_revision = matches!(&revision.action, ReducerAction::ApplyUserRevision { .. });
+        let is_terminal_document = matches!(
+            &revision.action,
+            ReducerAction::RecordLedgerSeal { terminal: true, .. }
+                | ReducerAction::ApplyFinalPassDocument { .. }
+        );
         let phase = if is_user_revision {
             TranscriptProjectionPhase::Formatted
-        } else if reducer_action == "record_ledger_terminal_seal" {
+        } else if is_terminal_document {
             TranscriptProjectionPhase::Finalizing
         } else {
             TranscriptProjectionPhase::Listening
@@ -504,10 +510,54 @@ impl TranscriptBus {
             writer.last_projection = Some(event.clone());
             emitted.push(event);
         }
-        if matches!(
-            &revision.action,
-            ReducerAction::RecordLedgerSeal { terminal: true, .. }
-        ) {
+        // A final-pass document can settle a session that sealed no
+        // occurrence at all (Silero heard nothing, Whisper heard everything).
+        // Its coordinates are the decoded PCM range and it carries no acoustic
+        // receipt, because none exists; the row still reaches the canvas.
+        if let ReducerAction::ApplyFinalPassDocument { receipt } = &revision.action
+            && revision.entries.is_empty()
+        {
+            let event = TranscriptBusEvidenceEvent {
+                schema: "codescribe.transcript-evidence.v1".to_string(),
+                sequence: writer.sequence.saturating_add(1),
+                emitted_at: Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
+                session_id: self.session.session_id.clone(),
+                mode: self.session.mode,
+                reducer_revision: revision.revision,
+                reducer_action: reducer_action.to_string(),
+                occurrence_session_id: receipt.session_id.clone(),
+                capture_epoch: receipt.capture_epoch,
+                sample_start: receipt.range.sample_start,
+                sample_end: receipt.range.sample_end,
+                document_index: 0,
+                label: receipt.rendered_text.clone(),
+                rendered_text: revision.rendered_text.clone(),
+                phase,
+                can_paste: availability.can_paste,
+                can_insert: availability.can_insert,
+                can_copy: availability.can_copy,
+                can_retranscribe: availability.can_retranscribe,
+                can_format: availability.can_format,
+                terminal: is_user_revision,
+                acoustic_receipts: Vec::new(),
+                seal_coverage: revision
+                    .seal_coverage
+                    .as_ref()
+                    .map(ProjectedSealCoverageReceipt::from),
+                comparison: revision
+                    .comparison
+                    .as_ref()
+                    .map(ProjectedTranscriptComparisonReceipt::from),
+            };
+            match self.write_evidence_event_locked(&mut writer, &event) {
+                Ok(()) => {
+                    writer.last_projection = Some(event.clone());
+                    emitted.push(event);
+                }
+                Err(error) => self.log_write_error(error),
+            }
+        }
+        if is_terminal_document {
             writer.sealed = true;
         }
         emitted

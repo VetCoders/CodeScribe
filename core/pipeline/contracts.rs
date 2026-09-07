@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::inline_format::OccurrenceLabelProposal;
 use crate::pipeline::acoustic_ledger::{
-    LedgerSealReceipt, MutationReceipt, ObservationIdentity, SealCoverageReceipt,
-    TranscriptComparisonReceipt,
+    FinalPassDocumentReceipt, LedgerSealReceipt, MutationReceipt, ObservationIdentity,
+    SealCoverageReceipt, TranscriptComparisonReceipt,
 };
 use crate::stt::tail_provider::TailSampleRange;
 
@@ -639,6 +639,11 @@ pub enum EngineEvent {
         receipt: SealCoverageReceipt,
         comparison: Option<TranscriptComparisonReceipt>,
     },
+    /// The whole-session file pass became the terminal document because the
+    /// sealed occurrences did not cover the measured speech. Reducer, Bus, and
+    /// Swift project it; the ledger minted it.
+    #[serde(skip)]
+    FinalPassDocument { receipt: FinalPassDocumentReceipt },
     /// Proposal-only output from the sole automatic post-ASR author. The
     /// reducer may admit it only through the ledger and only for coordinates
     /// of an occurrence that already exists.

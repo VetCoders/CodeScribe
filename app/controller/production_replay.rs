@@ -135,6 +135,9 @@ fn project_ledger_truth(events: &[EngineEvent], ledger: &mut AcousticLedger) -> 
                 ..
             } => reducer.apply_ledger_mutation(ledger, observation, receipt),
             EngineEvent::LedgerSeal { receipt } => reducer.apply_ledger_seal(receipt),
+            EngineEvent::FinalPassDocument { receipt } => {
+                Some(reducer.apply_final_pass_document(receipt))
+            }
             EngineEvent::OccurrenceLabelProposal { proposal } => {
                 // `apply_occurrence_label_proposal` returns `(formatter_returned, revision)`.
                 // Offline replay projection tracks rendered document text updates via `revision`;
