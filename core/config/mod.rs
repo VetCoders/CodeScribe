@@ -48,9 +48,6 @@ pub mod storage_reset;
 /// Config enums and the main `Config` struct definitions.
 mod types;
 
-// Vendor endpoints are pinned in the provider registry; this one is re-exported
-// for the account-auth module.
-pub use crate::llm::provider::DEFAULT_OPENAI_RESPONSES_ENDPOINT;
 // Re-export types
 pub use types::{
     Config, DeferredInsertShortcut, HoldArmModifier, ModeBinding, OverlayPositionMode,

@@ -1736,8 +1736,10 @@ async fn call_llm_endpoint(
 /// Resolve assistive-lane auth: signed-in ChatGPT OAuth wins over a stored API key.
 /// Returns `(secret, bearer_only)` — OAuth tokens must not also go out as `x-api-key`.
 async fn resolve_lane_auth(lane: &RuntimeLlmLane) -> Result<(String, bool)> {
-    if lane.credential().account_auth() {
-        let token = account_auth::access_token(lane.provider())
+    if lane.credential().account_auth()
+        && let Some(vendor) = lane.vendor()
+    {
+        let token = account_auth::access_token(vendor)
             .await
             .map_err(|error| anyhow::anyhow!("Provider account authentication failed: {error}"))?;
         return Ok((token, true));
@@ -1753,9 +1755,7 @@ async fn resolve_lane_auth(lane: &RuntimeLlmLane) -> Result<(String, bool)> {
     Ok((api_key.unwrap_or_default(), false))
 }
 
-/// Call LLM endpoint with SSE streaming (Responses API)
-///
-/// Uses mode-aware config: LLM_{FORMATTING,ASSISTIVE}_{ENDPOINT,MODEL,API_KEY}
+/// Call LLM endpoint with SSE streaming (Responses API) through the sealed lane.
 async fn call_llm_endpoint_streaming(
     user_message: &str,
     system_prompt: &str,
@@ -1885,8 +1885,6 @@ mod tests {
         "LLM_TEMPERATURE",
         "CODESCRIBE_ANTHROPIC_MAX_TOKENS",
     ];
-    /// Env flag set in the runtime-lanes child process so nested tests skip re-spawn.
-    const RUNTIME_LLM_LANES_TEST_CHILD: &str = "CODESCRIBE_RUNTIME_LLM_LANES_TEST_CHILD";
 
     /// The stale-chain classifier keys on the provider's error code alone:
     /// `previous_response_not_found` (id minted under a rotated-away key) is
@@ -2324,150 +2322,120 @@ mod tests {
         let _f4 = format_text_with_status_for_policy("test", None, &runtime_settings);
     }
 
-    /// Saved settings win over stale env — a settings change takes effect on the
-    /// next request, not the next restart.
-    ///
-    /// Re-executes itself as a child process with an isolated data dir and
-    /// deliberately stale `LLM_*` env. That indirection is required: the lane
-    /// resolvers read process-global state, so the contract cannot be observed
-    /// honestly from inside a shared test process.
+    /// Saved settings win on the next seal — a settings change takes effect on
+    /// the next request, not the next restart. Provider and model come from
+    /// `settings.json` through the one resolution path in the loader.
     #[test]
-    fn runtime_llm_lanes_read_fresh_settings_after_save() {
-        if std::env::var_os(RUNTIME_LLM_LANES_TEST_CHILD).is_none() {
-            let data_dir = tempfile::TempDir::new().expect("isolated data dir");
-            let executable = std::env::current_exe().expect("current core test executable");
-            let status = std::process::Command::new(executable)
-                .arg("--exact")
-                .arg("llm::ai_formatting::tests::runtime_llm_lanes_read_fresh_settings_after_save")
-                .arg("--nocapture")
-                .env(RUNTIME_LLM_LANES_TEST_CHILD, "1")
-                .env("CODESCRIBE_DATA_DIR", data_dir.path())
-                .env("CODESCRIBE_DISABLE_KEYCHAIN", "1")
-                .envs([
-                    ("LLM_FORMATTING_PROVIDER", "openai-responses"),
-                    (
-                        "LLM_FORMATTING_ENDPOINT",
-                        "https://stale-formatting.example/v1",
-                    ),
-                    ("LLM_FORMATTING_MODEL", "stale-formatting-model"),
-                    ("LLM_ASSISTIVE_PROVIDER", "openai-responses"),
-                    (
-                        "LLM_ASSISTIVE_ENDPOINT",
-                        "https://stale-assistive.example/v1",
-                    ),
-                    ("LLM_ASSISTIVE_MODEL", "stale-assistive-model"),
-                ])
-                .status()
-                .expect("run isolated runtime LLM lanes test");
-            assert!(
-                status.success(),
-                "isolated runtime LLM lanes test failed: {status}"
-            );
-            return;
-        }
-
-        crate::config::UserSettings {
-            llm_formatting_endpoint: Some("https://fresh-formatting.example/v1".to_string()),
-            llm_formatting_model: Some("fresh-formatting-model".to_string()),
-            llm_assistive_provider: Some("openai-responses".to_string()),
-            llm_assistive_endpoint: Some("https://fresh-assistive.example/v1".to_string()),
-            llm_assistive_model: Some("fresh-assistive-model".to_string()),
-            ..Default::default()
-        }
-        .save()
-        .expect("persist lane settings");
-
-        let snapshot = Config::load_runtime_snapshot().expect("seal runtime settings");
-        assert_eq!(
-            snapshot.llm_lanes().formatting().endpoint(),
-            "https://fresh-formatting.example/v1/responses"
-        );
-        assert_eq!(
-            snapshot.llm_lanes().formatting().model(),
-            "fresh-formatting-model"
-        );
-        assert_eq!(
-            snapshot.llm_lanes().assistive().endpoint(),
-            "https://fresh-assistive.example/v1/responses"
-        );
-        assert_eq!(
-            snapshot.llm_lanes().assistive().model(),
-            "fresh-assistive-model"
-        );
-    }
-
-    #[tokio::test]
     #[serial]
-    async fn every_runtime_llm_lane_authenticates_from_the_key_present_at_request_time() {
-        use crate::config::RuntimeLlmLaneKind;
-        use crate::state::conversation::{AiMode, reset_conversation_for_mode};
-
+    fn runtime_llm_lanes_read_fresh_settings_after_save() {
         let data_dir = tempfile::TempDir::new().expect("isolated data dir");
-        let mut server = mockito::Server::new_async().await;
-        let endpoint = format!("{}/v1/responses", server.url());
         let mut env = TestEnv::clean();
         env.set(
             "CODESCRIBE_DATA_DIR",
             data_dir.path().to_str().expect("utf-8 test data path"),
         );
         env.set("CODESCRIBE_DISABLE_KEYCHAIN", "1");
-        env.set("LLM_ENDPOINT", &endpoint);
-        env.set("LLM_MODEL", "gpt-test-main");
-        env.set("LLM_FORMATTING_PROVIDER", "openai-responses");
-        env.set("LLM_FORMATTING_ENDPOINT", &endpoint);
-        env.set("LLM_FORMATTING_MODEL", "gpt-test-formatting");
-        env.set("LLM_ASSISTIVE_PROVIDER", "openai-responses");
-        env.set("LLM_ASSISTIVE_ENDPOINT", &endpoint);
-        env.set("LLM_ASSISTIVE_MODEL", "gpt-test-assistive");
-        for key in [
-            "LLM_API_KEY",
-            "LLM_FORMATTING_API_KEY",
-            "LLM_ASSISTIVE_API_KEY",
-        ] {
+        for key in LANE_SELECTOR_ENV_KEYS {
             env.guards.push(EnvGuard::remove(key));
         }
+        let mut settings = crate::config::UserSettings {
+            llm_formatting_provider: Some("xai-responses".to_string()),
+            llm_formatting_model: Some("grok-fresh".to_string()),
+            llm_assistive_provider: Some("anthropic-messages".to_string()),
+            llm_assistive_model: Some("claude-fresh".to_string()),
+            ..Default::default()
+        };
+        settings.save().expect("persist lane settings");
 
-        // Seal the lane topology before any credential exists. This mirrors
-        // the production controller created through `new_without_keychain()`.
+        let snapshot = Config::load_runtime_snapshot().expect("seal runtime settings");
+        assert_eq!(
+            snapshot.llm_lanes().formatting().endpoint(),
+            "https://api.x.ai/v1/responses"
+        );
+        assert_eq!(snapshot.llm_lanes().formatting().model(), "grok-fresh");
+        assert_eq!(
+            snapshot.llm_lanes().assistive().endpoint(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(snapshot.llm_lanes().assistive().model(), "claude-fresh");
+
+        settings.llm_assistive_model = Some("claude-fresher".to_string());
+        settings.save().expect("persist changed model");
+        let snapshot = Config::load_runtime_snapshot().expect("re-seal runtime settings");
+        assert_eq!(snapshot.llm_lanes().assistive().model(), "claude-fresher");
+    }
+
+    /// Every env selector that could hand a lane a provider or a model.
+    const LANE_SELECTOR_ENV_KEYS: [&str; 4] = [
+        "LLM_FORMATTING_PROVIDER",
+        "LLM_FORMATTING_MODEL",
+        "LLM_ASSISTIVE_PROVIDER",
+        "LLM_ASSISTIVE_MODEL",
+    ];
+
+    /// Both lanes on one Custom row at the mock server, sealed before any key
+    /// exists (the production controller built through `new_without_keychain`);
+    /// the key that appears in the Keychain bundle afterwards is what every
+    /// request authenticates with — Custom keys never pass through env.
+    #[tokio::test]
+    #[serial]
+    async fn every_runtime_llm_lane_authenticates_from_the_key_present_at_request_time() {
+        use crate::config::RuntimeLlmLaneKind;
+        use crate::config::keychain::test_support::install_bundle;
+        use crate::llm::provider::{CustomProvider, WireFamily};
+        use crate::state::conversation::{AiMode, reset_conversation_for_mode};
+
+        let data_dir = tempfile::TempDir::new().expect("isolated data dir");
+        let mut server = mockito::Server::new_async().await;
+        let mut env = TestEnv::clean();
+        env.set(
+            "CODESCRIBE_DATA_DIR",
+            data_dir.path().to_str().expect("utf-8 test data path"),
+        );
+        env.set("CODESCRIBE_DISABLE_KEYCHAIN", "1");
+        for key in LANE_SELECTOR_ENV_KEYS {
+            env.guards.push(EnvGuard::remove(key));
+        }
+        let row = CustomProvider::new("Witness Box", WireFamily::OpenAiResponses, &server.url())
+            .expect("valid custom row");
+        let account = row.key_account();
+        let mut settings = crate::config::UserSettings::default();
+        settings.add_custom_provider(row).expect("add custom row");
+        settings.llm_formatting_provider = Some("custom:witness-box".to_string());
+        settings.llm_formatting_model = Some("gpt-test-formatting".to_string());
+        settings.llm_assistive_provider = Some("custom:witness-box".to_string());
+        settings.llm_assistive_model = Some("gpt-test-assistive".to_string());
+        settings.save().expect("persist lane settings");
+
+        // Seal the lane topology before any credential exists.
+        let _empty_bundle = install_bundle(&[]);
         let snapshot = Config::load_runtime_snapshot().expect("seal credential-free topology");
         for lane in [
-            RuntimeLlmLaneKind::Main,
             RuntimeLlmLaneKind::Formatting,
             RuntimeLlmLaneKind::Assistive,
         ] {
+            let lane = snapshot.llm_lanes().lane(lane);
+            assert_eq!(lane.credential().key_account(), account);
             assert!(
-                snapshot
-                    .llm_lanes()
-                    .lane(lane)
-                    .credential()
-                    .api_key()
-                    .is_none(),
+                lane.credential().api_key().is_none(),
                 "baseline snapshot must not already contain the test credential",
             );
         }
 
         let cases = [
             (
-                RuntimeLlmLaneKind::Main,
-                "LLM_API_KEY",
-                "synthetic-main-key",
-                false,
-            ),
-            (
                 RuntimeLlmLaneKind::Formatting,
-                "LLM_FORMATTING_API_KEY",
                 "synthetic-formatting-key",
                 false,
             ),
             (
                 RuntimeLlmLaneKind::Assistive,
-                "LLM_ASSISTIVE_API_KEY",
                 "synthetic-assistive-key",
                 true,
             ),
         ];
-        for (kind, account, synthetic_key, assistive) in cases {
-            env.set(account, synthetic_key);
+        for (kind, synthetic_key, assistive) in cases {
+            let _bundle = install_bundle(&[(account.as_str(), synthetic_key)]);
             let expected_authorization = format!("Bearer {synthetic_key}");
             let mock = server
                 .mock("POST", "/v1/responses")

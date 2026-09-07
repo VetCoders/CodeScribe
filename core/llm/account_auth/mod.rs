@@ -522,7 +522,7 @@ fn responses_probe_endpoint(provider: ProviderKind) -> Option<String> {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| crate::config::DEFAULT_OPENAI_RESPONSES_ENDPOINT.to_string()),
+                .unwrap_or_else(|| ProviderKind::OpenAiResponses.endpoint().to_string()),
         ),
         _ => None,
     }
