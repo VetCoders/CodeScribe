@@ -1004,13 +1004,24 @@ mod tests {
     /// precedence, so setting the env var stands in for "the user saved a key
     /// in Settings after launch".
     #[test]
+    #[serial_test::serial]
     fn fresh_seal_sees_a_key_saved_after_construction() {
         let agent = CodescribeAgent::default();
-        // SAFETY: test-local env mutation; no other test in this binary
-        // touches LLM_ASSISTIVE_API_KEY concurrently.
-        unsafe { std::env::set_var("LLM_ASSISTIVE_API_KEY", "witness-fresh-seal") };
+        let account = agent
+            .current_settings()
+            .llm_lanes()
+            .assistive()
+            .credential()
+            .key_account()
+            .to_string();
+        let previous = codescribe_core::config::keychain::cached_runtime_key(&account);
+        codescribe_core::config::keychain::save_key(&account, "witness-fresh-seal").unwrap();
         let fresh = agent.current_settings();
-        unsafe { std::env::remove_var("LLM_ASSISTIVE_API_KEY") };
+        if let Some(previous) = previous {
+            codescribe_core::config::keychain::save_key(&account, &previous).unwrap();
+        } else {
+            codescribe_core::config::keychain::delete_key(&account).unwrap();
+        }
         assert_eq!(
             fresh.llm_lanes().assistive().credential().api_key(),
             Some("witness-fresh-seal"),
