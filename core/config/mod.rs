@@ -28,6 +28,8 @@ pub mod energy_calibration;
 mod install_interlock;
 /// macOS Keychain storage for API keys (not plaintext `.env`).
 pub mod keychain;
+/// One-shot legacy LLM lane fields → provider registry shape.
+mod llm_migration;
 /// Load/save: defaults, settings.json, optional `.env`, process env overrides.
 mod loader;
 /// One-time legacy `.env` import into settings.json + Keychain.
@@ -46,11 +48,6 @@ pub mod storage_reset;
 /// Config enums and the main `Config` struct definitions.
 mod types;
 
-pub use defaults::{
-    DEFAULT_ASSISTIVE_MODEL, DEFAULT_FORMATTING_MODEL, DEFAULT_LLM_MODEL,
-    DEFAULT_OPENAI_RESPONSES_ENDPOINT, default_assistive_model, default_formatting_model,
-    default_llm_endpoint, default_llm_endpoint_option, default_llm_model,
-};
 // Re-export types
 pub use types::{
     Config, DeferredInsertShortcut, HoldArmModifier, ModeBinding, OverlayPositionMode,
@@ -75,11 +72,11 @@ pub use portable::{
     write_portable_export,
 };
 pub use settings::{
-    FormattingPolicy, PromptSource, RuntimeAiExecution, RuntimeAiRequestTiming,
-    RuntimeFormatterExecution, RuntimeLlmCredential, RuntimeLlmLane, RuntimeLlmLaneKind,
-    RuntimeLlmLanes, RuntimeSealedPrompt, RuntimeSettingsSnapshot, SettingsLoaderInput,
-    SettingsSnapshotDigest, SettingsSnapshotProvenance, SettingsSnapshotValidation,
-    SettingsSnapshotValidationError, UserSettings,
+    FormattingPolicy, PromptSource, RemovedCustomProvider, RuntimeAiExecution,
+    RuntimeAiRequestTiming, RuntimeFormatterExecution, RuntimeLlmCredential, RuntimeLlmLane,
+    RuntimeLlmLaneKind, RuntimeLlmLanes, RuntimeSealedPrompt, RuntimeSettingsSnapshot,
+    SettingsLoaderInput, SettingsSnapshotDigest, SettingsSnapshotProvenance,
+    SettingsSnapshotValidation, SettingsSnapshotValidationError, UserSettings,
 };
 pub use storage_reset::{AppDataResetGuard, begin_app_data_reset};
 pub use types::Language;

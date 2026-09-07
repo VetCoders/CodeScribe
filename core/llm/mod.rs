@@ -19,5 +19,5 @@ pub mod model_discovery;
 pub mod provider;
 /// SSE client for OpenAI-compatible `/v1/responses` streaming.
 pub mod responses_streaming_manager;
-/// Vendor-pinned endpoints, auth, and docs-seeded parsers.
+/// Vendor wire specifications (one self-contained module per pinned vendor).
 pub mod vendors;

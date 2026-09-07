@@ -4,6 +4,7 @@
 //! macOS Keychain. This is an import path, not an ongoing precedence rule.
 
 use super::keychain;
+use super::llm_migration::{SpeechV2Legacy, migrate_legacy_llm_lanes};
 use super::settings::{FormattingPolicy, UserSettings, parse_agent_workspace_roots};
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -37,17 +38,32 @@ pub fn migrate_if_needed(file_env: Option<&HashMap<String, String>>) {
     if let Some(v) = migrated_value(file_env, "WHISPER_LANGUAGE") {
         settings.whisper_language = Some(v);
     }
-    if let Some(v) = migrated_value(file_env, "LLM_ENDPOINT") {
-        settings.llm_endpoint = Some(v);
-    }
-    if let Some(v) = migrated_value(file_env, "LLM_MODEL") {
-        settings.llm_model = Some(v);
-    }
-    if let Some(v) = migrated_value(file_env, "LLM_ASSISTIVE_ENDPOINT") {
-        settings.llm_assistive_endpoint = Some(v);
-    }
-    if let Some(v) = migrated_value(file_env, "LLM_ASSISTIVE_MODEL") {
-        settings.llm_assistive_model = Some(v);
+    // LLM lanes: the legacy endpoint/model/provider rows go through the same
+    // one-shot migration as a legacy settings.json (vendor by host, Custom row
+    // otherwise); the key rows below land directly in the account each lane
+    // resolved to.
+    let legacy_llm = SpeechV2Legacy {
+        llm_endpoint: migrated_value(file_env, "LLM_ENDPOINT"),
+        llm_model: migrated_value(file_env, "LLM_MODEL"),
+        formatting_endpoint: migrated_value(file_env, "LLM_FORMATTING_ENDPOINT"),
+        formatting_model: migrated_value(file_env, "LLM_FORMATTING_MODEL"),
+        assistive_endpoint: migrated_value(file_env, "LLM_ASSISTIVE_ENDPOINT"),
+        assistive_model: migrated_value(file_env, "LLM_ASSISTIVE_MODEL"),
+        assistive_provider: migrated_value(file_env, "LLM_ASSISTIVE_PROVIDER"),
+    };
+    let legacy_key_targets: HashMap<String, String> = if legacy_llm.needs_migration() {
+        migrate_legacy_llm_lanes(&legacy_llm, &mut settings)
+            .into_iter()
+            .map(|step| (step.from, step.to))
+            .collect()
+    } else {
+        settings.llm_formatting_model = legacy_llm.formatting_model.clone();
+        settings.llm_assistive_model = legacy_llm.assistive_model.clone();
+        settings.llm_assistive_provider = legacy_llm.assistive_provider.clone();
+        HashMap::new()
+    };
+    if let Some(v) = migrated_value(file_env, "LLM_FORMATTING_PROVIDER") {
+        settings.llm_formatting_provider = Some(v);
     }
     if let Some(v) = migrated_value(file_env, "FORMATTING_LEVEL") {
         match FormattingPolicy::parse(&v) {
@@ -56,12 +72,6 @@ pub fn migrate_if_needed(file_env: Option<&HashMap<String, String>>) {
         }
     }
     // Promoted fields (previously .env only)
-    if let Some(v) = migrated_value(file_env, "LLM_FORMATTING_ENDPOINT") {
-        settings.llm_formatting_endpoint = Some(v);
-    }
-    if let Some(v) = migrated_value(file_env, "LLM_FORMATTING_MODEL") {
-        settings.llm_formatting_model = Some(v);
-    }
     if let Some(v) = migrated_value(file_env, "LOCAL_MODEL") {
         settings.local_model = Some(v);
     }
@@ -168,10 +178,18 @@ pub fn migrate_if_needed(file_env: Option<&HashMap<String, String>>) {
     // Migrate API keys to Keychain before writing settings.json. The existence
     // of settings.json is the migration-complete sentinel, so a failed secret
     // write must leave the migration retryable on the next launch.
-    for &account in keychain::KEYCHAIN_ACCOUNTS {
-        if let Some(secret) = migrated_value(file_env, account)
+    let key_rows = keychain::KEYCHAIN_ACCOUNTS
+        .iter()
+        .map(|account| (*account, account.to_string()))
+        .chain(
+            legacy_key_targets
+                .iter()
+                .map(|(from, to)| (from.as_str(), to.clone())),
+        );
+    for (source, account) in key_rows {
+        if let Some(secret) = migrated_value(file_env, source)
             && !secret.is_empty()
-            && let Err(e) = save_migrated_key(account, &secret)
+            && let Err(e) = save_migrated_key(&account, &secret)
         {
             tracing::warn!(
                 "Migration: failed to save {account} to Keychain; will retry on next launch: {e}"
@@ -481,10 +499,10 @@ mod tests {
         let _tmp = setup_isolated_data_dir();
         let mut file_env = HashMap::new();
         file_env.insert("WHISPER_LANGUAGE".to_string(), "en".to_string());
-        file_env.insert("LLM_API_KEY".to_string(), "retry-secret".to_string());
+        file_env.insert("LLM_OPENAI_API_KEY".to_string(), "retry-secret".to_string());
 
-        set_test_save_key_failure(Some("LLM_API_KEY"));
-        remove_env_for_test("LLM_API_KEY");
+        set_test_save_key_failure(Some("LLM_OPENAI_API_KEY"));
+        remove_env_for_test("LLM_OPENAI_API_KEY");
 
         migrate_if_needed(Some(&file_env));
 
@@ -493,7 +511,7 @@ mod tests {
             "failed keychain save must not mark migration complete"
         );
         assert!(
-            std::env::var("LLM_API_KEY").is_err(),
+            std::env::var("LLM_OPENAI_API_KEY").is_err(),
             "injected failure happens before test key persistence"
         );
 
@@ -505,12 +523,12 @@ mod tests {
             "retry after keychain recovery should complete migration"
         );
         assert_eq!(
-            std::env::var("LLM_API_KEY").as_deref(),
+            std::env::var("LLM_OPENAI_API_KEY").as_deref(),
             Ok("retry-secret"),
             "retry writes the migrated secret"
         );
 
-        remove_env_for_test("LLM_API_KEY");
+        remove_env_for_test("LLM_OPENAI_API_KEY");
         remove_env_for_test("CODESCRIBE_DATA_DIR");
     }
 
@@ -521,7 +539,7 @@ mod tests {
         let _tmp = setup_isolated_data_dir();
         let mut first_env = HashMap::new();
         first_env.insert("WHISPER_LANGUAGE".to_string(), "en".to_string());
-        first_env.insert("LLM_API_KEY".to_string(), "first-secret".to_string());
+        first_env.insert("LLM_OPENAI_API_KEY".to_string(), "first-secret".to_string());
 
         migrate_if_needed(Some(&first_env));
 
@@ -530,11 +548,17 @@ mod tests {
             path.exists(),
             "successful migration writes completion sentinel"
         );
-        assert_eq!(std::env::var("LLM_API_KEY").as_deref(), Ok("first-secret"));
+        assert_eq!(
+            std::env::var("LLM_OPENAI_API_KEY").as_deref(),
+            Ok("first-secret")
+        );
 
         let mut second_env = HashMap::new();
         second_env.insert("WHISPER_LANGUAGE".to_string(), "pl".to_string());
-        second_env.insert("LLM_API_KEY".to_string(), "second-secret".to_string());
+        second_env.insert(
+            "LLM_OPENAI_API_KEY".to_string(),
+            "second-secret".to_string(),
+        );
 
         migrate_if_needed(Some(&second_env));
 
@@ -545,12 +569,12 @@ mod tests {
             "existing settings.json skips re-migration"
         );
         assert_eq!(
-            std::env::var("LLM_API_KEY").as_deref(),
+            std::env::var("LLM_OPENAI_API_KEY").as_deref(),
             Ok("first-secret"),
             "existing completion sentinel skips duplicate key migration"
         );
 
-        remove_env_for_test("LLM_API_KEY");
+        remove_env_for_test("LLM_OPENAI_API_KEY");
         remove_env_for_test("CODESCRIBE_DATA_DIR");
     }
 }
