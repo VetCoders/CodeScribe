@@ -948,71 +948,16 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertNil(state.errorMessage)
   }
 
-  func testUserEditCommitsOnlyThroughReturnedRustProjection() async {
+  func testEngineRevisionReplacesTerminalDocumentWithoutALocalEdit() {
     let state = OverlayState()
-    let engine = OverlayStateTestEngine()
-    state.engine = engine
-    projectText(
-      "Tekst bazowy",
-      to: state,
-      canPaste: true,
-      canInsert: true,
-      canCopy: true,
-      terminal: true,
-      sessionId: "revision-session",
-      reducerRevision: 7
-    )
-    state.revisionDraft = "Tekst poprawiony"
-    let requested = expectation(description: "revision intent reached Rust bridge")
-    engine.onRevision = { requested.fulfill() }
-
-    state.relayIntent(.commitRevision)
-    await fulfillment(of: [requested], timeout: 1)
-
-    XCTAssertEqual(
-      engine.revisionRequests,
-      [
-        OverlayStateTestEngine.RevisionRequest(
-          sessionId: "revision-session",
-          sourceRevision: 7,
-          renderedText: "Tekst poprawiony"
-        )
-      ]
-    )
-    XCTAssertEqual(state.formattedText, "Tekst bazowy", "FFI acknowledgement is not projection")
-    XCTAssertEqual(state.revision, 7)
-    XCTAssertTrue(state.revisionCommitPending)
-
-    projectText(
-      "Tekst poprawiony",
-      to: state,
-      canPaste: true,
-      canInsert: true,
-      canCopy: true,
-      terminal: true,
-      sessionId: "revision-session",
-      reducerRevision: 8,
-      reducerAction: "apply_manual_edit",
-      manualEditReceipt: "user-edit-revision-session-7-8-1"
-    )
-
-    XCTAssertEqual(state.formattedText, "Tekst poprawiony")
-    XCTAssertEqual(state.revisionDraft, "Tekst poprawiony")
+    projectText("Tekst bazowy", to: state, terminal: true, reducerRevision: 7)
+    let text = "  Tekst poprawiony\nraz raz  "
+    projectText(text, to: state, canCopy: true, terminal: true, reducerRevision: 8,
+      reducerAction: "apply_manual_edit", manualEditReceipt: "user-edit-test-7-8")
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
     XCTAssertEqual(state.revision, 8)
-    XCTAssertFalse(state.revisionCommitPending)
-    XCTAssertEqual(state.userRevisionProvenance, "user-edit-revision-session-7-8-1")
-    XCTAssertEqual(
-      OverlayIntentRail.projectedIntents(for: state),
-      [.insertPaste, .copy, .close],
-      "delivery actions return only after the new ledger projection"
-    )
-
-    state.insertCaretInCodescribeProbe = { false }
-    let pasted = expectation(description: "new revision reached delivery")
-    engine.onPaste = { pasted.fulfill() }
-    state.relayIntent(.insertPaste)
-    await fulfillment(of: [pasted], timeout: 1)
-    XCTAssertEqual(engine.pastedText, "Tekst poprawiony")
+    XCTAssertEqual(state.userRevisionProvenance, "user-edit-test-7-8")
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [.copy, .close])
   }
 
   func testFormatCommitsOnlyThroughFormatterProjectionAndFailureStaysVisible() async {
@@ -1055,9 +1000,8 @@ final class OverlayStateTests: XCTestCase {
     )
 
     XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
-    XCTAssertEqual(state.revisionDraft, engine.formatterRenderedText)
     XCTAssertFalse(state.formatterCommitPending)
-    XCTAssertNil(state.revisionCommitError)
+    XCTAssertNil(state.formatterError)
     XCTAssertNil(state.userRevisionProvenance, "formatter is not a human correction")
 
     engine.formatterShouldFail = true
@@ -1069,28 +1013,7 @@ final class OverlayStateTests: XCTestCase {
 
     XCTAssertFalse(state.formatterCommitPending)
     XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
-    XCTAssertTrue(state.revisionCommitError?.contains("gateway unavailable") == true)
-  }
-
-  func testDiscardAndCloseCancelDraftWithoutCreatingRevision() async {
-    let state = OverlayState()
-    let engine = OverlayStateTestEngine()
-    state.engine = engine
-    projectText("Ledger text", to: state, terminal: true, reducerRevision: 3)
-
-    state.revisionDraft = "Focus-exit draft"
-    state.scheduleRevisionCommitAfterFocusExit()
-    state.discardRevisionDraft()
-    await Task.yield()
-    XCTAssertEqual(state.revisionDraft, "Ledger text")
-    XCTAssertTrue(engine.revisionRequests.isEmpty, "discard must cancel deferred focus commit")
-
-    state.revisionDraft = "Close draft"
-    state.close()
-    await Task.yield()
-    XCTAssertEqual(state.formattedText, "Ledger text")
-    XCTAssertEqual(state.revisionDraft, "Ledger text")
-    XCTAssertTrue(engine.revisionRequests.isEmpty, "close must not create a document revision")
+    XCTAssertTrue(state.formatterError?.contains("gateway unavailable") == true)
   }
 
   func testCloseIsImmediateAndAgentButtonUsesControllerDelivery() async {

@@ -143,7 +143,7 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(engine.formatterRequests[0].sessionId, "intent-rail-fixture")
     XCTAssertEqual(engine.formatterRequests[0].sourceRevision, 1)
     XCTAssertTrue(state.formatterCommitPending, "FFI acknowledgement is not projection")
-    XCTAssertNil(state.revisionCommitError)
+    XCTAssertNil(state.formatterError)
   }
 
   func testCollapsedDockHasOnlyHandleAndExpandedDockSwapsInProjection() {
@@ -163,30 +163,9 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(OverlayDockLayout.minimumCanvasWidth, 320)
   }
 
-  func testDirtyRevisionReplacesDeliveryActionsWithCommitOrDiscard() {
-    let state = projectedState(
-      phase: "formatted",
-      text: "ledger text",
-      canPaste: true,
-      canInsert: true,
-      canCopy: true,
-      canRetranscribe: true,
-      canFormat: true,
-      terminal: true
-    )
-
-    state.revisionDraft = "local draft"
-
-    XCTAssertEqual(
-      OverlayIntentRail.projectedIntents(for: state),
-      [.commitRevision, .discardRevision, .close]
-    )
-    XCTAssertEqual(state.formattedText, "ledger text")
-  }
-
   func testEveryIntentHasVoiceOverCopyAndRailReportsProjectedPhase() {
     let intents: [OverlayIntent] = [
-      .finish, .commitRevision, .discardRevision, .copy, .insertPaste, .retranscribe, .format,
+      .finish, .copy, .insertPaste, .retranscribe, .format,
       .close,
     ]
 
@@ -194,8 +173,6 @@ final class OverlayIntentRailTests: XCTestCase {
       intents.map(\.accessibilityLabel),
       [
         "Finish recording",
-        "Commit transcript revision",
-        "Discard transcript draft",
         "Copy transcript",
         "Insert transcript",
         "Retranscribe recording",

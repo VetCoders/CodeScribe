@@ -275,7 +275,7 @@ struct DictationOverlayView: View {
   private var transcriptScroll: some View {
     VStack(alignment: .leading, spacing: 0) {
       LiveTranscriptTextView(
-        text: state.activeText,
+        projection: state.latestTranscriptProjection,
         appearance: palette.appearance
       )
       .modifier(OverlayScrollEdgeEffects())
