@@ -270,7 +270,9 @@ pub struct UserSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stt_endpoint: Option<String>,
+    pub stt_file_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stt_live_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_send_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1161,7 +1163,7 @@ impl RuntimeSettingsSnapshot {
 /// scars of exactly that failure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
-struct SettingsV2 {
+pub(super) struct SettingsV2 {
     schema_version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     interaction: Option<InteractionV2>,
@@ -1287,7 +1289,9 @@ struct SpeechEngineV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     local_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cloud_transcription_endpoint: Option<String>,
+    file_transcription_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    live_transcription_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cloud_max_upload_mb: Option<u64>,
     // De-ghosted (2026-05-30): Whisper model id (distinct from local_model_id path).
@@ -1519,6 +1523,8 @@ pub const PROMOTED_SETTINGS_KEYS: &[&str] = &[
     "USE_LOCAL_STT",
     "LOCAL_MODEL",
     "STT_ENDPOINT",
+    "STT_FILE_ENDPOINT",
+    "STT_LIVE_ENDPOINT",
     "TRANSCRIPT_SEND_MODE",
     "AUDIO_INPUT_DEVICE",
     SILERO_FUSION_ENV,
@@ -1565,7 +1571,7 @@ impl UserSettings {
     /// `schema_version: 3` and normalized values, so re-saving an older file
     /// upgrades it in place. Every field added to `UserSettings` must be routed
     /// here and in [`Self::from_v2`], or it ghosts on the next round-trip.
-    fn to_v2(&self) -> SettingsV2 {
+    pub(super) fn to_v2(&self) -> SettingsV2 {
         let normalized_mode_bindings = self.mode_bindings_normalized();
         SettingsV2 {
             schema_version: 3,
@@ -1594,7 +1600,8 @@ impl UserSettings {
                         .use_local_stt
                         .map(|v| if v { "local_whisper" } else { "cloud_whisper" }.to_string()),
                     local_model_id: self.local_model.clone(),
-                    cloud_transcription_endpoint: self.stt_endpoint.clone(),
+                    file_transcription_endpoint: self.stt_file_endpoint.clone(),
+                    live_transcription_endpoint: self.stt_live_endpoint.clone(),
                     cloud_max_upload_mb: self.backend_max_upload_mb,
                     whisper_model: self.whisper_model.clone(),
                     stt_engine: self.stt_engine.clone(),
@@ -1685,7 +1692,7 @@ impl UserSettings {
     /// back to the product defaults (`apple` / `smart`). An empty
     /// `speech.engine: {}` used to leave them unset, handing the decision to
     /// whatever the environment happened to say.
-    fn from_v2(v2: SettingsV2) -> Self {
+    pub(super) fn from_v2(v2: SettingsV2) -> Self {
         Self {
             whisper_language: v2.speech.as_ref().and_then(|s| s.language.clone()),
             hold_exclusive: v2
@@ -1811,11 +1818,16 @@ impl UserSettings {
                 .as_ref()
                 .and_then(|s| s.engine.as_ref())
                 .and_then(|e| e.local_model_id.clone()),
-            stt_endpoint: v2
+            stt_file_endpoint: v2
                 .speech
                 .as_ref()
                 .and_then(|s| s.engine.as_ref())
-                .and_then(|e| e.cloud_transcription_endpoint.clone()),
+                .and_then(|e| e.file_transcription_endpoint.clone()),
+            stt_live_endpoint: v2
+                .speech
+                .as_ref()
+                .and_then(|s| s.engine.as_ref())
+                .and_then(|e| e.live_transcription_endpoint.clone()),
             transcript_send_mode: v2.interaction.as_ref().and_then(|i| i.send_mode.clone()),
             audio_input_device: v2.audio.as_ref().and_then(|a| a.input_device_id.clone()),
             seal_lane_armed: v2
@@ -2071,7 +2083,12 @@ impl UserSettings {
                                         backup_path.display()
                                     );
                                 }
-                                if let Err(e) = v1.save_unlocked() {
+                                let mut settings = Self::from_v2(v1.to_v2());
+                                Self::migrate_legacy_llm_lanes_once(
+                                    &value_for_legacy,
+                                    &mut settings,
+                                );
+                                if let Err(e) = settings.save_unlocked() {
                                     warn!("Failed hard-migrating settings V1 -> V2: {e}");
                                 } else {
                                     info!(
@@ -2079,11 +2096,6 @@ impl UserSettings {
                                         backup_path.display()
                                     );
                                 }
-                                let mut settings = Self::from_v2(v1.to_v2());
-                                Self::migrate_legacy_llm_lanes_once(
-                                    &value_for_legacy,
-                                    &mut settings,
-                                );
                                 settings
                             }
                             Err(e) => {
@@ -2103,7 +2115,11 @@ impl UserSettings {
                     "No settings file at {} ({e}), using defaults",
                     path.display()
                 );
-                Self::default()
+                let mut settings = Self::default();
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    super::stt_migration::migrate_legacy_stt_lanes_once(&mut settings);
+                }
+                settings
             }
         }
     }
@@ -2114,10 +2130,17 @@ impl UserSettings {
     /// fields, so the next load finds nothing to migrate.
     fn migrate_legacy_llm_lanes_once(raw: &serde_json::Value, settings: &mut Self) {
         let legacy = super::llm_migration::SpeechV2Legacy::from_json(raw);
+        // Prepare both migrations before either serializer can discard the other
+        // domain's legacy fields. A crash between saves must not lose LLM intent.
+        let moves = if legacy.needs_migration() {
+            super::llm_migration::migrate_legacy_llm_lanes(&legacy, settings)
+        } else {
+            Vec::new()
+        };
+        super::stt_migration::migrate_legacy_stt_lanes_once(settings);
         if !legacy.needs_migration() {
             return;
         }
-        let moves = super::llm_migration::migrate_legacy_llm_lanes(&legacy, settings);
         match settings.save_unlocked() {
             // Hand back exactly what the next load will read: `to_v2` normalizes
             // on the way out (mode bindings and friends), so the first post-migration
@@ -2284,7 +2307,7 @@ impl UserSettings {
     }
 
     /// Persist while the settings transaction lock and app-data admission are held.
-    fn save_unlocked(&self) -> anyhow::Result<()> {
+    pub(super) fn save_unlocked(&self) -> anyhow::Result<()> {
         let dir = Self::settings_dir();
         fs::create_dir_all(&dir)?;
         let path = Self::settings_path();
@@ -2444,7 +2467,36 @@ impl UserSettings {
             "TRANSCRIPT_TAG_TEMPLATE" => self.transcript_tag_template = Some(value.to_owned()),
             "LLM_FORMATTING_MODEL" => self.llm_formatting_model = Some(value.to_owned()),
             "LOCAL_MODEL" => self.local_model = Some(value.to_owned()),
-            "STT_ENDPOINT" => self.stt_endpoint = Some(value.to_owned()),
+            "STT_ENDPOINT" => {
+                warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT");
+                let legacy = super::stt_migration::SttV2Legacy::from_endpoint(value);
+                let mut migrated = Self::default();
+                super::stt_migration::migrate_legacy_stt_lanes(&legacy, &mut migrated);
+                self.stt_file_endpoint = migrated.stt_file_endpoint;
+                self.stt_live_endpoint = migrated.stt_live_endpoint;
+            }
+            "STT_FILE_ENDPOINT" | "STT_LIVE_ENDPOINT" => {
+                let lane = if key == "STT_FILE_ENDPOINT" {
+                    crate::stt::SttLane::File
+                } else {
+                    crate::stt::SttLane::Live
+                };
+                let endpoint = if value.trim().is_empty() {
+                    None
+                } else {
+                    match crate::stt::validate_stt_endpoint(lane, value) {
+                        Ok(endpoint) => Some(endpoint),
+                        Err(error) => {
+                            warn!(%error, "Rejected STT endpoint write");
+                            return;
+                        }
+                    }
+                };
+                match lane {
+                    crate::stt::SttLane::File => self.stt_file_endpoint = endpoint,
+                    crate::stt::SttLane::Live => self.stt_live_endpoint = endpoint,
+                }
+            }
             "TRANSCRIPT_SEND_MODE" => self.transcript_send_mode = Some(value.to_owned()),
             "AUDIO_INPUT_DEVICE" => self.audio_input_device = Some(value.to_owned()),
             "SOUND_NAME" => self.sound_name = Some(value.to_owned()),

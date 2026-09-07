@@ -1440,8 +1440,8 @@ mod tests {
     /// Blank `ReportEnvironment` fixture — no endpoints or keys, corpus reference.
     fn mock_environment() -> ReportEnvironment {
         ReportEnvironment {
-            stt_endpoint: None,
-            stt_api_key_present: false,
+            stt_file_endpoint: None,
+            stt_file_api_key_present: false,
             llm_formatting_endpoint: None,
             llm_formatting_model: None,
             llm_formatting_key_present: false,

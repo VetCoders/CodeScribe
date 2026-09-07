@@ -105,10 +105,11 @@ impl Config {
         Self::load_with_keychain_population(true)
     }
 
-    /// Load runtime configuration without reading Keychain.
+    /// Load runtime configuration without bootstrapping Keychain accounts.
     ///
-    /// This is for UI/runtime surfaces that must not trigger a macOS Keychain
-    /// password prompt as a side effect of starting local dictation.
+    /// During the STT alias transition, the mandated one-shot migration and
+    /// legacy-key fallback can still access Keychain. Resolved snapshot rows
+    /// themselves never perform secret I/O.
     pub fn load_without_keychain() -> Self {
         Self::load_with_keychain_population(false)
     }
@@ -180,10 +181,12 @@ impl Config {
         let llm_lanes = Self::resolve_runtime_llm_lanes(&user_settings);
         let ai_execution = Self::resolve_runtime_ai_execution(formatting_policy);
         let mut digest_values = values.clone();
-        digest_values.stt_api_key = digest_values
-            .stt_api_key
-            .as_ref()
-            .map(|_| "<redacted:present>".to_string());
+        for key in [
+            &mut digest_values.stt_file_api_key,
+            &mut digest_values.stt_live_api_key,
+        ] {
+            *key = key.as_ref().map(|_| "<redacted:present>".to_string());
+        }
         let digest_material = format!(
             "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\n{}\n{}\n{}",
             formatting_policy.as_str(),
@@ -527,6 +530,21 @@ impl Config {
             }
         }
 
+        // STT rows retain explicit .env overrides, including on subsequent loads.
+        if let Some(file_env) = file_env_vars.as_ref() {
+            if let Some(raw) = file_env.get("STT_ENDPOINT") {
+                config.apply_stt_endpoint_alias(raw);
+            }
+            for (name, target) in [
+                ("STT_FILE_ENDPOINT", &mut config.stt_file_endpoint),
+                ("STT_LIVE_ENDPOINT", &mut config.stt_live_endpoint),
+            ] {
+                if let Some(value) = file_env.get(name) {
+                    *target = Some(value.clone());
+                }
+            }
+        }
+
         // Override with environment variables (explicit runtime env + injected env-managed .env).
         config.load_from_env();
         config.sanitize();
@@ -668,6 +686,22 @@ impl Config {
             if std::env::var_os(key).is_none() {
                 Self::config_init_set_env(key, value);
             }
+        }
+    }
+
+    fn apply_stt_endpoint_alias(&mut self, raw: &str) {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT (removed after 2026-10-15)"));
+        let mut migrated = UserSettings::default();
+        super::stt_migration::migrate_legacy_stt_lanes(
+            &super::stt_migration::SttV2Legacy::from_endpoint(raw),
+            &mut migrated,
+        );
+        if let Some(value) = migrated.stt_file_endpoint {
+            self.stt_file_endpoint = Some(value);
+        }
+        if let Some(value) = migrated.stt_live_endpoint {
+            self.stt_live_endpoint = Some(value);
         }
     }
 
@@ -829,17 +863,37 @@ impl Config {
             self.quick_notes_save_only = matches!(val.as_str(), "1" | "true" | "yes" | "on");
         }
 
-        // Backends - STT
-        if let Ok(val) = Self::config_runtime_env_var("STT_ENDPOINT") {
-            self.stt_endpoint = Some(val);
+        // Current lane rows override the warned legacy aliases through 2026-10-15.
+        if let Ok(raw) = Self::config_runtime_env_var("STT_ENDPOINT") {
+            self.apply_stt_endpoint_alias(&raw);
+        }
+        for (name, target) in [
+            ("STT_FILE_ENDPOINT", &mut self.stt_file_endpoint),
+            ("STT_LIVE_ENDPOINT", &mut self.stt_live_endpoint),
+            ("STT_FILE_API_KEY", &mut self.stt_file_api_key),
+            ("STT_LIVE_API_KEY", &mut self.stt_live_api_key),
+        ] {
+            if let Ok(value) = Self::config_runtime_env_var(name) {
+                *target = Some(value);
+            }
+        }
+        // The retired account is deliberately absent from KEYCHAIN_ACCOUNTS.
+        if let Some(key) = std::env::var("STT_API_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| super::keychain::load_key("STT_API_KEY"))
+        {
+            static WARN: std::sync::Once = std::sync::Once::new();
+            WARN.call_once(|| warn!("STT_API_KEY is retired; use STT_FILE_API_KEY / STT_LIVE_API_KEY (removed after 2026-10-15)"));
+            for target in [&mut self.stt_file_api_key, &mut self.stt_live_api_key] {
+                if target.as_deref().is_none_or(|v| v.trim().is_empty()) {
+                    *target = Some(key.clone());
+                }
+            }
         }
         if let Ok(val) = Self::config_runtime_env_var("CODESCRIBE_STT_INITIAL_PROMPT_ENABLED") {
             self.stt_initial_prompt_enabled =
                 matches!(val.as_str(), "1" | "true" | "yes" | "on" | "enabled");
-        }
-        // STT_API_KEY for cloud STT
-        if let Ok(val) = Self::config_runtime_env_var("STT_API_KEY") {
-            self.stt_api_key = Some(val);
         }
 
         // Local STT (Pure Rust Whisper)
@@ -1050,11 +1104,21 @@ impl Config {
             self.local_model = v.clone();
         }
 
-        // STT endpoint
-        if Self::config_runtime_env_var("STT_ENDPOINT").is_err()
-            && let Some(ref v) = settings.stt_endpoint
-        {
-            self.stt_endpoint = Some(v.clone());
+        for (name, target, value) in [
+            (
+                "STT_FILE_ENDPOINT",
+                &mut self.stt_file_endpoint,
+                &settings.stt_file_endpoint,
+            ),
+            (
+                "STT_LIVE_ENDPOINT",
+                &mut self.stt_live_endpoint,
+                &settings.stt_live_endpoint,
+            ),
+        ] {
+            if Self::config_runtime_env_var(name).is_err() {
+                *target = value.clone();
+            }
         }
 
         // Transcript send mode
@@ -1352,7 +1416,32 @@ impl Config {
                             Some(FormattingPolicy::parse(value)?.as_str().to_string())
                     }
                     "LOCAL_MODEL" => settings_ref.local_model = Some((*value).to_string()),
-                    "STT_ENDPOINT" => settings_ref.stt_endpoint = Some((*value).to_string()),
+                    "STT_FILE_ENDPOINT" | "STT_LIVE_ENDPOINT" => {
+                        let lane = if *key == "STT_FILE_ENDPOINT" {
+                            crate::stt::SttLane::File
+                        } else {
+                            crate::stt::SttLane::Live
+                        };
+                        let endpoint = if value.trim().is_empty() {
+                            None
+                        } else {
+                            Some(crate::stt::validate_stt_endpoint(lane, value)?)
+                        };
+                        match lane {
+                            crate::stt::SttLane::File => settings_ref.stt_file_endpoint = endpoint,
+                            crate::stt::SttLane::Live => settings_ref.stt_live_endpoint = endpoint,
+                        }
+                    }
+                    "STT_ENDPOINT" => {
+                        let mut migrated = UserSettings::default();
+                        super::stt_migration::migrate_legacy_stt_lanes(
+                            &super::stt_migration::SttV2Legacy::from_endpoint(value),
+                            &mut migrated,
+                        );
+                        settings_ref.stt_file_endpoint = migrated.stt_file_endpoint;
+                        settings_ref.stt_live_endpoint = migrated.stt_live_endpoint;
+                        warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT");
+                    }
                     "TRANSCRIPT_SEND_MODE" => {
                         settings_ref.transcript_send_mode = Some((*value).to_string())
                     }
@@ -3106,7 +3195,7 @@ mod tests {
         restore_env_for_test("AI_FORMATTING_ENABLED", previous);
     }
 
-    /// Non-promoted env-managed keys (e.g. STT_API_KEY) still load from optional .env.
+    /// Non-promoted env-managed keys (e.g. STT_FILE_API_KEY) still load from optional .env.
     #[test]
     #[serial]
     fn test_load_still_honors_env_managed_values_from_optional_env_file() {
@@ -3114,10 +3203,13 @@ mod tests {
 
         let env_path = Config::env_path();
         fs::create_dir_all(env_path.parent().expect("env dir")).expect("create env dir");
-        fs::write(&env_path, "STT_API_KEY=test-from-env-file\n").expect("write .env");
+        fs::write(&env_path, "STT_FILE_API_KEY=test-from-env-file\n").expect("write .env");
 
         let config = Config::load();
-        assert_eq!(config.stt_api_key.as_deref(), Some("test-from-env-file"));
+        assert_eq!(
+            config.stt_file_api_key.as_deref(),
+            Some("test-from-env-file")
+        );
     }
 
     /// Explicit runtime env must not synthesize or persist into settings.json.

@@ -292,6 +292,7 @@ pub async fn check_health() -> Result<bool> {
 /// # Ok(())
 /// # }
 /// ```
+/// Endpoint and credential come from `Config::stt_lane`.
 pub async fn transcribe_cloud(
     path: &Path,
     language: Option<&str>,
