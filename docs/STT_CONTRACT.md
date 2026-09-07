@@ -109,6 +109,20 @@ At terminal coverage time the live engine runs one local, in-process Whisper
 pass over the retained PCM (first measured speech sample to last). Its
 whole-session string is always comparison evidence (`SealCoverage.comparison`).
 
+**Whisper timestamp termination.** In timestamp mode, decoded words must be
+followed by a native closing timestamp before end-of-text. When the model
+prefers end-of-text inside an open span, the next token is selected from its
+remaining timestamp logits. The token watchdog and decoder context limit also
+reserve a closing-clock step. This preserves already decoded words when the
+long-file assembler consumes timestamped segments; it does not invent a time
+from the window boundary or infer timing from the text. Closed spans may end
+normally. Sampling cannot select end-of-text while a span is still open.
+Long-file decoding always requests native timestamps, including when a direct
+caller disables them for single-window output. Existing PCM-overlap ownership
+remains unchanged; text equality is never used to remove repeated words. The
+former split-and-discard path is removed: a failed window cannot
+be silently omitted from a successful file verdict.
+
 **Terminal settlement (2026-09-07, take 18bce670).** The ledger compares sealed
 occurrence coverage with measured speech and settles the session one of three
 ways. _Complete_ coverage: the occurrence document is terminal and the ledger

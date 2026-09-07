@@ -7,11 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Release reality
 
-| Version  | Repository milestone | Public distribution status                                                                         |
-| -------- | -------------------- | -------------------------------------------------------------------------------------------------- |
-| `0.13.3` | 2026-08-13           | **Latest published GitHub Release** (`v0.13.3`), signed, notarized, and stapled.                   |
-| `0.14.0` | 2026-08-17           | Source/daily-build milestone only; no Git tag or GitHub Release was published.                     |
-| `0.14.1` | 2026-08-18 onward    | Current source version and release candidate; no Git tag or GitHub Release has been published yet. |
+| Version  | Repository milestone | Public distribution status                                                                        |
+| -------- | -------------------- | ------------------------------------------------------------------------------------------------- |
+| `0.13.3` | 2026-08-13           | **Latest published GitHub Release** (`v0.13.3`), signed, notarized, and stapled.                  |
+| `0.14.0` | 2026-08-17           | Source/daily-build milestone only; no Git tag or GitHub Release was published.                    |
+| `0.14.1` | 2026-08-18           | Source/daily-build milestone; no GitHub Release was published.                                    |
+| `0.15.0` | 2026-09-07           | Current integrated candidate; local DMG verification is separate from a published GitHub Release. |
 
 The sections below distinguish code milestones from public releases. A version
 number in `Cargo.toml` is not evidence that a DMG, tag, appcast, or GitHub
@@ -19,13 +20,19 @@ Release exists.
 
 ## [Unreleased]
 
-> The `0.14.1` stabilization fight: retire Q8 completely, compose and validate
+> The `0.15.0` stabilization work: retire Q8 completely, compose and validate
 > one loader-compatible FP16/F32 Whisper bundle, make Apple and Whisper observe
 > the same PCM clock, stop text-only deduplication from deleting intentional
 > repetitions, and make every admitted correction and stop outcome auditable.
-> This work is in source; it is not yet a public `v0.14.1` release.
+> This work is in source; it is not yet a public `v0.15.0` GitHub release.
 
 ### Added
+
+- **Human-readable live transcription and file batches.** `codescribe transcribe live` follows committed app transcript projections, while file mode accepts
+  multiple inputs and streams decoded windows before the complete result.
+- **Finder transcription.** The "Transcribe with Codescribe" Quick Action
+  transcribes selected audio/video files into adjacent text files, preserves
+  existing results, and copies successful transcripts to the clipboard.
 
 - **Acoustic occurrence, observation, and mutation receipts.** The live path
   separates what was spoken on the PCM clock from what Apple/Whisper observed
@@ -50,6 +57,14 @@ Release exists.
   provider-session lease/cursor plus active names across provider recovery.
 
 ### Fixed
+
+- **Whisper words at decoder termination.** Timestamp mode closes the current
+  span with a model-selected native clock before end-of-text or the token limit.
+  Long-file assembly requires timestamps and no longer silently discards a
+  failed window. Diagnostic logs stay on stderr rather than transcript stdout.
+- **Provider credential migration survives retries.** Pending key moves are
+  persisted until acknowledged; custom endpoints with different paths, ports,
+  or wire formats keep separate identities.
 
 - **Repeated speech is no longer deleted by string equality.** Light+ stopped
   collapsing every immediately repeated word, and decoder-loop cleanup now

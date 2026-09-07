@@ -297,6 +297,11 @@ fn apply_timestamp_rules(
     if sampled_tokens.is_empty() {
         logits[..timestamp_begin].fill(f32::NEG_INFINITY);
     }
+    if sampled_tokens.is_empty() || (last_was_timestamp && !penultimate_was_timestamp) {
+        // An opening clock needs a later native clock to close it. The last
+        // clock in the vocabulary can close a span, but cannot open one.
+        logits[timestamp_end] = f32::NEG_INFINITY;
+    }
 
     let timestamp_max = logits[timestamp_begin..=timestamp_end]
         .iter()
@@ -318,6 +323,42 @@ fn apply_timestamp_rules(
         .fold(f32::NEG_INFINITY, f32::max);
     if timestamp_logsumexp > max_text_logit {
         logits[..timestamp_begin].fill(f32::NEG_INFINITY);
+    }
+    prepare_timestamp_termination(logits, sampled_tokens, eot_token, range, false);
+}
+
+/// Stopping may not strand decoded words outside native timestamp spans.
+/// Keep the model's clock scores; only constrain which token class may follow.
+fn prepare_timestamp_termination(
+    logits: &mut [f32],
+    sampled_tokens: &[u32],
+    eot_token: u32,
+    range: &timestamps::TimestampRange,
+    force_close: bool,
+) {
+    let open_span = sampled_tokens
+        .last()
+        .is_some_and(|token| !range.is_timestamp(*token))
+        && sampled_tokens
+            .iter()
+            .any(|token| range.is_timestamp(*token));
+    if !open_span {
+        return;
+    }
+    let eot = logits
+        .get(eot_token as usize)
+        .copied()
+        .unwrap_or(f32::NEG_INFINITY);
+    let model_wants_end = eot.is_finite() && logits.iter().all(|score| *score <= eot);
+    if force_close || model_wants_end {
+        for (token, score) in logits.iter_mut().enumerate() {
+            if !range.is_timestamp(token as u32) {
+                *score = f32::NEG_INFINITY;
+            }
+        }
+    } else if let Some(score) = logits.get_mut(eot_token as usize) {
+        // Sampling can otherwise select EOT even when it is not the argmax.
+        *score = f32::NEG_INFINITY;
     }
 }
 
@@ -678,7 +719,7 @@ impl LocalWhisperEngine {
             }
         };
 
-        self.transcribe_samples_16k_raw(&samples, language, debug_tokens)
+        self.transcribe_samples_16k_raw(&samples, language, debug_tokens, false)
     }
 
     /// Transcribe arbitrarily long audio in VAD-aligned, overlapping windows.
@@ -763,60 +804,16 @@ impl LocalWhisperEngine {
         let mut logprob_sum = 0.0_f32;
         let mut logprob_count = 0_u32;
         let mut worst_compression = 0.0_f32;
-        let mut refused_windows = 0_u32;
 
-        // Time-ordered work stack: a window whose decode carries words but no
-        // closed timestamp span (a runaway decode never emits the closing
-        // clock token) is re-tried as two halves before it is refused.
-        let mut pending: Vec<(f32, f32, u8)> = windows
-            .into_iter()
-            .rev()
-            .map(|(start_sec, end_sec)| (start_sec, end_sec, 0_u8))
-            .collect();
-
-        while let Some((start_sec, end_sec, splits)) = pending.pop() {
+        for (start_sec, end_sec) in windows {
             let start = ((start_sec * 16_000.0).round() as usize).min(samples.len());
             let end = ((end_sec * 16_000.0).round() as usize).min(samples.len());
             if end <= start {
                 continue;
             }
             let chunk = &samples[start..end];
-            let mut transcript = self.transcribe_samples_16k_raw(chunk, language, debug_tokens)?;
-
-            // `merge_chunk_transcripts` refuses words without timestamp
-            // provenance by contract. That refusal is the WINDOW's verdict,
-            // not the file's: retry shorter, then drop the window and keep
-            // `covered_until_secs` where it was so the neighbour's overlap
-            // re-describes as much of the hole as it can.
-            if transcript.segments.is_empty() && !transcript.text.trim().is_empty() {
-                let window_chars = transcript.text.chars().count();
-                if splits < SEGMENTLESS_WINDOW_MAX_SPLITS
-                    && end_sec - start_sec >= SEGMENTLESS_WINDOW_MIN_SPLIT_SECS
-                {
-                    let mid_sec = (start_sec + end_sec) / 2.0;
-                    tracing::warn!(
-                        window_start = start_sec,
-                        window_end = end_sec,
-                        chars = window_chars,
-                        split = splits + 1,
-                        "long-file window decoded words without a closed timestamp span; \
-                         retrying as two halves"
-                    );
-                    pending.push((mid_sec, end_sec, splits + 1));
-                    pending.push((start_sec, mid_sec, splits + 1));
-                    continue;
-                }
-                refused_windows += 1;
-                tracing::warn!(
-                    window_start = start_sec,
-                    window_end = end_sec,
-                    chars = window_chars,
-                    refused_windows,
-                    "long-file window refused: words without timestamp provenance \
-                     after retries; this span is missing from the transcript"
-                );
-                continue;
-            }
+            let mut transcript =
+                self.transcribe_samples_16k_raw(chunk, language, debug_tokens, true)?;
 
             if let Some(lp) = transcript.avg_logprob {
                 logprob_sum += lp;
@@ -850,15 +847,6 @@ impl LocalWhisperEngine {
             )?;
             on_segments(&merged.segments[prior_segments..])?;
             covered_until_secs = covered_until_secs.max(end_sec);
-        }
-
-        if refused_windows > 0 {
-            tracing::warn!(
-                refused_windows,
-                total_secs,
-                "long-file transcript assembled with refused windows; \
-                 the missing spans are logged above"
-            );
         }
 
         Ok(RawTranscript {
@@ -976,6 +964,7 @@ impl LocalWhisperEngine {
         samples_16k: &[f32],
         language: Option<&str>,
         debug_tokens: bool,
+        require_timestamps: bool,
     ) -> Result<RawTranscript> {
         ensure!(!samples_16k.is_empty(), "audio is empty");
 
@@ -1022,7 +1011,12 @@ impl LocalWhisperEngine {
         {
             tokens.push(t);
         }
-        let timestamps_enabled = self.decoding_params.emit_timestamps && self.ts_range.is_some();
+        ensure!(
+            !require_timestamps || self.ts_range.is_some(),
+            "long-file assembly requires a Whisper model with native timestamp tokens"
+        );
+        let timestamps_enabled =
+            (require_timestamps || self.decoding_params.emit_timestamps) && self.ts_range.is_some();
         if !timestamps_enabled
             && let Some(t) = self.tokenizer.token_to_id("<|notimestamps|>")
             && (t as usize) < self.config.vocab_size
@@ -1078,6 +1072,8 @@ impl LocalWhisperEngine {
         let mut token_count = 0usize;
 
         for step in 0..max_new_tokens {
+            let at_decode_limit = all_tokens.len() >= runaway_budget
+                || (timestamps_enabled && step + 1 == max_new_tokens);
             if all_tokens.len() >= runaway_budget {
                 tracing::warn!(
                     "Runaway watchdog tripped: {} tokens for {:.2}s audio (budget {})",
@@ -1085,6 +1081,15 @@ impl LocalWhisperEngine {
                     audio_sec,
                     runaway_budget
                 );
+            }
+            if at_decode_limit
+                && (!timestamps_enabled
+                    || all_tokens.last().is_none_or(|token| {
+                        self.ts_range
+                            .as_ref()
+                            .is_some_and(|range| range.is_timestamp(*token))
+                    }))
+            {
                 break;
             }
             let token_tensor = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
@@ -1119,6 +1124,17 @@ impl LocalWhisperEngine {
                     no_timestamps_token,
                     range,
                 );
+                if at_decode_limit {
+                    // Spend the last decoder position on the model-selected
+                    // closing clock, never on words that assembly cannot retain.
+                    prepare_timestamp_termination(
+                        &mut logits_vec,
+                        &all_tokens,
+                        eot_token,
+                        range,
+                        true,
+                    );
+                }
             }
 
             // Avoid terminating immediately when nothing has been emitted yet
@@ -1177,6 +1193,10 @@ impl LocalWhisperEngine {
 
             // Track logprobs (5. Logprob Threshold)
             {
+                ensure!(
+                    best_val.is_finite(),
+                    "Whisper decoder has no finite legal token at step {step}"
+                );
                 let max_val = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exp_sum: f32 = logits_vec.iter().map(|&x| (x - max_val).exp()).sum();
                 let token_prob = (logits_vec[best_token as usize] - max_val).exp() / exp_sum;
@@ -1203,6 +1223,9 @@ impl LocalWhisperEngine {
 
             tokens.push(best_token);
             all_tokens.push(best_token);
+            if at_decode_limit {
+                break;
+            }
         }
 
         let (text, segments) = if timestamps_enabled {
@@ -1210,6 +1233,12 @@ impl LocalWhisperEngine {
                 .ts_range
                 .as_ref()
                 .ok_or_else(|| anyhow!("Timestamp range missing despite emit_timestamps=true"))?;
+            ensure!(
+                all_tokens
+                    .last()
+                    .is_none_or(|token| range.is_timestamp(*token)),
+                "Whisper decoder stopped with an unclosed native timestamp span"
+            );
             timestamps::extract_segments(&all_tokens, &self.tokenizer, range)
         } else {
             (
@@ -1970,15 +1999,6 @@ pub(crate) fn silence_spans_from_vad_probabilities(
     spans
 }
 
-/// How many times a long-file window may be halved after decoding words
-/// without a closed timestamp span (2 = down to quarters of the planned
-/// window) before that span is refused and the file continues without it.
-const SEGMENTLESS_WINDOW_MAX_SPLITS: u8 = 2;
-
-/// Windows shorter than this are not split further; a runaway decode on
-/// two seconds of audio is refused outright.
-const SEGMENTLESS_WINDOW_MIN_SPLIT_SECS: f32 = 2.0;
-
 /// Merge the next window's transcript onto the accumulated one, deduplicating
 /// the overlap REGION by segment time instead of by text.
 ///
@@ -2026,6 +2046,101 @@ mod stt_live_first_v2_red {
     use super::*;
     use crate::pipeline::contracts::{RawTranscript, TranscriptSegment};
 
+    #[test]
+    fn end_of_text_must_close_the_native_timestamp_span_first() {
+        let range = timestamps::TimestampRange {
+            begin: 5,
+            end_inclusive: 7,
+        };
+        // The model wants to stop after a word. Its best closing clock is 6.
+        let mut logits = vec![0.0, 1.0, 0.0, 10.0, 0.0, 0.0, 4.0, 3.0];
+        apply_timestamp_rules(&mut logits, &[5, 1], 3, Some(4), &range);
+        assert!(logits[..5].iter().all(|value| *value == f32::NEG_INFINITY));
+        assert_eq!(
+            logits[6], 4.0,
+            "closing clock must retain the model's score"
+        );
+        assert_eq!(logits[7], 3.0);
+    }
+
+    #[test]
+    fn token_budget_closes_with_model_scores_and_preserves_all_decoded_words() {
+        use tokenizers::{Tokenizer, models::wordlevel::WordLevel};
+        let tokenizer = Tokenizer::new(
+            WordLevel::builder()
+                .vocab(
+                    [
+                        ("[UNK]".to_string(), 0),
+                        ("pierwsze".to_string(), 1),
+                        ("ostatnie".to_string(), 2),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .unk_token("[UNK]".to_string())
+                .build()
+                .unwrap(),
+        );
+        let range = timestamps::TimestampRange {
+            begin: 5,
+            end_inclusive: 8,
+        };
+        let mut tokens = vec![5, 1, 6, 2];
+        // Without termination repair, the closed first word survives while
+        // the final word exists only in raw text and disappears at assembly.
+        let (_, before) = timestamps::extract_segments(&tokens, &tokenizer, &range);
+        assert_eq!(
+            before.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            ["pierwsze"]
+        );
+        let mut logits = vec![0.0, 10.0, 9.0, 1.0, 0.0, 0.0, 0.0, 4.0, 3.0];
+        apply_timestamp_rules(&mut logits, &tokens, 3, Some(4), &range);
+        prepare_timestamp_termination(&mut logits, &tokens, 3, &range, true);
+        let clock = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0;
+        assert_eq!(clock, 7);
+        assert_eq!(logits[clock], 4.0);
+        tokens.push(clock as u32);
+        let (text, segments) = timestamps::extract_segments(&tokens, &tokenizer, &range);
+        assert_eq!(text, "pierwsze ostatnie");
+        assert_eq!(
+            segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            ["pierwsze", "ostatnie"]
+        );
+        let mut assembled = RawTranscript::default();
+        merge_chunk_transcripts(
+            &mut assembled,
+            RawTranscript {
+                text: text.clone(),
+                segments,
+                ..Default::default()
+            },
+            0.0,
+        )
+        .unwrap();
+        assert_eq!(assembled.text, text);
+    }
+
+    #[test]
+    fn sampling_cannot_end_an_open_span_but_closed_spans_can_end() {
+        let range = timestamps::TimestampRange {
+            begin: 5,
+            end_inclusive: 7,
+        };
+        let scores = vec![0.0, 10.0, 0.0, 5.0, 0.0, 0.0, 1.0, 0.0];
+        let mut open = scores.clone();
+        prepare_timestamp_termination(&mut open, &[5, 1], 3, &range, false);
+        assert_eq!(open[3], f32::NEG_INFINITY);
+        assert_eq!(open[1], scores[1]);
+        let mut closed = scores.clone();
+        prepare_timestamp_termination(&mut closed, &[5, 1, 6], 3, &range, false);
+        assert_eq!(closed, scores);
+    }
+
     /// Timestamp mode must actively force a clock token; omitting the
     /// `<|notimestamps|>` prompt token alone produced `segments=0` in the real
     /// file route.
@@ -2038,7 +2153,8 @@ mod stt_live_first_v2_red {
         let mut initial_logits = vec![1.0; 8];
         apply_timestamp_rules(&mut initial_logits, &[], 3, Some(4), &range);
         assert!(initial_logits[..5].iter().all(|value| value.is_infinite()));
-        assert!(initial_logits[5..].iter().all(|value| value.is_finite()));
+        assert!(initial_logits[5..7].iter().all(|value| value.is_finite()));
+        assert_eq!(initial_logits[7], f32::NEG_INFINITY);
 
         let mut after_timestamp = vec![1.0; 8];
         apply_timestamp_rules(&mut after_timestamp, &[5], 3, Some(4), &range);
