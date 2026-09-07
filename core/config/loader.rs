@@ -671,21 +671,6 @@ impl Config {
         }
     }
 
-    /// Treat a whitespace-only value as unset — an empty env var is a common way
-    /// to accidentally "configure" a key into a broken state.
-    fn env_missing_or_empty(key: &str) -> bool {
-        Self::config_runtime_env_var(key)
-            .ok()
-            .is_none_or(|value| value.trim().is_empty())
-    }
-
-    /// Seed a default without ever overwriting a value the user actually set.
-    fn config_init_set_env_if_missing(key: &str, value: impl AsRef<str>) {
-        if Self::env_missing_or_empty(key) {
-            Self::config_init_set_env(key, value.as_ref());
-        }
-    }
-
     /// Load configuration values from environment variables.
     pub fn load_from_env(&mut self) {
         // Hotkeys

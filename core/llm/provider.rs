@@ -1021,7 +1021,8 @@ mod tests {
             "https://api.libraxis.com/v1/responses",
         )
         .unwrap();
-        let registry = ProviderRegistry::new(vec![libraxis.clone()]);
+        let row = libraxis;
+        let registry = ProviderRegistry::new(vec![row.clone()]);
         let all = registry.all();
         assert_eq!(all.len(), 5);
         assert_eq!(
@@ -1052,8 +1053,8 @@ mod tests {
             .unwrap();
         assert_eq!(custom.display_name, "api.libraxis.com");
         assert_eq!(custom.wire, WireFamily::OpenAiResponses);
-        assert_eq!(custom.endpoint, libraxis.endpoint);
-        assert_eq!(custom.key_account, libraxis.key_account());
+        assert_eq!(custom.endpoint, row.endpoint);
+        assert_eq!(custom.key_account, row.key_account());
         assert!(!custom.key_required);
         assert_eq!(custom.oauth_vendor, None);
         assert!(custom.supports_vision("anything"));
@@ -1061,7 +1062,7 @@ mod tests {
             registry.resolve(&ProviderRef::Custom("gone".to_string())),
             None
         );
-        assert_eq!(registry.custom(), &[libraxis]);
+        assert_eq!(registry.custom(), &[row]);
     }
 
     /// OpenAI policy stays permissive so the Responses request path is untouched.

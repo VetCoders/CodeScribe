@@ -2119,6 +2119,9 @@ impl UserSettings {
         }
         let moves = super::llm_migration::migrate_legacy_llm_lanes(&legacy, settings);
         match settings.save_unlocked() {
+            // Hand back exactly what the next load will read: `to_v2` normalizes
+            // on the way out (mode bindings and friends), so the first post-migration
+            // load must not differ from the second.
             Ok(()) => info!(
                 "Migrated legacy LLM lane fields to the provider registry (formatting={:?}, assistive={:?}, custom_rows={})",
                 settings.llm_formatting_provider,
@@ -2127,6 +2130,7 @@ impl UserSettings {
             ),
             Err(error) => warn!("Failed to persist migrated LLM lanes: {error}"),
         }
+        *settings = Self::from_v2(settings.to_v2());
         super::llm_migration::queue_key_moves(moves);
     }
 
