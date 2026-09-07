@@ -2141,12 +2141,12 @@ mod tests {
         }
     }
 
-    /// Effect witness: a vendor endpoint is pinned in code. The retired
+    /// Effect witness (§F.4): a vendor endpoint is pinned in code. The retired
     /// endpoint env names change nothing (one warning), and the settings file
     /// has no field that could move a vendor lane off its host.
     #[test]
     #[serial]
-    fn vendor_endpoint_cannot_be_overridden_by_legacy_env() {
+    fn vendor_endpoint_cannot_be_overridden() {
         let _tmp = setup_isolated_data_dir();
         let _env = clear_llm_lane_env();
         let _bundle = super::super::keychain::test_support::install_bundle(&[]);
@@ -2162,6 +2162,32 @@ mod tests {
         assert_eq!(lane.vendor(), Some(ProviderKind::XaiResponses));
         assert_eq!(lane.endpoint(), "https://api.x.ai/v1/responses");
         assert_eq!(lane.credential().key_account(), "LLM_XAI_API_KEY");
+    }
+
+    /// Every retired endpoint/model env name is ignored — the lane seals on the
+    /// vendor's pinned endpoint and seed model — and each one is warned about
+    /// once per process (the warn ledger holds the name afterwards).
+    #[test]
+    #[serial]
+    fn legacy_endpoint_env_is_ignored_with_warning() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        let _legacy_model = TestEnvGuard::unset("LLM_MODEL");
+        set_env_for_test("LLM_FORMATTING_ENDPOINT", "https://proxy.example/v1");
+        set_env_for_test("LLM_ENDPOINT", "https://proxy.example/v1");
+        set_env_for_test("LLM_MODEL", "stale-main-model");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().formatting();
+        assert_eq!(lane.endpoint(), ProviderKind::OpenAiResponses.endpoint());
+        assert_eq!(lane.model(), crate::llm::provider::DEFAULT_FORMATTING_MODEL);
+        let warned = LEGACY_LLM_ENV_WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .expect("warn ledger");
+        for planted in ["LLM_FORMATTING_ENDPOINT", "LLM_ENDPOINT", "LLM_MODEL"] {
+            assert!(warned.contains(planted), "{planted} was not warned about");
+        }
     }
 
     /// Effect witness: the formatting lane on xAI keeps a Grok model chosen in
@@ -2199,7 +2225,7 @@ mod tests {
     /// from settings — with no model it seals unavailable and says why.
     #[test]
     #[serial]
-    fn custom_provider_without_key_is_available_and_needs_a_model() {
+    fn custom_provider_without_key_is_available() {
         let _tmp = setup_isolated_data_dir();
         let _env = clear_llm_lane_env();
         let _bundle = super::super::keychain::test_support::install_bundle(&[]);
@@ -2261,10 +2287,11 @@ mod tests {
     }
 
     /// REMOVE AFTER 2026-10-15: the retired `LLM_API_KEY` env name still feeds
-    /// the OpenAI account (only), and never a vendor with its own account.
+    /// the OpenAI account (only) with one warning, and never a vendor with its
+    /// own account.
     #[test]
     #[serial]
-    fn legacy_openai_key_alias_feeds_only_the_openai_account() {
+    fn legacy_openai_key_alias_warns() {
         let _tmp = setup_isolated_data_dir();
         let _env = clear_llm_lane_env();
         let _bundle = super::super::keychain::test_support::install_bundle(&[]);
@@ -2274,6 +2301,13 @@ mod tests {
         assert_eq!(lane.credential().key_account(), "LLM_OPENAI_API_KEY");
         assert_eq!(lane.credential().api_key(), Some("legacy-secret"));
         assert!(lane.available());
+        assert!(
+            LEGACY_LLM_ENV_WARNED
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .expect("warn ledger")
+                .contains("LLM_API_KEY")
+        );
 
         set_env_for_test("LLM_ASSISTIVE_PROVIDER", "anthropic-messages");
         let snapshot = seal_lanes();
@@ -2862,7 +2896,7 @@ mod tests {
         let runtime_settings = Config::load_runtime_snapshot().expect("runtime settings seal");
         assert_eq!(
             runtime_settings.llm_lanes().assistive().endpoint(),
-            crate::llm::provider::DEFAULT_OPENAI_RESPONSES_ENDPOINT
+            ProviderKind::OpenAiResponses.endpoint()
         );
     }
 
