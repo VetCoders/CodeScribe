@@ -61,6 +61,7 @@ fn init_tracing(default_filter: &str) {
     };
 
     let stderr_layer = fmt::layer()
+        .with_writer(std::io::stderr)
         .with_ansi(true)
         .with_target(true)
         .with_thread_ids(true)
@@ -176,6 +177,37 @@ fn install_panic_hook() {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn warning_log_keeps_stdout_clean() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::tests::logging_subprocess_witness",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RUST_LOG", "warn")
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        let marker = "codescribe-log-channel-witness";
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains(marker),
+            "warning missing from stderr"
+        );
+        assert!(
+            !String::from_utf8_lossy(&result.stdout).contains(marker),
+            "warning polluted transcript stdout"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for the log-channel regression"]
+    fn logging_subprocess_witness() {
+        init_logging_with_default_filter("warn");
+        tracing::warn!("codescribe-log-channel-witness");
+    }
 
     #[test]
     fn test_processes_are_refused_a_file_sink() {
