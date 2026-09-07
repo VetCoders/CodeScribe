@@ -20,7 +20,14 @@ class FinderQuickActionTests(unittest.TestCase):
             self.assertEqual(service["NSRequiredContext"]["NSApplicationIdentifier"], "com.apple.finder")
             workflow = root / "Transcribe with Codescribe.workflow/Contents/document.wflow"
             with workflow.open("rb") as handle:
-                command = plistlib.load(handle)["actions"][0]["action"]["ActionParameters"]["COMMAND_STRING"]
+                document = plistlib.load(handle)
+            metadata = document["workflowMetaData"]
+            finder = "/System/Library/CoreServices/Finder.app"
+            self.assertEqual(metadata["applicationBundleID"], "com.apple.finder")
+            self.assertEqual(metadata["applicationPath"], finder)
+            self.assertEqual(metadata["applicationPaths"], [finder])
+            self.assertEqual(metadata["applicationBundleIDsByPath"], {finder: "com.apple.finder"})
+            command = document["actions"][0]["action"]["ActionParameters"]["COMMAND_STRING"]
             fake = root / "codescribe"
             fake.write_text(
                 '#!/bin/zsh\n'

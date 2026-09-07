@@ -220,10 +220,19 @@ cat > "$CONTENTS/document.wflow" <<PLIST
 	<dict/>
 	<key>workflowMetaData</key>
 	<dict>
+		<key>applicationBundleID</key>
+		<string>com.apple.finder</string>
 		<key>applicationBundleIDsByPath</key>
-		<dict/>
+		<dict>
+			<key>/System/Library/CoreServices/Finder.app</key>
+			<string>com.apple.finder</string>
+		</dict>
+		<key>applicationPath</key>
+		<string>/System/Library/CoreServices/Finder.app</string>
 		<key>applicationPaths</key>
-		<array/>
+		<array>
+			<string>/System/Library/CoreServices/Finder.app</string>
+		</array>
 		<key>inputTypeIdentifier</key>
 		<string>com.apple.Automator.fileSystemObject</string>
 		<key>outputTypeIdentifier</key>
