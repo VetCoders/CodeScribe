@@ -26,7 +26,7 @@ host, date, room, or control-plane path is embedded in Codescribe.
 
 ## Event families
 
-`codescribe.transcript.v1` now carries lifecycle only. `publish_started` emits
+App `codescribe.transcript.v1` rows carry lifecycle only. `publish_started` emits
 one empty `session_started` event for the controller-owned session, and
 `publish_ended` emits one empty `session_ended` event when the controller
 leaves that session (every path back to Idle, including zero-seal takes and
@@ -34,6 +34,13 @@ stop-timeout recovery). Neither can publish document text. The terminal row
 does carry the already-resolved projection phase and action availability so a
 file tailer can combine it with the last authenticated render without inventing
 UI policy.
+
+CLI file rows use the same schema with `source=cli_file_verdict`. Draft rows
+retain per-segment `text` and supply an engine-assembled `rendered_text` snapshot;
+seals supply the exact final document. Readers copy snapshots without joining
+segments. Legacy CLI seals already carry the full document in `text`.
+`session_ended` preserves the preceding document. CLI projections retain their
+source and never claim occurrence or acoustic ledger receipts.
 
 One microphone: the live app take is the most recently started app session
 that has no later `session_ended` (or legacy `transcript_sealed`) for that

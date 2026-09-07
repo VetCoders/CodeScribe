@@ -1,21 +1,8 @@
 //! CLI file-transcription lane on the clean transcript bus.
 //!
-//! WHY THIS IS NOT A METHOD ON [`TranscriptBus`]. That type is the throne's
-//! observer: it copies occurrence-authenticated ledger revisions and its module
-//! doc promises it never "accepts arbitrary text" or "re-transcribes a file".
-//! A CLI file pass is exactly the thing that promise excludes — it has no
-//! ledger, no acoustic receipts, and no occurrence identity. Rather than
-//! loosening that promise (which the whole one-throne plan exists to protect),
-//! the CLI gets its own writer on the same NDJSON shape, and every event it
-//! writes names itself.
-//!
-//! Wire compatibility is deliberate: these are `codescribe.transcript.v1`
-//! events with the statuses `scripts/bus-demux.py` and
-//! `codescribe transcribe live` already read (`utterance_draft`,
-//! `transcript_sealed`). What separates them from app events is the additive
-//! `source` field — absent on everything the app writes, `"cli_file_verdict"`
-//! here. A consumer that wants ledger-backed truth filters on its absence; a
-//! consumer that just wants the operator's words reads both.
+//! The file engine owns document assembly. Rows keep per-segment `text` for
+//! utterance consumers and a complete `rendered_text` for passive canvases.
+//! `source=cli_file_verdict` identifies file output without claiming ledger receipts.
 
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -42,6 +29,7 @@ pub struct CliTranscriptLane {
     mode: TranscriptMode,
     path: PathBuf,
     sequence: u64,
+    document: String,
     /// Utterance numbering is its own axis, exactly as in the app: drafts are
     /// 1, 2, 3… while `sequence` counts every line including lifecycle ones.
     /// Deriving one from the other would make `utterance_id` skip.
@@ -67,6 +55,7 @@ impl CliTranscriptLane {
             mode,
             path,
             sequence: 0,
+            document: String::new(),
             utterance_counter: 0,
             started: false,
             ended: false,
@@ -92,21 +81,17 @@ impl CliTranscriptLane {
         Ok(())
     }
 
-    /// Publish ONE decoded segment as its own utterance draft.
-    ///
-    /// The grain matters and it is not a style choice. Measured against a real
-    /// app session's drafts, `utterance_draft` carries a single self-contained
-    /// utterance with its own `utterance_id` — a short phrase, one per decoded
-    /// unit — never the growing document. Publishing the accumulated text
-    /// makes every append-only tailer (`codescribe transcribe live`,
-    /// `scripts/bus-demux.py`) reprint the whole transcript once per segment,
-    /// which is quadratic noise in a terminal and a false claim that the
-    /// utterance got longer.
+    /// Publish a segment and its engine-assembled document snapshot.
     pub fn publish_draft(&mut self, text: &str, segment: &TranscriptSegment) -> io::Result<()> {
         self.publish_started()?;
         self.utterance_counter = self.utterance_counter.saturating_add(1);
         let mut event = self.lifecycle("utterance_draft", Some(self.utterance_counter));
         event.text = text.to_string();
+        if !self.document.is_empty() {
+            self.document.push(' ');
+        }
+        self.document.push_str(text);
+        event.can_copy = !self.document.is_empty();
         event.audio_start_seconds = Some(segment.start_ts);
         event.audio_end_seconds = Some(segment.end_ts);
         self.write(event)
@@ -125,16 +110,7 @@ impl CliTranscriptLane {
             .collect()
     }
 
-    /// Publish every decoded segment as its own draft, in order, and return the
-    /// texts the caller should print — one line per utterance.
-    ///
-    /// This loop lives here, and not at the call site, on purpose. When the
-    /// caller owned it, it handed `publish_draft` the running document instead
-    /// of the segment, and no test driving the lane could see that: the lane
-    /// faithfully wrote whatever it was given, under the right status and with
-    /// a plausible `utterance_id`. Owning the iteration makes the accumulation
-    /// unreachable from any call site, so a test of THIS method witnesses the
-    /// effect a bus tailer actually gets.
+    /// Publish and return printable segments in decoder order.
     pub fn publish_segments(&mut self, segments: &[TranscriptSegment]) -> io::Result<Vec<String>> {
         let spoken = Self::segment_texts(segments);
         for (text, segment) in spoken.iter().zip(
@@ -155,6 +131,9 @@ impl CliTranscriptLane {
         self.publish_started()?;
         let mut event = self.lifecycle("transcript_sealed", None);
         event.text = text.to_string();
+        self.document = text.to_string();
+        event.phase = super::transcript_bus::TranscriptProjectionPhase::Formatted;
+        event.can_copy = !text.is_empty();
         event.segments = segments.to_vec();
         event.audio_start_seconds = segments.first().map(|segment| segment.start_ts);
         event.audio_end_seconds = segments.last().map(|segment| segment.end_ts);
@@ -220,9 +199,12 @@ impl CliTranscriptLane {
         let mut event = self.lifecycle("session_ended", None);
         event.end_reason = Some(reason);
         event.terminal = true;
-        if reason != TranscriptSessionEndReason::Completed {
-            event.phase = super::transcript_bus::TranscriptProjectionPhase::Error;
-        }
+        event.phase = if reason == TranscriptSessionEndReason::Completed {
+            super::transcript_bus::TranscriptProjectionPhase::Formatted
+        } else {
+            super::transcript_bus::TranscriptProjectionPhase::Error
+        };
+        event.can_copy = !self.document.is_empty();
         self.write(event)?;
         self.ended = true;
         Ok(())
@@ -276,7 +258,23 @@ impl CliTranscriptLane {
         }
         let mut file = options.open(&self.path)?;
 
-        let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
+        #[derive(serde::Serialize)]
+        struct DocumentRow<'a> {
+            #[serde(flatten)]
+            event: &'a CleanTranscriptEvent,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            rendered_text: Option<&'a str>,
+        }
+        let rendered_text = matches!(
+            event.status.as_str(),
+            "utterance_draft" | "transcript_sealed"
+        )
+        .then_some(self.document.as_str());
+        let mut encoded = serde_json::to_vec(&DocumentRow {
+            event: &event,
+            rendered_text,
+        })
+        .map_err(io::Error::other)?;
         encoded.push(b'\n');
         file.write_all(&encoded)?;
         file.flush()?;
@@ -303,6 +301,42 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn passive_reader_gets_complete_documents_and_preserves_the_terminal_text() {
+        use super::super::transcript_projection::TranscriptProjectionReader;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let mut lane =
+            CliTranscriptLane::open_at("cli-test".into(), TranscriptMode::Dictation, path.clone())
+                .unwrap();
+        lane.publish_segments(&[segment("raz", 0.0, 1.0), segment("raz", 1.0, 2.0)])
+            .unwrap();
+        let verdict = "  raz raz\ne\u{301} 👩‍💻  ";
+        lane.publish_sealed(verdict, &[]).unwrap();
+        lane.publish_ended(TranscriptSessionEndReason::Completed)
+            .unwrap();
+        let mut reader = TranscriptProjectionReader::new();
+        let rows: Vec<_> = std::fs::read(path)
+            .unwrap()
+            .chunks(7)
+            .flat_map(|bytes| reader.push_bytes(bytes))
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.rendered_text.as_str())
+                .collect::<Vec<_>>(),
+            ["raz", "raz raz", verdict, verdict]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.source.as_deref() == Some(CLI_FILE_VERDICT_SOURCE)
+                    && row.occurrence_session_id.is_empty()
+                    && row.can_copy)
+        );
+        assert!(rows.last().unwrap().terminal);
     }
 
     #[test]

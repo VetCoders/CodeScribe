@@ -646,6 +646,7 @@ mod tests {
     ) -> codescribe::presentation::transcript_projection::TranscriptProjection {
         codescribe::presentation::transcript_projection::TranscriptProjection {
             schema: codescribe::presentation::transcript_projection::PROJECTION_SCHEMA,
+            source: None,
             kind,
             session_id: session.to_string(),
             sequence: revision,
