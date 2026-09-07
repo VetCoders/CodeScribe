@@ -872,10 +872,11 @@
               "file": "app/presentation/transcript_bus.rs",
               "required_code": [
                 "ReducerAction::RecordLedgerSeal { terminal: true, .. } => \"record_ledger_terminal_seal\"",
+                "let is_terminal_document = matches!(",
                 "ledger.serial_of(&entry.occurrence)",
                 "rendered_text: revision.rendered_text.clone()",
                 "acoustic_receipts: vec![Self::project_serial(",
-                "ReducerAction::RecordLedgerSeal { terminal: true, .. }",
+                "if is_terminal_document {",
                 "writer.sealed = true"
               ]
             },
@@ -1337,15 +1338,17 @@
           "name": "speech_coverage_to_terminal_truth",
           "hops": [
             {
-              "symbol": "repair_terminal_seal_coverage",
+              "symbol": "settle_terminal_coverage",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
                 "session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)",
                 "ledger.assess_seal_coverage(",
                 "InProcessTailProvider.transcribe(&request, &window.samples)",
+                "ledger.record_seal_coverage(coverage.clone())",
                 "EngineEvent::SealCoverage {",
-                "EnergyAdmission::QualifyFinalPassGap",
-                "record_seal_coverage(final_receipt.clone())"
+                "ledger.record_final_pass_document(&range, &full_pass.text)",
+                "EngineEvent::FinalPassDocument { receipt }",
+                "TerminalSettlement::Refused(coverage)"
               ]
             },
             {
@@ -1399,8 +1402,7 @@
               "symbol": "stop",
               "file": "core/audio/streaming_recorder.rs",
               "required_code": [
-                ".latest_seal_coverage()",
-                "receipt.status == SealCoverageStatus::Incomplete",
+                ".refused_terminal_coverage()",
                 "return Err(anyhow::Error::new(TerminalSealRefused {",
                 "receipt",
                 "audio_path"
@@ -1409,7 +1411,7 @@
           ],
           "required_invocations": [
             {
-              "callee": "repair_terminal_seal_coverage",
+              "callee": "settle_terminal_coverage",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "apple_stream_worker",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
@@ -1417,7 +1419,13 @@
             {
               "callee": "assess_seal_coverage",
               "callee_file": "core/pipeline/acoustic_ledger.rs",
-              "caller": "repair_terminal_seal_coverage",
+              "caller": "settle_terminal_coverage",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "record_final_pass_document",
+              "callee_file": "core/pipeline/acoustic_ledger.rs",
+              "caller": "settle_terminal_coverage",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
             },
             {
@@ -1433,7 +1441,7 @@
               "caller_file": "app/presentation/emitter.rs"
             },
             {
-              "callee": "latest_seal_coverage",
+              "callee": "refused_terminal_coverage",
               "callee_file": "core/pipeline/acoustic_ledger.rs",
               "caller": "stop",
               "caller_file": "core/audio/streaming_recorder.rs"
