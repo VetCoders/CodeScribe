@@ -33,6 +33,7 @@ use codescribe_core::llm::model_discovery::{
 use codescribe_core::llm::provider::{
     CustomProvider, ProviderKind, ProviderRef, ProviderRegistry, ResolvedProvider, WireFamily,
 };
+use codescribe_core::stt::lanes::{SttLane, validate_stt_endpoint};
 use directories::BaseDirs;
 
 use crate::{CsError, CsLanguage, application_runtime};
@@ -120,7 +121,8 @@ pub struct CsSettings {
     // ── STT backend ──
     pub use_local_stt: bool,
     pub local_model: String,
-    pub stt_endpoint: Option<String>,
+    pub stt_file_endpoint: Option<String>,
+    pub stt_live_endpoint: Option<String>,
     /// STT engine selection (`CODESCRIBE_STT_ENGINE`): `"auto"` | `"apple"` |
     /// `"whisper"`. `None` means the built-in auto policy. Written back via
     /// `update_config` with the same key (promoted → settings.json).
@@ -223,7 +225,8 @@ impl CsSettings {
             quick_notes_save_only: config.quick_notes_save_only,
             use_local_stt: config.use_local_stt,
             local_model: config.local_model.clone(),
-            stt_endpoint: config.stt_endpoint.clone(),
+            stt_file_endpoint: config.stt_file_endpoint.clone(),
+            stt_live_endpoint: config.stt_live_endpoint.clone(),
             stt_engine: setting_string(settings.stt_engine.clone()),
             final_pass_mode: setting_string(settings.final_pass_mode.clone()),
             restore_clipboard: config.restore_clipboard,
@@ -325,7 +328,8 @@ pub struct CsKeyStatus {
     pub llm_openai_api_key_set: bool,
     pub llm_xai_api_key_set: bool,
     pub llm_anthropic_api_key_set: bool,
-    pub stt_api_key_set: bool,
+    pub stt_file_api_key_set: bool,
+    pub stt_live_api_key_set: bool,
     pub github_token_set: bool,
 }
 
@@ -345,7 +349,7 @@ pub enum CsApiKeyProbeStatus {
     Network,
     /// Nothing is stored for this account, so no request was made.
     Missing,
-    /// This account has no cheap liveness probe (e.g. `STT_API_KEY`) or belongs
+    /// This account has no cheap liveness probe or belongs
     /// to no registered provider.
     Unsupported,
 }
@@ -391,6 +395,19 @@ pub struct CsProviderOption {
     pub account_login_enabled: bool,
     pub account_status_message: String,
     pub oauth_client_id: Option<String>,
+}
+
+/// One STT endpoint and its credential presence; secrets never leave Keychain.
+#[derive(uniffi::Record)]
+pub struct CsSttLane {
+    pub id: String,
+    pub title: String,
+    pub accepts: String,
+    pub placeholder: String,
+    pub endpoint: Option<String>,
+    pub endpoint_wire_key: String,
+    pub key_account: String,
+    pub api_key_set: bool,
 }
 
 /// Input-only secret: consumed into the Keychain bundle, never returned.
@@ -740,7 +757,8 @@ impl CodescribeConfig {
             llm_openai_api_key_set: keychain::key_present("LLM_OPENAI_API_KEY"),
             llm_xai_api_key_set: keychain::key_present("LLM_XAI_API_KEY"),
             llm_anthropic_api_key_set: keychain::key_present("LLM_ANTHROPIC_API_KEY"),
-            stt_api_key_set: keychain::key_present("STT_API_KEY"),
+            stt_file_api_key_set: keychain::key_present("STT_FILE_API_KEY"),
+            stt_live_api_key_set: keychain::key_present("STT_LIVE_API_KEY"),
             github_token_set: keychain::key_present("GITHUB_TOKEN"),
         }
     }
@@ -1058,8 +1076,28 @@ impl CodescribeConfig {
         }
     }
 
+    pub fn stt_lanes(&self) -> Vec<CsSttLane> {
+        let settings = UserSettings::load();
+        SttLane::ALL
+            .into_iter()
+            .map(|lane| CsSttLane {
+                id: lane.id().into(),
+                title: lane.title().into(),
+                accepts: lane.accepts().into(),
+                placeholder: lane.placeholder().into(),
+                endpoint: match lane {
+                    SttLane::File => settings.stt_file_endpoint.clone(),
+                    SttLane::Live => settings.stt_live_endpoint.clone(),
+                },
+                endpoint_wire_key: lane.wire_key().into(),
+                key_account: lane.key_account().into(),
+                api_key_set: keychain::key_present(lane.key_account()),
+            })
+            .collect()
+    }
+
     pub fn service_key_accounts(&self) -> Vec<String> {
-        ["STT_API_KEY", "GITHUB_TOKEN"].map(str::to_string).to_vec()
+        vec!["GITHUB_TOKEN".into()]
     }
 
     /// Store an API key in the Keychain. `account` must be a known
@@ -2249,6 +2287,11 @@ fn persist_custom_provider(
 }
 
 fn validate_provider_setting(key: &str, value: &str) -> Result<(), CsError> {
+    if let Some(lane) = SttLane::ALL.into_iter().find(|lane| lane.wire_key() == key)
+        && !value.trim().is_empty()
+    {
+        validate_stt_endpoint(lane, value).map_err(provider_error)?;
+    }
     if key.starts_with("LLM_") && key.ends_with("_ENDPOINT") {
         return Err(provider_error("removed: endpoints live on providers"));
     }
@@ -2524,7 +2567,8 @@ mod reset_tests {
         let accounts = agent_secret_accounts();
         assert!(accounts.contains(&"LLM_OPENAI_API_KEY"));
         assert!(accounts.contains(&"LLM_OPENAI_ACCOUNT_TOKENS"));
-        assert!(!accounts.contains(&"STT_API_KEY"));
+        assert!(!accounts.contains(&"STT_FILE_API_KEY"));
+        assert!(!accounts.contains(&"STT_LIVE_API_KEY"));
         assert!(!accounts.contains(&"GITHUB_TOKEN"));
     }
 
@@ -2978,11 +3022,13 @@ mod reset_tests {
 #[cfg(test)]
 mod settings_snapshot_tests {
     use super::{
-        CodescribeConfig, CsSettings, remove_path_without_following_symlinks, setting_string,
+        CodescribeConfig, CsConfigEntry, CsError, CsSettings, SttLane, ensure_known_account,
+        keychain, remove_path_without_following_symlinks, setting_string,
     };
     use codescribe_core::config::{Config, UserSettings};
     use serial_test::serial;
     use std::ffi::{OsStr, OsString};
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Unique scratch data dir under the OS temp dir. Keyed by pid and
@@ -3114,10 +3160,7 @@ mod settings_snapshot_tests {
         let root = tempfile::tempdir().unwrap();
         let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
         let config = CodescribeConfig::new();
-        assert_eq!(
-            config.service_key_accounts(),
-            ["STT_API_KEY", "GITHUB_TOKEN"]
-        );
+        assert_eq!(config.service_key_accounts(), ["GITHUB_TOKEN"]);
         assert_eq!(config.available_providers().len(), 4);
         assert!(
             config
@@ -3146,6 +3189,85 @@ mod settings_snapshot_tests {
             config.discover_models("custom:missing".into()).status,
             "error"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn stt_lanes_are_two_atomic_rows_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let config = CodescribeConfig::new();
+        let rows = config.stt_lanes();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["file", "live"]
+        );
+        for (row, lane) in rows.iter().zip(SttLane::ALL) {
+            assert_eq!(row.id, lane.id());
+            assert_eq!(row.endpoint_wire_key, lane.wire_key());
+            assert_eq!(row.key_account, lane.key_account());
+            assert_eq!(row.api_key_set, keychain::key_present(lane.key_account()));
+            ensure_known_account(&row.key_account).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn update_config_rejects_wss_on_file_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let _data = EnvGuard::set("CODESCRIBE_DATA_DIR", root.path());
+        let config = CodescribeConfig::new();
+        for (lane, good, bad) in [
+            (
+                SttLane::File,
+                "https://api.libraxis.cloud/v1/audio/transcriptions",
+                "wss://api.libraxis.cloud/v1/audio/transcribe",
+            ),
+            (
+                SttLane::Live,
+                "wss://api.libraxis.cloud/v1/audio/transcribe",
+                "https://api.libraxis.cloud/v1/audio/transcriptions",
+            ),
+        ] {
+            config
+                .update_config(lane.wire_key().into(), good.into())
+                .unwrap();
+            let before = fs::read(UserSettings::settings_path()).unwrap();
+            assert!(matches!(
+                config.update_config(lane.wire_key().into(), bad.into()),
+                Err(CsError::Config { .. })
+            ));
+            assert!(matches!(
+                config.update_config_many(vec![CsConfigEntry {
+                    key: lane.wire_key().into(),
+                    value: bad.into()
+                }]),
+                Err(CsError::Config { .. })
+            ));
+            assert_eq!(fs::read(UserSettings::settings_path()).unwrap(), before);
+            assert_eq!(
+                config
+                    .stt_lanes()
+                    .into_iter()
+                    .find(|row| row.id == lane.id())
+                    .unwrap()
+                    .endpoint
+                    .as_deref(),
+                Some(good)
+            );
+            config
+                .update_config(lane.wire_key().into(), "".into())
+                .unwrap();
+            assert!(
+                config
+                    .stt_lanes()
+                    .into_iter()
+                    .find(|row| row.id == lane.id())
+                    .unwrap()
+                    .endpoint
+                    .is_none()
+            );
+        }
     }
 
     /// The assistive provider is a promoted key: a Settings write must land in

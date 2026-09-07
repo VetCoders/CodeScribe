@@ -527,37 +527,33 @@ fn transcribe_file_hq(path: String) -> Result<CsTranscription, CsError> {
     })
 }
 
-async fn transcribe_file_cloud(path: String) -> Result<CsTranscription, CsError> {
-    let config = codescribe_core::config::Config::load();
-    let endpoint = config
-        .stt_endpoint
-        .clone()
-        .filter(|value| !value.trim().is_empty());
-    let key = config
-        .stt_api_key
-        .clone()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_default();
-    let Some(endpoint) = endpoint else {
+fn cloud_file_lane(
+    config: &codescribe_core::config::Config,
+) -> Result<codescribe_core::stt::lanes::ResolvedSttLane, CsError> {
+    let lane = config
+        .stt_lane(codescribe_core::stt::lanes::SttLane::File)
+        .ok_or_else(|| CsError::Recording {
+            msg: "Cloud pass needs a file transcription endpoint (Providers › Speech-to-text)"
+                .into(),
+        })?;
+    if lane.key_missing() {
         return Err(CsError::Recording {
-            msg: "Cloud pass needs STT_ENDPOINT".to_string(),
-        });
-    };
-    // Same invert as Settings → Test: a stored Voice Lab socket is not a
-    // multipart URL. Public HTTPS file URLs stay file.
-    let endpoint = codescribe_core::stt::tail_provider::file_probe_endpoint(&endpoint);
-    if codescribe_core::stt::tail_provider::stt_auth_mode(&endpoint)
-        != codescribe_core::stt::tail_provider::SttAuthMode::Unauthenticated
-        && key.is_empty()
-    {
-        return Err(CsError::Recording {
-            msg: "Cloud pass needs STT_API_KEY for this endpoint".to_string(),
+            msg: "Cloud pass needs STT_FILE_API_KEY for this endpoint".into(),
         });
     }
-    let verdict =
-        codescribe::client::transcribe_cloud(std::path::Path::new(&path), None, &endpoint, &key)
-            .await
-            .map_err(|e| CsError::Recording { msg: e.to_string() })?;
+    Ok(lane)
+}
+
+async fn transcribe_file_cloud(path: String) -> Result<CsTranscription, CsError> {
+    let lane = cloud_file_lane(&codescribe_core::config::Config::load())?;
+    let verdict = codescribe::client::transcribe_cloud(
+        std::path::Path::new(&path),
+        None,
+        &lane.endpoint,
+        lane.api_key.as_deref().unwrap_or_default(),
+    )
+    .await
+    .map_err(|e| CsError::Recording { msg: e.to_string() })?;
     Ok(CsTranscription {
         text: verdict.text,
         language: "und".to_string(),
@@ -585,30 +581,40 @@ mod retranscribe_tests {
     }
 
     #[test]
-    fn cloud_pass_inverts_voice_lab_socket_to_file() {
+    fn cloud_pass_reads_the_file_lane_only() {
+        let mut config = codescribe_core::config::Config {
+            stt_live_endpoint: Some("wss://api.libraxis.cloud/v1/audio/transcribe".into()),
+            stt_live_api_key: Some("live-only-key".into()),
+            ..Default::default()
+        };
+        assert!(
+            cloud_file_lane(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("file transcription endpoint")
+        );
+        config.stt_file_endpoint =
+            Some("https://api.libraxis.cloud/v1/audio/transcriptions".into());
+        assert!(
+            cloud_file_lane(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("STT_FILE_API_KEY")
+        );
+        config.stt_file_api_key = Some("file-only-key".into());
+        let lane = cloud_file_lane(&config).unwrap();
+        assert_eq!(Some(&lane.endpoint), config.stt_file_endpoint.as_ref());
+        assert_eq!(lane.api_key.as_deref(), Some("file-only-key"));
+        config.stt_file_api_key = None;
+        config.stt_file_endpoint = Some("http://127.0.0.1:8444/v1/audio/transcriptions".into());
+        let lane = cloud_file_lane(&config).unwrap();
         assert_eq!(
-            codescribe_core::stt::tail_provider::file_probe_endpoint(
-                "ws://127.0.0.1:8446/v1/audio/transcribe"
-            ),
+            lane.endpoint,
             "http://127.0.0.1:8444/v1/audio/transcriptions"
         );
         assert_eq!(
-            codescribe_core::stt::tail_provider::file_probe_endpoint(
-                "https://api.libraxis.cloud/v1/audio/transcriptions"
-            ),
-            "https://api.libraxis.cloud/v1/audio/transcriptions"
-        );
-    }
-
-    #[test]
-    fn remapped_loopback_file_url_names_programming_vocabulary() {
-        let endpoint = codescribe_core::stt::tail_provider::file_probe_endpoint(
-            "ws://127.0.0.1:8446/v1/audio/transcribe",
-        );
-        assert_eq!(endpoint, "http://127.0.0.1:8444/v1/audio/transcriptions");
-        assert_eq!(
             codescribe_core::stt::request_vocabulary::codescribe_stt_vocabulary_form_part(
-                &endpoint
+                &lane.endpoint
             ),
             Some(("vocabulary", "programming"))
         );
