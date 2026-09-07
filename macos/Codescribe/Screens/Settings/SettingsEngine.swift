@@ -15,12 +15,9 @@ import Foundation
 //   FORMATTING_LEVEL      "off" | "correction" | "smart" | "max"
 //   USE_LOCAL_STT         "1" | "0"
 //   LOCAL_MODEL / STT_ENDPOINT / LLM_<LANE>_PROVIDER / LLM_<LANE>_MODEL ...  free strings
-//   (no endpoint keys: endpoints live on providers — vendors factory-pinned,
-//   custom rows edited through add/update_custom_provider)
-// Keychain accounts (CsKeyStatus, core/config/keychain.rs::KEYCHAIN_ACCOUNTS):
-//   LLM_LIBRAXIS_API_KEY / LLM_OPENAI_API_KEY / LLM_XAI_API_KEY / LLM_ANTHROPIC_API_KEY /
-//   STT_API_KEY / GITHUB_TOKEN (atlas §B.3: Libraxis is a vendor, first in the picker)
-//   + LLM_CUSTOM_<ID>_API_KEY per custom provider (presence via CsProviderOption.apiKeySet)
+//   (no endpoint keys: endpoints belong to providers — vendors factory-pinned, custom rows CRUD)
+// Keychain accounts (CsKeyStatus, core/config/keychain.rs::KEYCHAIN_ACCOUNTS): one per vendor
+//   (LLM_<VENDOR>_API_KEY), STT_API_KEY, GITHUB_TOKEN; custom rows carry LLM_CUSTOM_<ID>_API_KEY
 
 /// Subset of the codescribe config surface the Settings screen consumes.
 @MainActor
@@ -300,8 +297,7 @@ struct MockSettingsEngine: SettingsEngine {
   var resetAgentDataObserver: (() throws -> Void)?
   var clearMcpConfigurationObserver: (() throws -> Void)?
   var settingsLoader: (() -> CsSettings)?
-  /// Custom rows + lane bindings survive across calls (the bridge persists them
-  /// in settings.json; the mock keeps them in one reference-typed store).
+  /// Custom rows + lane bindings persist across calls (reference-typed, like settings.json).
   var providerStore: MockProviderStore = MockProviderStore()
   var updateConfigManyObserver: (([CsConfigEntry]) throws -> Void)?
   var resetAudioInputDeviceObserver: (() throws -> Void)?
@@ -471,27 +467,20 @@ struct MockSettingsEngine: SettingsEngine {
   }
 }
 
-/// Mock-side stand-in for the core `ProviderRegistry` + `UserSettings` custom
-/// CRUD. Reference-typed so the value-typed `MockSettingsEngine` observes its
-/// own writes. Validation mirrors the core's shape (empty name, bad scheme,
-/// duplicate id, unknown provider) only as far as tests need to see an error
-/// surface — the real rules live in `core/llm/provider.rs`.
+/// Mock-side stand-in for the core registry's custom CRUD + lane bindings.
+/// Reference-typed so the value-typed `MockSettingsEngine` observes its own
+/// writes. Validation mirrors only what the tests read (blank name, bad scheme,
+/// unknown provider); the real rules live in `core/llm/provider.rs`.
 @MainActor
 final class MockProviderStore {
   enum Failure: Error, Equatable {
     case emptyName
     case invalidEndpoint(String)
-    case duplicateId(String)
     case unknownProvider(String)
   }
 
-  var custom: [CsProviderOption]
-  var laneProviders: [CsLlmLane: String]
-
-  init(custom: [CsProviderOption] = [], laneProviders: [CsLlmLane: String] = [:]) {
-    self.custom = custom
-    self.laneProviders = laneProviders
-  }
+  var custom: [CsProviderOption] = []
+  var laneProviders: [CsLlmLane: String] = [:]
 
   /// Slug + scheme check in the core's shape; the row id is `custom:<slug>`.
   private func row(_ draft: CsCustomProviderDraft, keySet: Bool) throws -> CsProviderOption {
@@ -502,28 +491,21 @@ final class MockProviderStore {
       throw Failure.invalidEndpoint(draft.endpoint)
     }
     let account = slug.uppercased().replacingOccurrences(of: "-", with: "_")
-    return CsProviderOption(
-      id: "custom:\(slug)", kind: "custom", displayName: draft.name, wire: draft.wire,
-      endpoint: draft.endpoint, apiKeyAccount: "LLM_CUSTOM_\(account)_API_KEY",
-      apiKeySet: keySet, keyRequired: false, accountSignedIn: false,
-      accountLoginEnabled: false, accountStatusMessage: "provider account login unavailable",
-      oauthClientId: nil)
+    return .row(
+      id: "custom:\(slug)", kind: "custom", name: draft.name, wire: draft.wire,
+      endpoint: draft.endpoint, account: "LLM_CUSTOM_\(account)_API_KEY", keySet: keySet)
   }
 
-  /// Bridge rows are addressed by slug or by picker id — both resolve here.
-  private func index(of id: String) throws -> Int {
-    let providerId = id.hasPrefix("custom:") ? id : "custom:\(id)"
-    guard let index = custom.firstIndex(where: { $0.id == providerId }) else {
-      throw Failure.unknownProvider(id)
+  /// Bridge rows are addressed by the bare slug (§D 17:55Z); the picker id has the prefix.
+  private func index(of slug: String) throws -> Int {
+    guard let index = custom.firstIndex(where: { $0.id == "custom:\(slug)" }) else {
+      throw Failure.unknownProvider(slug)
     }
     return index
   }
 
   func add(_ draft: CsCustomProviderDraft) throws -> CsProviderOption {
     let option = try row(draft, keySet: draft.apiKey != nil)
-    guard !custom.contains(where: { $0.id == option.id }) else {
-      throw Failure.duplicateId(option.id)
-    }
     custom.append(option)
     return option
   }
@@ -552,8 +534,7 @@ final class MockProviderStore {
     laneProviders[lane] = providerId
   }
 
-  /// Resolved-lane projection the way the loader would seal it, for tests that
-  /// inject `runtimeLlmLaneProvider`.
+  /// Resolved-lane projection the way the loader would seal it.
   func runtimeLane(_ lane: CsLlmLane, model: String = "gpt-5.2") -> CsRuntimeLlmLane {
     let providerId = laneProviders[lane] ?? "openai-responses"
     let provider = (CsProviderOption.sampleProviders + custom).first { $0.id == providerId }
@@ -812,66 +793,37 @@ extension CsApiKeyProbeResult {
 }
 
 extension CsProviderOption {
-  /// Preview seed mirroring `ALL_PROVIDERS` (picker order §B.3: Libraxis,
-  /// OpenAI, xAI, Anthropic) with factory endpoints. OpenAI + xAI ship public
-  /// desktop client ids (NOTICE); Libraxis and Anthropic have no OAuth flow.
+  /// Registry row shape shared by the vendor seed and the mock custom store.
+  /// Vendors require a key; custom hosts are key-optional. Only OAuth vendors
+  /// (OpenAI + xAI ship public desktop client ids, NOTICE) can be "not signed in".
+  static func row(
+    id: String, kind: String, name: String, wire: String, endpoint: String, account: String,
+    keySet: Bool = false, login: Bool = false
+  ) -> CsProviderOption {
+    CsProviderOption(
+      id: id, kind: kind, displayName: name, wire: wire, endpoint: endpoint,
+      apiKeyAccount: account, apiKeySet: keySet, keyRequired: kind == "vendor",
+      accountSignedIn: false, accountLoginEnabled: login,
+      accountStatusMessage: login ? "not signed in" : "provider account login unavailable",
+      oauthClientId: nil)
+  }
+
+  /// Preview seed mirroring `ALL_PROVIDERS` with factory endpoints; the mock
+  /// order is §B.3's (Libraxis, OpenAI, xAI, Anthropic) — I1 owns the real one.
   static let sampleProviders: [CsProviderOption] = [
-    CsProviderOption(
-      id: "libraxis-responses",
-      kind: "vendor",
-      displayName: "Libraxis",
-      wire: "responses",
-      endpoint: "https://api.libraxis.com/v1/responses",
-      apiKeyAccount: "LLM_LIBRAXIS_API_KEY",
-      apiKeySet: false,
-      keyRequired: true,
-      accountSignedIn: false,
-      accountLoginEnabled: false,
-      accountStatusMessage: "provider account login unavailable",
-      oauthClientId: nil
-    ),
-    CsProviderOption(
-      id: "openai-responses",
-      kind: "vendor",
-      displayName: "OpenAI",
-      wire: "responses",
-      endpoint: "https://api.openai.com/v1/responses",
-      apiKeyAccount: "LLM_OPENAI_API_KEY",
-      apiKeySet: true,
-      keyRequired: true,
-      accountSignedIn: false,
-      accountLoginEnabled: true,
-      accountStatusMessage: "not signed in",
-      oauthClientId: nil
-    ),
-    CsProviderOption(
-      id: "xai-responses",
-      kind: "vendor",
-      displayName: "xAI",
-      wire: "responses",
-      endpoint: "https://api.x.ai/v1/responses",
-      apiKeyAccount: "LLM_XAI_API_KEY",
-      apiKeySet: false,
-      keyRequired: true,
-      accountSignedIn: false,
-      accountLoginEnabled: true,
-      accountStatusMessage: "not signed in",
-      oauthClientId: nil
-    ),
-    CsProviderOption(
-      id: "anthropic-messages",
-      kind: "vendor",
-      displayName: "Anthropic",
-      wire: "messages",
-      endpoint: "https://api.anthropic.com/v1/messages",
-      apiKeyAccount: "LLM_ANTHROPIC_API_KEY",
-      apiKeySet: false,
-      keyRequired: true,
-      accountSignedIn: false,
-      accountLoginEnabled: false,
-      accountStatusMessage: "provider account login unavailable",
-      oauthClientId: nil
-    ),
+    .row(
+      id: "libraxis-responses", kind: "vendor", name: "Libraxis", wire: "responses",
+      endpoint: "https://api.libraxis.com/v1/responses", account: "LLM_LIBRAXIS_API_KEY"),
+    .row(
+      id: "openai-responses", kind: "vendor", name: "OpenAI", wire: "responses",
+      endpoint: "https://api.openai.com/v1/responses", account: "LLM_OPENAI_API_KEY",
+      keySet: true, login: true),
+    .row(
+      id: "xai-responses", kind: "vendor", name: "xAI", wire: "responses",
+      endpoint: "https://api.x.ai/v1/responses", account: "LLM_XAI_API_KEY", login: true),
+    .row(
+      id: "anthropic-messages", kind: "vendor", name: "Anthropic", wire: "messages",
+      endpoint: "https://api.anthropic.com/v1/messages", account: "LLM_ANTHROPIC_API_KEY"),
   ]
 }
 
