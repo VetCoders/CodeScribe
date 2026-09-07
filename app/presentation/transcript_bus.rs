@@ -266,6 +266,8 @@ pub enum TranscriptSessionEndReason {
     StartSuperseded,
     /// The recorder could not be started after `session_started` was written.
     StartFailed,
+    /// A CLI file decoder or output sink failed after opening its session.
+    TranscriptionFailed,
 }
 
 /// Append-only public event contract. `text` is always clean reducer truth;
@@ -663,7 +665,8 @@ impl TranscriptBus {
             }
             TranscriptSessionEndReason::Completed => TranscriptProjectionPhase::NoSpeech,
             TranscriptSessionEndReason::StartSuperseded
-            | TranscriptSessionEndReason::StartFailed => TranscriptProjectionPhase::Error,
+            | TranscriptSessionEndReason::StartFailed
+            | TranscriptSessionEndReason::TranscriptionFailed => TranscriptProjectionPhase::Error,
         };
         let availability = self.projection_availability(has_text, false, session_wav_exists);
         let event = CleanTranscriptEvent {

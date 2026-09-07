@@ -530,6 +530,18 @@ impl LocalWhisperEngine {
         language: Option<&str>,
         options: FileTranscriptionOptions,
     ) -> Result<TranscriptionVerdict> {
+        self.transcribe_file_with_language_observed(path, language, options, &mut |_| Ok(()))
+    }
+
+    /// Observe admitted segments after each window, before decoding the next.
+    /// Streaming and ordinary file calls use the same assembly and verdict.
+    pub fn transcribe_file_with_language_observed(
+        &mut self,
+        path: &Path,
+        language: Option<&str>,
+        options: FileTranscriptionOptions,
+        on_segments: &mut dyn FnMut(&[crate::pipeline::contracts::TranscriptSegment]) -> Result<()>,
+    ) -> Result<TranscriptionVerdict> {
         let (samples, sample_rate) =
             audio_loader::load_audio_file(path).context("Failed to load audio file")?;
 
@@ -580,6 +592,7 @@ impl LocalWhisperEngine {
             sample_rate,
             language,
             &silence_spans,
+            on_segments,
         )?;
         super::timing::record_inference_ms(inference_started.elapsed().as_millis() as u64);
         let raw_for_final_pass = raw;
@@ -698,6 +711,7 @@ impl LocalWhisperEngine {
             sample_rate,
             language,
             &silence_spans,
+            &mut |_| Ok(()),
         )
     }
 
@@ -715,6 +729,7 @@ impl LocalWhisperEngine {
         sample_rate: u32,
         language: Option<&str>,
         silence_spans: &[(f32, f32)],
+        on_segments: &mut dyn FnMut(&[crate::pipeline::contracts::TranscriptSegment]) -> Result<()>,
     ) -> Result<RawTranscript> {
         let samples = audio_loader::resample_to_16k(audio, sample_rate);
         if samples.is_empty() {
@@ -823,6 +838,7 @@ impl LocalWhisperEngine {
             let overlap_end_secs = covered_until_secs.max(start_sec);
             let window_segments = transcript.segments.len();
             let window_chars = transcript.text.chars().count();
+            let prior_segments = merged.segments.len();
             merge_chunk_transcripts(&mut merged, transcript, overlap_end_secs).with_context(
                 || {
                     format!(
@@ -832,6 +848,7 @@ impl LocalWhisperEngine {
                     )
                 },
             )?;
+            on_segments(&merged.segments[prior_segments..])?;
             covered_until_secs = covered_until_secs.max(end_sec);
         }
 

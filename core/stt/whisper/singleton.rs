@@ -454,8 +454,18 @@ pub fn transcribe_file_verdict(
     language: Option<&str>,
     options: FileTranscriptionOptions,
 ) -> Result<TranscriptionVerdict> {
+    transcribe_file_verdict_observed(path, language, options, &mut |_| Ok(()))
+}
+
+/// Streaming observes the process-owned engine instead of creating a second model.
+pub fn transcribe_file_verdict_observed(
+    path: &std::path::Path,
+    language: Option<&str>,
+    options: FileTranscriptionOptions,
+    on_segments: &mut dyn FnMut(&[crate::pipeline::contracts::TranscriptSegment]) -> Result<()>,
+) -> Result<TranscriptionVerdict> {
     with_engine_initial_prompt(file_transcription_initial_prompt(), |engine| {
-        engine.transcribe_file_with_language(path, language, options)
+        engine.transcribe_file_with_language_observed(path, language, options, on_segments)
     })
 }
 

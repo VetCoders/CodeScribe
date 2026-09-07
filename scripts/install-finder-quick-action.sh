@@ -13,32 +13,43 @@
 # workflow always calls the installed binary.
 set -euo pipefail
 
-SERVICE_DIR="$HOME/Library/Services"
+SERVICE_DIR="${1:-$HOME/Library/Services}"
 WORKFLOW="$SERVICE_DIR/Transcribe with Codescribe.workflow"
 CONTENTS="$WORKFLOW/Contents"
 
 SHELL_COMMAND=$(cat <<'SCRIPT'
-CODESCRIBE="$HOME/.cargo/bin/codescribe"
+CODESCRIBE="${CODESCRIBE_BIN:-$HOME/.local/bin/codescribe}"
 if [ ! -x "$CODESCRIBE" ]; then
-  osascript -e 'display notification "codescribe CLI not found in ~/.cargo/bin" with title "Codescribe"'
+  CODESCRIBE="$HOME/.cargo/bin/codescribe"
+fi
+if [ ! -x "$CODESCRIBE" ]; then
+  osascript -e 'display notification "Install the Codescribe CLI first" with title "Codescribe"'
   exit 1
 fi
 combined=""
 failed=0
 for f in "$@"; do
   out="${f%.*}.txt"
-  if "$CODESCRIBE" transcribe --no-bus "$f" > "$out" 2>/dev/null; then
+  if [ -e "$out" ] || [ -L "$out" ]; then
+    print -ru2 -- "Refusing to overwrite: $out"
+    failed=$((failed + 1))
+    continue
+  fi
+  tmp=$(mktemp "${out}.XXXXXX") || { failed=$((failed + 1)); continue; }
+  if "$CODESCRIBE" transcribe --no-bus "$f" > "$tmp" && ln "$tmp" "$out"; then
     combined="$combined$(cat "$out")"$'\n\n'
   else
-    rm -f "$out"
+    print -ru2 -- "Transcription failed: $f"
     failed=$((failed + 1))
   fi
+  rm -f "$tmp"
 done
 if [ -n "$combined" ]; then
   printf '%s' "$combined" | pbcopy
 fi
 count=$#
-osascript -e "display notification \"$((count - failed))/$count transcribed · text copied · .txt next to sources\" with title \"Codescribe\""
+osascript -e "display notification \"$((count - failed))/$count transcribed · text copied for successful files · existing files kept\" with title \"Codescribe\""
+[ "$failed" -eq 0 ]
 SCRIPT
 )
 
@@ -66,6 +77,11 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 			</dict>
 			<key>NSMessage</key>
 			<string>runWorkflowAsService</string>
+			<key>NSRequiredContext</key>
+			<dict>
+				<key>NSApplicationIdentifier</key>
+				<string>com.apple.finder</string>
+			</dict>
 			<key>NSSendFileTypes</key>
 			<array>
 				<string>public.audio</string>
@@ -238,7 +254,9 @@ cat > "$CONTENTS/document.wflow" <<PLIST
 PLIST
 
 # Ask the pasteboard server to pick up the new service without a re-login.
-/System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
+if (( $# == 0 )); then
+  /System/Library/CoreServices/pbs -update >/dev/null 2>&1 || true
+fi
 
 echo "installed: $WORKFLOW"
 echo "Finder → right-click audio/video selection → Quick Actions → Transcribe with Codescribe"

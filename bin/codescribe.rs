@@ -49,7 +49,7 @@ enum Command {
         /// File language; live accepts it for compatibility but app settings own capture
         #[arg(short, long, global = true)]
         language: Option<String>,
-        /// Live-canvas view: flush each decoded segment as it lands
+        /// Print admitted segments after each decode window, without repeating the final text
         #[arg(long)]
         stream: bool,
         /// Print only; do not publish this verdict onto the transcript bus
@@ -495,33 +495,44 @@ fn transcribe(
     }
 
     let started = std::time::Instant::now();
-    // The one legal file route — identical to the GUI's stop-path final pass.
-    let verdict = codescribe_core::stt::transcribe_file_verdict(file, language)?;
-    let decode_secs = started.elapsed().as_secs_f64();
-
     let stdout = std::io::stdout();
-
-    let transcript_text = if stream && !verdict.raw.segments.is_empty() {
-        // One segment = one utterance draft, the app's own grain; the lane owns
-        // that loop so stdout and the bus cannot disagree about what a line is.
-        let assembled = match lane.as_mut() {
-            Some(lane) => lane
-                .publish_segments(&verdict.raw.segments)
-                .unwrap_or_else(|error| {
-                    eprintln!("bus draft write failed: {error}");
-                    CliTranscriptLane::segment_texts(&verdict.raw.segments)
-                }),
-            None => CliTranscriptLane::segment_texts(&verdict.raw.segments),
-        };
-        let mut out = stdout.lock();
-        for line in &assembled {
-            writeln!(out, "{line}")?;
+    let mut streamed_text = String::new();
+    let verdict =
+        codescribe_core::stt::transcribe_file_verdict_observed(file, language, &mut |segments| {
+            if stream {
+                let lines = match lane.as_mut() {
+                    Some(lane) => lane.publish_segments(segments).unwrap_or_else(|error| {
+                        eprintln!("bus draft write failed: {error}");
+                        CliTranscriptLane::segment_texts(segments)
+                    }),
+                    None => CliTranscriptLane::segment_texts(segments),
+                };
+                let mut out = stdout.lock();
+                for line in lines {
+                    writeln!(out, "{line}")?;
+                    if !streamed_text.is_empty() {
+                        streamed_text.push(' ');
+                    }
+                    streamed_text.push_str(&line);
+                }
+                out.flush()?;
+            }
+            Ok(())
+        });
+    let verdict = match verdict {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            if let Some(lane) = lane.as_mut()
+                && let Err(bus_error) =
+                    lane.publish_ended(TranscriptSessionEndReason::TranscriptionFailed)
+            {
+                eprintln!("bus failure end write failed: {bus_error}");
+            }
+            return Err(error);
         }
-        out.flush()?;
-        assembled.join(" ")
-    } else {
-        verdict.text.clone()
     };
+    let decode_secs = started.elapsed().as_secs_f64();
+    let transcript_text = verdict.text.clone();
     // L2: previews/drafts stay raw; seal and delivery take the custom lexicon.
     let delivered_text =
         codescribe_core::quality::overlay_quality::apply_custom_lexicon(&transcript_text);
@@ -532,12 +543,11 @@ fn transcribe(
         eprintln!("bus seal write failed: {error}");
     }
 
-    // Delivery on stdout (the stream view already printed the canvas; the
-    // delivery still follows it so scripts always end with the final text).
-    if stream {
-        eprintln!("--- delivery ---");
+    // A stream already carries the transcript. Only an actual final correction
+    // (for example the custom lexicon) warrants a marked replacement.
+    if let Some(final_output) = final_stdout(stream, &streamed_text, &delivered_text) {
+        println!("{final_output}");
     }
-    println!("{delivered_text}");
 
     // Provenance to stderr, GUI-truth style.
     eprintln!(
@@ -567,9 +577,40 @@ fn transcribe(
     Ok(())
 }
 
+fn final_stdout(stream: bool, streamed: &str, delivered: &str) -> Option<String> {
+    if !stream || streamed.is_empty() {
+        return Some(delivered.to_string());
+    }
+    if streamed.split_whitespace().eq(delivered.split_whitespace()) {
+        None
+    } else {
+        Some(format!("⟲ final: {delivered}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_does_not_repeat_delivery_but_exposes_a_real_final_correction() {
+        assert_eq!(
+            final_stdout(true, "Pierwsze zdanie. Drugie.", "Pierwsze zdanie. Drugie."),
+            None
+        );
+        assert_eq!(
+            final_stdout(true, "raszt", "Rust"),
+            Some("⟲ final: Rust".into())
+        );
+        assert_eq!(
+            final_stdout(true, "", "Tekst bez segmentów"),
+            Some("Tekst bez segmentów".into())
+        );
+        assert_eq!(
+            final_stdout(false, "", "Pełny dokument"),
+            Some("Pełny dokument".into())
+        );
+    }
 
     #[test]
     fn live_command_is_a_subcommand_not_a_file_named_live() {

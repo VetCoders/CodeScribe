@@ -50,7 +50,9 @@ never refuse install forever because an old session lacked an end line.
 `start_superseded` when a key-up or reschedule invalidated a hold start after
 `session_started` and before the take became an active recording, and
 `start_failed` when the recorder could not be started after the session was
-announced. The controller has exactly one terminal publisher
+announced. CLI file sessions use `transcription_failed` when decoding or
+stream output fails after publishing a draft; the partial text is never sealed
+as a completed document. The controller has exactly one terminal publisher
 (`end_transcript_bus`); the delayed hold start unwinds every pre-active exit
 through `unwind_hold_start`, so no started session is left without its
 terminal line. The first terminal line wins; later calls are no-ops.
@@ -231,6 +233,28 @@ render for that session; old rows without the additive fields retain the same
 deterministic formatted/no-speech fallback. On macOS the follower wakes from
 kqueue vnode events; a bounded timeout exists only to recover from a missed
 rotation/replacement watch.
+
+## File CLI and Finder
+
+`codescribe transcribe --no-bus recording.wav second.m4a` decodes files in
+order through the process-owned Whisper singleton. One failed file does not
+prevent later files from running; the batch exits nonzero if any file fails.
+Use `--no-bus` for archive batches that should not replace Copy-last.
+
+`--stream` prints and flushes newly admitted segments after each decode window,
+before starting the next window. These are file-verdict drafts, not live
+microphone observations. Overlapping windows use the same timestamp assembly
+as non-streaming transcription. The final text is not printed a second time;
+if final lexicon processing changes it, a `⟲ final:` line explicitly replaces
+the draft. Without `--stream`, stdout contains only the final transcript.
+Warnings and file/provenance headers go to stderr. Streaming does not remove
+decode-window latency or make decoder tokens into committed transcript text.
+
+Run `scripts/install-finder-quick-action.sh` to install **Transcribe with
+Codescribe** in Finder's Quick Actions menu. It uses the installed CLI with
+`--no-bus`, writes a sibling `.txt`, and copies successful results to the
+clipboard. Existing output files are preserved and reported as failures.
+Failed decodes leave no partial `.txt`, and other selected files continue.
 
 ## C11 evidence boundary
 

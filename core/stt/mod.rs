@@ -202,6 +202,17 @@ pub fn transcribe_file_verdict(
     path: &std::path::Path,
     language: Option<&str>,
 ) -> anyhow::Result<crate::pipeline::contracts::TranscriptionVerdict> {
+    transcribe_file_verdict_observed(path, language, &mut |_| Ok(()))
+}
+
+/// File final-pass with incremental observation of admitted decode windows.
+pub fn transcribe_file_verdict_observed(
+    path: &std::path::Path,
+    language: Option<&str>,
+    on_segments: &mut dyn FnMut(
+        &[crate::pipeline::contracts::TranscriptSegment],
+    ) -> anyhow::Result<()>,
+) -> anyhow::Result<crate::pipeline::contracts::TranscriptionVerdict> {
     use crate::pipeline::contracts::FileTranscriptionOptions;
 
     match default_engine() {
@@ -211,11 +222,19 @@ pub fn transcribe_file_verdict(
             tracing::info!(
                 "file final-pass forced to Whisper (Apple is live-only; SFSpeechURL is not final)"
             );
-            whisper::transcribe_file_verdict(path, language, FileTranscriptionOptions::default())
+            whisper::transcribe_file_verdict_observed(
+                path,
+                language,
+                FileTranscriptionOptions::default(),
+                on_segments,
+            )
         }
-        SttEngine::Candle => {
-            whisper::transcribe_file_verdict(path, language, FileTranscriptionOptions::default())
-        }
+        SttEngine::Candle => whisper::transcribe_file_verdict_observed(
+            path,
+            language,
+            FileTranscriptionOptions::default(),
+            on_segments,
+        ),
     }
 }
 
@@ -357,15 +376,11 @@ mod tests {
         // must call whisper::transcribe_file_verdict only (no apple_stt file).
         // data_assets/02: Apple URL final 66c beat live 26c and still lost human 600c+.
         let src = include_str!("mod.rs");
-        let apple_arm = src
-            .split("SttEngine::Apple =>")
-            .nth(2) // third occurrence ≈ file-final match arm after live helpers
-            .unwrap_or("");
-        // Fall back: scan the function body by name.
+        // Include the observed implementation delegated to by the plain file
+        // entry point. A prefix split would stop at its similarly named helper.
         let fn_body = src
-            .split("pub fn transcribe_file_verdict")
-            .nth(1)
-            .and_then(|s| s.split("const WARMUP_SAMPLE_RATE").next())
+            .split_once("pub fn transcribe_file_verdict(")
+            .and_then(|(_, s)| s.split("const WARMUP_SAMPLE_RATE").next())
             .unwrap_or("");
         assert!(
             fn_body.contains("forced to Whisper") || fn_body.contains("file final-pass forced"),
@@ -375,6 +390,5 @@ mod tests {
             !fn_body.contains("apple_stt::transcribe_file_verdict"),
             "transcribe_file_verdict must not call apple_stt file path (Apple is live-only)"
         );
-        let _ = apple_arm;
     }
 }

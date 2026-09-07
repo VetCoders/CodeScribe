@@ -158,6 +158,7 @@ install:
 	 CODESCRIBE_LOCAL_INSTALL=1 cargo install --path . --force
 	@mkdir -p ~/.codescribe
 	@$(MAKE) hooks
+	@./scripts/install-finder-quick-action.sh
 	@echo "Installed: qube tools $$(grep '^version' $(VERSION_FILE) | head -1 | sed 's/.*\"\(.*\)\"/v\1/')"
 	@echo "Note: Whisper is not embedded — download via Settings → Dictation or make download-model"
 
@@ -167,6 +168,7 @@ install-no-embed:
 	 CODESCRIBE_NO_EMBED=1 CODESCRIBE_LOCAL_INSTALL=1 cargo install --path . --force
 	@mkdir -p ~/.codescribe
 	@$(MAKE) hooks
+	@./scripts/install-finder-quick-action.sh
 	@echo "Installed: qube tools $$(grep '^version' $(VERSION_FILE) | head -1 | sed 's/.*\"\(.*\)\"/v\1/')"
 	@echo "Note: Set CODESCRIBE_MODEL_PATH at runtime if Whisper is needed"
 

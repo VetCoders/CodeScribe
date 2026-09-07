@@ -219,6 +219,10 @@ impl CliTranscriptLane {
         }
         let mut event = self.lifecycle("session_ended", None);
         event.end_reason = Some(reason);
+        event.terminal = true;
+        if reason != TranscriptSessionEndReason::Completed {
+            event.phase = super::transcript_bus::TranscriptProjectionPhase::Error;
+        }
         self.write(event)?;
         self.ended = true;
         Ok(())
@@ -452,5 +456,42 @@ mod tests {
         lane.publish_ended(TranscriptSessionEndReason::Completed)
             .unwrap();
         assert!(!path.exists() || std::fs::read_to_string(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_stream_closes_once_without_sealing_partial_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let mut lane = CliTranscriptLane::open_at(
+            "cli-failure".into(),
+            TranscriptMode::Dictation,
+            path.clone(),
+        )
+        .unwrap();
+        lane.publish_draft("partial", &segment("partial", 0.0, 1.0))
+            .unwrap();
+        lane.publish_ended(TranscriptSessionEndReason::TranscriptionFailed)
+            .unwrap();
+        lane.publish_ended(TranscriptSessionEndReason::Completed)
+            .unwrap();
+        let events = read(&path);
+        assert_eq!(events.len(), 3);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.status == "transcript_sealed")
+        );
+        let end = events.last().unwrap();
+        assert_eq!(end.status, "session_ended");
+        assert!(end.terminal);
+        assert_eq!(
+            end.phase,
+            super::super::transcript_bus::TranscriptProjectionPhase::Error
+        );
+        assert_eq!(
+            end.end_reason,
+            Some(TranscriptSessionEndReason::TranscriptionFailed)
+        );
+        assert!(end.text.is_empty());
     }
 }

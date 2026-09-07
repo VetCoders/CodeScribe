@@ -49,5 +49,5 @@ pub use timing::{FinalPassTiming, take_final_pass_timing};
 // provisioning provenance do not collapse back into plain text.
 pub use singleton::{
     detect_language, get_model_path, init, is_initialized, transcribe, transcribe_file_verdict,
-    transcribe_with_segments,
+    transcribe_file_verdict_observed, transcribe_with_segments,
 };

@@ -18,6 +18,20 @@
 version = "1.2.0"
 updated = "2026-08-27"
 
+[vars.CODESCRIBE_BIN]
+default = ""
+type = "string"
+reload = "restart"
+category = "cli"
+description = "Optional Finder Quick Action CLI executable override; normally resolves ~/.local/bin/codescribe then ~/.cargo/bin/codescribe"
+
+[vars.CODESCRIBE_STREAM_TEST_WAV]
+default = ""
+type = "string"
+reload = "restart"
+category = "test"
+description = "Private multi-window WAV for the ignored real CLI streaming timing and verdict-parity test"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Application async runtime
 # ═══════════════════════════════════════════════════════════════════════════════
