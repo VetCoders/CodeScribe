@@ -143,19 +143,55 @@ final class ProvidersPanelTests: XCTestCase {
       llmOpenaiApiKeySet: false,
       llmXaiApiKeySet: true,
       llmAnthropicApiKeySet: false,
-      sttApiKeySet: true,
+      sttFileApiKeySet: true,
+      sttLiveApiKeySet: false,
       githubTokenSet: false
     )
     XCTAssertTrue(status.isSet(account: "LLM_LIBRAXIS_API_KEY"))
     XCTAssertFalse(status.isSet(account: "LLM_OPENAI_API_KEY"))
     XCTAssertTrue(status.isSet(account: "LLM_XAI_API_KEY"))
     XCTAssertFalse(status.isSet(account: "LLM_ANTHROPIC_API_KEY"))
-    XCTAssertTrue(status.isSet(account: "STT_API_KEY"))
+    XCTAssertTrue(status.isSet(account: "STT_FILE_API_KEY"))
+    XCTAssertFalse(status.isSet(account: "STT_LIVE_API_KEY"))
     XCTAssertFalse(status.isSet(account: "GITHUB_TOKEN"))
-    for legacy in ["LLM_API_KEY", "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY"] {
-      XCTAssertFalse(status.isSet(account: legacy), "\(legacy): per-lane accounts are gone (D3)")
+    for legacy in [
+      "LLM_API_KEY", "LLM_ASSISTIVE_API_KEY", "LLM_FORMATTING_API_KEY", "STT_API_KEY",
+    ] {
+      XCTAssertFalse(
+        status.isSet(account: legacy), "\(legacy): retired account (D3 / stt-lanes-v1)")
     }
-    XCTAssertEqual(makeModel().serviceKeyAccounts, ["STT_API_KEY", "GITHUB_TOKEN"])
+    XCTAssertEqual(makeModel().serviceKeyAccounts, ["GITHUB_TOKEN"])
     XCTAssertEqual(SettingsViewModel.keyLabel(for: "LLM_LIBRAXIS_API_KEY"), "Libraxis API key")
+    XCTAssertEqual(SettingsViewModel.keyLabel(for: "STT_FILE_API_KEY"), "File transcription key")
+    XCTAssertEqual(SettingsViewModel.keyLabel(for: "STT_LIVE_API_KEY"), "Live transcript key")
+  }
+
+  /// stt-lanes-v1 §F.7: Providers renders File then Live, each lane one atomic
+  /// endpoint + key row, and a lane save writes ONLY that lane's wire key.
+  func testSpeechToTextSectionRendersFileThenLiveAsAtomicRows() {
+    var writes: [(key: String, value: String)] = []
+    let model = makeModel { writes.append((key: $0.0, value: $0.1)) }
+    _ = SpeechToTextSection(model: model)
+
+    XCTAssertEqual(
+      model.sttLanes.map(\.id), ["file", "live"], "sttLanes() order is the contract's")
+    XCTAssertEqual(
+      model.sttLanes.map(\.endpointWireKey), ["STT_FILE_ENDPOINT", "STT_LIVE_ENDPOINT"])
+    XCTAssertEqual(model.sttLanes.map(\.keyAccount), ["STT_FILE_API_KEY", "STT_LIVE_API_KEY"])
+    XCTAssertEqual(model.sttLanes.map(\.title), ["File transcription", "Live transcript"])
+    XCTAssertFalse(
+      model.serviceKeyAccounts.contains { $0.hasPrefix("STT_") },
+      "STT keys ride on the lanes, never on Service keys")
+
+    model.setSttLaneEndpoint("file", " https://asr.example/v1/audio/transcriptions ")
+    XCTAssertEqual(writes.last?.key, "STT_FILE_ENDPOINT")
+    XCTAssertEqual(writes.last?.value, "https://asr.example/v1/audio/transcriptions")
+    model.setSttLaneEndpoint("live", "wss://asr.example/v1/audio/transcribe")
+    XCTAssertEqual(writes.last?.key, "STT_LIVE_ENDPOINT")
+    XCTAssertEqual(writes.map(\.key), ["STT_FILE_ENDPOINT", "STT_LIVE_ENDPOINT"])
+
+    model.setSttLaneEndpoint("ndjson", "https://x")
+    XCTAssertEqual(writes.count, 2, "an unknown lane id writes nothing (two lanes, not three)")
+    XCTAssertNil(model.lastError)
   }
 }

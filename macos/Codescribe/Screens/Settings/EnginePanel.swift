@@ -567,25 +567,9 @@ struct EnginePanel: View {
       )
       .font(CSFont.ui(11.5, .medium))
       .foregroundStyle(model.cloudConsentGranted ? CSColor.oliveLight : CSColor.amber)
-      SettingsUrlRow(
-        title: "Live WSS socket",
-        keyLabel: "STT_ENDPOINT",
-        current: model.sttEndpoint,
-        placeholder: "https://…",
-        help:
-          "Live Cloud Layer-1 WebSocket mapper (Libraxis multipart URL → wss://…/v1/audio/transcribe). Not a secret — the API key stays in the Keychain on Providers. Clearing restores the provider default.",
-        unsetLabel: "provider default",
-        onSave: { model.setSttEndpoint($0) }
-      )
-      SettingsUrlRow(
-        title: "Gateway session URL",
-        keyLabel: "CODESCRIBE_ASR_GATEWAY_URL",
-        current: model.asrGatewayUrl,
-        placeholder: "https://…/session",
-        help:
-          "Session-mint endpoint for live Cloud Layer 1. Not the WSS socket. Clearing restores unset.",
-        onSave: { model.setAsrGatewayUrl($0) }
-      )
+      Text("Endpoints and keys live on Providers › Speech-to-text Cloud Service.")
+        .font(CSFont.ui(11.5))
+        .foregroundStyle(CSColor.textMutedAlt)
     }
     .csSettingsCard()
   }

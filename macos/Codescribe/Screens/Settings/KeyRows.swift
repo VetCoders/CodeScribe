@@ -4,7 +4,7 @@ import SwiftUI
 // Row-level building blocks for credential and URL editing. Secrets go to the
 // Keychain via `setApiKey` and are NEVER read back across the FFI; presence
 // renders from `apiKeySet` / `CsKeyStatus` booleans. Composed by
-// `ProvidersPanel` (vendor + custom + service keys) and `EnginePanel` (STT URLs).
+// `ProvidersPanel` (vendor + custom + speech-to-text lanes + service keys).
 
 // MARK: - Shared chrome
 
@@ -98,9 +98,10 @@ extension SettingsChipButton where Label == Text {
 
 // MARK: - URL row (non-secret)
 
-/// Non-secret URL field: the STT live WSS socket (`STT_ENDPOINT`) and the Cloud
-/// session-mint URL. Provider endpoints are NOT edited here — vendors are
-/// factory-pinned and custom hosts edit theirs in `CustomProviderForm`.
+/// Non-secret URL field: the speech-to-text lane endpoints
+/// (`STT_FILE_ENDPOINT` / `STT_LIVE_ENDPOINT`) and the Cloud session-mint URL,
+/// all on Providers › Speech-to-text. Provider endpoints are NOT edited here —
+/// vendors are factory-pinned and custom hosts edit theirs in `CustomProviderForm`.
 struct SettingsUrlRow: View {
   let title: String
   let keyLabel: String

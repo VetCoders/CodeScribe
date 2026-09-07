@@ -964,6 +964,8 @@ final class SettingsViewModel: ObservableObject {
   @Published private(set) var settings: CsSettings
   @Published private(set) var keyStatus: CsKeyStatus
   @Published private(set) var providers: [CsProviderOption]
+  /// Speech-to-text lanes (File, Live): atomic endpoint + key rows on Providers.
+  @Published private(set) var sttLanes: [CsSttLane]
   @Published private var modelDiscoveries: [String: CsModelDiscovery] = [:]
   /// Set when removing a custom provider bounced one or more lanes back to the
   /// default vendor (bridge `lanesReset`). Cleared on the next lane edit.
@@ -1100,6 +1102,7 @@ final class SettingsViewModel: ObservableObject {
     )
     self.keyStatus = .sampleAllSet
     self.providers = CsProviderOption.sampleProviders
+    self.sttLanes = engine?.sttLanes() ?? [.sampleFile, .sampleLive]
     self.configDir = ""
     self.needsOnboarding = false
     self.agentReadiness = .sample
@@ -1128,6 +1131,7 @@ final class SettingsViewModel: ObservableObject {
       applyLoadedSettings(engine.loadSettings())
       keyStatus = engine.keyStatus()
       providers = engine.availableProviders()
+      sttLanes = engine.sttLanes()
       configDir = engine.configDir()
       needsOnboarding = engine.shouldShowOnboarding()
       refreshModelDiscoveries(providerIds: LLMLane.allCases.map { llmLane($0).providerId })
@@ -1594,13 +1598,13 @@ final class SettingsViewModel: ObservableObject {
     formatActiveSTT(lastServing: lastServingVerdict)
   }
 
-  /// STT is "healthy" (olive dot) when a local model is configured, or when a
-  /// cloud endpoint is set. Runtime serving truth comes from the shared
-  /// controller snapshot, not this configuration-only health estimate.
+  /// STT is "healthy" (olive dot) when a local model is configured, or when
+  /// either cloud lane has an endpoint. Runtime serving truth comes from the
+  /// shared controller snapshot, not this configuration-only health estimate.
   var sttHealthy: Bool {
-    settings.useLocalStt
-      ? !settings.localModel.isEmpty
-      : (settings.sttEndpoint?.isEmpty == false)
+    if settings.useLocalStt { return !settings.localModel.isEmpty }
+    return settings.sttFileEndpoint?.isEmpty == false
+      || settings.sttLiveEndpoint?.isEmpty == false
   }
 
   var whisperLanguageCode: String { settings.whisperLanguage.shortCode }
@@ -2227,15 +2231,12 @@ final class SettingsViewModel: ObservableObject {
     persist("AGENT_WORKSPACE_ROOTS", cleaned.joined(separator: ":"))
   }
 
-  /// Current cloud STT endpoint override, empty when the provider default applies.
-  var sttEndpoint: String { settings.sttEndpoint ?? "" }
-
-  /// Persist the cloud STT endpoint (`STT_ENDPOINT`). Blank clears the override
-  /// so cloud lanes fall back to the provider default. Restart-scoped, like the
-  /// env contract says — the field exists so the key's companion endpoint no
-  /// longer requires hand-editing ~/.codescribe/.env.
-  func setSttEndpoint(_ value: String) {
-    persist("STT_ENDPOINT", value.trimmingCharacters(in: .whitespaces))
+  /// Persist one lane's endpoint (`STT_FILE_ENDPOINT` / `STT_LIVE_ENDPOINT`). Blank
+  /// clears; the bridge validates the scheme per lane and a rejection lands in `lastError`.
+  func setSttLaneEndpoint(_ id: String, _ value: String) {
+    guard let lane = sttLanes.first(where: { $0.id == id }) else { return }
+    persist(lane.endpointWireKey, value.trimmingCharacters(in: .whitespaces))
+    if let engine { sttLanes = engine.sttLanes() }
   }
 
   private func persist(_ key: String, _ value: String) {
@@ -2277,7 +2278,8 @@ final class SettingsViewModel: ObservableObject {
     case "LLM_OPENAI_API_KEY": return "OpenAI API key"
     case "LLM_XAI_API_KEY": return "xAI (Grok) API key"
     case "LLM_ANTHROPIC_API_KEY": return "Anthropic API key"
-    case "STT_API_KEY": return "Speech-to-text API key"
+    case "STT_FILE_API_KEY": return "File transcription key"
+    case "STT_LIVE_API_KEY": return "Live transcript key"
     case "GITHUB_TOKEN": return "GitHub token"
     default: return account
     }
@@ -2291,7 +2293,7 @@ final class SettingsViewModel: ObservableObject {
   /// Operator-defined rows (`custom:<id>`), unbounded.
   var customProviders: [CsProviderOption] { providers.filter { $0.kind == "custom" } }
 
-  /// Non-provider Keychain accounts (STT, GitHub).
+  /// Non-provider Keychain accounts (GitHub). STT keys ride on `sttLanes`.
   var serviceKeyAccounts: [String] { engine?.serviceKeyAccounts() ?? [] }
 
   /// Lane-picker dot: credential present or key-optional host → green; else red.
@@ -2343,6 +2345,7 @@ final class SettingsViewModel: ObservableObject {
     applyLoadedSettings(engine.loadSettings())
     keyStatus = engine.keyStatus()
     providers = engine.availableProviders()
+    sttLanes = engine.sttLanes()
     refreshAgentStatus()
   }
 
