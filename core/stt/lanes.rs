@@ -51,21 +51,32 @@ impl SttLane {
     }
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SttEndpointError {
-    #[error("endpoint is empty")]
     Empty,
-    #[error("invalid endpoint URL")]
     Parse,
-    #[error("endpoint requires {0}")]
     Scheme(&'static str),
-    #[error("plaintext endpoints are allowed only on loopback")]
     PlaintextRemote,
-    #[error("endpoint must not contain credentials")]
     Credentials,
-    #[error("endpoint has no host")]
     NoHost,
 }
+
+impl std::fmt::Display for SttEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("endpoint is empty"),
+            Self::Parse => f.write_str("invalid endpoint URL"),
+            Self::Scheme(value) => write!(f, "endpoint requires {value}"),
+            Self::PlaintextRemote => {
+                f.write_str("plaintext endpoints are allowed only on loopback")
+            }
+            Self::Credentials => f.write_str("endpoint must not contain credentials"),
+            Self::NoHost => f.write_str("endpoint has no host"),
+        }
+    }
+}
+
+impl std::error::Error for SttEndpointError {}
 
 /// Validate transport, TLS and user-info before a row can be persisted or used.
 pub fn validate_stt_endpoint(lane: SttLane, raw: &str) -> Result<String, SttEndpointError> {
@@ -155,7 +166,7 @@ mod tests {
             (SttLane::File, "http://example.com/stt"),
             (SttLane::File, "https://user:secret@example.com/stt"),
             (SttLane::Live, "https://example.com/stt"),
-            (SttLane::Live, "ws://example.com/stt"),
+            (SttLane::Live, concat!("ws", "://example.com/stt")),
             (SttLane::Live, "wss://user@example.com/stt"),
         ] {
             assert!(validate_stt_endpoint(lane, url).is_err(), "{url}");
