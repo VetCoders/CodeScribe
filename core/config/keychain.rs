@@ -319,6 +319,38 @@ pub fn cached_runtime_key(account: &str) -> Option<String> {
     non_empty_secret(read_bundle_cache().and_then(|bundle| bundle.keys.get(account).cloned()))
 }
 
+/// Test-only view of a decoded Keychain bundle: what seal-time readers see when
+/// secrets exist in Keychain and nowhere in the process environment.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{KeychainBundle, read_bundle_cache, write_bundle_cache};
+
+    /// Restores whatever bundle cache existed before the fixture on drop.
+    pub(crate) struct BundleCacheGuard {
+        previous: Option<KeychainBundle>,
+    }
+
+    /// Install `keys` as the process bundle cache, exactly as a decoded
+    /// Keychain read would leave it.
+    pub(crate) fn install_bundle(keys: &[(&str, &str)]) -> BundleCacheGuard {
+        let previous = read_bundle_cache();
+        let mut bundle = KeychainBundle::default();
+        for (account, secret) in keys {
+            bundle
+                .keys
+                .insert((*account).to_string(), (*secret).to_string());
+        }
+        write_bundle_cache(Some(bundle));
+        BundleCacheGuard { previous }
+    }
+
+    impl Drop for BundleCacheGuard {
+        fn drop(&mut self) {
+            write_bundle_cache(self.previous.take());
+        }
+    }
+}
+
 /// Resolve the current runtime secret, reading Keychain when the in-memory
 /// cache has not been populated yet. Use this only on explicit secret-use
 /// paths, where a macOS Keychain prompt is appropriate.

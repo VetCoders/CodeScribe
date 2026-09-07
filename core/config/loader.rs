@@ -286,7 +286,7 @@ impl Config {
             && provider.wire_family() == WireFamily::OpenAiResponses
             && endpoint_requires_key
             && account_auth::provider_oauth_config(provider)
-                .is_ok_and(|row| Self::runtime_env_non_empty(row.tokens_account).is_some());
+                .is_ok_and(|row| Self::signed_in_provider_account(row.tokens_account));
         let available = api_key.is_some() || !endpoint_requires_key || account_auth;
         let unavailable_reason = (!available).then(|| {
             format!(
@@ -427,6 +427,25 @@ impl Config {
         Self::config_runtime_env_var(key)
             .ok()
             .and_then(Self::non_empty_string)
+    }
+
+    /// Seal-time truth of "a provider account is signed in": the serialized
+    /// token record under `tokens_account`, read exactly where sign-in put it —
+    /// the Keychain bundle, through the process cache (no Keychain I/O at seal
+    /// time, same corridor as every API key). An explicit process env value
+    /// still wins, as for every other secret. The record must parse: a corrupt
+    /// blob seals as "not signed in" instead of a lane that fails at first use.
+    ///
+    /// Deliberately not [`Self::runtime_env_non_empty`]: token accounts are
+    /// kept out of `KEYCHAIN_ACCOUNTS` so OAuth tokens are never mirrored into
+    /// the process environment (child processes inherit it). That helper could
+    /// therefore only see env, which the app never seeds with tokens — from
+    /// 6517d4f6a until this change account auth was unreachable in production:
+    /// Settings showed "signed in as …" while every sealed lane carried
+    /// `account_auth=false`, and removing the API key refused the lane.
+    fn signed_in_provider_account(tokens_account: &str) -> bool {
+        super::keychain::cached_runtime_key(tokens_account)
+            .is_some_and(|raw| serde_json::from_str::<account_auth::AccountTokens>(&raw).is_ok())
     }
 
     fn non_empty_string(value: String) -> Option<String> {
@@ -2064,6 +2083,104 @@ mod tests {
         remove_env_for_test("CODESCRIBE_STT_INITIAL_PROMPT_ENABLED");
         remove_env_for_test(SILERO_FUSION_ENV);
         tmp
+    }
+
+    /// Clear every process-env input that could hand the assistive lane a
+    /// credential or move it off the official OpenAI endpoint.
+    fn clear_assistive_lane_env() -> Vec<TestEnvGuard> {
+        vec![
+            TestEnvGuard::unset("LLM_ASSISTIVE_PROVIDER"),
+            TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT"),
+            TestEnvGuard::unset("LLM_ENDPOINT"),
+            TestEnvGuard::unset("LLM_ASSISTIVE_API_KEY"),
+            TestEnvGuard::unset(account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT),
+        ]
+    }
+
+    /// Effect witness for the 2026-09-07 refusal on dragon: sign-in tokens
+    /// live only in the Keychain bundle — never in process env — and the sealed
+    /// assistive lane must resolve to account auth and be available with no
+    /// API key anywhere. The Settings label already read the bundle; the lane
+    /// read env and sealed `account_auth=false` for every signed-in operator.
+    #[test]
+    #[serial]
+    fn assistive_lane_seals_account_auth_from_bundle_tokens_without_env() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_assistive_lane_env();
+        let tokens = account_auth::AccountTokens::new(
+            ProviderKind::OpenAiResponses,
+            "access".to_string(),
+            Some("refresh".to_string()),
+            None,
+            None,
+            Some(3600),
+        );
+        let _bundle = super::super::keychain::test_support::install_bundle(&[(
+            account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT,
+            &serde_json::to_string(&tokens).expect("serialize tokens"),
+        )]);
+
+        let snapshot =
+            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let lane = snapshot.llm_lanes().assistive();
+        assert_eq!(lane.provider(), ProviderKind::OpenAiResponses);
+        assert!(
+            ProviderKind::endpoint_requires_api_key(lane.endpoint()),
+            "witness must run against a credentialed endpoint, got {}",
+            lane.endpoint()
+        );
+        assert!(
+            lane.credential().api_key().is_none(),
+            "no API key may take part in this witness"
+        );
+        assert!(
+            lane.credential().account_auth(),
+            "bundle-only sign-in must seal as account auth"
+        );
+        assert!(lane.available(), "signed-in lane must be available");
+        assert!(lane.request_available());
+        assert_eq!(lane.unavailable_reason(), None);
+    }
+
+    /// Negative control for the witness above: same env, a bundle without a
+    /// token record, no API key — the lane must refuse and say why.
+    #[test]
+    #[serial]
+    fn assistive_lane_without_key_or_bundle_tokens_refuses() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_assistive_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+
+        let snapshot =
+            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let lane = snapshot.llm_lanes().assistive();
+        assert!(!lane.credential().account_auth());
+        assert!(!lane.available());
+        assert!(
+            lane.unavailable_reason()
+                .is_some_and(|reason| reason.contains("signed-in provider account")),
+            "refusal must name the missing account, got {:?}",
+            lane.unavailable_reason()
+        );
+    }
+
+    /// A corrupt token record is "not signed in" at seal time, not a lane that
+    /// fails at its first request.
+    #[test]
+    #[serial]
+    fn assistive_lane_treats_corrupt_bundle_tokens_as_not_signed_in() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_assistive_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[(
+            account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT,
+            "not-a-token-record",
+        )]);
+
+        let snapshot =
+            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let lane = snapshot.llm_lanes().assistive();
+        assert!(!lane.credential().account_auth());
+        assert!(!lane.available());
     }
 
     #[test]
