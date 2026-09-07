@@ -4,6 +4,7 @@ import SwiftUI
 // the Agent is." Vendors (OpenAI, xAI, Anthropic) are factory-pinned: the
 // endpoint is shown, never edited. A custom provider is any host speaking the
 // Responses or Messages wire; its endpoint sits next to its (optional) key.
+// Speech-to-text is two atomic lanes (File, Live), each an endpoint + key row.
 // Models are chosen per request lane under Agent › Request lanes.
 
 struct ProvidersPanel: View {
@@ -49,6 +50,9 @@ struct ProvidersPanel: View {
         onEdit: { formTarget = .edit($0) }
       )
       .padding(.top, CSSpace.section)
+
+      SpeechToTextSection(model: model)
+        .padding(.top, CSSpace.section)
 
       ServiceKeysSection(model: model)
         .padding(.top, CSSpace.section)
@@ -370,17 +374,90 @@ struct CustomProviderForm: View {
   }
 }
 
+// MARK: - Speech-to-text Cloud Service (stt-lanes-v1 §D)
+
+/// Two lanes, File then Live, in `sttLanes()` order. Each lane is one atomic endpoint +
+/// key row (ADR Tier 3): the key is never shown apart from the address it authenticates.
+struct SpeechToTextSection: View {
+  @ObservedObject var model: SettingsViewModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      SettingsSectionLabel("Speech-to-text Cloud Service")
+      Text("Your recordings leave your machine.")
+        .font(CSFont.ui(12.5, .semibold))
+        .foregroundStyle(CSColor.amber)
+        .padding(.top, 8)
+      Text("Cloud mode and consent stay on Dictation; endpoints and keys live here.")
+        .font(CSFont.ui(11.5))
+        .lineSpacing(2)
+        .foregroundStyle(CSColor.textMutedAlt)
+        .padding(.top, 4)
+      VStack(spacing: 8) {
+        ForEach(model.sttLanes, id: \.id) { lane in
+          SttLaneCard(model: model, lane: lane)
+        }
+      }
+      .padding(.top, 12)
+    }
+  }
+}
+
+/// One lane card: title, what the lane accepts, its endpoint row and its key
+/// row (with Test). The Live card also hosts the session-mint URL, moved here
+/// from Dictation because URLs live where the keys are.
+struct SttLaneCard: View {
+  @ObservedObject var model: SettingsViewModel
+  let lane: CsSttLane
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text(lane.title)
+        .font(CSFont.ui(14.5, .bold))
+        .foregroundStyle(CSColor.textHigh)
+      Text(lane.accepts)
+        .font(CSFont.mono(10.5, .medium))
+        .foregroundStyle(CSColor.textMutedAlt)
+        .fixedSize(horizontal: false, vertical: true)
+      SettingsUrlRow(
+        title: "Endpoint",
+        keyLabel: lane.endpointWireKey,
+        current: lane.endpoint ?? "",
+        placeholder: lane.placeholder,
+        help:
+          "Not a secret. Blank clears the lane; the bridge rejects a URL whose scheme does not fit this lane.",
+        onSave: { model.setSttLaneEndpoint(lane.id, $0) }
+      )
+      KeyRow(model: model, account: lane.keyAccount, label: "API key", isSet: lane.apiKeySet)
+      if lane.id == "live" {
+        SettingsUrlRow(
+          title: "Gateway session URL",
+          keyLabel: "CODESCRIBE_ASR_GATEWAY_URL",
+          current: model.asrGatewayUrl,
+          placeholder: "https://…/session",
+          help:
+            "Session-mint endpoint for live Cloud Layer 1. Not the live socket above. Clearing restores unset.",
+          onSave: { model.setAsrGatewayUrl($0) }
+        )
+      }
+    }
+    .csSettingsCard()
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("\(lane.title) lane")
+  }
+}
+
 // MARK: - Service keys
 
-/// Keys that are not LLM providers: speech-to-text and GitHub. Their URLs (if
-/// any) live on Dictation, so only the secret is edited here.
+/// Keys that are not LLM providers and not speech-to-text: GitHub. Only the
+/// secret is edited here.
 struct ServiceKeysSection: View {
   @ObservedObject var model: SettingsViewModel
 
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       SettingsSectionLabel("Service keys")
-      Text("Speech-to-text and GitHub. Not LLM providers — the STT socket URL lives on Dictation.")
+      Text("GitHub token. Speech-to-text endpoints and keys live in the section above.")
         .font(CSFont.ui(11.5))
         .lineSpacing(2)
         .foregroundStyle(CSColor.textMutedAlt)

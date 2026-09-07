@@ -1225,7 +1225,8 @@ final class SettingsTruthTests: XCTestCase {
       case "CODESCRIBE_LAYERED_TRANSCRIPTION": persisted.layeredTranscription = value
       case "CODESCRIBE_STT_ENGINE": persisted.sttEngine = value
       case "CODESCRIBE_ASR_GATEWAY_URL": persisted.asrGatewayUrl = value
-      case "STT_ENDPOINT": persisted.sttEndpoint = value
+      case "STT_FILE_ENDPOINT": persisted.sttFileEndpoint = value
+      case "STT_LIVE_ENDPOINT": persisted.sttLiveEndpoint = value
       case "FINAL_PASS_MODE": persisted.finalPassMode = value
       default: break
       }
@@ -1272,8 +1273,12 @@ final class SettingsTruthTests: XCTestCase {
     XCTAssertEqual(writes.suffix(2).map(\.1), ["apple_only", "off"])
     XCTAssertEqual(model.asrModeId, "apple_only")
 
-    model.setSttEndpoint("wss://asr.example/v1/audio/transcribe")
-    XCTAssertEqual(writes.last?.0, "STT_ENDPOINT")
+    model.setSttLaneEndpoint("live", "wss://asr.example/v1/audio/transcribe")
+    XCTAssertEqual(writes.last?.0, "STT_LIVE_ENDPOINT")
+    XCTAssertEqual(model.sttLanes.last?.endpoint, "wss://asr.example/v1/audio/transcribe")
+    model.setSttLaneEndpoint("file", "https://asr.example/v1/audio/transcriptions")
+    XCTAssertEqual(writes.last?.0, "STT_FILE_ENDPOINT")
+    XCTAssertEqual(model.sttLanes.first?.endpoint, "https://asr.example/v1/audio/transcriptions")
     model.setAsrGatewayUrl("https://gateway.example/session")
     XCTAssertEqual(writes.last?.0, "CODESCRIBE_ASR_GATEWAY_URL")
 

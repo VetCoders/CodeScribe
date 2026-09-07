@@ -14,10 +14,11 @@ import Foundation
 //   AI_FORMATTING_ENABLED "1" | "0"
 //   FORMATTING_LEVEL      "off" | "correction" | "smart" | "max"
 //   USE_LOCAL_STT         "1" | "0"
-//   LOCAL_MODEL / STT_ENDPOINT / LLM_<LANE>_PROVIDER / LLM_<LANE>_MODEL ...  free strings
+//   LOCAL_MODEL / STT_{FILE,LIVE}_ENDPOINT / LLM_<LANE>_PROVIDER / LLM_<LANE>_MODEL ...  free strings
 //   (no endpoint keys: endpoints belong to providers — vendors factory-pinned, custom rows CRUD)
 // Keychain accounts (CsKeyStatus, core/config/keychain.rs::KEYCHAIN_ACCOUNTS): one per vendor
-//   (LLM_<VENDOR>_API_KEY), STT_API_KEY, GITHUB_TOKEN; custom rows carry LLM_CUSTOM_<ID>_API_KEY
+//   (LLM_<VENDOR>_API_KEY), STT_FILE_API_KEY, STT_LIVE_API_KEY, GITHUB_TOKEN; custom rows carry
+//   LLM_CUSTOM_<ID>_API_KEY
 
 /// Subset of the codescribe config surface the Settings screen consumes.
 @MainActor
@@ -52,8 +53,11 @@ protocol SettingsEngine {
 
   // Keychain-backed API keys — presence booleans only, secrets never read back
   func keyStatus() -> CsKeyStatus
-  /// Non-provider Keychain accounts (STT, GitHub); provider accounts ride on `CsProviderOption`.
+  /// Non-provider Keychain accounts (GitHub); provider accounts ride on
+  /// `CsProviderOption`, STT accounts on `CsSttLane` (atomic endpoint + key).
   func serviceKeyAccounts() -> [String]
+  /// Speech-to-text lanes, always two, File then Live (stt-lanes-v1 §C).
+  func sttLanes() -> [CsSttLane]
   func setApiKey(account: String, secret: String) throws
   func clearApiKey(account: String) throws
   func testApiKey(account: String) throws -> CsApiKeyProbeResult
@@ -173,6 +177,7 @@ final class RealSettingsEngine: SettingsEngine {
 
   func keyStatus() -> CsKeyStatus { config.keyStatus() }
   func serviceKeyAccounts() -> [String] { config.serviceKeyAccounts() }
+  func sttLanes() -> [CsSttLane] { config.sttLanes() }
   func setApiKey(account: String, secret: String) throws {
     try config.setApiKey(account: account, secret: secret)
   }
@@ -372,7 +377,19 @@ struct MockSettingsEngine: SettingsEngine {
   }
 
   func keyStatus() -> CsKeyStatus { status }
-  func serviceKeyAccounts() -> [String] { ["STT_API_KEY", "GITHUB_TOKEN"] }
+  func serviceKeyAccounts() -> [String] { ["GITHUB_TOKEN"] }
+  /// Two sample lanes whose endpoint and key presence follow the mock's
+  /// settings / status, so a persisted `STT_*_ENDPOINT` write is witnessable.
+  func sttLanes() -> [CsSttLane] {
+    let loaded = loadSettings()
+    var file = CsSttLane.sampleFile
+    file.endpoint = loaded.sttFileEndpoint
+    file.apiKeySet = status.sttFileApiKeySet
+    var live = CsSttLane.sampleLive
+    live.endpoint = loaded.sttLiveEndpoint
+    live.apiKeySet = status.sttLiveApiKeySet
+    return [file, live]
+  }
   func setApiKey(account: String, secret: String) throws {}
   func clearApiKey(account: String) throws {}
   func testApiKey(account: String) throws -> CsApiKeyProbeResult {
@@ -716,7 +733,8 @@ extension CsSettings {
     quickNotesSaveOnly: false,
     useLocalStt: true,
     localModel: "whisper-large-v3-turbo",
-    sttEndpoint: nil,
+    sttFileEndpoint: nil,
+    sttLiveEndpoint: nil,
     sttEngine: nil,
     finalPassMode: nil,
     restoreClipboard: true,
@@ -757,7 +775,8 @@ extension CsKeyStatus {
     llmOpenaiApiKeySet: true,
     llmXaiApiKeySet: false,
     llmAnthropicApiKeySet: false,
-    sttApiKeySet: true,
+    sttFileApiKeySet: true,
+    sttLiveApiKeySet: true,
     githubTokenSet: false
   )
 
@@ -769,7 +788,8 @@ extension CsKeyStatus {
     case "LLM_OPENAI_API_KEY": return llmOpenaiApiKeySet
     case "LLM_XAI_API_KEY": return llmXaiApiKeySet
     case "LLM_ANTHROPIC_API_KEY": return llmAnthropicApiKeySet
-    case "STT_API_KEY": return sttApiKeySet
+    case "STT_FILE_API_KEY": return sttFileApiKeySet
+    case "STT_LIVE_API_KEY": return sttLiveApiKeySet
     case "GITHUB_TOKEN": return githubTokenSet
     default: return false
     }
@@ -780,13 +800,36 @@ extension CsApiKeyProbeResult {
   static func sample(account: String) -> CsApiKeyProbeResult {
     CsApiKeyProbeResult(
       account: account,
-      status: account == "STT_API_KEY" ? .unsupported : .ok,
-      message: account == "STT_API_KEY"
-        ? "no cheap liveness probe is available for this STT key"
-        : "key accepted and quota available",
+      status: .ok,
+      message: "key accepted and quota available",
       probedEndpoint: nil
     )
   }
+}
+
+extension CsSttLane {
+  /// Mirrors `SttLane::File` (§B.0): https multipart or NDJSON `:stream`.
+  static let sampleFile = CsSttLane(
+    id: "file",
+    title: "File transcription",
+    accepts: "https multipart /v1/audio/transcriptions or NDJSON …:stream",
+    placeholder: "https://…/v1/audio/transcriptions",
+    endpoint: nil,
+    endpointWireKey: "STT_FILE_ENDPOINT",
+    keyAccount: "STT_FILE_API_KEY",
+    apiKeySet: false
+  )
+  /// Mirrors `SttLane::Live` (§B.0): wss live socket (stt-ws-v1).
+  static let sampleLive = CsSttLane(
+    id: "live",
+    title: "Live transcript",
+    accepts: "wss live socket (stt-ws-v1)",
+    placeholder: "wss://…/v1/audio/transcribe",
+    endpoint: nil,
+    endpointWireKey: "STT_LIVE_ENDPOINT",
+    keyAccount: "STT_LIVE_API_KEY",
+    apiKeySet: false
+  )
 }
 
 extension CsProviderOption {

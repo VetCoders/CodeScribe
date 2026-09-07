@@ -387,7 +387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stt =
           settings.useLocalStt
           ? "local (\(settings.localModel))"
-          : "cloud (\(settings.sttEndpoint ?? "default"))"
+          : "cloud (file: \(settings.sttFileEndpoint ?? "unset"), live: \(settings.sttLiveEndpoint ?? "unset"))"
         let text = [
           "codescribe debug info",
           "app version: \(version) (\(build))",
