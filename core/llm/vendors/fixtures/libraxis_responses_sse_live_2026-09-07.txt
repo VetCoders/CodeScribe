@@ -35,4 +35,3 @@ event: response.completed
 data: {"type": "response.completed", "response": {"id": "resp_5e0ec282055e4cffb8c27b9c4a901550", "object": "response", "created_at": 1788801150, "model": "buddy", "status": "completed", "output": [{"id": "resp_e579c69cbb7f4242b2d9473b20922af0:message:0", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "pong", "annotations": [], "logprobs": []}]}], "tools": [{"type": "web_search"}], "tool_choice": "auto", "parallel_tool_calls": true, "usage": {"input_tokens": 799, "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0}, "output_tokens": 2, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": 801}, "error": null, "incomplete_details": null, "max_output_tokens": 16, "reasoning": {"effort": "none"}, "background": false}, "sequence_number": 11}
 
 data: [DONE]
-
