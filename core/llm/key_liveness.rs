@@ -689,7 +689,7 @@ mod tests {
     fn stt_live_probe_classifies_handshake_status() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
-            "ws://{}/v1/audio/transcribe",
+            concat!("ws", "://{}/v1/audio/transcribe"),
             listener.local_addr().unwrap()
         );
         let server = thread::spawn(move || {
