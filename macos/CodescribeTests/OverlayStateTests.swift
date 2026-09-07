@@ -331,19 +331,18 @@ final class OverlayStateTests: XCTestCase {
 
   func testCanvasPreservesEmptyAndExactEngineTextWithoutLifecyclePlaceholders() {
     let state = OverlayState()
-    XCTAssertEqual(state.listeningDisplay, "")
+    XCTAssertEqual(state.activeText, "")
     state.handleRecordingPreparing()
     state.handleRecordingStarted()
-    XCTAssertEqual(state.listeningDisplay, "")
+    XCTAssertEqual(state.activeText, "")
 
     let text = "  raz raz\nZażółć — e\u{301} 👩‍💻  "
     projectText(text, to: state)
-    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
     state.handleRecordingFinalising()
-    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
 
     projectText("", to: state)
-    XCTAssertEqual(state.listeningDisplay, "")
     XCTAssertEqual(state.activeText, "")
   }
 
@@ -359,12 +358,12 @@ final class OverlayStateTests: XCTestCase {
     projectText("analyze the repo", to: state)
     XCTAssertTrue(state.canCopy)
     XCTAssertEqual(state.activeText, "analyze the repo")
-    XCTAssertEqual(state.liveText, "analyze the repo")
+    XCTAssertEqual(state.activeText, "analyze the repo")
 
     projectText("analyze the repo for duplicate dispatch", to: state)
     XCTAssertTrue(state.canCopy)
     XCTAssertEqual(state.activeText, "analyze the repo for duplicate dispatch")
-    XCTAssertEqual(state.listeningDisplay, "analyze the repo for duplicate dispatch")
+    XCTAssertEqual(state.activeText, "analyze the repo for duplicate dispatch")
   }
 
   func testAdmittedProjectionPaintsWithoutSwiftRevalidatingReceipts() {
@@ -1136,7 +1135,7 @@ final class OverlayStateTests: XCTestCase {
     state.handleRecordingPreparing()
     state.handleRecordingStarted()
     projectText("alpha {selection_1} beta", to: state)
-    XCTAssertEqual(state.liveText, "alpha {selection_1} beta")
+    XCTAssertEqual(state.activeText, "alpha {selection_1} beta")
 
     projectText("alpha {selection_1} beta", to: state, terminal: true)
     state.finishControllerRecording()
@@ -1351,7 +1350,7 @@ final class OverlayStateTests: XCTestCase {
     projectText(text, to: state)
     state.applyPresentationStatus(refusalStatus())
     XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
-    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
   }
 
   func testCalibrationSuccessProjectionCarriesNewProfileVersion() {
@@ -1433,7 +1432,7 @@ final class OverlayStateTests: XCTestCase {
 
     XCTAssertNotEqual(state.mode, .error, "an error with a draft must not discard the take")
     XCTAssertEqual(state.activeText, "zdanie pierwsze zdanie drugie")
-    XCTAssertEqual(state.liveText, "zdanie pierwsze zdanie drugie")
+    XCTAssertEqual(state.activeText, "zdanie pierwsze zdanie drugie")
   }
 
   func testTerminalFailureSidebandEndsCaptureWithoutRewritingProjection() {
@@ -1770,12 +1769,12 @@ final class OverlayStateTests: XCTestCase {
       terminal: true
     )
     state.finishControllerRecording()
-    XCTAssertEqual(state.liveText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
 
     state.handleRecordingStarted()
 
     XCTAssertEqual(state.mode, .formatted)
-    XCTAssertEqual(state.liveText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
     XCTAssertEqual(state.formattedText, "tekst poprzedniego nagrania")
 
     projectSessionText(

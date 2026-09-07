@@ -483,28 +483,13 @@ final class OverlayState {
     return engine
   }
 
-  /// Rust-rendered transcript bytes from the latest admitted projection.
-  private var rawLiveText: String {
-    formattedText
-  }
-
-  var liveText: String {
-    rawLiveText
-  }
-
-  /// Exact engine text, including an empty document. Lifecycle labels belong
-  /// in chrome; they must never become selectable/copied transcript characters.
-  var listeningDisplay: String {
-    liveText
-  }
-
   /// Timer is mandatory for any session that has started, including the
   /// frozen value after stop.
   var showsSessionTimer: Bool {
     captureStartedAtUptime != nil
   }
 
-  /// Exact rendered bytes for non-canvas consumers such as copy/delivery.
+  /// Exact engine text shared by the canvas, sizing, copy, and delivery.
   var activeText: String {
     formattedText
   }
@@ -647,8 +632,7 @@ final class OverlayState {
     freezeCaptureClock()
     levelMeter.reset()
     do {
-      // The controller bridge returns "" here; the authoritative transcript
-      // is the id-ordered assembly of `UtteranceFinal` events (see liveText).
+      // Stop acknowledges lifecycle; transcript projections own the text.
       _ = try await engine.stopRecording()
       recording = false
       isFinalPass = false

@@ -270,9 +270,8 @@ final class OverlayController: ObservableObject {
   private func resizeForProjectedContent() {
     guard automaticContentSizingEnabled, let panel else { return }
     let screen = panel.screen ?? NSScreen.main
-    let text = state.mode == .formatted ? state.revisionDraft : state.listeningDisplay
     let targetHeight = OverlayContentSizePolicy.preferredHeight(
-      for: text,
+      for: state.activeText,
       width: panel.frame.width,
       textScale: textScale.scale,
       screen: screen
