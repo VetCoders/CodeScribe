@@ -1,6 +1,6 @@
 # ADR 2026-08-14 — Provider credential topology (keys and endpoints live together)
 
-Status: ACCEPTED, NOT IMPLEMENTED (runtime re-verified 2026-08-22)
+Status: ACCEPTED, IMPLEMENTED — wave 1 landed 2026-09-07 (plan provider-registry-v2: core registry vendor|custom, bridge catalog, Settings › Providers + Agent › Request lanes; Libraxis as a first-class vendor, first in the picker on a live witness). Open: composer model picker, vc-prune of the wave.
 Owner: product contract; implementation remains a dedicated cut (W14 candidate)
 
 The current Settings/config model still exposes lane-specific endpoint/key
