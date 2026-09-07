@@ -12,21 +12,85 @@ use std::collections::BTreeMap;
 use std::sync::{Once, OnceLock, RwLock};
 use tracing::{debug, info};
 
+use crate::llm::provider::is_custom_key_account;
+
 /// Keychain service identity for every Codescribe generic-password item.
 const SERVICE: &str = "com.vetcoders.codescribe";
 /// Account name of the single bundled secret item (all API keys together).
 const BUNDLE_ACCOUNT: &str = "codescribe_keychain_bundle_v1";
 
-/// Known API key accounts stored in Keychain.
+/// Static secret accounts: one per pinned vendor, plus STT and GitHub.
+///
+/// Only these are seeded into process env at bootstrap. Custom-provider keys
+/// (`LLM_CUSTOM_<ID>_API_KEY`, see [`is_known_account`]) and OAuth token
+/// records live in the same bundle but are read from it directly, never from
+/// env.
 pub const KEYCHAIN_ACCOUNTS: &[&str] = &[
-    "LLM_API_KEY",
-    "STT_API_KEY",
-    "LLM_FORMATTING_API_KEY",
-    "LLM_ASSISTIVE_API_KEY",
-    "LLM_ANTHROPIC_API_KEY",
+    "LLM_OPENAI_API_KEY",
     "LLM_XAI_API_KEY",
+    "LLM_ANTHROPIC_API_KEY",
+    "LLM_LIBRAXIS_API_KEY",
+    "STT_API_KEY",
     "GITHUB_TOKEN",
 ];
+
+/// A static account or a well-formed custom-provider key account.
+pub fn is_known_account(account: &str) -> bool {
+    KEYCHAIN_ACCOUNTS.contains(&account) || is_custom_key_account(account)
+}
+
+/// Whether a non-blank secret exists for `account` without touching Keychain.
+///
+/// Static accounts honour an explicit process env value; custom accounts read
+/// the bundle cache only.
+pub fn key_present(account: &str) -> bool {
+    cached_runtime_key(account).is_some()
+}
+
+/// One legacy → current secret relocation inside the bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyMove {
+    /// Legacy account to drain (for example `LLM_FORMATTING_API_KEY`).
+    pub from: String,
+    /// Account that owns the secret from now on (a provider `key_account`).
+    pub to: String,
+}
+
+/// Apply [`KeyMove`]s to the bundle: copy `from` into `to` when `to` is absent,
+/// then remove `from`. Returns the number of bundle entries changed.
+///
+/// Idempotent — a second pass finds no `from` entries and changes nothing. A
+/// `to` that already holds a secret keeps it: the user's current key is never
+/// overwritten by a legacy one. No-op in test harnesses (no Keychain I/O).
+pub fn apply_key_moves(moves: &[KeyMove]) -> Result<usize> {
+    if moves.is_empty() || is_test_env() {
+        return Ok(0);
+    }
+    let Some(mut bundle) = load_bundle() else {
+        return Ok(0);
+    };
+    let mut changed = 0;
+    for step in moves {
+        let Some(secret) = bundle.keys.remove(&step.from) else {
+            continue;
+        };
+        changed += 1;
+        if !bundle.keys.contains_key(&step.to) {
+            bundle.keys.insert(step.to.clone(), secret);
+            changed += 1;
+            info!("Keychain: moved {} into {}", step.from, step.to);
+        } else {
+            info!(
+                "Keychain: dropped legacy {} ({} already set)",
+                step.from, step.to
+            );
+        }
+    }
+    if changed > 0 {
+        save_bundle(&bundle)?;
+    }
+    Ok(changed)
+}
 
 /// All Codescribe secrets in a single Keychain item.
 ///
@@ -277,11 +341,19 @@ fn is_xctest_host_by_signals(config_file: bool, session_id: bool, bundle_path: b
 }
 
 /// Saves a secret to the macOS Keychain under the Codescribe service.
-/// In test environments, sets the env var directly instead of touching Keychain.
+///
+/// In test environments a static account is set as an env var instead; a
+/// custom-provider account (never read from env) goes into the bundle cache.
 pub fn save_key(account: &str, secret: &str) -> Result<()> {
     if is_test_env() {
         debug!("Test env: skipping Keychain save for {account}");
-        unsafe { std::env::set_var(account, secret) };
+        if is_custom_key_account(account) {
+            let mut bundle = read_bundle_cache().unwrap_or_default();
+            bundle.keys.insert(account.to_string(), secret.to_string());
+            write_bundle_cache(Some(bundle));
+        } else {
+            unsafe { std::env::set_var(account, secret) };
+        }
         return Ok(());
     }
     let mut bundle = load_bundle().unwrap_or_default();
@@ -307,16 +379,30 @@ pub fn load_key(account: &str) -> Option<String> {
 
 /// Resolve the current runtime secret without touching Keychain.
 ///
-/// Explicit process environment values retain highest priority. Values copied
-/// from Keychain during bootstrap are origin-tracked, so a later Settings save
-/// or delete cannot be shadowed by that stale process snapshot.
+/// Explicit process environment values retain highest priority for static
+/// accounts. Values copied from Keychain during bootstrap are origin-tracked,
+/// so a later Settings save or delete cannot be shadowed by that stale process
+/// snapshot. Custom-provider accounts never consult env.
 pub fn cached_runtime_key(account: &str) -> Option<String> {
-    let env_value = non_empty_env(account);
-    let seeded_env_value = process_env_seed(account);
-    if let Some(value) = explicit_env_value(env_value, seeded_env_value.as_deref()) {
+    if let Some(value) = explicit_env_for(account) {
         return Some(value);
     }
-    non_empty_secret(read_bundle_cache().and_then(|bundle| bundle.keys.get(account).cloned()))
+    non_empty_secret(cached_bundle_secret(account))
+}
+
+/// The bundle-cache entry for `account`, untrimmed.
+fn cached_bundle_secret(account: &str) -> Option<String> {
+    read_bundle_cache().and_then(|bundle| bundle.keys.get(account).cloned())
+}
+
+/// The explicit (user-exported) env value for a static account; `None` for a
+/// custom-provider account, whose key must never reach process env.
+fn explicit_env_for(account: &str) -> Option<String> {
+    if is_custom_key_account(account) {
+        return None;
+    }
+    let seeded_env_value = process_env_seed(account);
+    explicit_env_value(non_empty_env(account), seeded_env_value.as_deref())
 }
 
 /// Test-only view of a decoded Keychain bundle: what seal-time readers see when
@@ -355,12 +441,10 @@ pub(crate) mod test_support {
 /// cache has not been populated yet. Use this only on explicit secret-use
 /// paths, where a macOS Keychain prompt is appropriate.
 pub fn runtime_key(account: &str) -> Option<String> {
-    let env_value = non_empty_env(account);
-    let seeded_env_value = process_env_seed(account);
-    if let Some(value) = explicit_env_value(env_value, seeded_env_value.as_deref()) {
+    if let Some(value) = explicit_env_for(account) {
         return Some(value);
     }
-    non_empty_secret(load_key(account))
+    non_empty_secret(cached_bundle_secret(account).or_else(|| load_key(account)))
 }
 
 /// Read `account` from the process environment, trimmed, treating blank as unset.
@@ -406,6 +490,12 @@ fn non_empty_secret(value: Option<String>) -> Option<String> {
 pub fn delete_key(account: &str) -> Result<()> {
     if is_test_env() {
         debug!("Test env: skipping Keychain delete for {account}");
+        if is_custom_key_account(account)
+            && let Some(mut bundle) = read_bundle_cache()
+        {
+            bundle.keys.remove(account);
+            write_bundle_cache(Some(bundle));
+        }
         return Ok(());
     }
     let mut bundle = load_bundle().unwrap_or_default();
@@ -439,7 +529,8 @@ pub fn delete_key(account: &str) -> Result<()> {
     }
 }
 
-/// Populates environment variables from Keychain for any keys not already set.
+/// Populates environment variables from Keychain for any static account not
+/// already set. Custom-provider keys and OAuth records stay in the bundle.
 ///
 /// This ensures `.env` values always take priority over Keychain entries.
 pub fn populate_env_from_keychain() {
@@ -472,7 +563,55 @@ pub fn populate_env_from_keychain() {
 /// Keychain bypass and runtime-key priority regressions (no live Keychain I/O).
 #[cfg(test)]
 mod tests {
-    use super::{is_xctest_host_by_signals, keychain_disabled_by_signals, resolve_runtime_key};
+    use super::{
+        KEYCHAIN_ACCOUNTS, cached_runtime_key, is_known_account, is_xctest_host_by_signals,
+        key_present, keychain_disabled_by_signals, resolve_runtime_key, test_support,
+    };
+    use serial_test::serial;
+
+    /// The static roster is one account per pinned vendor plus STT and GitHub;
+    /// legacy lane accounts are gone and custom accounts are known by shape.
+    #[test]
+    fn static_accounts_are_per_vendor_and_custom_accounts_are_known_by_shape() {
+        assert_eq!(
+            KEYCHAIN_ACCOUNTS,
+            &[
+                "LLM_OPENAI_API_KEY",
+                "LLM_XAI_API_KEY",
+                "LLM_ANTHROPIC_API_KEY",
+                "LLM_LIBRAXIS_API_KEY",
+                "STT_API_KEY",
+                "GITHUB_TOKEN",
+            ]
+        );
+        assert!(is_known_account("LLM_LIBRAXIS_API_KEY"));
+        assert!(is_known_account("LLM_CUSTOM_MY_LOCAL_API_KEY"));
+        assert!(!is_known_account("LLM_API_KEY"));
+        assert!(!is_known_account("LLM_FORMATTING_API_KEY"));
+        assert!(!is_known_account("LLM_ASSISTIVE_API_KEY"));
+    }
+
+    /// Effect witness: a custom-provider key is read from the bundle only. An
+    /// env var of the same name (never legitimately set) is ignored, and
+    /// `key_present` follows the same rule.
+    #[test]
+    #[serial]
+    fn custom_provider_keys_come_from_the_bundle_never_from_env() {
+        let account = "LLM_CUSTOM_MY_LOCAL_API_KEY";
+        // SAFETY: serial test; the var is removed again below.
+        unsafe { std::env::set_var(account, "from-env") };
+        {
+            let _bundle = test_support::install_bundle(&[]);
+            assert_eq!(cached_runtime_key(account), None);
+            assert!(!key_present(account));
+        }
+        {
+            let _bundle = test_support::install_bundle(&[(account, " from-bundle ")]);
+            assert_eq!(cached_runtime_key(account).as_deref(), Some("from-bundle"));
+            assert!(key_present(account));
+        }
+        unsafe { std::env::remove_var(account) };
+    }
 
     /// Any single XCTest host marker is enough — Xcode has rotated which env it sets.
     #[test]

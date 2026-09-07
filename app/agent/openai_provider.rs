@@ -89,7 +89,9 @@ impl OpenAiProvider {
         let snapshot_key_present = lane.credential().api_key().is_some();
         let api_key_account = Some(lane.credential().key_account().to_string());
         let use_account_auth = lane.credential().account_auth();
-        let provider = lane.provider();
+        // Account auth is only ever sealed for a vendor lane; a Custom
+        // provider never reaches the token path, so the default is inert.
+        let provider = lane.vendor().unwrap_or_default();
 
         let use_previous_response_id =
             parse_env_bool("CODESCRIBE_AGENT_USE_PREVIOUS_RESPONSE_ID", true);

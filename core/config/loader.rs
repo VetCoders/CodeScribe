@@ -20,10 +20,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use super::defaults::{
-    default_assistive_model, default_assistive_provider, default_formatting_model,
-    default_formatting_provider, default_llm_endpoint, default_llm_model,
-};
 use super::energy_calibration::{SealedEnergyCalibration, energy_calibration_path};
 use super::settings::{
     DEFAULT_AGENT_WORKSPACE_ROOT, DEFAULT_SEAL_LANE_ARMED, FormattingPolicy, RuntimeAiExecution,
@@ -37,12 +33,30 @@ use super::types::{
     Config, DeferredInsertShortcut, Language, OverlayPositionMode, TranscriptSendMode,
 };
 use crate::llm::account_auth;
-use crate::llm::provider::{LlmMode, ProviderKind, WireFamily};
+use crate::llm::provider::{LlmMode, ProviderKind, ProviderRef, ProviderRegistry, WireFamily};
 
 /// Has the process already seeded its environment from config? Seeding happens
 /// once, at the first load; later loads read snapshots instead, so a background
 /// thread never sees `set_var` racing under it.
 static CONFIG_ENV_BOOTSTRAPPED: AtomicBool = AtomicBool::new(false);
+/// Retired per-lane key names still accepted as `LLM_OPENAI_API_KEY` aliases.
+/// REMOVE AFTER 2026-10-15.
+const LEGACY_LLM_KEY_ENV: [&str; 3] = [
+    "LLM_API_KEY",
+    "LLM_FORMATTING_API_KEY",
+    "LLM_ASSISTIVE_API_KEY",
+];
+/// Retired endpoint/model env names; present ⇒ one warning, never honored.
+const LEGACY_LLM_ENDPOINT_ENV: [&str; 6] = [
+    "LLM_ENDPOINT",
+    "LLM_FORMATTING_ENDPOINT",
+    "LLM_ASSISTIVE_ENDPOINT",
+    "LLM_XAI_ENDPOINT",
+    "LLM_ANTHROPIC_ENDPOINT",
+    "LLM_MODEL",
+];
+/// Legacy LLM env names this process has already warned about.
+static LEGACY_LLM_ENV_WARNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 /// Serializes the one bootstrap load, so two concurrent `Config::load()` calls
 /// cannot both decide they are the first writer.
@@ -163,13 +177,9 @@ impl Config {
             field: "formatting_policy",
             reason: error.to_string(),
         })?;
-        let llm_lanes = Self::resolve_runtime_llm_lanes(&values, &user_settings);
+        let llm_lanes = Self::resolve_runtime_llm_lanes(&user_settings);
         let ai_execution = Self::resolve_runtime_ai_execution(formatting_policy);
         let mut digest_values = values.clone();
-        digest_values.llm_api_key = digest_values
-            .llm_api_key
-            .as_ref()
-            .map(|_| "<redacted:present>".to_string());
         digest_values.stt_api_key = digest_values
             .stt_api_key
             .as_ref()
@@ -257,50 +267,99 @@ impl Config {
             .unwrap_or(default)
     }
 
-    /// Resolve the complete LLM organ during the one settings-loader pass.
-    /// Consumers only receive the sealed result; none may repeat this work.
-    fn resolve_runtime_llm_lanes(values: &Config, settings: &UserSettings) -> RuntimeLlmLanes {
+    /// Resolve both LLM lanes during the one settings-loader pass. Consumers
+    /// only receive the sealed result; none may repeat this work.
+    fn resolve_runtime_llm_lanes(settings: &UserSettings) -> RuntimeLlmLanes {
+        Self::warn_legacy_llm_endpoint_env();
+        let registry = ProviderRegistry::from_settings(settings);
         RuntimeLlmLanes::seal(
-            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Main, values, settings),
-            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Formatting, values, settings),
-            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Assistive, values, settings),
+            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Formatting, &registry, settings),
+            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Assistive, &registry, settings),
         )
     }
 
+    /// The single resolution path (`00_ATLAS.md §B`): provider reference from
+    /// env, then settings, then the default vendor; the registry turns it into
+    /// endpoint + wire + key account; the model comes from env, settings, or
+    /// the vendor default (a Custom provider has no default and seals as
+    /// unavailable until one is chosen). Credentials are read through the
+    /// Keychain corridor only.
     fn resolve_runtime_llm_lane(
         lane: RuntimeLlmLaneKind,
-        values: &Config,
+        registry: &ProviderRegistry,
         settings: &UserSettings,
     ) -> RuntimeLlmLane {
-        let provider = Self::resolve_runtime_llm_provider(lane, settings);
-        let endpoint = Self::resolve_runtime_llm_endpoint(lane, provider, values, settings);
-        let model = Self::resolve_runtime_llm_model(lane, provider, settings);
-        let key_account = match lane {
-            RuntimeLlmLaneKind::Main => "LLM_API_KEY",
-            RuntimeLlmLaneKind::Formatting => "LLM_FORMATTING_API_KEY",
-            RuntimeLlmLaneKind::Assistive => provider.api_key_env_key(),
+        let (mode, persisted_provider, persisted_model) = match lane {
+            RuntimeLlmLaneKind::Formatting => (
+                LlmMode::Formatting,
+                settings.llm_formatting_provider.as_deref(),
+                settings.llm_formatting_model.as_deref(),
+            ),
+            RuntimeLlmLaneKind::Assistive => (
+                LlmMode::Assistive,
+                settings.llm_assistive_provider.as_deref(),
+                settings.llm_assistive_model.as_deref(),
+            ),
         };
-        let api_key = Self::runtime_env_non_empty(key_account);
-        let endpoint_requires_key = ProviderKind::endpoint_requires_api_key(&endpoint);
+        let reference = Self::runtime_env_non_empty(mode.provider_env_key())
+            .as_deref()
+            .and_then(ProviderRef::parse)
+            .or_else(|| persisted_provider.and_then(ProviderRef::parse))
+            .unwrap_or_default();
+        let (provider, mut unavailable_reason) = match registry.resolve(&reference) {
+            Some(provider) => (provider, None),
+            None => (
+                registry
+                    .resolve(&ProviderRef::default())
+                    .expect("the default vendor is always registered"),
+                Some(format!(
+                    "custom provider `{}` no longer exists",
+                    reference.custom_id().unwrap_or_default()
+                )),
+            ),
+        };
+        let model = Self::runtime_env_non_empty(mode.model_env_key())
+            .or_else(|| {
+                persisted_model
+                    .map(str::to_string)
+                    .and_then(Self::non_empty_string)
+            })
+            .or_else(|| {
+                provider
+                    .reference
+                    .vendor()
+                    .map(|vendor| vendor.default_model(mode).to_string())
+            })
+            .unwrap_or_default();
+        if model.is_empty() && unavailable_reason.is_none() {
+            unavailable_reason = Some(format!(
+                "no model selected for provider {}",
+                provider.display_name
+            ));
+        }
+        let api_key = Self::runtime_lane_api_key(&provider.key_account);
         let account_auth = lane == RuntimeLlmLaneKind::Assistive
-            && provider.wire_family() == WireFamily::OpenAiResponses
-            && endpoint_requires_key
-            && account_auth::provider_oauth_config(provider)
-                .is_ok_and(|row| Self::signed_in_provider_account(row.tokens_account));
-        let available = api_key.is_some() || !endpoint_requires_key || account_auth;
-        let unavailable_reason = (!available).then(|| {
-            format!(
-                "The {} lane points at {}, which requires a credential, but neither Keychain account {} nor a supported signed-in provider account is available.",
+            && provider.wire == WireFamily::OpenAiResponses
+            && provider.oauth_vendor.is_some_and(|vendor| {
+                account_auth::provider_oauth_config(vendor)
+                    .is_ok_and(|row| Self::signed_in_provider_account(row.tokens_account))
+            });
+        let credentialed = api_key.is_some() || account_auth || !provider.key_required;
+        if !credentialed && unavailable_reason.is_none() {
+            unavailable_reason = Some(format!(
+                "The {} lane points at {} ({}), which requires a credential, but neither Keychain account {} nor a supported signed-in provider account is available.",
                 lane.as_str(),
-                endpoint,
-                key_account,
-            )
-        });
-        let credential = RuntimeLlmCredential::seal(key_account, api_key, account_auth);
+                provider.display_name,
+                provider.endpoint,
+                provider.key_account,
+            ));
+        }
+        let available = unavailable_reason.is_none();
+        let credential =
+            RuntimeLlmCredential::seal(provider.key_account.clone(), api_key, account_auth);
         RuntimeLlmLane::seal(
             lane,
             provider,
-            endpoint,
             model,
             credential,
             available,
@@ -308,119 +367,49 @@ impl Config {
         )
     }
 
-    fn resolve_runtime_llm_provider(
-        lane: RuntimeLlmLaneKind,
-        settings: &UserSettings,
-    ) -> ProviderKind {
-        let persisted = match lane {
-            RuntimeLlmLaneKind::Assistive => settings.llm_assistive_provider.clone(),
-            RuntimeLlmLaneKind::Main | RuntimeLlmLaneKind::Formatting => None,
-        };
-        let env_key = match lane {
-            RuntimeLlmLaneKind::Formatting => Some("LLM_FORMATTING_PROVIDER"),
-            RuntimeLlmLaneKind::Assistive => Some("LLM_ASSISTIVE_PROVIDER"),
-            RuntimeLlmLaneKind::Main => None,
-        };
-        let fallback = match lane {
-            RuntimeLlmLaneKind::Formatting => default_formatting_provider(),
-            RuntimeLlmLaneKind::Main | RuntimeLlmLaneKind::Assistive => {
-                default_assistive_provider()
-            }
-        };
-        persisted
-            .and_then(Self::non_empty_string)
-            .and_then(|raw| ProviderKind::from_str(&raw).ok())
-            .or_else(|| {
-                env_key
-                    .and_then(Self::runtime_env_non_empty)
-                    .and_then(|raw| ProviderKind::from_str(&raw).ok())
-            })
-            .or_else(|| ProviderKind::from_str(&fallback).ok())
-            .unwrap_or_default()
-    }
-
-    fn resolve_runtime_llm_model(
-        lane: RuntimeLlmLaneKind,
-        provider: ProviderKind,
-        settings: &UserSettings,
-    ) -> String {
-        let (lane_setting, lane_env) = match lane {
-            RuntimeLlmLaneKind::Main => (None, None),
-            RuntimeLlmLaneKind::Formatting => (
-                settings.llm_formatting_model.clone(),
-                Some("LLM_FORMATTING_MODEL"),
-            ),
-            RuntimeLlmLaneKind::Assistive => (
-                settings.llm_assistive_model.clone(),
-                Some("LLM_ASSISTIVE_MODEL"),
-            ),
-        };
-        let owned = |candidate: String| provider.owns_model(&candidate).then_some(candidate);
-        let lane_model = lane_setting
-            .and_then(Self::non_empty_string)
-            .and_then(owned)
-            .or_else(|| {
-                lane_env
-                    .and_then(Self::runtime_env_non_empty)
-                    .and_then(owned)
-            });
-        let resolved = if lane == RuntimeLlmLaneKind::Main || provider.owns_generic_lane_config() {
-            lane_model
-                .or_else(|| {
-                    settings
-                        .llm_model
-                        .clone()
-                        .and_then(Self::non_empty_string)
-                        .and_then(owned)
-                })
-                .or_else(|| Self::runtime_env_non_empty("LLM_MODEL").and_then(owned))
-        } else {
-            lane_model
-        };
-        resolved.unwrap_or_else(|| match lane {
-            RuntimeLlmLaneKind::Main => default_llm_model(),
-            RuntimeLlmLaneKind::Formatting => {
-                provider.default_model(LlmMode::Formatting).to_string()
-            }
-            RuntimeLlmLaneKind::Assistive => provider.default_model(LlmMode::Assistive).to_string(),
+    /// The API key for a provider account through the Keychain corridor.
+    ///
+    /// Env alias, REMOVE AFTER 2026-10-15: the retired `LLM_API_KEY` /
+    /// `LLM_FORMATTING_API_KEY` / `LLM_ASSISTIVE_API_KEY` process-env names
+    /// still feed the OpenAI account (and only that one), with a single warn.
+    fn runtime_lane_api_key(account: &str) -> Option<String> {
+        let key = super::keychain::cached_runtime_key(account);
+        if key.is_some() || account != ProviderKind::OpenAiResponses.api_key_account() {
+            return key;
+        }
+        LEGACY_LLM_KEY_ENV.iter().find_map(|legacy| {
+            let value = std::env::var(legacy).ok().and_then(Self::non_empty_string)?;
+            Self::warn_once_legacy_llm_env(
+                legacy,
+                "is a retired key name; it feeds LLM_OPENAI_API_KEY until 2026-10-15 — move it to Settings › Providers",
+            );
+            Some(value)
         })
     }
 
-    fn resolve_runtime_llm_endpoint(
-        lane: RuntimeLlmLaneKind,
-        provider: ProviderKind,
-        values: &Config,
-        settings: &UserSettings,
-    ) -> String {
-        let resolved = if lane == RuntimeLlmLaneKind::Main || provider.owns_generic_lane_config() {
-            let (lane_setting, lane_env) = match lane {
-                RuntimeLlmLaneKind::Main => (None, None),
-                RuntimeLlmLaneKind::Formatting => (
-                    settings.llm_formatting_endpoint.clone(),
-                    Some("LLM_FORMATTING_ENDPOINT"),
-                ),
-                RuntimeLlmLaneKind::Assistive => (
-                    settings.llm_assistive_endpoint.clone(),
-                    Some("LLM_ASSISTIVE_ENDPOINT"),
-                ),
-            };
-            lane_setting
-                .and_then(Self::non_empty_string)
-                .or_else(|| lane_env.and_then(Self::runtime_env_non_empty))
-                .or_else(|| {
-                    settings
-                        .llm_endpoint
-                        .clone()
-                        .and_then(Self::non_empty_string)
-                })
-                .or_else(|| Self::runtime_env_non_empty("LLM_ENDPOINT"))
-                .or_else(|| values.llm_endpoint.clone().and_then(Self::non_empty_string))
-                .unwrap_or_else(default_llm_endpoint)
-        } else {
-            Self::runtime_env_non_empty(provider.identity().endpoint_env)
-                .unwrap_or_else(|| provider.identity().default_endpoint.to_string())
-        };
-        provider.normalize_endpoint(&resolved)
+    /// Legacy endpoint/model env is not honored anywhere anymore: vendor
+    /// endpoints are pinned, a different host is a Custom provider. Say so once.
+    fn warn_legacy_llm_endpoint_env() {
+        for legacy in LEGACY_LLM_ENDPOINT_ENV {
+            if std::env::var_os(legacy).is_some() {
+                Self::warn_once_legacy_llm_env(
+                    legacy,
+                    "is no longer honored; add a Custom provider in Settings › Providers",
+                );
+            }
+        }
+    }
+
+    /// One warning per legacy variable per process.
+    fn warn_once_legacy_llm_env(key: &'static str, what: &str) {
+        let warned = LEGACY_LLM_ENV_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+        let first = warned
+            .lock()
+            .map(|mut seen| seen.insert(key))
+            .unwrap_or(true);
+        if first {
+            warn!("{key} {what}");
+        }
     }
 
     fn runtime_env_non_empty(key: &str) -> Option<String> {
@@ -501,8 +490,22 @@ impl Config {
             super::keychain::populate_env_from_keychain();
         }
 
-        // Load user settings from JSON
+        // Load user settings from JSON. A legacy LLM lane layout migrates
+        // inside `load`; its Keychain key moves are applied here, the only
+        // place allowed to touch the bundle during a load.
         let user_settings = super::settings::UserSettings::load();
+        if populate_keychain {
+            let moves = super::llm_migration::take_key_moves();
+            if !moves.is_empty() {
+                match super::keychain::apply_key_moves(&moves) {
+                    Ok(changed) => info!(
+                        "Applied {} legacy LLM key move(s) ({changed} bundle changes)",
+                        moves.len()
+                    ),
+                    Err(error) => warn!("Legacy LLM key moves failed: {error}"),
+                }
+            }
+        }
 
         let mut config = Self::default();
 
@@ -526,7 +529,6 @@ impl Config {
 
         // Override with environment variables (explicit runtime env + injected env-managed .env).
         config.load_from_env();
-        config.apply_default_llm_runtime_env();
         config.sanitize();
         Self::mark_process_env_bootstrapped(seed_process_env);
         config
@@ -595,7 +597,7 @@ impl Config {
     /// bootstrap reads as absent afterwards — so persisted settings win over
     /// config's own startup copy.
     fn config_runtime_env_var(key: &str) -> Result<String, VarError> {
-        if super::keychain::KEYCHAIN_ACCOUNTS.contains(&key) {
+        if super::keychain::is_known_account(key) {
             return super::keychain::cached_runtime_key(key).ok_or(VarError::NotPresent);
         }
         if !Self::can_seed_process_env() && Self::was_seeded_env_key(key) {
@@ -682,40 +684,6 @@ impl Config {
         if Self::env_missing_or_empty(key) {
             Self::config_init_set_env(key, value.as_ref());
         }
-    }
-
-    /// Give all three LLM lanes (base, formatting, assistive) a complete
-    /// endpoint/model/provider triple, so a lane whose override is unset still
-    /// resolves instead of failing at first use. The base endpoint is reused for
-    /// every lane; only explicitly configured values differ.
-    ///
-    /// Deliberately seeds no API key: a missing credential must surface as an
-    /// auth error the user can act on, not as a silent fallback to some other
-    /// lane's key.
-    fn apply_default_llm_runtime_env(&mut self) {
-        let endpoint = self
-            .llm_endpoint
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(default_llm_endpoint);
-
-        self.llm_endpoint = Some(endpoint.clone());
-
-        Self::config_init_set_env_if_missing("LLM_ENDPOINT", &endpoint);
-        Self::config_init_set_env_if_missing("LLM_MODEL", default_llm_model());
-        Self::config_init_set_env_if_missing("LLM_FORMATTING_ENDPOINT", &endpoint);
-        Self::config_init_set_env_if_missing("LLM_FORMATTING_MODEL", default_formatting_model());
-        Self::config_init_set_env_if_missing(
-            "LLM_FORMATTING_PROVIDER",
-            default_formatting_provider(),
-        );
-        Self::config_init_set_env_if_missing("LLM_ASSISTIVE_ENDPOINT", &endpoint);
-        Self::config_init_set_env_if_missing("LLM_ASSISTIVE_MODEL", default_assistive_model());
-        Self::config_init_set_env_if_missing(
-            "LLM_ASSISTIVE_PROVIDER",
-            default_assistive_provider(),
-        );
     }
 
     /// Load configuration values from environment variables.
@@ -874,15 +842,6 @@ impl Config {
         }
         if let Ok(val) = Self::config_runtime_env_var("QUICK_NOTES_SAVE_ONLY") {
             self.quick_notes_save_only = matches!(val.as_str(), "1" | "true" | "yes" | "on");
-        }
-
-        // Backends - LLM
-        // LLM_API_KEY for cloud providers
-        if let Ok(val) = Self::config_runtime_env_var("LLM_API_KEY") {
-            self.llm_api_key = Some(val);
-        }
-        if let Ok(val) = Self::config_runtime_env_var("LLM_ENDPOINT") {
-            self.llm_endpoint = Some(val);
         }
 
         // Backends - STT
@@ -1089,48 +1048,9 @@ impl Config {
         {
             self.sound_volume = v;
         }
-        // LLM endpoints (from JSON, lower priority than .env)
-        if Self::config_runtime_env_var("LLM_ENDPOINT").is_err()
-            && let Some(ref v) = settings.llm_endpoint
-        {
-            self.llm_endpoint = Some(v.clone());
-        }
-        if Self::config_runtime_env_var("LLM_MODEL").is_err()
-            && let Some(ref v) = settings.llm_model
-        {
-            // LLM_MODEL is not in Config struct but read from env at runtime
-            // Set env var so downstream code picks it up
-            Self::safe_set_env("LLM_MODEL", v);
-        }
-        // Assistive LLM (not in Config struct, read from env at runtime)
-        if Self::config_runtime_env_var("LLM_ASSISTIVE_ENDPOINT").is_err()
-            && let Some(ref v) = settings.llm_assistive_endpoint
-        {
-            Self::safe_set_env("LLM_ASSISTIVE_ENDPOINT", v);
-        }
-        if Self::config_runtime_env_var("LLM_ASSISTIVE_MODEL").is_err()
-            && let Some(ref v) = settings.llm_assistive_model
-        {
-            Self::safe_set_env("LLM_ASSISTIVE_MODEL", v);
-        }
-        if Self::config_runtime_env_var("LLM_ASSISTIVE_PROVIDER").is_err()
-            && let Some(ref v) = settings.llm_assistive_provider
-        {
-            Self::safe_set_env("LLM_ASSISTIVE_PROVIDER", v);
-        }
+        // LLM lanes are not seeded into process env: the loader resolves them
+        // from settings.json + explicit env through one path (`resolve_runtime_llm_lane`).
         // ── Promoted fields (previously .env only) ──
-
-        // LLM formatting (not in Config struct, read from env at runtime)
-        if Self::config_runtime_env_var("LLM_FORMATTING_ENDPOINT").is_err()
-            && let Some(ref v) = settings.llm_formatting_endpoint
-        {
-            Self::safe_set_env("LLM_FORMATTING_ENDPOINT", v);
-        }
-        if Self::config_runtime_env_var("LLM_FORMATTING_MODEL").is_err()
-            && let Some(ref v) = settings.llm_formatting_model
-        {
-            Self::safe_set_env("LLM_FORMATTING_MODEL", v);
-        }
 
         // Local STT
         if Self::config_runtime_env_var("USE_LOCAL_STT").is_err()
@@ -1301,8 +1221,8 @@ impl Config {
             .map(|policy| policy.as_str().to_string());
         let value = normalized_formatting.as_deref().unwrap_or(value);
 
-        // API keys → Keychain
-        if super::keychain::KEYCHAIN_ACCOUNTS.contains(&key) {
+        // API keys (vendor and custom-provider accounts) → Keychain
+        if super::keychain::is_known_account(key) {
             super::keychain::save_key(key, value)?;
             return Ok(());
         }
@@ -1423,8 +1343,8 @@ impl Config {
         }
 
         for (key, value) in entries {
-            // API keys → Keychain
-            if super::keychain::KEYCHAIN_ACCOUNTS.contains(key) {
+            // API keys (vendor and custom-provider accounts) → Keychain
+            if super::keychain::is_known_account(key) {
                 super::keychain::save_key(key, value)?;
                 continue;
             }
@@ -1648,9 +1568,9 @@ impl Config {
         Ok(())
     }
 
-    /// Handle the LLM override keys, where blank means *clear* rather than
-    /// "store an empty string". Removing the field lets the resolver fall back
-    /// to the default; storing `""` would pin the lane to an unusable endpoint.
+    /// Handle the LLM lane keys, where blank means *clear* rather than "store
+    /// an empty string". Removing the field lets the resolver fall back to the
+    /// default vendor / vendor model; storing `""` would pin an unusable lane.
     ///
     /// Returns `false` for keys it does not own, so the caller continues with
     /// its normal typed routing.
@@ -1661,13 +1581,10 @@ impl Config {
     ) -> bool {
         let normalized = (!value.trim().is_empty()).then(|| value.to_string());
         match key {
-            "LLM_ENDPOINT" => settings.llm_endpoint = normalized,
-            "LLM_MODEL" => settings.llm_model = normalized,
-            "LLM_ASSISTIVE_ENDPOINT" => settings.llm_assistive_endpoint = normalized,
-            "LLM_ASSISTIVE_MODEL" => settings.llm_assistive_model = normalized,
-            "LLM_ASSISTIVE_PROVIDER" => settings.llm_assistive_provider = normalized,
-            "LLM_FORMATTING_ENDPOINT" => settings.llm_formatting_endpoint = normalized,
+            "LLM_FORMATTING_PROVIDER" => settings.llm_formatting_provider = normalized,
             "LLM_FORMATTING_MODEL" => settings.llm_formatting_model = normalized,
+            "LLM_ASSISTIVE_PROVIDER" => settings.llm_assistive_provider = normalized,
+            "LLM_ASSISTIVE_MODEL" => settings.llm_assistive_model = normalized,
             _ => return false,
         }
         true
@@ -1912,43 +1829,19 @@ impl Config {
             }
         }
 
-        // Legacy LLM endpoint → canonical LLM_ENDPOINT
-        if let Some(val) = vars.remove("LLM_SERVER_URL") {
-            changed = true;
-            if put_if_missing("LLM_ENDPOINT", val, &mut vars) {
+        // Retired LLM env (Ollama-era hosts, shared endpoint/model, provider
+        // flag): endpoints are pinned per vendor now, so these rows are dropped
+        // rather than rewritten into names nothing reads.
+        for retired in [
+            "LLM_SERVER_URL",
+            "LLM_HOST",
+            "OLLAMA_HOST",
+            "OLLAMA_MODEL",
+            "AI_PROVIDER",
+        ] {
+            if vars.remove(retired).is_some() {
                 changed = true;
             }
-        }
-
-        // Legacy LLM host → canonical LLM_ENDPOINT (/api/chat)
-        let legacy_host = vars
-            .remove("LLM_HOST")
-            .or_else(|| vars.remove("OLLAMA_HOST"));
-        if let Some(host) = legacy_host {
-            changed = true;
-            if !vars.contains_key("LLM_ENDPOINT") {
-                let trimmed = host.trim_end_matches('/');
-                let endpoint = if trimmed.ends_with("/api/chat") {
-                    trimmed.to_string()
-                } else {
-                    format!("{}/api/chat", trimmed)
-                };
-                vars.insert("LLM_ENDPOINT".to_string(), endpoint);
-                changed = true;
-            }
-        }
-
-        // Legacy model name → canonical LLM_MODEL (shared fallback)
-        if let Some(model) = vars.remove("OLLAMA_MODEL") {
-            changed = true;
-            if put_if_missing("LLM_MODEL", model, &mut vars) {
-                changed = true;
-            }
-        }
-
-        // Remove deprecated provider flag
-        if vars.remove("AI_PROVIDER").is_some() {
-            changed = true;
         }
 
         if changed {
@@ -2085,16 +1978,50 @@ mod tests {
         tmp
     }
 
-    /// Clear every process-env input that could hand the assistive lane a
-    /// credential or move it off the official OpenAI endpoint.
-    fn clear_assistive_lane_env() -> Vec<TestEnvGuard> {
+    /// Clear every process-env input that could hand a lane a credential,
+    /// a provider, or a model: the vendor accounts, the retired aliases that
+    /// still feed OpenAI, and the lane selectors.
+    fn clear_llm_lane_env() -> Vec<TestEnvGuard> {
         vec![
             TestEnvGuard::unset("LLM_ASSISTIVE_PROVIDER"),
-            TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT"),
-            TestEnvGuard::unset("LLM_ENDPOINT"),
+            TestEnvGuard::unset("LLM_ASSISTIVE_MODEL"),
+            TestEnvGuard::unset("LLM_FORMATTING_PROVIDER"),
+            TestEnvGuard::unset("LLM_FORMATTING_MODEL"),
+            TestEnvGuard::unset("LLM_OPENAI_API_KEY"),
+            TestEnvGuard::unset("LLM_XAI_API_KEY"),
+            TestEnvGuard::unset("LLM_ANTHROPIC_API_KEY"),
+            TestEnvGuard::unset("LLM_LIBRAXIS_API_KEY"),
+            TestEnvGuard::unset("LLM_API_KEY"),
+            TestEnvGuard::unset("LLM_FORMATTING_API_KEY"),
             TestEnvGuard::unset("LLM_ASSISTIVE_API_KEY"),
+            TestEnvGuard::unset("LLM_ENDPOINT"),
+            TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT"),
+            TestEnvGuard::unset("LLM_FORMATTING_ENDPOINT"),
             TestEnvGuard::unset(account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT),
         ]
+    }
+
+    /// Seal lanes from the current settings.json + env without Keychain I/O.
+    fn seal_lanes() -> RuntimeSettingsSnapshot {
+        Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings")
+    }
+
+    /// One Custom row at `endpoint` on the Responses wire, saved to settings.json
+    /// with the assistive lane pointing at it.
+    fn save_custom_assistive_row(endpoint: &str, model: Option<&str>) -> String {
+        let mut settings = UserSettings::load();
+        let row = crate::llm::provider::CustomProvider::new(
+            "My Box",
+            WireFamily::OpenAiResponses,
+            endpoint,
+        )
+        .expect("valid custom row");
+        let id = row.id.clone();
+        settings.add_custom_provider(row).expect("add custom row");
+        settings.llm_assistive_provider = Some(format!("custom:{id}"));
+        settings.llm_assistive_model = model.map(str::to_string);
+        settings.save().expect("save settings");
+        id
     }
 
     /// Effect witness for the 2026-09-07 refusal on dragon: sign-in tokens
@@ -2106,7 +2033,7 @@ mod tests {
     #[serial]
     fn assistive_lane_seals_account_auth_from_bundle_tokens_without_env() {
         let _tmp = setup_isolated_data_dir();
-        let _env = clear_assistive_lane_env();
+        let _env = clear_llm_lane_env();
         let tokens = account_auth::AccountTokens::new(
             ProviderKind::OpenAiResponses,
             "access".to_string(),
@@ -2120,15 +2047,10 @@ mod tests {
             &serde_json::to_string(&tokens).expect("serialize tokens"),
         )]);
 
-        let snapshot =
-            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let snapshot = seal_lanes();
         let lane = snapshot.llm_lanes().assistive();
-        assert_eq!(lane.provider(), ProviderKind::OpenAiResponses);
-        assert!(
-            ProviderKind::endpoint_requires_api_key(lane.endpoint()),
-            "witness must run against a credentialed endpoint, got {}",
-            lane.endpoint()
-        );
+        assert_eq!(lane.vendor(), Some(ProviderKind::OpenAiResponses));
+        assert_eq!(lane.endpoint(), "https://api.openai.com/v1/responses");
         assert!(
             lane.credential().api_key().is_none(),
             "no API key may take part in this witness"
@@ -2148,11 +2070,10 @@ mod tests {
     #[serial]
     fn assistive_lane_without_key_or_bundle_tokens_refuses() {
         let _tmp = setup_isolated_data_dir();
-        let _env = clear_assistive_lane_env();
+        let _env = clear_llm_lane_env();
         let _bundle = super::super::keychain::test_support::install_bundle(&[]);
 
-        let snapshot =
-            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let snapshot = seal_lanes();
         let lane = snapshot.llm_lanes().assistive();
         assert!(!lane.credential().account_auth());
         assert!(!lane.available());
@@ -2170,17 +2091,214 @@ mod tests {
     #[serial]
     fn assistive_lane_treats_corrupt_bundle_tokens_as_not_signed_in() {
         let _tmp = setup_isolated_data_dir();
-        let _env = clear_assistive_lane_env();
+        let _env = clear_llm_lane_env();
         let _bundle = super::super::keychain::test_support::install_bundle(&[(
             account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT,
             "not-a-token-record",
         )]);
 
-        let snapshot =
-            Config::load_runtime_snapshot_without_keychain().expect("seal runtime settings");
+        let snapshot = seal_lanes();
         let lane = snapshot.llm_lanes().assistive();
         assert!(!lane.credential().account_auth());
         assert!(!lane.available());
+    }
+
+    /// Zero-state seal: both lanes on the OpenAI vendor with the vendor's own
+    /// models, keyed on `LLM_OPENAI_API_KEY`, and nothing LLM-related planted
+    /// in process env (the old bootstrap seeded six variables).
+    #[test]
+    #[serial]
+    fn zero_state_lanes_seal_openai_vendor_defaults_without_env_seeding() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        let _config = Config::load();
+        let snapshot = seal_lanes();
+        let formatting = snapshot.llm_lanes().formatting();
+        let assistive = snapshot.llm_lanes().assistive();
+        assert_eq!(formatting.provider(), &ProviderRef::default());
+        assert_eq!(formatting.endpoint(), "https://api.openai.com/v1/responses");
+        assert_eq!(
+            formatting.model(),
+            crate::llm::provider::DEFAULT_FORMATTING_MODEL
+        );
+        assert_eq!(
+            assistive.model(),
+            crate::llm::provider::DEFAULT_ASSISTIVE_MODEL
+        );
+        assert_eq!(formatting.credential().key_account(), "LLM_OPENAI_API_KEY");
+        assert_eq!(assistive.credential().key_account(), "LLM_OPENAI_API_KEY");
+        assert_eq!(formatting.provider_display_name(), "OpenAI (Responses)");
+        assert!(!formatting.available());
+        for planted in LEGACY_LLM_ENDPOINT_ENV
+            .iter()
+            .chain(["LLM_FORMATTING_PROVIDER", "LLM_ASSISTIVE_PROVIDER"].iter())
+        {
+            assert!(
+                std::env::var_os(planted).is_none(),
+                "loader must not seed {planted} into process env"
+            );
+        }
+    }
+
+    /// Effect witness: a vendor endpoint is pinned in code. The retired
+    /// endpoint env names change nothing (one warning), and the settings file
+    /// has no field that could move a vendor lane off its host.
+    #[test]
+    #[serial]
+    fn vendor_endpoint_cannot_be_overridden_by_legacy_env() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        let _legacy_endpoint = TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT");
+        set_env_for_test(
+            "LLM_ASSISTIVE_ENDPOINT",
+            "https://proxy.example/v1/responses",
+        );
+        set_env_for_test("LLM_ENDPOINT", "https://proxy.example/v1/responses");
+        set_env_for_test("LLM_ASSISTIVE_PROVIDER", "xai-responses");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().assistive();
+        assert_eq!(lane.vendor(), Some(ProviderKind::XaiResponses));
+        assert_eq!(lane.endpoint(), "https://api.x.ai/v1/responses");
+        assert_eq!(lane.credential().key_account(), "LLM_XAI_API_KEY");
+    }
+
+    /// Effect witness: the formatting lane on xAI keeps a Grok model chosen in
+    /// settings — the old `owns_model` prefix filter that threw it away is gone.
+    #[test]
+    #[serial]
+    fn formatting_lane_on_xai_keeps_grok_model() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[(
+            "LLM_XAI_API_KEY",
+            "xai-secret",
+        )]);
+        let mut settings = UserSettings::load();
+        settings.llm_formatting_provider = Some("xai-responses".to_string());
+        settings.llm_formatting_model = Some("grok-4.5-fast".to_string());
+        settings.save().expect("save settings");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().formatting();
+        assert_eq!(lane.vendor(), Some(ProviderKind::XaiResponses));
+        assert_eq!(lane.model(), "grok-4.5-fast");
+        assert_eq!(lane.credential().api_key(), Some("xai-secret"));
+        assert!(lane.available());
+        // A vendor model from settings is never filtered, whatever its prefix.
+        settings.llm_formatting_model = Some("claude-sonnet-5".to_string());
+        settings.save().expect("save settings");
+        assert_eq!(
+            seal_lanes().llm_lanes().formatting().model(),
+            "claude-sonnet-5"
+        );
+    }
+
+    /// Effect witness: a Custom provider without a key is available (key not
+    /// required), reads its key only from the bundle, and takes its model
+    /// from settings — with no model it seals unavailable and says why.
+    #[test]
+    #[serial]
+    fn custom_provider_without_key_is_available_and_needs_a_model() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        let id = save_custom_assistive_row("http://my.local:8080/v1", Some("qwen"));
+        assert_eq!(id, "my-box");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().assistive();
+        assert_eq!(lane.provider(), &ProviderRef::Custom("my-box".to_string()));
+        assert_eq!(lane.vendor(), None);
+        assert_eq!(lane.provider_display_name(), "My Box");
+        assert_eq!(lane.endpoint(), "http://my.local:8080/v1/responses");
+        assert_eq!(lane.model(), "qwen");
+        assert_eq!(lane.credential().key_account(), "LLM_CUSTOM_MY_BOX_API_KEY");
+        assert_eq!(lane.credential().api_key(), None);
+        assert!(lane.available());
+        assert!(lane.request_available());
+        assert!(lane.supports_vision("qwen"));
+
+        let _key_bundle = super::super::keychain::test_support::install_bundle(&[(
+            "LLM_CUSTOM_MY_BOX_API_KEY",
+            "box-secret",
+        )]);
+        assert_eq!(
+            seal_lanes().llm_lanes().assistive().credential().api_key(),
+            Some("box-secret")
+        );
+
+        let mut settings = UserSettings::load();
+        settings.llm_assistive_model = None;
+        settings.save().expect("save settings");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().assistive();
+        assert!(!lane.available());
+        assert_eq!(
+            lane.unavailable_reason(),
+            Some("no model selected for provider My Box")
+        );
+    }
+
+    /// A lane pointing at a Custom id that no longer exists falls back to the
+    /// default vendor and names the missing row.
+    #[test]
+    #[serial]
+    fn missing_custom_row_falls_back_to_default_vendor_with_reason() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        let mut settings = UserSettings::load();
+        settings.llm_assistive_provider = Some("custom:gone".to_string());
+        settings.save().expect("save settings");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().assistive();
+        assert_eq!(lane.provider(), &ProviderRef::default());
+        assert!(!lane.available());
+        assert_eq!(
+            lane.unavailable_reason(),
+            Some("custom provider `gone` no longer exists")
+        );
+    }
+
+    /// REMOVE AFTER 2026-10-15: the retired `LLM_API_KEY` env name still feeds
+    /// the OpenAI account (only), and never a vendor with its own account.
+    #[test]
+    #[serial]
+    fn legacy_openai_key_alias_feeds_only_the_openai_account() {
+        let _tmp = setup_isolated_data_dir();
+        let _env = clear_llm_lane_env();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        set_env_for_test("LLM_API_KEY", "legacy-secret");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().formatting();
+        assert_eq!(lane.credential().key_account(), "LLM_OPENAI_API_KEY");
+        assert_eq!(lane.credential().api_key(), Some("legacy-secret"));
+        assert!(lane.available());
+
+        set_env_for_test("LLM_ASSISTIVE_PROVIDER", "anthropic-messages");
+        let snapshot = seal_lanes();
+        let lane = snapshot.llm_lanes().assistive();
+        assert_eq!(lane.credential().key_account(), "LLM_ANTHROPIC_API_KEY");
+        assert_eq!(lane.credential().api_key(), None);
+        assert!(!lane.available());
+    }
+
+    /// A custom-provider key saved through the config write path lands in
+    /// the Keychain corridor, not in settings.json or process env.
+    #[test]
+    #[serial]
+    fn custom_key_write_routes_to_keychain_not_settings() {
+        let _tmp = setup_isolated_data_dir();
+        let _bundle = super::super::keychain::test_support::install_bundle(&[]);
+        Config::default()
+            .save_to_env("LLM_CUSTOM_MY_BOX_API_KEY", "box-secret")
+            .expect("save custom key");
+        assert!(std::env::var_os("LLM_CUSTOM_MY_BOX_API_KEY").is_none());
+        assert!(!UserSettings::settings_path().exists());
+        assert!(!Config::env_path().exists());
+        assert!(super::super::keychain::key_present(
+            "LLM_CUSTOM_MY_BOX_API_KEY"
+        ));
     }
 
     #[test]
@@ -2337,44 +2455,29 @@ mod tests {
         .expect("write config RMW child witness");
     }
 
-    /// Every LLM write key as `(key, sample value, JSON pointer)`. A `None`
-    /// pointer marks a key with no durable `settings.json` home — it is still
-    /// exercised, to prove writing it does not invent one.
-    fn llm_write_key_cases() -> &'static [(&'static str, &'static str, Option<&'static str>)] {
+    /// Every LLM lane write key as `(key, sample value, JSON pointer)`.
+    fn llm_write_key_cases() -> &'static [(&'static str, &'static str, &'static str)] {
         &[
             (
-                "LLM_ENDPOINT",
-                "https://main.example/v1",
-                Some("/speech/llm_endpoint"),
-            ),
-            ("LLM_MODEL", "gpt-main-test", Some("/speech/llm_model")),
-            ("LLM_PROVIDER", "openai-responses", None),
-            (
-                "LLM_ASSISTIVE_ENDPOINT",
-                "https://assistive.example/v1",
-                Some("/speech/assistive/llm_endpoint"),
-            ),
-            (
-                "LLM_ASSISTIVE_MODEL",
-                "gpt-assistive-test",
-                Some("/speech/assistive/llm_model"),
-            ),
-            (
-                "LLM_ASSISTIVE_PROVIDER",
-                "anthropic-messages",
-                Some("/speech/assistive/llm_provider"),
-            ),
-            (
-                "LLM_FORMATTING_ENDPOINT",
-                "https://formatting.example/v1",
-                Some("/speech/formatting/llm_endpoint"),
+                "LLM_FORMATTING_PROVIDER",
+                "xai-responses",
+                "/speech/formatting/llm_provider",
             ),
             (
                 "LLM_FORMATTING_MODEL",
                 "gpt-formatting-test",
-                Some("/speech/formatting/llm_model"),
+                "/speech/formatting/llm_model",
             ),
-            ("LLM_FORMATTING_PROVIDER", "openai-responses", None),
+            (
+                "LLM_ASSISTIVE_PROVIDER",
+                "anthropic-messages",
+                "/speech/assistive/provider",
+            ),
+            (
+                "LLM_ASSISTIVE_MODEL",
+                "gpt-assistive-test",
+                "/speech/assistive/llm_model",
+            ),
         ]
     }
 
@@ -2392,19 +2495,15 @@ mod tests {
         UserSettings::load()
     }
 
-    /// Assert a promoted LLM optional field is absent in loaded settings.
-    fn assert_optional_override_absent(settings: &UserSettings, key: &str) {
-        let actual = match key {
-            "LLM_ENDPOINT" => settings.llm_endpoint.as_deref(),
-            "LLM_MODEL" => settings.llm_model.as_deref(),
-            "LLM_ASSISTIVE_ENDPOINT" => settings.llm_assistive_endpoint.as_deref(),
-            "LLM_ASSISTIVE_MODEL" => settings.llm_assistive_model.as_deref(),
-            "LLM_ASSISTIVE_PROVIDER" => settings.llm_assistive_provider.as_deref(),
-            "LLM_FORMATTING_ENDPOINT" => settings.llm_formatting_endpoint.as_deref(),
+    /// The loaded value of one LLM lane key.
+    fn lane_setting<'a>(settings: &'a UserSettings, key: &str) -> Option<&'a str> {
+        match key {
+            "LLM_FORMATTING_PROVIDER" => settings.llm_formatting_provider.as_deref(),
             "LLM_FORMATTING_MODEL" => settings.llm_formatting_model.as_deref(),
-            _ => return,
-        };
-        assert_eq!(actual, None, "{key} must be unset, got {actual:?}");
+            "LLM_ASSISTIVE_PROVIDER" => settings.llm_assistive_provider.as_deref(),
+            "LLM_ASSISTIVE_MODEL" => settings.llm_assistive_model.as_deref(),
+            _ => None,
+        }
     }
 
     /// Promoted save must land in settings.json and must not set process env.
@@ -2412,15 +2511,15 @@ mod tests {
     #[serial]
     fn save_to_env_persists_promoted_setting_without_process_env_mutation() {
         let _tmp = setup_isolated_data_dir();
-        let _model = TestEnvGuard::unset("LLM_MODEL");
+        let _model = TestEnvGuard::unset("LLM_FORMATTING_MODEL");
 
         Config::default()
-            .save_to_env("LLM_MODEL", "runtime-model")
+            .save_to_env("LLM_FORMATTING_MODEL", "runtime-model")
             .expect("save setting");
 
-        assert!(std::env::var("LLM_MODEL").is_err());
+        assert!(std::env::var("LLM_FORMATTING_MODEL").is_err());
         assert_eq!(
-            UserSettings::load().llm_model.as_deref(),
+            UserSettings::load().llm_formatting_model.as_deref(),
             Some("runtime-model")
         );
     }
@@ -2626,16 +2725,12 @@ mod tests {
     #[serial]
     fn empty_llm_override_unsets_json_path_and_restores_resolved_fallback() {
         let _tmp = setup_isolated_data_dir();
-        let _lane_endpoint = TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT");
-        let _shared_endpoint = TestEnvGuard::unset("LLM_ENDPOINT");
+        let _env = clear_llm_lane_env();
         let config = Config::default();
 
         config
-            .save_to_env(
-                "LLM_ASSISTIVE_ENDPOINT",
-                "https://api.libraxis.cloud/v1/responses",
-            )
-            .expect("set assistive endpoint override");
+            .save_to_env("LLM_ASSISTIVE_MODEL", "gpt-custom-pick")
+            .expect("set assistive model override");
 
         let set_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(UserSettings::settings_path()).expect("read settings after set"),
@@ -2643,30 +2738,28 @@ mod tests {
         .expect("parse settings after set");
         assert_eq!(
             set_json
-                .pointer("/speech/assistive/llm_endpoint")
+                .pointer("/speech/assistive/llm_model")
                 .and_then(serde_json::Value::as_str),
-            Some("https://api.libraxis.cloud/v1/responses")
+            Some("gpt-custom-pick")
         );
 
         config
-            .save_to_env("LLM_ASSISTIVE_ENDPOINT", "")
-            .expect("reset assistive endpoint override");
+            .save_to_env("LLM_ASSISTIVE_MODEL", "")
+            .expect("reset assistive model override");
 
         let reset_json: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(UserSettings::settings_path()).expect("read settings after reset"),
         )
         .expect("parse settings after reset");
         assert!(
-            reset_json
-                .pointer("/speech/assistive/llm_endpoint")
-                .is_none(),
+            reset_json.pointer("/speech/assistive/llm_model").is_none(),
             "reset must remove the override path, got {reset_json}"
         );
-        assert_eq!(UserSettings::load().llm_assistive_endpoint, None);
+        assert_eq!(UserSettings::load().llm_assistive_model, None);
         let runtime_settings = Config::load_runtime_snapshot().expect("runtime settings seal");
         assert_eq!(
-            runtime_settings.llm_lanes().assistive().endpoint(),
-            crate::config::DEFAULT_OPENAI_RESPONSES_ENDPOINT
+            runtime_settings.llm_lanes().assistive().model(),
+            crate::llm::provider::DEFAULT_ASSISTIVE_MODEL
         );
     }
 
@@ -2704,7 +2797,7 @@ mod tests {
         let runtime_settings = Config::load_runtime_snapshot().expect("runtime settings seal");
         assert_eq!(
             runtime_settings.llm_lanes().assistive().provider(),
-            crate::llm::provider::ProviderKind::OpenAiResponses
+            &ProviderRef::default()
         );
     }
 
@@ -2726,22 +2819,24 @@ mod tests {
     #[serial]
     fn save_to_env_many_blank_llm_overrides_remove_json_paths_and_restore_fallbacks() {
         let _tmp = setup_isolated_data_dir();
-        let _endpoint = TestEnvGuard::unset("LLM_ENDPOINT");
-        let _model = TestEnvGuard::unset("LLM_MODEL");
-        let _formatting_endpoint = TestEnvGuard::unset("LLM_FORMATTING_ENDPOINT");
-        let _formatting_model = TestEnvGuard::unset("LLM_FORMATTING_MODEL");
-        let _assistive_endpoint = TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT");
-        let _assistive_model = TestEnvGuard::unset("LLM_ASSISTIVE_MODEL");
-        let _assistive_provider = TestEnvGuard::unset("LLM_ASSISTIVE_PROVIDER");
+        let _env = clear_llm_lane_env();
         let config = Config::default();
 
         let set_entries: Vec<(&str, &str)> = llm_write_key_cases()
             .iter()
-            .filter_map(|(key, value, pointer)| pointer.map(|_| (*key, *value)))
+            .map(|(key, value, _)| (*key, *value))
             .collect();
         config
             .save_to_env_many(&set_entries)
             .expect("set optional LLM overrides");
+        let settings = UserSettings::load();
+        for (key, value, _) in llm_write_key_cases() {
+            assert_eq!(
+                lane_setting(&settings, key),
+                Some(*value),
+                "{key} not stored"
+            );
+        }
 
         let reset_entries: Vec<(&str, &str)> = set_entries
             .iter()
@@ -2758,18 +2853,16 @@ mod tests {
         .expect("parse settings after reset");
         let settings = UserSettings::load();
         for (key, _, pointer) in llm_write_key_cases() {
-            if let Some(pointer) = pointer {
-                assert!(
-                    reset_json.pointer(pointer).is_none(),
-                    "batch reset must remove {key} at {pointer}, got {reset_json}"
-                );
-                assert_optional_override_absent(&settings, key);
-            }
+            assert!(
+                reset_json.pointer(pointer).is_none(),
+                "batch reset must remove {key} at {pointer}, got {reset_json}"
+            );
+            assert_eq!(lane_setting(&settings, key), None, "{key} must be unset");
         }
         let runtime_settings = Config::load_runtime_snapshot().expect("runtime settings seal");
         assert_eq!(
             runtime_settings.llm_lanes().assistive().endpoint(),
-            crate::config::DEFAULT_OPENAI_RESPONSES_ENDPOINT
+            crate::llm::provider::DEFAULT_OPENAI_RESPONSES_ENDPOINT
         );
     }
 
@@ -2778,20 +2871,20 @@ mod tests {
     #[serial]
     fn save_to_env_many_persists_batch_without_process_env_mutation() {
         let _tmp = setup_isolated_data_dir();
-        let _model = TestEnvGuard::unset("LLM_MODEL");
+        let _model = TestEnvGuard::unset("LLM_ASSISTIVE_MODEL");
         let _workspace_roots = TestEnvGuard::unset("AGENT_WORKSPACE_ROOTS");
 
         Config::default()
             .save_to_env_many(&[
-                ("LLM_MODEL", "batch-model"),
+                ("LLM_ASSISTIVE_MODEL", "batch-model"),
                 ("AGENT_WORKSPACE_ROOTS", "/tmp/a:/tmp/b"),
             ])
             .expect("save settings batch");
 
-        assert!(std::env::var("LLM_MODEL").is_err());
+        assert!(std::env::var("LLM_ASSISTIVE_MODEL").is_err());
         assert!(std::env::var("AGENT_WORKSPACE_ROOTS").is_err());
         assert_eq!(
-            UserSettings::load().llm_model.as_deref(),
+            UserSettings::load().llm_assistive_model.as_deref(),
             Some("batch-model")
         );
         assert_eq!(
@@ -2802,56 +2895,6 @@ mod tests {
             !Config::env_path().exists(),
             "a fully promoted settings batch must not create a legacy .env"
         );
-    }
-
-    /// Load seeds OpenAI Responses endpoint/model defaults without requiring API keys.
-    #[test]
-    #[serial]
-    fn load_injects_openai_responses_defaults_without_api_key() {
-        let _tmp = setup_isolated_data_dir();
-        let _endpoint = TestEnvGuard::unset("LLM_ENDPOINT");
-        let _model = TestEnvGuard::unset("LLM_MODEL");
-        let _formatting_endpoint = TestEnvGuard::unset("LLM_FORMATTING_ENDPOINT");
-        let _formatting_model = TestEnvGuard::unset("LLM_FORMATTING_MODEL");
-        let _assistive_endpoint = TestEnvGuard::unset("LLM_ASSISTIVE_ENDPOINT");
-        let _assistive_model = TestEnvGuard::unset("LLM_ASSISTIVE_MODEL");
-        let _api_key = TestEnvGuard::unset("LLM_API_KEY");
-        let _formatting_key = TestEnvGuard::unset("LLM_FORMATTING_API_KEY");
-        let _assistive_key = TestEnvGuard::unset("LLM_ASSISTIVE_API_KEY");
-
-        let config = Config::load();
-
-        assert_eq!(
-            config.llm_endpoint.as_deref(),
-            Some(super::super::DEFAULT_OPENAI_RESPONSES_ENDPOINT)
-        );
-        assert_eq!(
-            std::env::var("LLM_ENDPOINT").as_deref(),
-            Ok(super::super::DEFAULT_OPENAI_RESPONSES_ENDPOINT)
-        );
-        assert_eq!(
-            std::env::var("LLM_MODEL").as_deref(),
-            Ok(super::super::DEFAULT_LLM_MODEL)
-        );
-        assert_eq!(
-            std::env::var("LLM_FORMATTING_ENDPOINT").as_deref(),
-            Ok(super::super::DEFAULT_OPENAI_RESPONSES_ENDPOINT)
-        );
-        assert_eq!(
-            std::env::var("LLM_FORMATTING_MODEL").as_deref(),
-            Ok(super::super::DEFAULT_FORMATTING_MODEL)
-        );
-        assert_eq!(
-            std::env::var("LLM_ASSISTIVE_ENDPOINT").as_deref(),
-            Ok(super::super::DEFAULT_OPENAI_RESPONSES_ENDPOINT)
-        );
-        assert_eq!(
-            std::env::var("LLM_ASSISTIVE_MODEL").as_deref(),
-            Ok(super::super::DEFAULT_ASSISTIVE_MODEL)
-        );
-        assert!(std::env::var("LLM_API_KEY").is_err());
-        assert!(std::env::var("LLM_FORMATTING_API_KEY").is_err());
-        assert!(std::env::var("LLM_ASSISTIVE_API_KEY").is_err());
     }
 
     /// apply_user_settings copies hold/double-tap/silence/exclusive timing into Config.
