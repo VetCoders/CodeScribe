@@ -9,8 +9,6 @@
 //! records `<lane>_provider` + `<lane>_model`. Keys move per lane into the
 //! resolved provider's account; nothing is copied globally.
 
-use std::sync::{Mutex, OnceLock};
-
 use tracing::info;
 
 use super::keychain::KeyMove;
@@ -79,30 +77,6 @@ impl SpeechV2Legacy {
     }
 }
 
-/// Key moves produced by a migration inside `UserSettings::load`, waiting for
-/// the loader's Keychain step (the only place allowed to touch the bundle).
-static PENDING_KEY_MOVES: OnceLock<Mutex<Vec<KeyMove>>> = OnceLock::new();
-
-fn pending() -> &'static Mutex<Vec<KeyMove>> {
-    PENDING_KEY_MOVES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Queue key moves for the loader.
-pub fn queue_key_moves(moves: Vec<KeyMove>) {
-    let mut guard = pending()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.extend(moves);
-}
-
-/// Drain the queued key moves.
-pub fn take_key_moves() -> Vec<KeyMove> {
-    let mut guard = pending()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::mem::take(&mut *guard)
-}
-
 /// Legacy Keychain account each lane read its key from.
 const fn legacy_lane_account(lane: RuntimeLlmLaneKind) -> &'static str {
     match lane {
@@ -122,8 +96,8 @@ fn vendor_for_endpoint(endpoint: &str) -> Option<ProviderKind> {
 }
 
 /// Resolve one legacy `(provider, endpoint)` pair to a provider reference,
-/// adding a Custom row to `settings` when the host is not a vendor. Rows are
-/// shared: two lanes on the same host get one row.
+/// adding a Custom row to `settings` when the host is not a vendor. Only the
+/// same normalized endpoint and wire may share a row; a host alone is not identity.
 fn resolve_legacy_endpoint(
     legacy_provider: ProviderKind,
     endpoint: Option<&str>,
@@ -138,15 +112,26 @@ fn resolve_legacy_endpoint(
     let host = endpoint_host(endpoint);
     let wire = legacy_provider.wire_family();
     match CustomProvider::new(host, wire, endpoint) {
-        Ok(row) => {
-            let id = row.id.clone();
-            if !settings
+        Ok(mut row) => {
+            if let Some(existing) = settings
                 .llm_custom_providers
                 .iter()
-                .any(|existing| existing.id == id)
+                .find(|existing| existing.endpoint == row.endpoint && existing.wire == row.wire)
             {
-                settings.llm_custom_providers.push(row);
+                return ProviderRef::Custom(existing.id.clone());
             }
+            let base_id = row.id.clone();
+            let mut suffix = 2;
+            while settings
+                .llm_custom_providers
+                .iter()
+                .any(|existing| existing.id == row.id)
+            {
+                row.id = format!("{base_id}-{suffix}");
+                suffix += 1;
+            }
+            let id = row.id.clone();
+            settings.llm_custom_providers.push(row);
             ProviderRef::Custom(id)
         }
         Err(error) => {
@@ -408,6 +393,33 @@ mod tests {
         assert!(moves.iter().all(|m| m.to == "LLM_CUSTOM_127_0_0_1_API_KEY"));
     }
 
+    #[test]
+    fn distinct_services_on_one_host_keep_their_endpoints_and_key_accounts() {
+        for second_endpoint in [
+            "http://localhost:9000/v1/responses",
+            "http://localhost:8000/second/v1/responses",
+        ] {
+            let legacy = SpeechV2Legacy {
+                formatting_endpoint: Some("http://localhost:8000/v1/responses".into()),
+                assistive_endpoint: Some(second_endpoint.into()),
+                ..SpeechV2Legacy::default()
+            };
+            let mut settings = UserSettings::default();
+            let moves = migrate_legacy_llm_lanes(&legacy, &mut settings);
+            assert_eq!(settings.llm_custom_providers.len(), 2);
+            assert_ne!(
+                settings.llm_formatting_provider,
+                settings.llm_assistive_provider
+            );
+            assert_eq!(
+                settings.llm_custom_providers[0].endpoint,
+                "http://localhost:8000/v1/responses"
+            );
+            assert_eq!(settings.llm_custom_providers[1].endpoint, second_endpoint);
+            assert_ne!(moves[0].to, moves[1].to);
+        }
+    }
+
     /// A legacy Anthropic assistive lane on the vendor host keeps its vendor
     /// and takes the vendor's key account.
     #[test]
@@ -449,17 +461,5 @@ mod tests {
         );
         let blank = serde_json::json!({ "speech": { "llm_endpoint": "  " } });
         assert!(!SpeechV2Legacy::from_json(&blank).needs_migration());
-    }
-
-    /// The queue hands moves from `UserSettings::load` to the loader once.
-    #[test]
-    fn queued_key_moves_are_taken_exactly_once() {
-        let _ = take_key_moves();
-        queue_key_moves(vec![KeyMove {
-            from: "LLM_API_KEY".to_string(),
-            to: "LLM_OPENAI_API_KEY".to_string(),
-        }]);
-        assert_eq!(take_key_moves().len(), 1);
-        assert!(take_key_moves().is_empty());
     }
 }

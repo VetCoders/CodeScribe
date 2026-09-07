@@ -48,7 +48,7 @@ pub fn key_present(account: &str) -> bool {
 }
 
 /// One legacy → current secret relocation inside the bundle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyMove {
     /// Legacy account to drain (for example `LLM_FORMATTING_API_KEY`).
     pub from: String,
@@ -57,23 +57,54 @@ pub struct KeyMove {
 }
 
 /// Apply [`KeyMove`]s to the bundle: copy `from` into `to` when `to` is absent,
-/// then remove `from`. Returns the number of bundle entries changed.
+/// then remove the copied `from`. Returns the number of bundle entries changed.
 ///
 /// Idempotent — a second pass finds no `from` entries and changes nothing. A
 /// `to` that already holds a secret keeps it: the user's current key is never
-/// overwritten by a legacy one. No-op in test harnesses (no Keychain I/O).
+/// overwritten by a legacy one; a differing legacy secret remains recoverable.
+/// Disabled Keychain access leaves relocation pending.
 pub fn apply_key_moves(moves: &[KeyMove]) -> Result<usize> {
-    if moves.is_empty() || is_test_env() {
+    if moves.is_empty() {
         return Ok(0);
     }
-    let Some(mut bundle) = load_bundle() else {
-        return Ok(0);
+    anyhow::ensure!(
+        !is_test_env(),
+        "Keychain disabled; relocation must remain pending"
+    );
+    // Do not collapse denial/corruption into an empty bundle: that would erase
+    // the durable retry intent. -25300 is Security.framework errSecItemNotFound.
+    let mut bundle = match get_generic_password(SERVICE, BUNDLE_ACCOUNT) {
+        Ok(bytes) => decode_bundle(&bytes).context("Keychain bundle cannot be decoded")?,
+        Err(error) if error.code() == -25300 => KeychainBundle::default(),
+        Err(error) => return Err(error).context("Keychain relocation read failed"),
     };
+    let changed = relocate_bundle_keys(&mut bundle, moves);
+    if changed > 0 {
+        save_bundle(&bundle)?;
+    } else {
+        write_bundle_cache(Some(bundle));
+    }
+    Ok(changed)
+}
+
+fn relocate_bundle_keys(bundle: &mut KeychainBundle, moves: &[KeyMove]) -> usize {
     let mut changed = 0;
     for step in moves {
-        let Some(secret) = bundle.keys.remove(&step.from) else {
+        let Some(secret) = bundle.keys.get(&step.from).cloned() else {
             continue;
         };
+        if bundle
+            .keys
+            .get(&step.to)
+            .is_some_and(|current| current != &secret)
+        {
+            info!(
+                "Keychain: retained legacy {} ({} holds a different key)",
+                step.from, step.to
+            );
+            continue;
+        }
+        bundle.keys.remove(&step.from);
         changed += 1;
         if !bundle.keys.contains_key(&step.to) {
             bundle.keys.insert(step.to.clone(), secret);
@@ -81,15 +112,12 @@ pub fn apply_key_moves(moves: &[KeyMove]) -> Result<usize> {
             info!("Keychain: moved {} into {}", step.from, step.to);
         } else {
             info!(
-                "Keychain: dropped legacy {} ({} already set)",
+                "Keychain: removed copied legacy {} ({} already has the same key)",
                 step.from, step.to
             );
         }
     }
-    if changed > 0 {
-        save_bundle(&bundle)?;
-    }
-    Ok(changed)
+    changed
 }
 
 /// All Codescribe secrets in a single Keychain item.
@@ -568,6 +596,30 @@ mod tests {
         key_present, keychain_disabled_by_signals, resolve_runtime_key, test_support,
     };
     use serial_test::serial;
+
+    #[test]
+    fn relocation_preserves_a_different_existing_key_and_is_retry_safe() {
+        let mut bundle = super::KeychainBundle::default();
+        bundle.keys.insert("old-a".into(), "legacy-a".into());
+        bundle.keys.insert("new-a".into(), "current-a".into());
+        bundle.keys.insert("old-b".into(), "legacy-b".into());
+        let moves = [
+            super::KeyMove {
+                from: "old-a".into(),
+                to: "new-a".into(),
+            },
+            super::KeyMove {
+                from: "old-b".into(),
+                to: "new-b".into(),
+            },
+        ];
+        assert_eq!(super::relocate_bundle_keys(&mut bundle, &moves), 2);
+        assert_eq!(bundle.keys.get("old-a").unwrap(), "legacy-a");
+        assert_eq!(bundle.keys.get("new-a").unwrap(), "current-a");
+        assert_eq!(bundle.keys.get("new-b").unwrap(), "legacy-b");
+        assert!(!bundle.keys.contains_key("old-b"));
+        assert_eq!(super::relocate_bundle_keys(&mut bundle, &moves), 0);
+    }
 
     /// The static roster is one account per pinned vendor plus STT and GitHub;
     /// legacy lane accounts are gone and custom accounts are known by shape.

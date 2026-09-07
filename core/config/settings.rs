@@ -225,6 +225,9 @@ pub struct UserSettings {
     /// endpoints are pinned in code and never appear here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub llm_custom_providers: Vec<CustomProvider>,
+    /// Durable, secret-free relocation intent until the Keychain write succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_key_moves: Vec<super::keychain::KeyMove>,
     /// Optional override for the OpenAI OAuth client id (non-secret app identity).
     /// `None` falls through to env, then the shipped Codex CLI public app id
     /// (see `NOTICE`). Env `CODESCRIBE_OPENAI_OAUTH_CLIENT_ID` is the dev fallback.
@@ -1189,6 +1192,8 @@ struct SettingsV2 {
 struct ProvidersV2 {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     custom: Vec<CustomProvider>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_key_moves: Vec<super::keychain::KeyMove>,
 }
 
 /// `agent` section. Written only when at least one of its parts is present, so
@@ -1671,8 +1676,11 @@ impl UserSettings {
                     capabilities,
                 }),
             },
-            providers: (!self.llm_custom_providers.is_empty()).then(|| ProvidersV2 {
+            providers: (!self.llm_custom_providers.is_empty()
+                || !self.pending_key_moves.is_empty())
+            .then(|| ProvidersV2 {
                 custom: self.llm_custom_providers.clone(),
+                pending_key_moves: self.pending_key_moves.clone(),
             }),
         }
     }
@@ -1762,6 +1770,11 @@ impl UserSettings {
                 .providers
                 .as_ref()
                 .map(|p| p.custom.clone())
+                .unwrap_or_default(),
+            pending_key_moves: v2
+                .providers
+                .as_ref()
+                .map(|p| p.pending_key_moves.clone())
                 .unwrap_or_default(),
             llm_assistive_model: v2
                 .speech
@@ -2071,7 +2084,14 @@ impl UserSettings {
                                         backup_path.display()
                                     );
                                 }
-                                if let Err(e) = v1.save_unlocked() {
+                                let mut settings = Self::from_v2(v1.to_v2());
+                                // Keep the legacy endpoint mapping until its durable key
+                                // relocation intent is part of the first V2 write.
+                                Self::migrate_legacy_llm_lanes_once(
+                                    &value_for_legacy,
+                                    &mut settings,
+                                );
+                                if let Err(e) = settings.save_unlocked() {
                                     warn!("Failed hard-migrating settings V1 -> V2: {e}");
                                 } else {
                                     info!(
@@ -2079,11 +2099,6 @@ impl UserSettings {
                                         backup_path.display()
                                     );
                                 }
-                                let mut settings = Self::from_v2(v1.to_v2());
-                                Self::migrate_legacy_llm_lanes_once(
-                                    &value_for_legacy,
-                                    &mut settings,
-                                );
                                 settings
                             }
                             Err(e) => {
@@ -2109,7 +2124,7 @@ impl UserSettings {
     }
 
     /// Run the one-shot legacy LLM lane migration when the raw document still
-    /// carries endpoint fields, persist the new shape, and queue the key moves
+    /// carries endpoint fields and persist the new shape with pending key moves
     /// for the loader's Keychain step. Idempotent: the saved file has no legacy
     /// fields, so the next load finds nothing to migrate.
     fn migrate_legacy_llm_lanes_once(raw: &serde_json::Value, settings: &mut Self) {
@@ -2118,6 +2133,7 @@ impl UserSettings {
             return;
         }
         let moves = super::llm_migration::migrate_legacy_llm_lanes(&legacy, settings);
+        settings.pending_key_moves.extend(moves);
         match settings.save_unlocked() {
             // Hand back exactly what the next load will read: `to_v2` normalizes
             // on the way out (mode bindings and friends), so the first post-migration
@@ -2131,7 +2147,27 @@ impl UserSettings {
             Err(error) => warn!("Failed to persist migrated LLM lanes: {error}"),
         }
         *settings = Self::from_v2(settings.to_v2());
-        super::llm_migration::queue_key_moves(moves);
+    }
+
+    /// Acknowledge relocation only after the secret store confirms its write.
+    /// Re-read under the settings lock so acknowledgment preserves newer edits.
+    pub(crate) fn settle_pending_key_moves() -> anyhow::Result<usize> {
+        Self::settle_pending_key_moves_with(super::keychain::apply_key_moves)
+    }
+
+    fn settle_pending_key_moves_with(
+        apply: impl FnOnce(&[super::keychain::KeyMove]) -> anyhow::Result<usize>,
+    ) -> anyhow::Result<usize> {
+        let _data_io = super::storage_reset::begin_app_data_io()?;
+        let _settings_io = settings_io_lock();
+        let mut latest = Self::load_unlocked();
+        if latest.pending_key_moves.is_empty() {
+            return Ok(0);
+        }
+        let changed = apply(&latest.pending_key_moves)?;
+        latest.pending_key_moves.clear();
+        latest.save_unlocked()?;
+        Ok(changed)
     }
 
     /// Add a Custom provider row. The id is derived from the name and must be
@@ -3201,19 +3237,19 @@ mod tests {
             Some("libraxis-responses")
         );
         assert_eq!(
-            super::super::llm_migration::take_key_moves().len(),
+            loaded.pending_key_moves.len(),
             3,
-            "three legacy key moves queued for the loader"
+            "three legacy key moves durably retained for the loader"
         );
 
-        // Second load: same settings, no rewrite, no key moves.
+        // Second load: same settings and durable moves, without rewriting.
         let again = UserSettings::load();
         assert_eq!(again, loaded);
         assert_eq!(
             fs::read_to_string(&path).expect("read settings after second load"),
             written
         );
-        assert!(super::super::llm_migration::take_key_moves().is_empty());
+        assert_eq!(again.pending_key_moves, loaded.pending_key_moves);
 
         // Unknown host on the assistive lane → one Custom row.
         let self_hosted = serde_json::json!({
@@ -3242,7 +3278,75 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("my-local")
         );
-        let _ = super::super::llm_migration::take_key_moves();
+    }
+
+    #[test]
+    #[serial]
+    fn key_relocation_failure_survives_reload_and_preserves_later_settings_edits() {
+        let _tmp = setup_isolated_data_dir();
+        fs::write(
+            UserSettings::settings_path(),
+            serde_json::json!({
+                "schema_version": 3,
+                "speech": {"assistive": {
+                    "llm_endpoint": "http://localhost:9000/v1/responses",
+                    "llm_model": "local-model"
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected_moves = UserSettings::load().pending_key_moves;
+        assert!(!expected_moves.is_empty());
+        let failure = UserSettings::settle_pending_key_moves_with(|moves| {
+            assert_eq!(moves, expected_moves);
+            anyhow::bail!("simulated Keychain denial")
+        });
+        assert!(failure.is_err());
+
+        // No process-local queue participates: reconstruct the exact retry from disk.
+        let mut reloaded = UserSettings::load();
+        assert_eq!(reloaded.pending_key_moves, expected_moves);
+        reloaded.sound_volume = Some(0.42);
+        reloaded.save().unwrap();
+        UserSettings::settle_pending_key_moves_with(|moves| {
+            assert_eq!(moves, expected_moves);
+            Ok(moves.len())
+        })
+        .unwrap();
+        let settled = UserSettings::load();
+        assert!(settled.pending_key_moves.is_empty());
+        assert_eq!(settled.sound_volume, Some(0.42));
+        assert_eq!(settled.llm_assistive_model.as_deref(), Some("local-model"));
+        UserSettings::settle_pending_key_moves_with(|_| panic!("already acknowledged")).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn v1_migration_persists_key_relocation_with_the_provider_mapping() {
+        let _tmp = setup_isolated_data_dir();
+        fs::write(
+            UserSettings::settings_path(),
+            serde_json::json!({
+                "llm_assistive_endpoint": "http://localhost:9000/v1/responses",
+                "llm_assistive_model": "old-model"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let loaded = UserSettings::load();
+        assert_eq!(loaded.llm_assistive_model.as_deref(), Some("old-model"));
+        assert!(loaded.pending_key_moves.iter().any(|step| {
+            step.from == "LLM_ASSISTIVE_API_KEY" && step.to == "LLM_CUSTOM_LOCALHOST_API_KEY"
+        }));
+        let again = UserSettings::load();
+        assert_eq!(again.pending_key_moves, loaded.pending_key_moves);
+        assert_eq!(again.llm_assistive_provider, loaded.llm_assistive_provider);
+        assert!(
+            UserSettings::settings_dir()
+                .join("settings.v1.bak.json")
+                .exists()
+        );
     }
 
     /// Custom rows: duplicate ids are refused, the id survives an update, and

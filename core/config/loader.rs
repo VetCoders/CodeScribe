@@ -494,16 +494,12 @@ impl Config {
         // inside `load`; its Keychain key moves are applied here, the only
         // place allowed to touch the bundle during a load.
         let user_settings = super::settings::UserSettings::load();
-        if populate_keychain {
-            let moves = super::llm_migration::take_key_moves();
-            if !moves.is_empty() {
-                match super::keychain::apply_key_moves(&moves) {
-                    Ok(changed) => info!(
-                        "Applied {} legacy LLM key move(s) ({changed} bundle changes)",
-                        moves.len()
-                    ),
-                    Err(error) => warn!("Legacy LLM key moves failed: {error}"),
+        if populate_keychain && !user_settings.pending_key_moves.is_empty() {
+            match super::settings::UserSettings::settle_pending_key_moves() {
+                Ok(changed) => {
+                    info!("Applied legacy LLM key relocation ({changed} bundle changes)")
                 }
+                Err(error) => warn!("Legacy LLM key relocation remains pending: {error}"),
             }
         }
 
