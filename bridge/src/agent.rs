@@ -13,7 +13,6 @@ use codescribe_core::agent::{
 };
 use codescribe_core::attachment::{MAX_VISION_IMAGE_BYTES, load_image_for_vision};
 use codescribe_core::config::RuntimeSettingsSnapshot;
-use codescribe_core::llm::provider::{ProviderKind, provider_supports_vision};
 use tokio::task::AbortHandle;
 
 use crate::{CsError, application_runtime};
@@ -255,8 +254,7 @@ impl CodescribeAgent {
             let assistive_lane = settings.llm_lanes().assistive();
             let images = validate_composer_attachments(
                 &attachments,
-                assistive_lane.provider(),
-                assistive_lane.model(),
+                assistive_lane.supports_vision(assistive_lane.model()),
             )?;
             agent.run_stream(text, thread_id, images, listener).await
         })
@@ -849,8 +847,7 @@ fn compose_agent_system_prompt(assistive_prompt: &str) -> String {
 /// degraded message. Also gates on the selected model's vision capability.
 fn validate_composer_attachments(
     attachments: &[CsAttachment],
-    provider: ProviderKind,
-    model: &str,
+    supports_vision: bool,
 ) -> Result<Vec<ImageAttachment>, CsError> {
     if attachments.is_empty() {
         return Ok(Vec::new());
@@ -868,7 +865,7 @@ fn validate_composer_attachments(
 
     // Vision gate: refuse (readable error) rather than silently drop the images
     // when the sealed assistive model cannot read them.
-    if !provider_supports_vision(provider, model) {
+    if !supports_vision {
         return Err(CsError::Agent {
             msg: "The selected model can't read images. Switch to a vision-capable \
                   model in Settings, or remove the attachment before sending."
@@ -987,7 +984,7 @@ mod tests {
     fn validate_test_attachments(
         attachments: &[CsAttachment],
     ) -> Result<Vec<ImageAttachment>, CsError> {
-        validate_composer_attachments(attachments, ProviderKind::OpenAiResponses, "gpt-4o")
+        validate_composer_attachments(attachments, true)
     }
 
     /// An empty attachment list must yield zero vision payloads, not invent one.
@@ -997,20 +994,38 @@ mod tests {
         assert!(images.is_empty());
     }
 
+    #[test]
+    fn composer_rejects_images_when_sealed_lane_disallows_vision() {
+        let attachments = [CsAttachment {
+            path: "/not-loaded.png".into(),
+        }];
+        let error = validate_composer_attachments(&attachments, false).unwrap_err();
+        assert!(error.to_string().contains("can't read images"));
+    }
+
     /// Effect witness for the 2026-09-04 seal-lifecycle 401: a credential that
     /// appears AFTER the handle is constructed must reach the very next call.
     /// The witness is the resolved lane credential (what the request would
-    /// send), not a struct field name. Env outranks Keychain in the loader
-    /// precedence, so setting the env var stands in for "the user saved a key
-    /// in Settings after launch".
+    /// send), using the same provider account write as Settings.
     #[test]
+    #[serial_test::serial]
     fn fresh_seal_sees_a_key_saved_after_construction() {
         let agent = CodescribeAgent::default();
-        // SAFETY: test-local env mutation; no other test in this binary
-        // touches LLM_ASSISTIVE_API_KEY concurrently.
-        unsafe { std::env::set_var("LLM_ASSISTIVE_API_KEY", "witness-fresh-seal") };
+        let account = agent
+            .current_settings()
+            .llm_lanes()
+            .assistive()
+            .credential()
+            .key_account()
+            .to_string();
+        let previous = codescribe_core::config::keychain::cached_runtime_key(&account);
+        codescribe_core::config::keychain::save_key(&account, "witness-fresh-seal").unwrap();
         let fresh = agent.current_settings();
-        unsafe { std::env::remove_var("LLM_ASSISTIVE_API_KEY") };
+        if let Some(previous) = previous {
+            codescribe_core::config::keychain::save_key(&account, &previous).unwrap();
+        } else {
+            codescribe_core::config::keychain::delete_key(&account).unwrap();
+        }
         assert_eq!(
             fresh.llm_lanes().assistive().credential().api_key(),
             Some("witness-fresh-seal"),
