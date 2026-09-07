@@ -45,6 +45,8 @@ pub mod prompts;
 pub mod settings;
 /// Process-wide app-data I/O fence used by destructive reset.
 pub mod storage_reset;
+/// One-shot STT transport and credential migration.
+pub mod stt_migration;
 /// Config enums and the main `Config` struct definitions.
 mod types;
 

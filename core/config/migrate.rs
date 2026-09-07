@@ -75,8 +75,19 @@ pub fn migrate_if_needed(file_env: Option<&HashMap<String, String>>) {
     if let Some(v) = migrated_value(file_env, "LOCAL_MODEL") {
         settings.local_model = Some(v);
     }
+    for (lane, target) in [
+        (crate::stt::SttLane::File, &mut settings.stt_file_endpoint),
+        (crate::stt::SttLane::Live, &mut settings.stt_live_endpoint),
+    ] {
+        if let Some(value) = migrated_value(file_env, lane.wire_key()) {
+            *target = crate::stt::validate_stt_endpoint(lane, &value).ok();
+        }
+    }
     if let Some(v) = migrated_value(file_env, "STT_ENDPOINT") {
-        settings.stt_endpoint = Some(v);
+        super::stt_migration::migrate_legacy_stt_lanes(
+            &super::stt_migration::SttV2Legacy::from_endpoint(&v),
+            &mut settings,
+        );
     }
     if let Some(v) = migrated_value(file_env, "TRANSCRIPT_SEND_MODE") {
         settings.transcript_send_mode = Some(v);

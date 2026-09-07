@@ -30,7 +30,8 @@ pub const KEYCHAIN_ACCOUNTS: &[&str] = &[
     "LLM_OPENAI_API_KEY",
     "LLM_XAI_API_KEY",
     "LLM_ANTHROPIC_API_KEY",
-    "STT_API_KEY",
+    "STT_FILE_API_KEY",
+    "STT_LIVE_API_KEY",
     "GITHUB_TOKEN",
 ];
 
@@ -116,6 +117,39 @@ fn relocate_bundle_keys(bundle: &mut KeychainBundle, moves: &[KeyMove]) -> usize
                 step.from, step.to
             );
         }
+    }
+    changed
+}
+
+/// Copy a legacy key to missing targets, then drain the source in one bundle write.
+/// A failed write leaves the source/cache intact so a later load can retry.
+pub fn fan_out_key(from: &str, targets: &[&str]) -> usize {
+    if targets.is_empty() || targets.contains(&from) {
+        return 0;
+    }
+    let bundle = if is_test_env() {
+        read_bundle_cache()
+    } else {
+        load_bundle()
+    };
+    let Some(mut bundle) = bundle else {
+        return 0;
+    };
+    let Some(secret) = bundle.keys.remove(from) else {
+        return 0;
+    };
+    let mut changed = 1;
+    for target in targets {
+        if !bundle.keys.contains_key(*target) {
+            bundle.keys.insert((*target).into(), secret.clone());
+            changed += 1;
+        }
+    }
+    if is_test_env() {
+        write_bundle_cache(Some(bundle));
+    } else if let Err(error) = save_bundle(&bundle) {
+        tracing::warn!(%error, "STT key fan-out failed; source retained");
+        return 0;
     }
     changed
 }
@@ -632,7 +666,8 @@ mod tests {
                 "LLM_OPENAI_API_KEY",
                 "LLM_XAI_API_KEY",
                 "LLM_ANTHROPIC_API_KEY",
-                "STT_API_KEY",
+                "STT_FILE_API_KEY",
+                "STT_LIVE_API_KEY",
                 "GITHUB_TOKEN",
             ]
         );
@@ -739,6 +774,36 @@ mod tests {
         assert_eq!(
             resolve_runtime_key(Some("old".to_string()), Some("old".to_string()), None),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod stt_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn fan_out_key_copies_to_absent_targets_then_drains_source() {
+        let _bundle =
+            test_support::install_bundle(&[("legacy-stt", "old"), ("STT_LIVE_API_KEY", "current")]);
+        assert_eq!(
+            fan_out_key("legacy-stt", &["STT_FILE_API_KEY", "STT_LIVE_API_KEY"]),
+            2
+        );
+        let bundle = read_bundle_cache().unwrap();
+        assert_eq!(
+            bundle.keys.get("STT_FILE_API_KEY").map(String::as_str),
+            Some("old")
+        );
+        assert_eq!(
+            bundle.keys.get("STT_LIVE_API_KEY").map(String::as_str),
+            Some("current")
+        );
+        assert!(!bundle.keys.contains_key("legacy-stt"));
+        assert_eq!(
+            fan_out_key("legacy-stt", &["STT_FILE_API_KEY", "STT_LIVE_API_KEY"]),
+            0
         );
     }
 }

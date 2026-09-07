@@ -103,8 +103,8 @@ pub struct QualityReport {
 /// reports apart later. Only key *presence* is recorded, never key material.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReportEnvironment {
-    pub stt_endpoint: Option<String>,
-    pub stt_api_key_present: bool,
+    pub stt_file_endpoint: Option<String>,
+    pub stt_file_api_key_present: bool,
     pub llm_formatting_endpoint: Option<String>,
     pub llm_formatting_model: Option<String>,
     pub llm_formatting_key_present: bool,
@@ -413,7 +413,7 @@ fn prepare_cloud_jobs(
         Some(credentials) => credentials,
         _ => {
             return CloudJobSet::Skipped(
-                "Cloud transcription skipped: STT_ENDPOINT/STT_API_KEY missing".into(),
+                "Cloud transcription skipped: STT_FILE_ENDPOINT/STT_FILE_API_KEY missing".into(),
             );
         }
     };
@@ -458,18 +458,11 @@ fn prepare_cloud_jobs(
 /// absent. Loopback servers intentionally accept an empty key; remote owners
 /// still require one.
 fn cloud_reference_credentials(app_config: &Config) -> Option<(String, String)> {
-    let endpoint = app_config.stt_endpoint.as_deref()?.trim();
-    let api_key = app_config.stt_api_key.as_deref().unwrap_or_default().trim();
-
-    if endpoint.is_empty()
-        || (crate::stt::tail_provider::stt_auth_mode(endpoint)
-            != crate::stt::tail_provider::SttAuthMode::Unauthenticated
-            && api_key.is_empty())
-    {
+    let row = app_config.stt_lane(crate::stt::SttLane::File)?;
+    if row.key_missing() {
         return None;
     }
-
-    Some((endpoint.to_string(), api_key.to_string()))
+    Some((row.endpoint, row.api_key.unwrap_or_default()))
 }
 
 /// Typed context for pair processing to keep function argument counts bounded.
@@ -1511,13 +1504,10 @@ fn snapshot_environment(
 ) -> ReportEnvironment {
     let config = runtime_settings.values();
     let formatting = runtime_settings.llm_lanes().formatting();
+    let file = config.stt_lane(crate::stt::SttLane::File);
     ReportEnvironment {
-        stt_endpoint: config.stt_endpoint.clone(),
-        stt_api_key_present: config
-            .stt_api_key
-            .as_ref()
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false),
+        stt_file_endpoint: file.as_ref().map(|row| row.endpoint.clone()),
+        stt_file_api_key_present: file.as_ref().is_some_and(|row| row.api_key.is_some()),
         llm_formatting_endpoint: Some(formatting.endpoint().to_string()),
         llm_formatting_model: Some(formatting.model().to_string()),
         llm_formatting_key_present: formatting.credential().api_key().is_some(),
@@ -1936,8 +1926,8 @@ mod tests {
     fn cloud_reference_credentials_ignore_local_committed_transcript_mode() {
         let mut config = Config {
             use_local_stt: true,
-            stt_endpoint: Some(" https://api.example.test/v1/audio/transcriptions ".into()),
-            stt_api_key: Some(" test-token ".into()),
+            stt_file_endpoint: Some(" https://api.example.test/v1/audio/transcriptions ".into()),
+            stt_file_api_key: Some(" test-token ".into()),
             ..Default::default()
         };
 
@@ -1949,10 +1939,10 @@ mod tests {
             ))
         );
 
-        config.stt_api_key = Some("   ".into());
+        config.stt_file_api_key = Some("   ".into());
         assert_eq!(cloud_reference_credentials(&config), None);
 
-        config.stt_endpoint = Some("http://127.0.0.1:8000/v1/audio/transcriptions".into());
+        config.stt_file_endpoint = Some("http://127.0.0.1:8000/v1/audio/transcriptions".into());
         assert_eq!(
             cloud_reference_credentials(&config),
             Some((

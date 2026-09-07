@@ -584,8 +584,11 @@ pub struct Config {
     #[serde(default = "default_local_model")]
     pub local_model: String,
 
-    /// Cloud STT endpoint used when cloud is selected as the committed verdict path.
-    pub stt_endpoint: Option<String>,
+    /// Atomic File and Live rows frozen into each runtime snapshot.
+    pub stt_file_endpoint: Option<String>,
+    pub stt_file_api_key: Option<String>,
+    pub stt_live_endpoint: Option<String>,
+    pub stt_live_api_key: Option<String>,
 
     /// Opt-in Whisper domain-vocabulary initial prompt.
     ///
@@ -594,9 +597,6 @@ pub struct Config {
     /// for diagnosis and future retuning.
     #[serde(default = "default_stt_initial_prompt_enabled")]
     pub stt_initial_prompt_enabled: bool,
-
-    /// API key for cloud STT providers used on the committed verdict path
-    pub stt_api_key: Option<String>,
 
     // ===== Clipboard =====
     /// Whether to restore previous clipboard after paste
@@ -661,9 +661,11 @@ impl Default for Config {
             quick_notes_save_only: false,
             use_local_stt: true,
             local_model: default_local_model(),
-            stt_endpoint: None,
+            stt_file_endpoint: None,
+            stt_live_endpoint: None,
             stt_initial_prompt_enabled: default_stt_initial_prompt_enabled(),
-            stt_api_key: None,
+            stt_file_api_key: None,
+            stt_live_api_key: None,
             restore_clipboard: default_restore_clipboard(),
             restore_clipboard_delay_ms: default_restore_clipboard_delay_ms(),
             start_at_login: false,
