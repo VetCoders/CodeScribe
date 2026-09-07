@@ -17,7 +17,6 @@ import SwiftUI
 struct DictationOverlayView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
-  @FocusState private var transcriptEditorFocused: Bool
   @Bindable var state: OverlayState
   var dockInitiallyExpanded = false
 
@@ -232,17 +231,19 @@ struct DictationOverlayView: View {
   // MARK: Body
 
   private var bodySection: some View {
-    Group {
+    VStack(alignment: .leading, spacing: CSSpace.sm) {
+      // One permanent transcript surface. Status and lifecycle never replace
+      // its contents; the engine may replace them only via its projection.
+      transcriptScroll
       if let status = state.presentationStatus {
         presentationStatusBody(status)
           .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
       } else {
         switch state.mode {
         case .listening, .finalizing:
-          listeningBody
-            .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
+          EmptyView()
         case .formatted:
-          formattedBody
+          EmptyView()
         case .noSpeech:
           noSpeechBody
             .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
@@ -264,11 +265,7 @@ struct DictationOverlayView: View {
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.mode)
   }
 
-  private var listeningBody: some View {
-    // Transcript is the product. Audio evidence lives in the primary chrome
-    // waveform; do not restack a decorative strip above the words.
-    transcriptScroll
-  }
+
 
   /// Native live transcript: follows the newest words until the user clicks or
   /// selects an older phrase. The `NSTextView` keeps that selection stable across
@@ -278,7 +275,7 @@ struct DictationOverlayView: View {
   private var transcriptScroll: some View {
     VStack(alignment: .leading, spacing: 0) {
       LiveTranscriptTextView(
-        text: state.listeningDisplay,
+        text: state.activeText,
         appearance: palette.appearance
       )
       .modifier(OverlayScrollEdgeEffects())
@@ -293,76 +290,7 @@ struct DictationOverlayView: View {
     .frame(maxWidth: .infinity, alignment: .leading)
   }
 
-  private var formattedBody: some View {
-    VStack(alignment: .leading, spacing: CSSpace.sm) {
-      HStack(spacing: CSSpace.xs) {
-        if state.formatterCommitPending {
-          ProgressView()
-            .controlSize(.small)
-          Text("Formatting revision…")
-        } else if state.revisionCommitPending {
-          ProgressView()
-            .controlSize(.small)
-          Text("Committing revision…")
-        } else if state.isRevisionDraftDirty {
-          Image(systemName: "pencil.line")
-          Text("Draft · not committed")
-        } else {
-          Image(systemName: "checkmark.seal")
-          Text("Ledger projection")
-        }
-      }
-      .csMono(10, .semibold)
-      .foregroundStyle(
-        state.isRevisionDraftDirty ? CSColor.terracotta : palette.mutedText.color
-      )
-      .accessibilityElement(children: .combine)
-      .accessibilityIdentifier("overlay-revision-status")
 
-      TextField(
-        "Edit final transcript",
-        text: $state.revisionDraft,
-        axis: .vertical
-      )
-      .textFieldStyle(.plain)
-      .csFont(19, .medium)
-      .foregroundStyle(palette.primaryText.color)
-      .lineSpacing(6)
-      .lineLimit(3...12)
-      .focused($transcriptEditorFocused)
-      .disabled(state.revisionCommitPending || state.formatterCommitPending)
-      .accessibilityLabel("Final transcript revision draft")
-      .accessibilityHint("Edits stay local until committed to the transcript ledger")
-      .accessibilityIdentifier("overlay-transcript-editor")
-      .onChange(of: state.revisionDraft) { _, _ in
-        state.noteRevisionDraftActivity()
-      }
-      .onChange(of: transcriptEditorFocused) { wasFocused, isFocused in
-        if wasFocused && !isFocused {
-          state.scheduleRevisionCommitAfterFocusExit()
-        }
-      }
-      .onExitCommand {
-        state.discardRevisionDraft()
-        transcriptEditorFocused = false
-      }
-
-      if let error = state.revisionCommitError {
-        Label(error, systemImage: "exclamationmark.triangle")
-          .csMono(10, .medium)
-          .foregroundStyle(CSColor.terracotta)
-          .accessibilityIdentifier("overlay-revision-error")
-      }
-    }
-    .frame(
-      maxWidth: .infinity, minHeight: bodyMinHeight, maxHeight: .infinity,
-      alignment: .topLeading
-    )
-    .clipped()
-    .accessibilityLabel("Final transcript")
-    .accessibilityValue(state.revisionDraft)
-    .accessibilityIdentifier("overlay-transcript-formatted")
-  }
 
   /// Terminal outcome for a session that captured no usable speech. Replaces
   /// the empty editable FINAL with a calm, non-alarming notice (mic glyph +

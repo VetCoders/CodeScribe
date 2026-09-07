@@ -492,20 +492,10 @@ final class OverlayState {
     rawLiveText
   }
 
-  /// Text shown in the listening/finalizing body.
-  ///
-  /// CAPTURED WORDS ALWAYS WIN OVER PHASE. The previous shape let the
-  /// transcribing phase replace the live canvas with "transcribing…", so
-  /// stopping a recording made the user's own words vanish behind a spinner
-  /// until the final text swapped in — the Founder dictated the bug report
-  /// into the very canvas that then ate it (2026-08-09 20:13): "wyłączenie
-  /// nagrywania zastępuje tekst … i podmienia dopiero ostateczny tekst a tego
-  /// ma nie być". The overlay doctrine forbids exactly this class: never drop
-  /// visible transcript. Phase placeholders render only on an EMPTY canvas;
-  /// the header pill carries the phase otherwise.
+  /// Exact engine text, including an empty document. Lifecycle labels belong
+  /// in chrome; they must never become selectable/copied transcript characters.
   var listeningDisplay: String {
-    if !liveText.isEmpty { return liveText }
-    return mode == .finalizing ? "finalizing…" : "listening…"
+    liveText
   }
 
   /// Timer is mandatory for any session that has started, including the
@@ -1386,10 +1376,8 @@ final class OverlayState {
       calibrationVersion: event.calibrationVersion
     )
     presentationStatus = status
-    latestTranscriptProjection = nil
-    deliveredText = ""
-    formattedText = ""
-    revision = 0
+    // Status is a sibling message, not a replacement transcript document.
+    // Only a subsequent transcript projection may change the displayed bytes.
     canPaste = false
     canInsert = false
     canCopy = false

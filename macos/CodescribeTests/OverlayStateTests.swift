@@ -329,6 +329,24 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertTrue(state.showsSessionTimer)
   }
 
+  func testCanvasPreservesEmptyAndExactEngineTextWithoutLifecyclePlaceholders() {
+    let state = OverlayState()
+    XCTAssertEqual(state.listeningDisplay, "")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertEqual(state.listeningDisplay, "")
+
+    let text = "  raz raz\nZażółć — e\u{301} 👩‍💻  "
+    projectText(text, to: state)
+    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
+    state.handleRecordingFinalising()
+    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
+
+    projectText("", to: state)
+    XCTAssertEqual(state.listeningDisplay, "")
+    XCTAssertEqual(state.activeText, "")
+  }
+
   func testCanonicalProjectionOwnsCanvasAndCopyFromFirstAdmittedRevision() {
     let state = OverlayState()
     XCTAssertFalse(state.canCopy)
@@ -1325,6 +1343,15 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertFalse(state.canFormat)
     XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [.close])
     XCTAssertEqual(visibleCallbacks, 1)
+  }
+
+  func testStatusCannotEraseTheEngineTranscript() {
+    let state = OverlayState()
+    let text = "  silnik\nraz raz 👩‍💻  "
+    projectText(text, to: state)
+    state.applyPresentationStatus(refusalStatus())
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    XCTAssertEqual(Array(state.listeningDisplay.utf8), Array(text.utf8))
   }
 
   func testCalibrationSuccessProjectionCarriesNewProfileVersion() {

@@ -46,11 +46,13 @@ and the process-lifetime runtime lock. Never tear down the app mid-take;
 never refuse install forever because an old session lacked an end line.
 
 `session_ended` carries one typed `end_reason` (`TranscriptSessionEndReason`):
-`completed` for a take that reached the serialized stop path,
+`completed` for a take whose serialized stop and transcript processing succeeded,
 `start_superseded` when a key-up or reschedule invalidated a hold start after
 `session_started` and before the take became an active recording, and
 `start_failed` when the recorder could not be started after the session was
-announced. CLI file sessions use `transcription_failed` when decoding or
+announced. App refusal, stop timeout, and forced recovery use
+`transcription_failed`; returning the recorder to Idle does not imply transcript
+success. CLI file sessions use `transcription_failed` when decoding or
 stream output fails after publishing a draft; the partial text is never sealed
 as a completed document. The controller has exactly one terminal publisher
 (`end_transcript_bus`); the delayed hold start unwinds every pre-active exit
