@@ -14,9 +14,10 @@ import Foundation
 //   AI_FORMATTING_ENABLED "1" | "0"
 //   FORMATTING_LEVEL      "off" | "correction" | "smart" | "max"
 //   USE_LOCAL_STT         "1" | "0"
-//   LOCAL_MODEL / STT_ENDPOINT / LLM_MODEL / LLM_ENDPOINT / LLM_ASSISTIVE_* ...  free strings
-// Keychain accounts (CsKeyStatus, core/config/keychain.rs::KEYCHAIN_ACCOUNTS):
-//   LLM_API_KEY / STT_API_KEY / LLM_FORMATTING_API_KEY / LLM_ASSISTIVE_API_KEY / LLM_ANTHROPIC_API_KEY / GITHUB_TOKEN
+//   LOCAL_MODEL / STT_ENDPOINT / LLM_<LANE>_PROVIDER / LLM_<LANE>_MODEL ...  free strings
+//   (no endpoint keys: endpoints belong to providers — vendors factory-pinned, custom rows CRUD)
+// Keychain accounts (CsKeyStatus, core/config/keychain.rs::KEYCHAIN_ACCOUNTS): one per vendor
+//   (LLM_<VENDOR>_API_KEY), STT_API_KEY, GITHUB_TOKEN; custom rows carry LLM_CUSTOM_<ID>_API_KEY
 
 /// Subset of the codescribe config surface the Settings screen consumes.
 @MainActor
@@ -27,9 +28,6 @@ protocol SettingsEngine {
   func shouldShowOnboarding() -> Bool
   func onboardingMode() -> String?
   func setOnboardingMode(mode: String) throws
-
-  /// Delegates to the core provider registry (no suffix-list duplicate in Swift).
-  func normalizeOpenaiResponsesEndpoint(_ endpoint: String) -> String
 
   // Config writes (auto-tiered by the core router)
   func updateConfig(key: String, value: String) throws
@@ -54,14 +52,19 @@ protocol SettingsEngine {
 
   // Keychain-backed API keys — presence booleans only, secrets never read back
   func keyStatus() -> CsKeyStatus
-  func keyAccounts() -> [String]
+  /// Non-provider Keychain accounts (STT, GitHub); provider accounts ride on `CsProviderOption`.
+  func serviceKeyAccounts() -> [String]
   func setApiKey(account: String, secret: String) throws
   func clearApiKey(account: String) throws
   func testApiKey(account: String) throws -> CsApiKeyProbeResult
   func testApiKeyAsync(account: String) async throws -> CsApiKeyProbeResult
 
-  // Assistive/agent-lane providers and live model discovery
+  // Provider registry (vendors + custom rows), lane binding, model discovery.
   func availableProviders() -> [CsProviderOption]
+  func addCustomProvider(draft: CsCustomProviderDraft) throws -> CsProviderOption
+  func updateCustomProvider(id: String, draft: CsCustomProviderDraft) throws -> CsProviderOption
+  func removeCustomProvider(id: String) throws -> CsCustomProviderRemoval
+  func setLaneProvider(lane: CsLlmLane, providerId: String) throws
   func discoverModels(providerId: String) -> CsModelDiscovery
   func discoverModelsAsync(providerId: String) async -> CsModelDiscovery
   func startAccountLogin(providerId: String) throws -> CsAccountLoginResult
@@ -132,10 +135,6 @@ final class RealSettingsEngine: SettingsEngine {
   func onboardingMode() -> String? { config.onboardingMode() }
   func setOnboardingMode(mode: String) throws { try config.setOnboardingMode(mode: mode) }
 
-  func normalizeOpenaiResponsesEndpoint(_ endpoint: String) -> String {
-    config.normalizeOpenaiResponsesEndpoint(endpoint: endpoint)
-  }
-
   func updateConfig(key: String, value: String) throws {
     try config.updateConfig(key: key, value: value)
   }
@@ -173,7 +172,7 @@ final class RealSettingsEngine: SettingsEngine {
   }
 
   func keyStatus() -> CsKeyStatus { config.keyStatus() }
-  func keyAccounts() -> [String] { config.keyAccounts() }
+  func serviceKeyAccounts() -> [String] { config.serviceKeyAccounts() }
   func setApiKey(account: String, secret: String) throws {
     try config.setApiKey(account: account, secret: secret)
   }
@@ -188,6 +187,18 @@ final class RealSettingsEngine: SettingsEngine {
   }
 
   func availableProviders() -> [CsProviderOption] { config.availableProviders() }
+  func addCustomProvider(draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    try config.addCustomProvider(draft: draft)
+  }
+  func updateCustomProvider(id: String, draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    try config.updateCustomProvider(id: id, draft: draft)
+  }
+  func removeCustomProvider(id: String) throws -> CsCustomProviderRemoval {
+    try config.removeCustomProvider(id: id)
+  }
+  func setLaneProvider(lane: CsLlmLane, providerId: String) throws {
+    try config.setLaneProvider(lane: lane, providerId: providerId)
+  }
   func discoverModels(providerId: String) -> CsModelDiscovery {
     config.discoverModels(providerId: providerId)
   }
@@ -284,6 +295,8 @@ struct MockSettingsEngine: SettingsEngine {
   var resetAgentDataObserver: (() throws -> Void)?
   var clearMcpConfigurationObserver: (() throws -> Void)?
   var settingsLoader: (() -> CsSettings)?
+  /// Custom rows + lane bindings persist across calls (reference-typed, like settings.json).
+  var providerStore: MockProviderStore = MockProviderStore()
   var updateConfigManyObserver: (([CsConfigEntry]) throws -> Void)?
   var resetAudioInputDeviceObserver: (() throws -> Void)?
   var voiceLabEditObserver: ((String, String) throws -> CsVoiceLabSaveResult)?
@@ -359,20 +372,28 @@ struct MockSettingsEngine: SettingsEngine {
   }
 
   func keyStatus() -> CsKeyStatus { status }
-  func keyAccounts() -> [String] {
-    [
-      "LLM_API_KEY", "STT_API_KEY", "LLM_FORMATTING_API_KEY",
-      "LLM_ASSISTIVE_API_KEY", "LLM_ANTHROPIC_API_KEY", "LLM_XAI_API_KEY",
-      "GITHUB_TOKEN",
-    ]
-  }
+  func serviceKeyAccounts() -> [String] { ["STT_API_KEY", "GITHUB_TOKEN"] }
   func setApiKey(account: String, secret: String) throws {}
   func clearApiKey(account: String) throws {}
   func testApiKey(account: String) throws -> CsApiKeyProbeResult {
     CsApiKeyProbeResult.sample(account: account)
   }
 
-  func availableProviders() -> [CsProviderOption] { CsProviderOption.sampleProviders }
+  func availableProviders() -> [CsProviderOption] {
+    CsProviderOption.sampleProviders + providerStore.custom
+  }
+  func addCustomProvider(draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    try providerStore.add(draft)
+  }
+  func updateCustomProvider(id: String, draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    try providerStore.update(id: id, draft: draft)
+  }
+  func removeCustomProvider(id: String) throws -> CsCustomProviderRemoval {
+    try providerStore.remove(id: id)
+  }
+  func setLaneProvider(lane: CsLlmLane, providerId: String) throws {
+    try providerStore.setLane(lane, providerId: providerId, known: availableProviders())
+  }
   func discoverModels(providerId: String) -> CsModelDiscovery {
     CsModelDiscovery.sample(for: providerId)
   }
@@ -387,17 +408,6 @@ struct MockSettingsEngine: SettingsEngine {
     )
   }
 
-  func normalizeOpenaiResponsesEndpoint(_ endpoint: String) -> String {
-    // Mock: pass-through or minimal normalize for preview stability.
-    var base = endpoint.trimmingCharacters(
-      in: .whitespacesAndNewlines.union(.init(charactersIn: "/")))
-    for s in ["/v1/responses", "/v1/chat/completions", "/v1/completions"] where base.hasSuffix(s) {
-      base.removeLast(s.count)
-      return base + "/v1/responses"
-    }
-    if base.hasSuffix("/v1") { base.removeLast(3) }
-    return base + "/v1/responses"
-  }
   func awaitAccountLogin(providerId: String, timeoutSeconds: UInt64) throws -> CsAccountLoginResult
   {
     CsAccountLoginResult(
@@ -452,6 +462,92 @@ struct MockSettingsEngine: SettingsEngine {
   func resetAgentData() throws { try resetAgentDataObserver?() }
   func clearMcpConfiguration() throws {
     try clearMcpConfigurationObserver?()
+  }
+}
+
+/// Mock-side stand-in for the core registry's custom CRUD + lane bindings —
+/// reference-typed so the value-typed engine observes its own writes. Validation
+/// covers only what tests read; the real rules live in `core/llm/provider.rs`.
+@MainActor
+final class MockProviderStore {
+  enum Failure: Error, Equatable {
+    case emptyName
+    case invalidEndpoint(String)
+    case unknownProvider(String)
+  }
+
+  var custom: [CsProviderOption] = []
+  var laneProviders: [CsLlmLane: String] = [:]
+
+  /// Slug + scheme check in the core's shape; the row id is `custom:<slug>`.
+  private func row(_ draft: CsCustomProviderDraft, keySet: Bool) throws -> CsProviderOption {
+    let slug = String(draft.name.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
+      .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    guard !slug.isEmpty else { throw Failure.emptyName }
+    guard draft.endpoint.hasPrefix("http://") || draft.endpoint.hasPrefix("https://") else {
+      throw Failure.invalidEndpoint(draft.endpoint)
+    }
+    let account = slug.uppercased().replacingOccurrences(of: "-", with: "_")
+    return .row(
+      id: "custom:\(slug)", kind: "custom", name: draft.name, wire: draft.wire,
+      endpoint: draft.endpoint, account: "LLM_CUSTOM_\(account)_API_KEY", keySet: keySet)
+  }
+
+  /// Bridge rows are addressed by the bare slug (§D 17:55Z); the picker id has the prefix.
+  private func index(of slug: String) throws -> Int {
+    guard let index = custom.firstIndex(where: { $0.id == "custom:\(slug)" }) else {
+      throw Failure.unknownProvider(slug)
+    }
+    return index
+  }
+
+  func add(_ draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    let option = try row(draft, keySet: draft.apiKey != nil)
+    custom.append(option)
+    return option
+  }
+
+  /// Id (and therefore the key account) is immutable; only name/wire/endpoint move.
+  func update(id: String, draft: CsCustomProviderDraft) throws -> CsProviderOption {
+    let index = try index(of: id)
+    var option = try row(draft, keySet: custom[index].apiKeySet || draft.apiKey != nil)
+    option.id = custom[index].id
+    option.apiKeyAccount = custom[index].apiKeyAccount
+    custom[index] = option
+    return option
+  }
+
+  func remove(id: String) throws -> CsCustomProviderRemoval {
+    let removed = try custom.remove(at: index(of: id))
+    let reset = [CsLlmLane.formatting, .assistive].filter { laneProviders[$0] == removed.id }
+    for lane in reset { laneProviders[lane] = "openai-responses" }
+    return CsCustomProviderRemoval(id: id, lanesReset: reset)
+  }
+
+  func setLane(_ lane: CsLlmLane, providerId: String, known: [CsProviderOption]) throws {
+    guard known.contains(where: { $0.id == providerId }) else {
+      throw Failure.unknownProvider(providerId)
+    }
+    laneProviders[lane] = providerId
+  }
+
+  /// Resolved-lane projection the way the loader would seal it.
+  func runtimeLane(_ lane: CsLlmLane, model: String = "gpt-5.2") -> CsRuntimeLlmLane {
+    let providerId = laneProviders[lane] ?? "openai-responses"
+    let provider = (CsProviderOption.sampleProviders + custom).first { $0.id == providerId }
+    return CsRuntimeLlmLane(
+      lane: lane,
+      providerId: providerId,
+      providerDisplayName: provider?.displayName ?? providerId,
+      wire: provider?.wire ?? "responses",
+      endpoint: provider?.endpoint ?? "",
+      model: model,
+      keyAccount: provider?.apiKeyAccount ?? "",
+      keyPresent: provider?.apiKeySet ?? false,
+      accountAuth: provider?.accountSignedIn ?? false,
+      available: provider.map { $0.apiKeySet || $0.accountSignedIn || !$0.keyRequired } ?? false,
+      unavailableReason: nil
+    )
   }
 }
 
@@ -623,18 +719,16 @@ extension CsSettings {
     sttEndpoint: nil,
     sttEngine: nil,
     finalPassMode: nil,
-    llmEndpoint: "https://api.openai.com/v1/responses",
     restoreClipboard: true,
     restoreClipboardDelayMs: 200,
     startAtLogin: false,
     agentEnterSends: true,
     dumpAudioLogs: false,
-    llmModel: "gpt-4o-mini",
-    llmFormattingEndpoint: "https://api.openai.com/v1/responses",
+    // Contract §C: lane = provider ref + model; no endpoint fields on CsSettings.
+    llmFormattingProvider: "openai-responses",
     llmFormattingModel: "gpt-4o-mini",
-    llmAssistiveEndpoint: "https://api.openai.com/v1/responses",
-    llmAssistiveModel: "gpt-4o",
     llmAssistiveProvider: "openai-responses",
+    llmAssistiveModel: "gpt-4o",
     formattingLevel: "correction",
     whisperModel: "whisper-large-v3-turbo",
     layeredTranscription: nil,
@@ -656,26 +750,26 @@ extension CsSettings {
 }
 
 extension CsKeyStatus {
-  /// All providers configured — used by the preview seed.
+  /// OpenAI + STT configured — used by the preview seed. Field order follows
+  /// `KEYCHAIN_ACCOUNTS` (§B.3: Libraxis first).
   static let sampleAllSet = CsKeyStatus(
-    llmApiKeySet: true,
-    sttApiKeySet: true,
-    llmFormattingApiKeySet: true,
-    llmAssistiveApiKeySet: true,
-    llmAnthropicApiKeySet: false,
+    llmLibraxisApiKeySet: false,
+    llmOpenaiApiKeySet: true,
     llmXaiApiKeySet: false,
+    llmAnthropicApiKeySet: false,
+    sttApiKeySet: true,
     githubTokenSet: false
   )
 
-  /// Presence boolean for a canonical Keychain account name.
+  /// Presence boolean for a static Keychain account (`KEYCHAIN_ACCOUNTS`).
+  /// Custom-provider accounts are not here: read `CsProviderOption.apiKeySet`.
   func isSet(account: String) -> Bool {
     switch account {
-    case "LLM_API_KEY": return llmApiKeySet
-    case "STT_API_KEY": return sttApiKeySet
-    case "LLM_FORMATTING_API_KEY": return llmFormattingApiKeySet
-    case "LLM_ASSISTIVE_API_KEY": return llmAssistiveApiKeySet
-    case "LLM_ANTHROPIC_API_KEY": return llmAnthropicApiKeySet
+    case "LLM_LIBRAXIS_API_KEY": return llmLibraxisApiKeySet
+    case "LLM_OPENAI_API_KEY": return llmOpenaiApiKeySet
     case "LLM_XAI_API_KEY": return llmXaiApiKeySet
+    case "LLM_ANTHROPIC_API_KEY": return llmAnthropicApiKeySet
+    case "STT_API_KEY": return sttApiKeySet
     case "GITHUB_TOKEN": return githubTokenSet
     default: return false
     }
@@ -696,42 +790,36 @@ extension CsApiKeyProbeResult {
 }
 
 extension CsProviderOption {
-  /// Preview seed mirroring the core provider identities (OpenAI, Anthropic, xAI).
+  /// Row shape shared by the vendor seed and the mock custom store. Vendors
+  /// require a key; custom hosts are key-optional; `login` marks OAuth vendors.
+  static func row(
+    id: String, kind: String, name: String, wire: String, endpoint: String, account: String,
+    keySet: Bool = false, login: Bool = false
+  ) -> CsProviderOption {
+    CsProviderOption(
+      id: id, kind: kind, displayName: name, wire: wire, endpoint: endpoint,
+      apiKeyAccount: account, apiKeySet: keySet, keyRequired: kind == "vendor",
+      accountSignedIn: false, accountLoginEnabled: login,
+      accountStatusMessage: login ? "not signed in" : "provider account login unavailable",
+      oauthClientId: nil)
+  }
+
+  /// Preview seed mirroring `ALL_PROVIDERS` with factory endpoints; the mock
+  /// order is §B.3's (Libraxis, OpenAI, xAI, Anthropic) — I1 owns the real one.
   static let sampleProviders: [CsProviderOption] = [
-    // OpenAI + xAI ship public desktop client ids (NOTICE); Anthropic does not.
-    CsProviderOption(
-      id: "openai-responses",
-      displayName: "OpenAI (Responses)",
-      apiKeyAccount: "LLM_ASSISTIVE_API_KEY",
-      apiKeySet: true,
-      accountSignedIn: false,
-      accountLoginEnabled: true,
-      accountStatusMessage: "not signed in",
-      oauthClientId: nil,
-      models: []
-    ),
-    CsProviderOption(
-      id: "anthropic-messages",
-      displayName: "Anthropic (Messages)",
-      apiKeyAccount: "LLM_ANTHROPIC_API_KEY",
-      apiKeySet: false,
-      accountSignedIn: false,
-      accountLoginEnabled: false,
-      accountStatusMessage: "provider account login unavailable",
-      oauthClientId: nil,
-      models: []
-    ),
-    CsProviderOption(
-      id: "xai-responses",
-      displayName: "xAI (Grok)",
-      apiKeyAccount: "LLM_XAI_API_KEY",
-      apiKeySet: false,
-      accountSignedIn: false,
-      accountLoginEnabled: true,
-      accountStatusMessage: "not signed in",
-      oauthClientId: nil,
-      models: []
-    ),
+    .row(
+      id: "libraxis-responses", kind: "vendor", name: "Libraxis", wire: "responses",
+      endpoint: "https://api.libraxis.com/v1/responses", account: "LLM_LIBRAXIS_API_KEY"),
+    .row(
+      id: "openai-responses", kind: "vendor", name: "OpenAI", wire: "responses",
+      endpoint: "https://api.openai.com/v1/responses", account: "LLM_OPENAI_API_KEY",
+      keySet: true, login: true),
+    .row(
+      id: "xai-responses", kind: "vendor", name: "xAI", wire: "responses",
+      endpoint: "https://api.x.ai/v1/responses", account: "LLM_XAI_API_KEY", login: true),
+    .row(
+      id: "anthropic-messages", kind: "vendor", name: "Anthropic", wire: "messages",
+      endpoint: "https://api.anthropic.com/v1/messages", account: "LLM_ANTHROPIC_API_KEY"),
   ]
 }
 

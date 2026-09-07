@@ -153,12 +153,12 @@ final class SettingsTruthTests: XCTestCase {
   }
 
   func testProvidersAndAgentOwnDisjointSettingsCapabilities() {
-    XCTAssertEqual(KeysPanel.ownedCapabilities, [.apiKeys])
+    XCTAssertEqual(ProvidersPanel.ownedCapabilities, [.providers])
     XCTAssertEqual(
       AgentPanel.ownedCapabilities,
       [.llmLanes, .workspaceRoots, .agentStatus, .mcpServers, .toolPermissions]
     )
-    XCTAssertTrue(KeysPanel.ownedCapabilities.isDisjoint(with: AgentPanel.ownedCapabilities))
+    XCTAssertTrue(ProvidersPanel.ownedCapabilities.isDisjoint(with: AgentPanel.ownedCapabilities))
   }
 
   /// Capability matrix sample seed used by Settings previews and offline VM
@@ -331,18 +331,21 @@ final class SettingsTruthTests: XCTestCase {
       updateConfigObserver: { configWrites.append(($0, $1)) }
     )
     let model = SettingsViewModel(engine: engine)
-    let keychainSnapshot = model.keyAccounts.map {
-      "\($0):\(model.keyStatus.isSet(account: $0))"
+    // Provider accounts carry their own presence; service keys read CsKeyStatus.
+    let presence: (SettingsViewModel) -> [String] = { model in
+      model.providers.map { "\($0.apiKeyAccount):\($0.apiKeySet)" }
+        + model.serviceKeyAccounts.map { "\($0):\(model.keyStatus.isSet(account: $0))" }
     }
+    let keychainSnapshot = presence(model)
 
     model.select(.keys)
-    _ = KeysPanel(model: model)
+    _ = ProvidersPanel(model: model)
     model.select(.agent)
     _ = AgentPanel(model: model)
 
     XCTAssertTrue(configWrites.isEmpty, "the IA split must not write settings.json")
     XCTAssertEqual(
-      model.keyAccounts.map { "\($0):\(model.keyStatus.isSet(account: $0))" },
+      presence(model),
       keychainSnapshot,
       "the IA split must preserve the complete Keychain presence snapshot"
     )
@@ -600,58 +603,43 @@ final class SettingsTruthTests: XCTestCase {
     XCTAssertEqual(batches[1].map(\.value), ["0"])
   }
 
-  /// Agent owns the one lane-edit grammar. Every lane preserves its exact
-  /// endpoint/model keys, and whitespace/empty input keeps the reset semantics
-  /// (an empty write clears the JSON override).
+  /// Agent owns the one lane-edit grammar: a lane binds a provider (through
+  /// the bridge registry, `LLM_<LANE>_PROVIDER`) and a model (promoted key).
+  /// There is no endpoint key to write. A provider switch clears the model;
+  /// whitespace is trimmed; an empty write clears the JSON override.
   func testAgentLaneEditorsPreserveExactKeysAndEmptyResetSemantics() {
     var writes: [(key: String, value: String)] = []
+    let store = MockProviderStore()
     let model = SettingsViewModel(
-      engine: MockSettingsEngine(updateConfigObserver: { key, value in
-        writes.append((key, value))
-      }),
-      runtimeLlmLaneProvider: { lane in
-        CsRuntimeLlmLane(
-          lane: lane,
-          providerId: "openai-responses",
-          endpoint: "https://api.openai.com/v1/responses",
-          model: "gpt-5.2",
-          keyAccount: "LLM_ASSISTIVE_API_KEY",
-          keyPresent: true,
-          accountAuth: false,
-          available: true,
-          unavailableReason: nil
-        )
-      }
+      engine: MockSettingsEngine(
+        providerStore: store,
+        updateConfigObserver: { key, value in writes.append((key, value)) }
+      ),
+      runtimeLlmLaneProvider: { store.runtimeLane($0) }
     )
 
-    let lanes: [(lane: LLMLane, endpointKey: String, modelKey: String)] = [
-      (.assistive, "LLM_ASSISTIVE_ENDPOINT", "LLM_ASSISTIVE_MODEL"),
-      (.formatting, "LLM_FORMATTING_ENDPOINT", "LLM_FORMATTING_MODEL"),
-      (.main, "LLM_ENDPOINT", "LLM_MODEL"),
+    XCTAssertEqual(LLMLane.allCases, [.assistive, .formatting], "the Main lane is gone (D4)")
+    let lanes: [(lane: LLMLane, providerKey: String, modelKey: String)] = [
+      (.assistive, "LLM_ASSISTIVE_PROVIDER", "LLM_ASSISTIVE_MODEL"),
+      (.formatting, "LLM_FORMATTING_PROVIDER", "LLM_FORMATTING_MODEL"),
     ]
 
     for expectation in lanes {
-      XCTAssertEqual(expectation.lane.endpointKey, expectation.endpointKey)
+      XCTAssertEqual(expectation.lane.providerKey, expectation.providerKey)
       XCTAssertEqual(expectation.lane.modelKey, expectation.modelKey)
 
       writes.removeAll()
-      model.setLLMEndpoint(" https://example.test/v1 ", for: expectation.lane)
-      model.setLLMModel("model-x", for: expectation.lane)
-      model.setLLMEndpoint("   ", for: expectation.lane)
+      model.setLaneProvider("xai-responses", for: expectation.lane)
+      model.setLLMModel(" grok-4.5 ", for: expectation.lane)
       model.setLLMModel("", for: expectation.lane)
 
+      XCTAssertEqual(store.laneProviders[expectation.lane.bridgeLane], "xai-responses")
+      XCTAssertEqual(model.llmLane(expectation.lane).providerId, "xai-responses")
       XCTAssertEqual(
         writes.map(\.key),
-        [
-          expectation.endpointKey,
-          expectation.modelKey,
-          expectation.endpointKey,
-          expectation.modelKey,
-        ])
-      XCTAssertEqual(
-        writes.map(\.value),
-        ["https://example.test/v1", "model-x", "", ""]
+        [expectation.modelKey, expectation.modelKey, expectation.modelKey]
       )
+      XCTAssertEqual(writes.map(\.value), ["", "grok-4.5", ""])
     }
   }
 
@@ -697,12 +685,13 @@ final class SettingsTruthTests: XCTestCase {
 
     let providers = SettingsViewModel.preview(.keys)
     assertConcretePanel(
-      KeysPanel(model: providers), model: providers, section: .keys, name: "providers")
+      ProvidersPanel(model: providers), model: providers, section: .keys, name: "providers")
 
     let agent = SettingsViewModel.preview(.agent)
     assertConcretePanel(AgentPanel(model: agent), model: agent, section: .agent, name: "agent")
     let previewLane = agent.llmLane(.assistive)
     XCTAssertEqual(previewLane.providerId, "openai-responses")
+    XCTAssertEqual(previewLane.providerDisplayName, "OpenAI")
     XCTAssertEqual(previewLane.resolvedEndpoint, "https://api.openai.com/v1/responses")
   }
 

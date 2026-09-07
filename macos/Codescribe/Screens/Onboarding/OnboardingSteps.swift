@@ -615,7 +615,7 @@ struct ApiKeyStepView: View {
   }
 
   private var keyField: some View {
-    let account = model.selectedProvider?.apiKeyAccount ?? "LLM_ASSISTIVE_API_KEY"
+    let account = model.selectedProvider?.apiKeyAccount ?? "LLM_OPENAI_API_KEY"
     let isSet = model.selectedProviderKeySet
     return VStack(alignment: .leading, spacing: 10) {
       HStack(spacing: 10) {
