@@ -122,9 +122,11 @@ coverage is not incomplete. No arbitrary string can close committed Bus truth.
 
 ### Terminal document revisions
 
-The formatted canvas may hold a local, visibly uncommitted edit draft. Commit
-sends `session_id + source_revision + rendered_text` across FFI; it does not
-paint Swift state. `TranscriptReducer::apply_user_revision` accepts only the
+The overlay canvas is read-only in every phase and displays the exact engine
+projection, including empty text. Status messages and unfamiliar chrome phases
+never replace or reject its document. A user-revision request sends
+`session_id + source_revision + rendered_text` across FFI; it does not paint
+Swift state. `TranscriptReducer::apply_user_revision` accepts only the
 exact current terminal revision, and `AcousticLedger` appends a
 `ManualDocumentRevisionReceipt` with `provenance=user-edit`, the source
 occurrence/seal set, and the replacement bytes. A whole-document edit does not
@@ -135,8 +137,7 @@ projection carries the ledger's `user-edit-*` receipt in each source occurrence
 row and is the only event that replaces the formatted canvas and delivery
 buffer. It may follow `session_ended` because microphone lifecycle is already
 closed. Replay accepts that terminal revision only for the just-ended session;
-once a newer session is active, an older edit cannot displace it. Esc, Discard,
-and Close delete only the local draft and write no ledger or Bus revision.
+once a newer session is active, an older edit cannot displace it.
 
 The Format dock command is the sibling route, not a second reducer. Rust reads
 the exact current terminal document under the same `session_id + source_revision` CAS, runs `format_text_with_status_for_policy`, and admits only

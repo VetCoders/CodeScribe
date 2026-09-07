@@ -346,6 +346,16 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertEqual(state.activeText, "")
   }
 
+  func testUnknownChromePhaseCannotRejectEngineText() {
+    let state = OverlayState()
+    let text = "  raz raz\nZażółć — e\u{301} 👩‍💻  "
+    projectText(text, to: state, phase: "future_engine_phase")
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    projectText("", to: state, phase: "future_engine_phase", terminal: true)
+    XCTAssertEqual(state.activeText, "")
+    XCTAssertTrue(state.terminal)
+  }
+
   func testCanonicalProjectionOwnsCanvasAndCopyFromFirstAdmittedRevision() {
     let state = OverlayState()
     XCTAssertFalse(state.canCopy)
