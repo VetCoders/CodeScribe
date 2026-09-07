@@ -1433,6 +1433,8 @@ public protocol CodescribeConfigProtocol: AnyObject, Sendable {
      */
     func startAccountLogin(providerId: String) throws  -> CsAccountLoginResult
 
+    func sttLanes()  -> [CsSttLane]
+
     func testApiKey(account: String) throws  -> CsApiKeyProbeResult
 
     /**
@@ -2056,6 +2058,14 @@ open func startAccountLogin(providerId: String)throws  -> CsAccountLoginResult  
     uniffi_codescribe_ffi_fn_method_codescribeconfig_start_account_login(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(providerId),$0
+    )
+})
+}
+
+open func sttLanes() -> [CsSttLane]  {
+    return try!  FfiConverterSequenceTypeCsSttLane.lift(try! rustCall() {
+    uniffi_codescribe_ffi_fn_method_codescribeconfig_stt_lanes(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -7762,17 +7772,19 @@ public struct CsKeyStatus: Equatable, Hashable {
     public var llmOpenaiApiKeySet: Bool
     public var llmXaiApiKeySet: Bool
     public var llmAnthropicApiKeySet: Bool
-    public var sttApiKeySet: Bool
+    public var sttFileApiKeySet: Bool
+    public var sttLiveApiKeySet: Bool
     public var githubTokenSet: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(llmLibraxisApiKeySet: Bool, llmOpenaiApiKeySet: Bool, llmXaiApiKeySet: Bool, llmAnthropicApiKeySet: Bool, sttApiKeySet: Bool, githubTokenSet: Bool) {
+    public init(llmLibraxisApiKeySet: Bool, llmOpenaiApiKeySet: Bool, llmXaiApiKeySet: Bool, llmAnthropicApiKeySet: Bool, sttFileApiKeySet: Bool, sttLiveApiKeySet: Bool, githubTokenSet: Bool) {
         self.llmLibraxisApiKeySet = llmLibraxisApiKeySet
         self.llmOpenaiApiKeySet = llmOpenaiApiKeySet
         self.llmXaiApiKeySet = llmXaiApiKeySet
         self.llmAnthropicApiKeySet = llmAnthropicApiKeySet
-        self.sttApiKeySet = sttApiKeySet
+        self.sttFileApiKeySet = sttFileApiKeySet
+        self.sttLiveApiKeySet = sttLiveApiKeySet
         self.githubTokenSet = githubTokenSet
     }
 
@@ -7794,7 +7806,8 @@ public struct FfiConverterTypeCsKeyStatus: FfiConverterRustBuffer {
                 llmOpenaiApiKeySet: FfiConverterBool.read(from: &buf),
                 llmXaiApiKeySet: FfiConverterBool.read(from: &buf),
                 llmAnthropicApiKeySet: FfiConverterBool.read(from: &buf),
-                sttApiKeySet: FfiConverterBool.read(from: &buf),
+                sttFileApiKeySet: FfiConverterBool.read(from: &buf),
+                sttLiveApiKeySet: FfiConverterBool.read(from: &buf),
                 githubTokenSet: FfiConverterBool.read(from: &buf)
         )
     }
@@ -7804,7 +7817,8 @@ public struct FfiConverterTypeCsKeyStatus: FfiConverterRustBuffer {
         FfiConverterBool.write(value.llmOpenaiApiKeySet, into: &buf)
         FfiConverterBool.write(value.llmXaiApiKeySet, into: &buf)
         FfiConverterBool.write(value.llmAnthropicApiKeySet, into: &buf)
-        FfiConverterBool.write(value.sttApiKeySet, into: &buf)
+        FfiConverterBool.write(value.sttFileApiKeySet, into: &buf)
+        FfiConverterBool.write(value.sttLiveApiKeySet, into: &buf)
         FfiConverterBool.write(value.githubTokenSet, into: &buf)
     }
 }
@@ -9746,7 +9760,8 @@ public struct CsSettings: Equatable, Hashable {
     public var quickNotesSaveOnly: Bool
     public var useLocalStt: Bool
     public var localModel: String
-    public var sttEndpoint: String?
+    public var sttFileEndpoint: String?
+    public var sttLiveEndpoint: String?
     /**
      * STT engine selection (`CODESCRIBE_STT_ENGINE`): `"auto"` | `"apple"` |
      * `"whisper"`. `None` means the built-in auto policy. Written back via
@@ -9825,7 +9840,7 @@ public struct CsSettings: Equatable, Hashable {
          */transcriptSendMode: String, transcriptTaggingEnabled: Bool, transcriptTagTemplate: String, aiMaxTokens: Int32, aiAssistiveMaxTokens: Int32, showTrayGlyph: Bool, showDockIcon: Bool, transcriptionOverlayEnabled: Bool, holdIndicator: Bool, holdBadgeSize: UInt32, holdBadgeOffsetX: Int32, holdBadgeOffsetY: Int32,
         /**
          * `OverlayPositionMode::as_str()` — `"snapped_top_right"` / `"custom"`.
-         */overlayPositionMode: String, overlayCustomX: Double?, overlayCustomY: Double?, beepOnStart: Bool, soundName: String, soundVolume: Float, audioInputDevice: String?, historyEnabled: Bool, quickNotesEnabled: Bool, quickNotesSaveOnly: Bool, useLocalStt: Bool, localModel: String, sttEndpoint: String?,
+         */overlayPositionMode: String, overlayCustomX: Double?, overlayCustomY: Double?, beepOnStart: Bool, soundName: String, soundVolume: Float, audioInputDevice: String?, historyEnabled: Bool, quickNotesEnabled: Bool, quickNotesSaveOnly: Bool, useLocalStt: Bool, localModel: String, sttFileEndpoint: String?, sttLiveEndpoint: String?,
         /**
          * STT engine selection (`CODESCRIBE_STT_ENGINE`): `"auto"` | `"apple"` |
          * `"whisper"`. `None` means the built-in auto policy. Written back via
@@ -9896,7 +9911,8 @@ public struct CsSettings: Equatable, Hashable {
         self.quickNotesSaveOnly = quickNotesSaveOnly
         self.useLocalStt = useLocalStt
         self.localModel = localModel
-        self.sttEndpoint = sttEndpoint
+        self.sttFileEndpoint = sttFileEndpoint
+        self.sttLiveEndpoint = sttLiveEndpoint
         self.sttEngine = sttEngine
         self.finalPassMode = finalPassMode
         self.restoreClipboard = restoreClipboard
@@ -9968,7 +9984,8 @@ public struct FfiConverterTypeCsSettings: FfiConverterRustBuffer {
                 quickNotesSaveOnly: FfiConverterBool.read(from: &buf),
                 useLocalStt: FfiConverterBool.read(from: &buf),
                 localModel: FfiConverterString.read(from: &buf),
-                sttEndpoint: FfiConverterOptionString.read(from: &buf),
+                sttFileEndpoint: FfiConverterOptionString.read(from: &buf),
+                sttLiveEndpoint: FfiConverterOptionString.read(from: &buf),
                 sttEngine: FfiConverterOptionString.read(from: &buf),
                 finalPassMode: FfiConverterOptionString.read(from: &buf),
                 restoreClipboard: FfiConverterBool.read(from: &buf),
@@ -10028,7 +10045,8 @@ public struct FfiConverterTypeCsSettings: FfiConverterRustBuffer {
         FfiConverterBool.write(value.quickNotesSaveOnly, into: &buf)
         FfiConverterBool.write(value.useLocalStt, into: &buf)
         FfiConverterString.write(value.localModel, into: &buf)
-        FfiConverterOptionString.write(value.sttEndpoint, into: &buf)
+        FfiConverterOptionString.write(value.sttFileEndpoint, into: &buf)
+        FfiConverterOptionString.write(value.sttLiveEndpoint, into: &buf)
         FfiConverterOptionString.write(value.sttEngine, into: &buf)
         FfiConverterOptionString.write(value.finalPassMode, into: &buf)
         FfiConverterBool.write(value.restoreClipboard, into: &buf)
@@ -10068,6 +10086,85 @@ public func FfiConverterTypeCsSettings_lift(_ buf: RustBuffer) throws -> CsSetti
 #endif
 public func FfiConverterTypeCsSettings_lower(_ value: CsSettings) -> RustBuffer {
     return FfiConverterTypeCsSettings.lower(value)
+}
+
+
+/**
+ * One STT endpoint and its credential presence; secrets never leave Keychain.
+ */
+public struct CsSttLane: Equatable, Hashable {
+    public var id: String
+    public var title: String
+    public var accepts: String
+    public var placeholder: String
+    public var endpoint: String?
+    public var endpointWireKey: String
+    public var keyAccount: String
+    public var apiKeySet: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, title: String, accepts: String, placeholder: String, endpoint: String?, endpointWireKey: String, keyAccount: String, apiKeySet: Bool) {
+        self.id = id
+        self.title = title
+        self.accepts = accepts
+        self.placeholder = placeholder
+        self.endpoint = endpoint
+        self.endpointWireKey = endpointWireKey
+        self.keyAccount = keyAccount
+        self.apiKeySet = apiKeySet
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsSttLane: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsSttLane: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsSttLane {
+        return
+            try CsSttLane(
+                id: FfiConverterString.read(from: &buf),
+                title: FfiConverterString.read(from: &buf),
+                accepts: FfiConverterString.read(from: &buf),
+                placeholder: FfiConverterString.read(from: &buf),
+                endpoint: FfiConverterOptionString.read(from: &buf),
+                endpointWireKey: FfiConverterString.read(from: &buf),
+                keyAccount: FfiConverterString.read(from: &buf),
+                apiKeySet: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsSttLane, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.title, into: &buf)
+        FfiConverterString.write(value.accepts, into: &buf)
+        FfiConverterString.write(value.placeholder, into: &buf)
+        FfiConverterOptionString.write(value.endpoint, into: &buf)
+        FfiConverterString.write(value.endpointWireKey, into: &buf)
+        FfiConverterString.write(value.keyAccount, into: &buf)
+        FfiConverterBool.write(value.apiKeySet, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSttLane_lift(_ buf: RustBuffer) throws -> CsSttLane {
+    return try FfiConverterTypeCsSttLane.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSttLane_lower(_ value: CsSttLane) -> RustBuffer {
+    return FfiConverterTypeCsSttLane.lower(value)
 }
 
 
@@ -11518,7 +11615,7 @@ public enum CsApiKeyProbeStatus: Equatable, Hashable {
      */
     case missing
     /**
-     * This account has no cheap liveness probe (e.g. `STT_API_KEY`) or belongs
+     * This account has no cheap liveness probe or belongs
      * to no registered provider.
      */
     case unsupported
@@ -13552,6 +13649,31 @@ fileprivate struct FfiConverterSequenceTypeCsQualityRecord: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCsSttLane: FfiConverterRustBuffer {
+    typealias SwiftType = [CsSttLane]
+
+    public static func write(_ value: [CsSttLane], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCsSttLane.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CsSttLane] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CsSttLane]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCsSttLane.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCsThreadMessage: FfiConverterRustBuffer {
     typealias SwiftType = [CsThreadMessage]
 
@@ -14205,6 +14327,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_start_account_login() != 23026) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_stt_lanes() != 26394) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribeconfig_test_api_key() != 41767) {

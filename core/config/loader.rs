@@ -686,19 +686,9 @@ impl Config {
     }
 
     fn apply_stt_endpoint_alias(&mut self, raw: &str) {
-        static WARN: std::sync::Once = std::sync::Once::new();
-        WARN.call_once(|| warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT (removed after 2026-10-15)"));
-        let mut migrated = UserSettings::default();
-        super::stt_migration::migrate_legacy_stt_lanes(
-            &super::stt_migration::SttV2Legacy::from_endpoint(raw),
-            &mut migrated,
-        );
-        if let Some(value) = migrated.stt_file_endpoint {
-            self.stt_file_endpoint = Some(value);
-        }
-        if let Some(value) = migrated.stt_live_endpoint {
-            self.stt_live_endpoint = Some(value);
-        }
+        let (file, live) = super::stt_migration::split_retired_stt_endpoint(raw);
+        self.stt_file_endpoint = file.or(self.stt_file_endpoint.take());
+        self.stt_live_endpoint = live.or(self.stt_live_endpoint.take());
     }
 
     /// Load configuration values from environment variables.
@@ -1429,14 +1419,10 @@ impl Config {
                         }
                     }
                     "STT_ENDPOINT" => {
-                        let mut migrated = UserSettings::default();
-                        super::stt_migration::migrate_legacy_stt_lanes(
-                            &super::stt_migration::SttV2Legacy::from_endpoint(value),
-                            &mut migrated,
-                        );
-                        settings_ref.stt_file_endpoint = migrated.stt_file_endpoint;
-                        settings_ref.stt_live_endpoint = migrated.stt_live_endpoint;
-                        warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT");
+                        (
+                            settings_ref.stt_file_endpoint,
+                            settings_ref.stt_live_endpoint,
+                        ) = super::stt_migration::split_retired_stt_endpoint(value);
                     }
                     "TRANSCRIPT_SEND_MODE" => {
                         settings_ref.transcript_send_mode = Some((*value).to_string())
@@ -1891,12 +1877,10 @@ impl Config {
             }
         };
 
-        // Legacy STT endpoint → canonical STT_ENDPOINT
+        // Whisper-server era file endpoint → the File lane row (never the retired alias).
         if let Some(val) = vars.remove("WHISPER_SERVER_URL") {
             changed = true;
-            if put_if_missing("STT_ENDPOINT", val, &mut vars) {
-                changed = true;
-            }
+            put_if_missing("STT_FILE_ENDPOINT", val, &mut vars);
         }
 
         // Retired LLM env (Ollama-era hosts, shared endpoint/model, provider

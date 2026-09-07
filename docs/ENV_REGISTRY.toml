@@ -374,8 +374,8 @@ default = ""
 type = "string"
 reload = "restart"
 category = "stt"
-description = "Legacy migration-only alias via STT_ENDPOINT to File/Live"
-deprecated = "STT_ENDPOINT"
+description = "Legacy migration-only alias; rewritten in .env to STT_FILE_ENDPOINT"
+deprecated = "STT_FILE_ENDPOINT"
 
 [vars.LLM_SERVER_URL]
 default = ""

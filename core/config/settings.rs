@@ -2504,12 +2504,8 @@ impl UserSettings {
             "LLM_FORMATTING_MODEL" => self.llm_formatting_model = Some(value.to_owned()),
             "LOCAL_MODEL" => self.local_model = Some(value.to_owned()),
             "STT_ENDPOINT" => {
-                warn!("STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT");
-                let legacy = super::stt_migration::SttV2Legacy::from_endpoint(value);
-                let mut migrated = Self::default();
-                super::stt_migration::migrate_legacy_stt_lanes(&legacy, &mut migrated);
-                self.stt_file_endpoint = migrated.stt_file_endpoint;
-                self.stt_live_endpoint = migrated.stt_live_endpoint;
+                (self.stt_file_endpoint, self.stt_live_endpoint) =
+                    super::stt_migration::split_retired_stt_endpoint(value);
             }
             "STT_FILE_ENDPOINT" | "STT_LIVE_ENDPOINT" => {
                 let lane = if key == "STT_FILE_ENDPOINT" {

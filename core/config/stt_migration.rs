@@ -83,25 +83,31 @@ pub fn migrate_legacy_stt_lanes(
             }
         }
     }
-    let mut targets = Vec::new();
-    if settings
-        .stt_file_endpoint
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty())
-    {
-        targets.push(SttLane::File.key_account());
-    }
-    if settings
-        .stt_live_endpoint
-        .as_deref()
-        .is_some_and(|v| !v.trim().is_empty())
-    {
-        targets.push(SttLane::Live.key_account());
-    }
+    let mut targets: Vec<&'static str> = [
+        (SttLane::File, &settings.stt_file_endpoint),
+        (SttLane::Live, &settings.stt_live_endpoint),
+    ]
+    .into_iter()
+    .filter(|(_, row)| row.as_deref().is_some_and(|v| !v.trim().is_empty()))
+    .map(|(lane, _)| lane.key_account())
+    .collect();
     if targets.is_empty() {
         targets.push(SttLane::File.key_account());
     }
     (steps, targets)
+}
+
+/// Retired `STT_ENDPOINT` alias split into `(file, live)` rows; warned once per process.
+pub(crate) fn split_retired_stt_endpoint(raw: &str) -> (Option<String>, Option<String>) {
+    static WARN: std::sync::Once = std::sync::Once::new();
+    WARN.call_once(|| {
+        tracing::warn!(
+            "STT_ENDPOINT is retired; use STT_FILE_ENDPOINT / STT_LIVE_ENDPOINT (removed after 2026-10-15)"
+        )
+    });
+    let mut settings = UserSettings::default();
+    migrate_legacy_stt_lanes(&SttV2Legacy::from_endpoint(raw), &mut settings);
+    (settings.stt_file_endpoint, settings.stt_live_endpoint)
 }
 
 /// Called with the settings transaction lock held, before legacy fields are serialized away.

@@ -7,7 +7,7 @@
 //! - Proper error handling and logging
 
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
 use crate::pipeline::contracts::{TranscriptionConfidenceFlag, TranscriptionSource};
@@ -26,36 +25,6 @@ use crate::pipeline::contracts::{TranscriptionConfidenceFlag, TranscriptionSourc
 fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     path.canonicalize()
         .with_context(|| format!("Failed to resolve path: {}", path.display()))
-}
-
-/// Unencrypted WebSocket scheme prefix; built via concat so the literal never appears.
-const WS_SCHEME_PREFIX: &str = concat!("ws", "://");
-/// Encrypted WebSocket scheme prefix; always allowed for non-loopback hosts.
-const WSS_SCHEME_PREFIX: &str = "wss://";
-
-/// Reject plain WebSocket endpoints whose host is not a loopback address.
-///
-/// Encrypted WebSocket endpoints are always allowed. Plain WebSocket is only permitted for
-/// loopback hosts (`localhost`, `127.0.0.1`, `::1`) so credentials/audio never
-/// traverse the network unencrypted to a non-local backend.
-fn enforce_ws_scheme_loopback(endpoint_url: &str) -> Result<()> {
-    let url = reqwest::Url::parse(endpoint_url).context("STT endpoint is not a valid URL")?;
-    if url.scheme() != "ws" {
-        return Ok(());
-    }
-
-    let host = url
-        .host_str()
-        .map(|h| h.trim_matches(['[', ']']))
-        .unwrap_or_default();
-    if matches!(host, "localhost" | "127.0.0.1" | "::1") {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "Plain WebSocket is only allowed for loopback hosts; use wss:// for non-loopback endpoint '{}'",
-            endpoint_url
-        )
-    }
 }
 
 /// Maximum retry attempts for transcription requests
@@ -100,37 +69,6 @@ impl CloudTranscriptionVerdict {
             model_name,
         }
     }
-}
-
-// ============================================================================
-// WebSocket STT Protocol Structures
-// ============================================================================
-
-/// WebSocket config message (sent first)
-#[derive(Serialize)]
-struct WsConfig {
-    #[serde(rename = "type")]
-    msg_type: &'static str,
-    language: String,
-    api_key: String,
-    /// Codescribe domain token. Hosts that do not accept it are not this path.
-    vocabulary: &'static str,
-}
-
-/// WebSocket end signal (sent after audio)
-#[derive(Serialize)]
-struct WsEnd {
-    #[serde(rename = "type")]
-    msg_type: &'static str,
-}
-
-/// WebSocket response message
-#[derive(Deserialize, Debug)]
-struct WsResponse {
-    #[serde(rename = "type")]
-    msg_type: String,
-    text: Option<String>,
-    error: Option<String>,
 }
 
 /// NDJSON chunk response
@@ -373,13 +311,12 @@ async fn transcribe_external(
 
     let lang = language.unwrap_or("pl");
 
-    // Dispatch based on protocol (plain WebSocket for localhost, encrypted WebSocket for production)
-    if endpoint_url.starts_with(WSS_SCHEME_PREFIX) || endpoint_url.starts_with(WS_SCHEME_PREFIX) {
-        // Plain WebSocket is only permitted for loopback hosts; reject otherwise.
-        enforce_ws_scheme_loopback(endpoint_url)?;
-        // WebSocket streaming
-        transcribe_websocket(endpoint_url, api_key, buffer, lang).await
-    } else if endpoint_url.ends_with(":stream") {
+    // File lane only: `:stream` is the NDJSON variant, anything else is multipart.
+    // Live sockets belong to the Live lane (`Config::stt_lane(SttLane::Live)`).
+    if endpoint_url.starts_with("ws") {
+        anyhow::bail!("a WebSocket socket is not a file transcription endpoint: {endpoint_url}");
+    }
+    if endpoint_url.ends_with(":stream") {
         // NDJSON streaming HTTP
         transcribe_ndjson(endpoint_url, api_key, buffer, lang).await
     } else {
@@ -390,143 +327,6 @@ async fn transcribe_external(
             .unwrap_or("recording.wav");
         transcribe_multipart(endpoint_url, api_key, buffer, lang, filename).await
     }
-}
-
-// ============================================================================
-// WebSocket Streaming STT
-// ============================================================================
-
-/// LEGACY STOP/RECOVERY ONLY: upload one completed audio file over WebSocket.
-///
-/// This is not the live Layer 1 session transport. Do not add microphone frame
-/// streaming, normalized session state, or live adjudication here; those belong
-/// to `crate::asr_session::cloud` behind `AsrSessionProvider`.
-///
-/// Protocol:
-/// 1. Connect to WebSocket
-/// 2. Send config JSON: {"type": "config", "language": "...", "api_key": "..."}
-/// 3. Send audio as binary message
-/// 4. Send end signal: {"type": "end"}
-/// 5. Receive partial/final responses until final or close
-async fn transcribe_websocket(
-    url: &str,
-    api_key: &str,
-    audio_data: Vec<u8>,
-    language: &str,
-) -> Result<CloudTranscriptionVerdict> {
-    let start = Instant::now();
-    info!(
-        "[WS STT] Connecting to {} ({} bytes, lang={})",
-        url,
-        audio_data.len(),
-        language
-    );
-
-    let (mut ws, response) = connect_async(url)
-        .await
-        .context("Failed to connect to WebSocket STT endpoint")?;
-
-    debug!(
-        "[WS STT] Connected in {:?}, status: {:?}",
-        start.elapsed(),
-        response.status()
-    );
-
-    // 1. Send config. Topic is the product domain, never classified from audio.
-    let config = WsConfig {
-        msg_type: "config",
-        language: language.to_string(),
-        api_key: api_key.to_string(),
-        vocabulary: crate::stt::request_vocabulary::CODESCRIBE_STT_VOCABULARY,
-    };
-    ws.send(Message::Text(serde_json::to_string(&config)?.into()))
-        .await
-        .context("Failed to send WebSocket config")?;
-
-    // 2. Send audio binary
-    info!(
-        "[WS STT] Sending {} bytes ({:.2} MB)",
-        audio_data.len(),
-        audio_data.len() as f64 / 1_000_000.0
-    );
-    ws.send(Message::Binary(audio_data.into()))
-        .await
-        .context("Failed to send audio data")?;
-
-    // 3. Signal end
-    let end = WsEnd { msg_type: "end" };
-    ws.send(Message::Text(serde_json::to_string(&end)?.into()))
-        .await
-        .context("Failed to send end signal")?;
-
-    // 4. Collect responses
-    let mut final_text = String::new();
-    let mut partial_count = 0u32;
-
-    while let Some(msg) = ws.next().await {
-        match msg? {
-            Message::Text(txt) => {
-                let resp: WsResponse = serde_json::from_str(&txt)
-                    .with_context(|| format!("Failed to parse WS response: {}", txt))?;
-
-                match resp.msg_type.as_str() {
-                    "partial" => {
-                        partial_count += 1;
-                        if let Some(t) = &resp.text {
-                            debug!("[WS STT] partial #{}: {} chars", partial_count, t.len());
-                            // TODO: callback for real-time UI updates
-                        }
-                    }
-                    "final" => {
-                        if let Some(t) = resp.text {
-                            final_text = t;
-                            info!(
-                                "[WS STT] Final: {} chars after {} partials",
-                                final_text.len(),
-                                partial_count
-                            );
-                        }
-                        break;
-                    }
-                    "error" => {
-                        let err_msg = resp.error.unwrap_or_else(|| "Unknown error".to_string());
-                        error!("[WS STT] Error: {}", err_msg);
-                        anyhow::bail!("WebSocket STT error: {}", err_msg);
-                    }
-                    other => {
-                        warn!("[WS STT] Unknown message type: {}", other);
-                    }
-                }
-            }
-            Message::Close(frame) => {
-                debug!("[WS STT] Connection closed: {:?}", frame);
-                break;
-            }
-            Message::Ping(data) => {
-                let _ = ws.send(Message::Pong(data)).await;
-            }
-            _ => {}
-        }
-    }
-
-    let _ = ws.close(None).await;
-    let duration_ms = start.elapsed().as_millis();
-
-    info!(
-        "[WS STT] Complete in {}ms: {} chars",
-        duration_ms,
-        final_text.len()
-    );
-
-    if final_text.is_empty() {
-        anyhow::bail!("No transcription received from WebSocket STT");
-    }
-
-    Ok(CloudTranscriptionVerdict::new(
-        final_text,
-        Some(duration_ms.min(u128::from(u64::MAX)) as u64),
-        None,
-    ))
 }
 
 // ============================================================================
@@ -863,45 +663,10 @@ async fn transcribe_multipart_request(url: &str, api_key: &str, form: Form) -> R
     Ok(transcribe_response.text)
 }
 
-/// Unit tests for WS loopback policy, audio preflight, retry classification, serde.
+/// Unit tests for audio preflight, retry classification, serde.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a plain-WebSocket URL for loopback-policy tests without hardcoding the scheme.
-    fn plain_ws_url(authority: &str) -> String {
-        format!("{}{}", WS_SCHEME_PREFIX, authority)
-    }
-
-    #[test]
-    fn ws_config_names_programming_domain() {
-        let encoded = serde_json::to_value(&WsConfig {
-            msg_type: "config",
-            language: "pl".to_string(),
-            api_key: "unused".to_string(),
-            vocabulary: crate::stt::request_vocabulary::CODESCRIBE_STT_VOCABULARY,
-        })
-        .expect("serialize ws config");
-        assert_eq!(encoded["type"], "config");
-        assert_eq!(encoded["vocabulary"], "programming");
-        assert_ne!(encoded["vocabulary"], "veterinary");
-    }
-
-    /// Plain WebSocket only on loopback; non-loopback rejected; the secure scheme always ok.
-    #[test]
-    fn ws_plain_rejected_for_non_loopback() {
-        // Plain WebSocket to a non-loopback host must be rejected.
-        assert!(enforce_ws_scheme_loopback(&plain_ws_url("example.com:1234")).is_err());
-        assert!(enforce_ws_scheme_loopback(&plain_ws_url("192.168.1.10:1234")).is_err());
-
-        // Plain WebSocket to loopback hosts is allowed.
-        assert!(enforce_ws_scheme_loopback(&plain_ws_url("127.0.0.1:1234")).is_ok());
-        assert!(enforce_ws_scheme_loopback(&plain_ws_url("localhost:1234")).is_ok());
-        assert!(enforce_ws_scheme_loopback(&plain_ws_url("[::1]:1234")).is_ok());
-
-        // wss:// is always allowed regardless of host.
-        assert!(enforce_ws_scheme_loopback("wss://example.com:1234").is_ok());
-    }
 
     /// Empty buffer is rejected before any network call.
     #[test]
