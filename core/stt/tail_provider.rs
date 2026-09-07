@@ -70,54 +70,6 @@ pub fn stt_auth_mode(endpoint: &str) -> SttAuthMode {
     }
 }
 
-/// Map a live WebSocket STT URL onto the multipart file probe.
-///
-/// Settings → Test is always OpenAI-compatible `POST /v1/audio/transcriptions`.
-/// `http`/`https` stay. `ws`/`wss` whose path ends in `/transcribe` invert
-/// scheme and path — same rewrite for every host. Loopback `:8446` (Voice Lab
-/// socket) becomes `:8444` (file worker). Other live sockets stay as-is so
-/// [`validate_remote_endpoint`] still fail-closes them.
-pub fn file_probe_endpoint(endpoint: &str) -> String {
-    let Ok(mut url) = Url::parse(endpoint) else {
-        return endpoint.to_string();
-    };
-    let host = url
-        .host_str()
-        .unwrap_or_default()
-        .trim_matches(['[', ']'])
-        .to_owned();
-    match url.scheme() {
-        "http" | "https" => return url.to_string(),
-        "ws" | "wss" => {}
-        _ => return endpoint.to_string(),
-    }
-
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback());
-    let http_scheme = if url.scheme() == "wss" {
-        "https"
-    } else {
-        "http"
-    };
-
-    if !url.path().ends_with("/transcribe") {
-        return endpoint.to_string();
-    }
-    if url.set_scheme(http_scheme).is_err() {
-        return endpoint.to_string();
-    }
-    let path = url.path().trim_end_matches("transcribe").to_string() + "transcriptions";
-    url.set_path(&path);
-    url.set_query(None);
-    url.set_fragment(None);
-    if loopback && url.port() == Some(8446) && url.set_port(Some(8444)).is_err() {
-        return endpoint.to_string();
-    }
-    url.to_string()
-}
-
 const SIDECAR_PROTOCOL_VERSION: u8 = 1;
 const SIDECAR_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const SIDECAR_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1104,21 +1056,17 @@ impl RemoteTailProvider {
         validate_remote_endpoint(&endpoint)?;
         let api_key = api_key.into();
         if stt_auth_mode(&endpoint) != SttAuthMode::Unauthenticated && api_key.trim().is_empty() {
-            bail!("STT_API_KEY is required for remote tail provider");
+            bail!("STT_FILE_API_KEY is required for remote tail provider");
         }
         Ok(Self { endpoint, api_key })
     }
 
     fn from_config() -> Result<Self> {
         let config = crate::config::Config::load();
-        let endpoint = config
-            .stt_endpoint
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_LOCAL_REMOTE_ENDPOINT.to_string());
-        let api_key = config
-            .stt_api_key
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default();
+        let (endpoint, api_key) = config
+            .stt_lane(super::SttLane::File)
+            .map(|row| (row.endpoint, row.api_key.unwrap_or_default()))
+            .unwrap_or_else(|| (DEFAULT_LOCAL_REMOTE_ENDPOINT.to_string(), String::new()));
         Self::new(endpoint, api_key)
     }
 }
@@ -1236,18 +1184,7 @@ struct RemoteTailSegment {
 }
 
 pub(crate) fn validate_remote_endpoint(endpoint: &str) -> Result<()> {
-    let url = Url::parse(endpoint).context("invalid remote STT endpoint")?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow!("remote STT endpoint has no host"))?
-        .trim_matches(['[', ']']);
-    let loopback = host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        bail!("remote STT endpoint requires HTTPS except on loopback");
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("remote STT endpoint must not contain credentials");
-    }
+    super::validate_stt_endpoint(super::SttLane::File, endpoint)?;
     Ok(())
 }
 
@@ -1495,38 +1432,6 @@ mod tests {
         assert_eq!(
             coarsen_invalid_in_process_segments(&range, "jeden dwa", segments.clone()),
             segments
-        );
-    }
-
-    #[test]
-    fn file_probe_endpoint_inverts_known_live_sockets() {
-        assert_eq!(
-            file_probe_endpoint("https://api.libraxis.cloud/v1/audio/transcriptions"),
-            "https://api.libraxis.cloud/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("wss://api.libraxis.cloud/v1/audio/transcribe"),
-            "https://api.libraxis.cloud/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("ws://127.0.0.1:8000/v1/audio/transcribe"),
-            "http://127.0.0.1:8000/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("ws://127.0.0.1:8446/v1/audio/transcribe"),
-            "http://127.0.0.1:8444/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("wss://localhost:8446/v1/audio/transcribe"),
-            "https://localhost:8444/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("wss://stt.example.test/v1/audio/transcribe"),
-            "https://stt.example.test/v1/audio/transcriptions"
-        );
-        assert_eq!(
-            file_probe_endpoint("wss://stt.example.test/v1/audio/live"),
-            "wss://stt.example.test/v1/audio/live"
         );
     }
 

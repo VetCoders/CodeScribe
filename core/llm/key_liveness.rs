@@ -75,7 +75,7 @@ impl ApiKeyLivenessResult {
 /// Probe one Keychain account and classify the result for Settings.
 ///
 /// Resolution order is what keeps this honest: unknown accounts and missing
-/// keys are answered without a request; `STT_API_KEY` and `GITHUB_TOKEN` get
+/// keys are answered without a request; STT lane accounts and `GITHUB_TOKEN` get
 /// their own probes; every LLM account is probed against a provider — the
 /// row passed in, or (for a vendor account) the vendor that owns the account
 /// — by *wire family*, not by vendor, so a new provider on an existing
@@ -110,11 +110,16 @@ pub fn probe_api_key_liveness(
             );
         }
     };
-    let api_key = keychain::runtime_key(account);
-
-    if account == "STT_API_KEY" {
-        return probe_stt_key(&client, &Config::load_without_keychain(), account, api_key);
+    if account == "STT_FILE_API_KEY" || account == "STT_LIVE_API_KEY" {
+        let config = Config::load_without_keychain();
+        let api_key = keychain::runtime_key(account);
+        return if account == "STT_FILE_API_KEY" {
+            probe_stt_file_key(&client, &config, account, api_key)
+        } else {
+            probe_stt_live_key(&config, account, api_key)
+        };
     }
+    let api_key = keychain::runtime_key(account);
     let Some(api_key) = api_key else {
         return ApiKeyLivenessResult::new(
             account,
@@ -168,26 +173,29 @@ fn vendor_provider_for_account(account: &str) -> Option<ResolvedProvider> {
 
 /// Probe the configured multipart STT slot with 100 ms of synthetic silence.
 /// The response body is never surfaced; only auth/quota/transport status is.
-/// A live WebSocket URL is remapped to the file worker first — Test is not a
-/// handshake against the Voice Lab socket.
-fn probe_stt_key(
+/// The File row owns the URL and credential; no runtime inversion.
+fn probe_stt_file_key(
     client: &Client,
     config: &Config,
     account: &str,
     api_key: Option<String>,
 ) -> ApiKeyLivenessResult {
-    let endpoint = crate::stt::tail_provider::file_probe_endpoint(
-        config
-            .stt_endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("http://127.0.0.1:8000/v1/audio/transcriptions"),
-    );
-    let auth_mode = crate::stt::tail_provider::stt_auth_mode(&endpoint);
-    let Some(api_key) = api_key.or_else(|| {
-        (auth_mode == crate::stt::tail_provider::SttAuthMode::Unauthenticated).then(String::new)
-    }) else {
+    let Some(row) = config.stt_lane(crate::stt::SttLane::File) else {
+        return ApiKeyLivenessResult::new(
+            account,
+            ApiKeyLivenessStatus::Unsupported,
+            "no file transcription endpoint configured",
+        );
+    };
+    let endpoint = row.endpoint;
+    let auth_mode = row.auth_mode;
+    let Some(api_key) = api_key
+        .or(row.api_key)
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            (auth_mode == crate::stt::tail_provider::SttAuthMode::Unauthenticated).then(String::new)
+        })
+    else {
         return ApiKeyLivenessResult::new(
             account,
             ApiKeyLivenessStatus::Missing,
@@ -253,6 +261,93 @@ fn probe_stt_key(
         result.message = "local STT endpoint accepts unauthenticated requests".to_string();
     }
     result
+}
+
+/// Probe only the WebSocket upgrade, then immediately close without audio.
+fn probe_stt_live_key(
+    config: &Config,
+    account: &str,
+    api_key: Option<String>,
+) -> ApiKeyLivenessResult {
+    use crate::stt::{SttLane, tail_provider::SttAuthMode, validate_stt_endpoint};
+    use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest};
+    let Some(mut row) = config.stt_lane(SttLane::Live) else {
+        return ApiKeyLivenessResult::new(
+            account,
+            ApiKeyLivenessStatus::Unsupported,
+            "no live transcription endpoint configured",
+        );
+    };
+    row.api_key = api_key.or(row.api_key);
+    let verdict = |status, message| {
+        ApiKeyLivenessResult::new(account, status, message)
+            .with_probed_endpoint(row.endpoint.clone())
+    };
+    if validate_stt_endpoint(SttLane::Live, &row.endpoint).is_err() {
+        return verdict(
+            ApiKeyLivenessStatus::Network,
+            "configured live STT endpoint is invalid or insecure",
+        );
+    }
+    if row.key_missing() {
+        return verdict(ApiKeyLivenessStatus::Missing, "key is not configured");
+    }
+    let Ok(mut request) = row.endpoint.as_str().into_client_request() else {
+        return verdict(
+            ApiKeyLivenessStatus::Network,
+            "could not build WebSocket handshake",
+        );
+    };
+    let key = row.api_key.as_deref().unwrap_or_default();
+    let header = match row.auth_mode {
+        SttAuthMode::Unauthenticated => None,
+        SttAuthMode::Bearer => Some(("authorization", format!("Bearer {key}"))),
+        SttAuthMode::ApiKey => Some(("x-api-key", key.to_string())),
+    };
+    if let Some((name, value)) = header {
+        let Ok(value) = value.parse() else {
+            return verdict(
+                ApiKeyLivenessStatus::Invalid,
+                "credential is not a valid header value",
+            );
+        };
+        request.headers_mut().insert(name, value);
+    }
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return verdict(
+            ApiKeyLivenessStatus::Network,
+            "could not create WebSocket probe runtime",
+        );
+    };
+    let status = runtime.block_on(async {
+        match tokio::time::timeout(PROBE_TIMEOUT, tokio_tungstenite::connect_async(request)).await {
+            Ok(Ok((mut socket, _))) => {
+                let _ = tokio::time::timeout(PROBE_TIMEOUT, socket.close(None)).await;
+                ApiKeyLivenessStatus::Ok
+            }
+            Ok(Err(Error::Http(response))) => {
+                let status = StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+                    classify_probe_response(status, "")
+                } else {
+                    ApiKeyLivenessStatus::Network
+                }
+            }
+            _ => ApiKeyLivenessStatus::Network,
+        }
+    });
+    verdict(
+        status,
+        match status {
+            ApiKeyLivenessStatus::Ok => "socket accepted the credential",
+            ApiKeyLivenessStatus::Invalid => "socket rejected the credential",
+            _ => "socket handshake could not be verified",
+        },
+    )
 }
 
 /// Classify one provider HTTP response. This is the tested contract; network
@@ -536,7 +631,7 @@ mod tests {
     /// The STT slot has a real multipart probe instead of the historical
     /// Unsupported verdict, and reports the endpoint that answered.
     #[test]
-    fn stt_probe_uses_the_multipart_endpoint() {
+    fn stt_file_probe_uses_the_file_lane_without_inversion() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind STT probe server");
         let address = listener.local_addr().expect("STT probe address");
         let endpoint = format!("http://{address}/v1/audio/transcriptions");
@@ -558,13 +653,14 @@ mod tests {
             .build()
             .expect("build STT probe client");
         let config = Config {
-            stt_endpoint: Some(endpoint),
+            stt_file_endpoint: Some(endpoint),
+            stt_live_endpoint: Some("ws://127.0.0.1:1/wrong-lane".into()),
             ..Config::default()
         };
-        let result = probe_stt_key(
+        let result = probe_stt_file_key(
             &client,
             &config,
-            "STT_API_KEY",
+            "STT_FILE_API_KEY",
             Some("test-key".to_string()),
         );
         assert_eq!(result.status, ApiKeyLivenessStatus::Ok);
@@ -589,48 +685,39 @@ mod tests {
         );
     }
 
-    /// A stored Voice Lab socket is remapped onto the file worker before POST.
     #[test]
-    fn stt_probe_maps_live_websocket_to_multipart() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind STT live-socket probe server");
-        let address = listener
-            .local_addr()
-            .expect("STT live-socket probe address");
-        let live = format!("ws://127.0.0.1:{}/v1/audio/transcribe", address.port());
-        let expected = format!(
-            "http://127.0.0.1:{}/v1/audio/transcriptions",
-            address.port()
+    fn stt_live_probe_classifies_handshake_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "ws://{}/v1/audio/transcribe",
+            listener.local_addr().unwrap()
         );
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept remapped STT probe");
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(PROBE_TIMEOUT)).unwrap();
             let mut buffer = [0_u8; 8192];
-            let bytes_read = stream.read(&mut buffer).expect("read remapped STT probe");
+            let count = stream.read(&mut buffer).unwrap();
             stream
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"text\":\"\"}",
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
-                .expect("write remapped STT probe response");
-            String::from_utf8_lossy(&buffer[..bytes_read]).to_string()
+                .unwrap();
+            String::from_utf8_lossy(&buffer[..count]).to_string()
         });
-        let client = Client::builder()
-            .timeout(PROBE_TIMEOUT)
-            .connect_timeout(PROBE_TIMEOUT)
-            .build()
-            .expect("build remapped STT probe client");
         let config = Config {
-            stt_endpoint: Some(live),
-            ..Config::default()
+            stt_live_endpoint: Some(endpoint.clone()),
+            ..Default::default()
         };
-        let result = probe_stt_key(
-            &client,
-            &config,
-            "STT_API_KEY",
-            Some("test-key".to_string()),
+        let result = probe_stt_live_key(&config, "STT_LIVE_API_KEY", Some("test-key".into()));
+        assert_eq!(result.status, ApiKeyLivenessStatus::Invalid);
+        assert_eq!(result.probed_endpoint, Some(endpoint));
+        let request = server.join().unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("get /v1/audio/transcribe http/1.1"));
+        assert!(request.contains("upgrade: websocket"));
+        assert!(
+            !request.contains("test-key"),
+            "loopback must not send secrets"
         );
-        assert_eq!(result.status, ApiKeyLivenessStatus::Ok);
-        assert_eq!(result.probed_endpoint.as_deref(), Some(expected.as_str()));
-        let request = server.join().expect("remapped STT probe server");
-        assert!(request.starts_with("POST /v1/audio/transcriptions HTTP/1.1"));
     }
 
     /// 2xx means the provider accepted the key and returned a usable response.

@@ -951,6 +951,12 @@ fn configure_profile_environment(
         command.env_remove(key);
     }
     if !matches!(profile, ReplayProfile::AppleLayer1Remote) {
+        command
+            .env_remove("STT_FILE_API_KEY")
+            .env_remove("STT_LIVE_API_KEY");
+        command.env_remove("STT_FILE_ENDPOINT");
+        command.env_remove("STT_LIVE_ENDPOINT");
+        // Retired aliases must not re-enable cloud access in an offline profile.
         command.env_remove("STT_API_KEY");
         command.env_remove("STT_ENDPOINT");
         command.env_remove("CODESCRIBE_STT_ENDPOINT");
@@ -1390,8 +1396,8 @@ fn build_quality_report(
     QualityReport {
         generated_at: Utc::now().to_rfc3339(),
         environment: ReportEnvironment {
-            stt_endpoint: None,
-            stt_api_key_present: false,
+            stt_file_endpoint: None,
+            stt_file_api_key_present: false,
             llm_formatting_endpoint: None,
             llm_formatting_model: None,
             llm_formatting_key_present: false,

@@ -360,7 +360,7 @@ default = ""
 type = "string"
 reload = "restart"
 category = "stt"
-description = "Legacy migration-only alias rewritten to STT_ENDPOINT"
+description = "Legacy migration-only alias via STT_ENDPOINT to File/Live"
 deprecated = "STT_ENDPOINT"
 
 [vars.LLM_SERVER_URL]
@@ -694,19 +694,47 @@ reload = "restart"
 category = "stt"
 description = "Arm the DictationTranscriber PoC lane (W4-A) — the SpeechAnalyzer module behind SYSTEM dictation, the only Apple analyzer whose catalog carries pl-PL. Default off: unarmed, the backend fall-through is byte-for-byte the shipped SFSpeech order. Read by both the Rust side and the inherited bridge child, so one key arms the whole path. Not a shipped default — flipping it is an operator decision"
 
+[vars.STT_FILE_ENDPOINT]
+default = ""
+type = "string"
+reload = "restart"
+category = "stt"
+description = "File transcription endpoint: HTTPS multipart or NDJSON :stream; HTTP only on loopback"
+
+[vars.STT_LIVE_ENDPOINT]
+default = ""
+type = "string"
+reload = "restart"
+category = "stt"
+description = "Live transcript WebSocket endpoint: WSS; WS only on loopback"
+
+[vars.STT_FILE_API_KEY]
+default = ""
+type = "secret"
+reload = "restart"
+category = "stt"
+description = "File transcription key; prefer Settings / macOS Keychain"
+
+[vars.STT_LIVE_API_KEY]
+default = ""
+type = "secret"
+reload = "restart"
+category = "stt"
+description = "Live transcript key; prefer Settings / macOS Keychain"
+
 [vars.STT_ENDPOINT]
 default = ""
 type = "string"
 reload = "restart"
 category = "stt"
-description = "Canonical STT service endpoint. Explicit retranscribe and STT_TAIL_PROVIDER=remote use multipart file upload; normal cloud recording maps the known Libraxis or loopback endpoint to its live Voice Lab WebSocket. OpenAI multipart endpoints are never treated as live WSS."
+description = "RETIRED alias routed to File/Live by scheme (warned, removed after 2026-10-15)"
 
 [vars.STT_API_KEY]
 default = ""
 type = "secret"
 reload = "restart"
 category = "stt"
-description = "Cloud STT API key; prefer Settings / macOS Keychain"
+description = "RETIRED alias filling missing File/Live keys (warned, removed after 2026-10-15)"
 
 [vars.FINAL_PASS_MODE]
 default = "smart"
