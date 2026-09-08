@@ -345,12 +345,8 @@ pub trait TailProvider: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InProcessTailProvider;
 
-/// In-process Whisper decodes VAD-compacted speech. Its long-window decoder
-/// can return timestamp segments that overlap at a decode seam even though the
-/// complete transcript is still a valid observation of the bounded request.
-/// Do not promote that broken fine clock to exact PCM evidence, and do not
-/// discard the whole transcript. Fall back to one request-grain segment whose
-/// identity is the exact PCM range actually supplied to the provider.
+/// Reject a broken segment clock. Rendered text remains diagnostic payload;
+/// it must never become a manufactured whole-request coverage witness.
 fn coarsen_invalid_in_process_segments(
     request_range: &TailSampleRange,
     text: &str,
@@ -372,12 +368,9 @@ fn coarsen_invalid_in_process_segments(
         segment_count = segments.len(),
         sample_start = request_range.sample_start,
         sample_end = request_range.sample_end,
-        "tail_provider_segment_clock_coarsened"
+        "tail_provider_segment_clock_refused"
     );
-    vec![TimedTailSegment {
-        text: text.trim().to_string(),
-        range: request_range.clone(),
-    }]
+    Vec::new()
 }
 
 impl TailProvider for InProcessTailProvider {
@@ -415,15 +408,16 @@ impl TailProvider for InProcessTailProvider {
         let segments = raw
             .segments
             .into_iter()
-            .filter_map(|segment| {
+            .map(|segment| {
                 let compacted_start = to_sample(segment.start_ts);
                 let compacted_end = to_sample(segment.end_ts).max(compacted_start);
                 let (source_start, source_end) = crate::vad::map_compacted_sample_range(
                     &speech_index,
                     compacted_start,
                     compacted_end,
-                )?;
-                Some(TimedTailSegment {
+                )
+                .ok_or_else(|| anyhow!("Whisper segment has no source PCM mapping"))?;
+                Ok(TimedTailSegment {
                     text: segment.text,
                     range: TailSampleRange {
                         session: request_range.session.clone(),
@@ -433,7 +427,7 @@ impl TailProvider for InProcessTailProvider {
                     },
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let segments = coarsen_invalid_in_process_segments(request_range, &raw.text, segments);
         let payload = TailProviderPayload {
             identity: request.identity.clone(),
@@ -447,7 +441,7 @@ impl TailProvider for InProcessTailProvider {
                 source: TailEvidenceSource::Whisper,
                 revision: None,
                 stability: TailEvidenceStability::Final,
-                timing_quality: TailTimingQuality::CompactedSpeechRelative,
+                timing_quality: TailTimingQuality::ExactSampleRange,
                 avg_logprob: raw.avg_logprob,
             },
         };
@@ -1388,7 +1382,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_in_process_segment_clock_coarsens_without_losing_text() {
+    fn invalid_in_process_segment_clock_retains_only_diagnostic_text() {
         let range = TailSampleRange {
             session: "gap-recovery".into(),
             capture_epoch: 7,
@@ -1417,9 +1411,7 @@ mod tests {
         let coarsened =
             coarsen_invalid_in_process_segments(&range, "pełny poprawny tekst", segments);
 
-        assert_eq!(coarsened.len(), 1);
-        assert_eq!(coarsened[0].range, range);
-        assert_eq!(coarsened[0].text, "pełny poprawny tekst");
+        assert!(coarsened.is_empty());
         let payload = TailProviderPayload {
             identity: TailRequestIdentity {
                 request_id: u64::MAX,
@@ -1441,7 +1433,7 @@ mod tests {
         };
         payload
             .validate()
-            .expect("request-grain evidence validates");
+            .expect("diagnostic text without occurrence witnesses validates");
     }
 
     #[test]

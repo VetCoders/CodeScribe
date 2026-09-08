@@ -60,7 +60,7 @@ use crate::pipeline::acoustic_ledger::{
     AcousticEvidence, AcousticLedger, EnergyCalibration, MutationReceipt,
     ObservationIdentity as LedgerObservationIdentity,
     ObservationProducer as LedgerObservationProducer, OccurrenceIdentity, SealCoverageReceipt,
-    SealCoverageStatus, SealRefusal, TranscriptComparisonReceipt,
+    SealCoverageStatus, SealRefusal,
 };
 use crate::pipeline::contracts::{EngineEvent, EventSink, TranscriptSegment};
 use crate::stt::apple_stt::{LiveStreamEvent, LiveStreamSession};
@@ -2240,6 +2240,18 @@ fn admit_full_pass_gap_segments(
     threshold_samples: u64,
     gap_energy: EnergyAdmission,
 ) -> usize {
+    let exact_timing = full_pass.evidence.timing_quality
+        == crate::stt::tail_provider::TailTimingQuality::ExactSampleRange
+        || (cfg!(test)
+            && full_pass.evidence.timing_quality
+                == crate::stt::tail_provider::TailTimingQuality::Synthetic);
+    if !exact_timing || full_pass.validate().is_err() {
+        let _ = ev_tx.send(EngineEvent::Warning {
+            code: "seal_coverage_untrusted_segment_clock".into(),
+            message: "gap evidence requires valid source-PCM segment coordinates".into(),
+        });
+        return 0;
+    }
     let material_gaps = uncovered_speech_ranges
         .iter()
         .filter(|range| range.sample_end.saturating_sub(range.sample_start) > threshold_samples)
@@ -2282,7 +2294,7 @@ fn admit_full_pass_gap_segments(
                 energy: gap_energy,
             },
         )
-        .is_some()
+        .is_some_and(|receipt| receipt.grants_mutation())
         {
             admitted = admitted.saturating_add(1);
         }
@@ -2329,63 +2341,16 @@ fn repair_terminal_seal_coverage(
     } else {
         vad_ranges
     };
-    let (initial, apple_text) = {
-        let ledger = state
-            .acoustic_ledger
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            ledger.assess_seal_coverage(
-                &state.session_id,
-                state.capture_epoch,
-                &speech_ranges,
-                threshold_samples,
-            ),
-            ledger.rendered_text(),
-        )
-    };
-
-    let full_range = speech_ranges
-        .first()
-        .zip(speech_ranges.last())
-        .map(|(first, last)| TailSampleRange {
-            session: state.session_id.clone(),
-            capture_epoch: state.capture_epoch,
-            sample_start: first.sample_start,
-            sample_end: last.sample_end,
-        });
-    let full_pass = full_range.and_then(|range| {
-        let window = state.owned_pcm_window(range.sample_start, range.sample_end)?;
-        let request = TailProviderRequest {
-            identity: TailRequestIdentity {
-                request_id: u64::MAX,
-                range,
-            },
-            sample_rate: state.sample_rate,
-            language: language.map(str::to_owned),
-        };
-        match InProcessTailProvider.transcribe(&request, &window.samples) {
-            Ok(payload) if !payload.text.trim().is_empty() => Some(payload),
-            Ok(_) => {
-                let _ = ev_tx.send(EngineEvent::Warning {
-                    code: "seal_coverage_final_pass_empty".to_string(),
-                    message: "whole-session final pass returned no rendered text".to_string(),
-                });
-                None
-            }
-            Err(error) => {
-                let _ = ev_tx.send(EngineEvent::Warning {
-                    code: "seal_coverage_final_pass_failed".to_string(),
-                    message: error.to_string(),
-                });
-                None
-            }
-        }
-    });
-    let comparison = full_pass.as_ref().map(|payload| {
-        TranscriptComparisonReceipt::new(apple_text.clone(), payload.text.trim().to_string())
-    });
-
+    let initial = state
+        .acoustic_ledger
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .assess_seal_coverage(
+            &state.session_id,
+            state.capture_epoch,
+            &speech_ranges,
+            threshold_samples,
+        );
     state
         .acoustic_ledger
         .lock()
@@ -2393,21 +2358,61 @@ fn repair_terminal_seal_coverage(
         .record_seal_coverage(initial.clone());
     let _ = ev_tx.send(EngineEvent::SealCoverage {
         receipt: initial.clone(),
-        comparison: comparison.clone(),
+        comparison: None,
     });
     if initial.status == SealCoverageStatus::Complete {
         return initial;
     }
 
-    if let Some(full_pass) = full_pass.as_ref() {
-        admit_full_pass_gap_segments(
-            state,
-            ev_tx,
-            full_pass,
-            &initial.uncovered_speech_ranges,
-            threshold_samples,
-            EnergyAdmission::QualifyFinalPassGap,
-        );
+    // Decode only authenticated uncovered speech PCM. A gap request's rendered
+    // text is never itself a witness: each original mapped segment must pass
+    // the same containment, qualification and ledger corridor as before.
+    for (ordinal, range) in initial.uncovered_speech_ranges.iter().enumerate() {
+        if range.sample_end.saturating_sub(range.sample_start) <= threshold_samples {
+            continue;
+        }
+        let Some(window) = state.owned_pcm_window(range.sample_start, range.sample_end) else {
+            let _ = ev_tx.send(EngineEvent::Warning {
+                code: "seal_coverage_gap_pcm_unavailable".into(),
+                message: format!(
+                    "uncovered PCM {}..{} unavailable",
+                    range.sample_start, range.sample_end
+                ),
+            });
+            continue;
+        };
+        let request = TailProviderRequest {
+            identity: TailRequestIdentity {
+                request_id: u64::MAX - ordinal as u64,
+                range: range.clone(),
+            },
+            sample_rate: state.sample_rate,
+            language: language.map(str::to_owned),
+        };
+        match InProcessTailProvider.transcribe(&request, &window.samples) {
+            Ok(payload) if payload.identity == request.identity => {
+                admit_full_pass_gap_segments(
+                    state,
+                    ev_tx,
+                    &payload,
+                    std::slice::from_ref(range),
+                    threshold_samples,
+                    EnergyAdmission::QualifyFinalPassGap,
+                );
+            }
+            Ok(_) => {
+                let _ = ev_tx.send(EngineEvent::Warning {
+                    code: "seal_coverage_gap_identity_mismatch".into(),
+                    message: "provider returned another PCM request".into(),
+                });
+            }
+            Err(error) => {
+                let _ = ev_tx.send(EngineEvent::Warning {
+                    code: "seal_coverage_gap_inference_failed".into(),
+                    message: error.to_string(),
+                });
+            }
+        }
     }
 
     let final_receipt = state
@@ -2427,7 +2432,7 @@ fn repair_terminal_seal_coverage(
         .record_seal_coverage(final_receipt.clone());
     let _ = ev_tx.send(EngineEvent::SealCoverage {
         receipt: final_receipt.clone(),
-        comparison,
+        comparison: None,
     });
     final_receipt
 }
