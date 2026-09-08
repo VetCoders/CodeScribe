@@ -497,12 +497,51 @@ impl From<&RuntimeLlmLane> for CsRuntimeLlmLane {
     }
 }
 
+type CachedRuntimeSnapshot = Option<(Option<std::time::SystemTime>, RuntimeSettingsSnapshot)>;
+
+fn last_good_runtime_snapshot() -> &'static Mutex<CachedRuntimeSnapshot> {
+    static LAST_GOOD: OnceLock<Mutex<CachedRuntimeSnapshot>> = OnceLock::new();
+    LAST_GOOD.get_or_init(|| Mutex::new(None))
+}
+
+/// One loader snapshot for lane projection: reuse the last good value when the
+/// file mtime is unchanged, and never panic the UI if a transient read fails.
+fn load_runtime_snapshot_for_lane() -> RuntimeSettingsSnapshot {
+    let path = UserSettings::settings_path();
+    let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    {
+        let guard = last_good_runtime_snapshot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((cached_mtime, snapshot)) = guard.as_ref()
+            && *cached_mtime == mtime
+        {
+            return snapshot.clone();
+        }
+    }
+    let snapshot = match Config::load_runtime_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(_) => last_good_runtime_snapshot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, snapshot)| snapshot.clone())
+            .unwrap_or_else(|| Config::load_startup_runtime_snapshot(false)),
+    };
+    let mut guard = last_good_runtime_snapshot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some((mtime, snapshot.clone()));
+    snapshot
+}
+
 /// Project one lane from a single loader snapshot without exposing secrets.
 #[uniffi::export]
 pub fn runtime_llm_lane(lane: CsLlmLane) -> CsRuntimeLlmLane {
-    let runtime_settings = Config::load_runtime_snapshot()
-        .expect("canonical runtime settings must load for lane projection");
-    runtime_settings.llm_lanes().lane(lane.into()).into()
+    load_runtime_snapshot_for_lane()
+        .llm_lanes()
+        .lane(lane.into())
+        .into()
 }
 
 /// Last stop-path serving verdict from the controller runtime owner.
