@@ -42,6 +42,11 @@ use tracing::{debug, info, warn};
 pub struct TerminalSealRefused {
     pub receipt: SealCoverageReceipt,
     pub audio_path: Option<std::path::PathBuf>,
+    /// The committed live document at refusal time. The ledger refused the
+    /// seal, not the words: the controller may still hand this text to the
+    /// user as a degraded stop-path delivery. It is not a seal witness and is
+    /// never written back into the ledger or history as one.
+    pub committed_text: String,
 }
 
 impl std::fmt::Display for TerminalSealRefused {
@@ -513,9 +518,11 @@ impl StreamingRecorder {
             // mic is stopped and the take WAV is already on disk. Carry that
             // path in the typed refusal so the controller can retain the audio
             // and close the take without reading this as a recorder failure.
+            let committed_text = self.transcript_buffer.lock().await.clone();
             return Err(anyhow::Error::new(TerminalSealRefused {
                 receipt,
                 audio_path,
+                committed_text,
             }));
         }
 
@@ -1213,6 +1220,7 @@ mod terminal_seal_refusal_tests {
                 status: SealCoverageStatus::Incomplete,
             },
             audio_path,
+            committed_text: String::new(),
         }
     }
 

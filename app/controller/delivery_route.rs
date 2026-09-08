@@ -80,13 +80,25 @@ impl DeliveryRoute {
     }
 }
 
-/// Explicit operator delivery intent, frozen at the click that declares it.
+/// Operator delivery intent, frozen at session start (Orient, AgentVoice,
+/// NotesOnly) or at the explicit overlay click that declares it (overlay
+/// intents). OS focus at stop time is never an input.
 ///
-/// Only overlay-declared intents exist here. Session flags no longer derive an
-/// intent: delivery follows explicit operator intent, never OS focus or the
-/// mode a recording happened to start in.
+/// The stop path lost its intents in the W0 authority demolition
+/// (`ac6d399b3`, 2026-08-24) and with them auto-paste. Restored 2026-09-08:
+/// Auto Paste is the product's basic verb (Founder C02 2026-07-20, one
+/// persisted setting shared by Hold and Double Left Option).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryIntent {
+    /// Assistive hold / Double Right Option: the transcript is a first-class
+    /// Agent message. Never a focus-derived paste.
+    AgentVoice,
+    /// Hold Fn / Globe or toggle dictation: auto-paste into the latched target.
+    OrientDictation,
+    /// Double Left Option: formatted dictation. Same destination as dictation.
+    OrientFormat,
+    /// Save-only Quick Notes: history only, no user-visible delivery.
+    NotesOnly,
     /// Explicit overlay "To Agent" after any session.
     OverlayToAgent,
     /// Explicit overlay Insert / Paste Here. Frozen at the click, not at stop.
@@ -97,9 +109,34 @@ impl DeliveryIntent {
     /// Stable telemetry label.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::AgentVoice => "agent_voice",
+            Self::OrientDictation => "orient_dictation",
+            Self::OrientFormat => "orient_format",
+            Self::NotesOnly => "notes_only",
             Self::OverlayToAgent => "overlay_to_agent",
             Self::OverlayInsert => "overlay_insert",
         }
+    }
+}
+
+/// Freeze the stop-path intent from the flags the session started with.
+///
+/// Save-only notes outrank everything (nothing may leave history). Assistive
+/// outranks formatting: an assistive hold is an Agent message even when AI
+/// formatting is on. Everything else is Orient dictation.
+pub fn delivery_intent_from_session(
+    assistive: bool,
+    force_ai: bool,
+    notes_save_only: bool,
+) -> DeliveryIntent {
+    if notes_save_only {
+        DeliveryIntent::NotesOnly
+    } else if assistive {
+        DeliveryIntent::AgentVoice
+    } else if force_ai {
+        DeliveryIntent::OrientFormat
+    } else {
+        DeliveryIntent::OrientDictation
     }
 }
 
@@ -178,11 +215,59 @@ pub fn resolve_delivery_route(intent: DeliveryIntent, facts: DeliveryFacts) -> D
     }
 
     match intent {
+        DeliveryIntent::AgentVoice => DeliveryDecision {
+            route: DeliveryRoute::AgentComposer,
+            reason: "assistive_first_class",
+        },
+        DeliveryIntent::NotesOnly => DeliveryDecision {
+            route: DeliveryRoute::ArchiveOnly,
+            reason: "notes_save_only",
+        },
+        DeliveryIntent::OrientDictation | DeliveryIntent::OrientFormat => orient_route(facts),
         DeliveryIntent::OverlayToAgent => DeliveryDecision {
             route: DeliveryRoute::AgentComposer,
             reason: "explicit_to_agent",
         },
         DeliveryIntent::OverlayInsert => overlay_insert_route(facts),
+    }
+}
+
+/// Stop-path Orient (Hold Fn / Globe, Double Left Option, toggle Finish).
+///
+/// Auto Paste is one persisted setting shared by every Orient gesture. The
+/// vetoes that keep Orient off the paste gun, in order: the setting itself, a
+/// live-stream consumer that already owns the text, a pending quality commit,
+/// and the overlay canvas holding the caret. The doc table's `OrientCanvas` is
+/// `ArchiveOnly` here: the canvas already shows the committed document, so
+/// nothing else moves.
+fn orient_route(facts: DeliveryFacts) -> DeliveryDecision {
+    if !facts.auto_paste_enabled {
+        return DeliveryDecision {
+            route: DeliveryRoute::ArchiveOnly,
+            reason: "auto_paste_disabled",
+        };
+    }
+    if facts.live_stream_session {
+        return DeliveryDecision {
+            route: DeliveryRoute::ArchiveOnly,
+            reason: "live_stream_session",
+        };
+    }
+    if facts.commit_required {
+        return DeliveryDecision {
+            route: DeliveryRoute::ArchiveOnly,
+            reason: "quality_commit_pending",
+        };
+    }
+    if facts.latched_target_is_self {
+        return DeliveryDecision {
+            route: DeliveryRoute::DeferredInsert,
+            reason: "refuse_paste_into_self",
+        };
+    }
+    DeliveryDecision {
+        route: DeliveryRoute::ClipboardPaste,
+        reason: "auto_paste",
     }
 }
 
@@ -270,6 +355,10 @@ mod tests {
     #[test]
     fn empty_or_no_speech_archives_regardless_of_intent() {
         for intent in [
+            DeliveryIntent::AgentVoice,
+            DeliveryIntent::OrientDictation,
+            DeliveryIntent::OrientFormat,
+            DeliveryIntent::NotesOnly,
             DeliveryIntent::OverlayToAgent,
             DeliveryIntent::OverlayInsert,
         ] {
@@ -290,6 +379,97 @@ mod tests {
             );
             assert_eq!(silent.route, DeliveryRoute::ArchiveOnly, "{intent:?}");
         }
+    }
+
+    #[test]
+    fn orient_auto_pastes_into_the_latched_target() {
+        for intent in [
+            DeliveryIntent::OrientDictation,
+            DeliveryIntent::OrientFormat,
+        ] {
+            let decision = resolve_delivery_route(intent, facts(|_| {}));
+            assert_eq!(decision.route, DeliveryRoute::ClipboardPaste, "{intent:?}");
+            assert_eq!(decision.reason, "auto_paste");
+        }
+    }
+
+    #[test]
+    fn orient_with_auto_paste_off_archives_only() {
+        let decision = resolve_delivery_route(
+            DeliveryIntent::OrientDictation,
+            facts(|f| {
+                f.auto_paste_enabled = false;
+            }),
+        );
+        assert_eq!(decision.route, DeliveryRoute::ArchiveOnly);
+        assert_eq!(decision.reason, "auto_paste_disabled");
+    }
+
+    #[test]
+    fn orient_honours_live_stream_and_commit_vetoes() {
+        let live = resolve_delivery_route(
+            DeliveryIntent::OrientDictation,
+            facts(|f| {
+                f.live_stream_session = true;
+            }),
+        );
+        assert_eq!(live.route, DeliveryRoute::ArchiveOnly);
+        assert_eq!(live.reason, "live_stream_session");
+
+        let commit = resolve_delivery_route(
+            DeliveryIntent::OrientFormat,
+            facts(|f| {
+                f.commit_required = true;
+            }),
+        );
+        assert_eq!(commit.route, DeliveryRoute::ArchiveOnly);
+        assert_eq!(commit.reason, "quality_commit_pending");
+    }
+
+    #[test]
+    fn orient_into_self_parks_paste_here() {
+        let decision = resolve_delivery_route(
+            DeliveryIntent::OrientDictation,
+            facts(|f| {
+                f.latched_target_is_self = true;
+            }),
+        );
+        assert_eq!(decision.route, DeliveryRoute::DeferredInsert);
+        assert_eq!(decision.reason, "refuse_paste_into_self");
+    }
+
+    #[test]
+    fn agent_voice_never_auto_pastes() {
+        let decision = resolve_delivery_route(DeliveryIntent::AgentVoice, facts(|_| {}));
+        assert_eq!(decision.route, DeliveryRoute::AgentComposer);
+        assert_eq!(decision.reason, "assistive_first_class");
+    }
+
+    #[test]
+    fn notes_only_archives_even_with_auto_paste_on() {
+        let decision = resolve_delivery_route(DeliveryIntent::NotesOnly, facts(|_| {}));
+        assert_eq!(decision.route, DeliveryRoute::ArchiveOnly);
+        assert_eq!(decision.reason, "notes_save_only");
+    }
+
+    #[test]
+    fn session_intent_precedence_is_notes_then_assistive_then_format() {
+        assert_eq!(
+            delivery_intent_from_session(true, true, true),
+            DeliveryIntent::NotesOnly
+        );
+        assert_eq!(
+            delivery_intent_from_session(true, true, false),
+            DeliveryIntent::AgentVoice
+        );
+        assert_eq!(
+            delivery_intent_from_session(false, true, false),
+            DeliveryIntent::OrientFormat
+        );
+        assert_eq!(
+            delivery_intent_from_session(false, false, false),
+            DeliveryIntent::OrientDictation
+        );
     }
 
     #[test]

@@ -37,6 +37,35 @@
 Vetoes that keep Orient off the paste gun: empty / no-speech, live-stream
 session, quality-commit pending, overlay canvas holds the caret.
 
+### Stop path (restored 2026-09-08)
+
+The W0 authority demolition (`ac6d399b3`, 2026-08-24) removed the stop-path
+intents together with the old transcript cone, and with them auto-paste on
+release. Restored by `delivery_intent_from_session(assistive, force_ai, notes_save_only)` → `resolve_delivery_route` on both stop paths (toggle
+Finish and hold release):
+
+- `OrientCanvas` from the table is `ArchiveOnly` with
+  `reason=auto_paste_disabled`: the overlay canvas already shows the
+  committed document, nothing else moves.
+- `AgentVoice` resolves to `AgentComposer` with
+  `reason=assistive_first_class`; the stop path never pastes it.
+- `live_stream_session` and `commit_required` have no producer on the stop
+  path today; both are false by construction until one returns.
+- Transport is `execute_clipboard_paste`, shared with overlay Insert:
+  activate the latched target, confirm focus (bounded wait **or** the target
+  observed frontmost afterwards), preflight the event tap, borrow the
+  clipboard for one Cmd+V. Anything else parks Paste Here.
+- Exactly once per take (`claim_take_delivery`): a second stop of the same
+  take id archives only.
+- **Seal refused (degraded delivery).** When the ledger refuses the terminal
+  seal, `TerminalSealRefused` carries the committed live document and the
+  controller still delivers it with `seal_refused=true` on the same
+  `delivery_route:` line. History keeps its `failed` verdict, the ledger and
+  the coverage threshold are untouched, and no witness is minted: the user
+  gets the words the overlay already shows. Claude's call 2026-09-08, not a
+  Founder decision — revert is one match arm in `process_recording` and
+  `stop_toggle_and_adjudicate_inner`.
+
 Explicit overlay clicks do **not** inherit the live-stream or quality-commit
 vetoes. The user asked to insert now. Any Codescribe caret still refuses Cmd+V
 and arms Paste Here instead. Alacritty and other confirmed foreign targets get
@@ -57,7 +86,13 @@ One INFO line per stop / To Agent / overlay Insert / defer:
 
 ```text
 delivery_route: intent=overlay_insert route=clipboard_paste reason=explicit_insert target=Ghostty
+delivery_route: intent=orient_dictation route=clipboard_paste reason=auto_paste target=Ghostty
+delivery_route: intent=orient_dictation route=archive_only reason=auto_paste_disabled target=Ghostty
 ```
+
+The stop path adds a `seal_refused` field to that line and follows it with
+`stop-path delivery finished delivery=Pasted …` or a `warn` naming why the
+paste was parked.
 
 `reason=refuse_paste_into_self` is the smoking gun for "Codescribe owned focus,
 so the transcript was parked instead of being pasted into an unknown internal

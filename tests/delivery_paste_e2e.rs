@@ -3,8 +3,8 @@
 #![cfg(target_os = "macos")]
 
 use codescribe::controller::{
-    DeliveryIntent, DeliveryRoute, format_delivery_route_line, overlay_insert_facts,
-    resolve_delivery_route,
+    DeliveryIntent, DeliveryRoute, delivery_intent_from_session, format_delivery_route_line,
+    overlay_insert_facts, resolve_delivery_route,
 };
 use codescribe::os::clipboard::{ClipboardSnapshot, get_clipboard, set_clipboard};
 use serial_test::serial;
@@ -83,4 +83,32 @@ fn foreign_insert_selects_one_route_and_borrows_clipboard_losslessly() {
         return;
     };
     assert_eq!(restored, "clipboard-owner-sentinel");
+}
+
+/// Stop-path contract: a plain hold / toggle session freezes `OrientDictation`,
+/// Auto Paste on selects the clipboard route, Auto Paste off archives only,
+/// and an assistive session never reaches the paste gun.
+#[test]
+fn stop_path_intent_follows_the_auto_paste_setting() {
+    let dictation = delivery_intent_from_session(false, false, false);
+    assert_eq!(dictation, DeliveryIntent::OrientDictation);
+
+    let mut facts = overlay_insert_facts(true, false);
+    facts.auto_paste_enabled = true;
+    let on = resolve_delivery_route(dictation, facts);
+    assert_eq!(on.route, DeliveryRoute::ClipboardPaste);
+    assert_eq!(
+        format_delivery_route_line(dictation, on, Some("Ghostty")),
+        "delivery_route: intent=orient_dictation route=clipboard_paste reason=auto_paste target=Ghostty"
+    );
+
+    facts.auto_paste_enabled = false;
+    let off = resolve_delivery_route(dictation, facts);
+    assert_eq!(off.route, DeliveryRoute::ArchiveOnly);
+    assert_eq!(off.reason, "auto_paste_disabled");
+
+    facts.auto_paste_enabled = true;
+    let assistive = delivery_intent_from_session(true, false, false);
+    let agent = resolve_delivery_route(assistive, facts);
+    assert_eq!(agent.route, DeliveryRoute::AgentComposer);
 }

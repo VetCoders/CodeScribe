@@ -41,7 +41,8 @@ mod types;
 
 pub use delivery_route::{
     DeliveryIntent, DeliveryRoute, OverlayPasteDelivery, OverlayPasteResult,
-    format_delivery_route_line, overlay_insert_facts, resolve_delivery_route,
+    delivery_intent_from_session, format_delivery_route_line, overlay_insert_facts,
+    resolve_delivery_route,
 };
 pub(crate) use delivery_route::{
     TranscriptProjectionAvailability, resolve_transcript_projection_availability,
@@ -342,6 +343,49 @@ async fn stop_recorder_for_terminal(
     }
 }
 
+/// Exactly-once gate for stop-path delivery. Returns `true` when this take may
+/// deliver and records it. A take without an id cannot be deduplicated and
+/// always passes; the toggle path's `:stopping` suffix is not part of identity.
+fn claim_take_delivery(delivered: &mut Option<String>, take_id: Option<&str>) -> bool {
+    let Some(take_id) = take_id
+        .map(|id| id.trim().trim_end_matches(":stopping"))
+        .filter(|id| !id.is_empty())
+    else {
+        return true;
+    };
+    if delivered.as_deref() == Some(take_id) {
+        return false;
+    }
+    *delivered = Some(take_id.to_string());
+    true
+}
+
+#[cfg(test)]
+mod take_delivery_tests {
+    use super::claim_take_delivery;
+
+    #[test]
+    fn a_take_delivers_once_and_a_new_take_delivers_again() {
+        let mut delivered = None;
+        assert!(claim_take_delivery(&mut delivered, Some("take-a")));
+        assert!(!claim_take_delivery(&mut delivered, Some("take-a")));
+        assert!(!claim_take_delivery(
+            &mut delivered,
+            Some("take-a:stopping")
+        ));
+        assert!(claim_take_delivery(&mut delivered, Some("take-b")));
+        assert_eq!(delivered.as_deref(), Some("take-b"));
+    }
+
+    #[test]
+    fn a_take_without_identity_cannot_be_deduplicated() {
+        let mut delivered = Some("take-a".to_string());
+        assert!(claim_take_delivery(&mut delivered, None));
+        assert!(claim_take_delivery(&mut delivered, Some("  ")));
+        assert_eq!(delivered.as_deref(), Some("take-a"));
+    }
+}
+
 #[cfg(test)]
 mod session_audio_id_tests {
     use super::{retainable_session_id, session_audio_path, valid_session_audio_id};
@@ -475,6 +519,10 @@ pub struct RecordingController {
     /// App that was frontmost when the user initiated a hold session, before
     /// Codescribe badge/overlay UI can become frontmost.
     pre_overlay_frontmost_app: Arc<RwLock<Option<String>>>,
+    /// Take id whose stop-path delivery already fired. One recording delivers
+    /// exactly once (Founder C02 2026-07-20): a second stop of the same take
+    /// archives only.
+    delivered_take: Arc<Mutex<Option<String>>>,
 
     /// Sample offset (in the recorder buffer) marking the start of the next
     /// incremental segment. Advances on each `commit_segment` call so segment
@@ -671,6 +719,7 @@ impl RecordingController {
                 Config::config_dir(),
             ))),
             pre_overlay_frontmost_app: Arc::new(RwLock::new(None)),
+            delivered_take: Arc::new(Mutex::new(None)),
             last_segment_audio_offset: Arc::new(AtomicUsize::new(0)),
             // Conversation mode (lazy init)
             conversation_engine: Arc::new(Mutex::new(None)),
@@ -1319,6 +1368,25 @@ impl RecordingController {
                 .await;
         }
 
+        self.execute_clipboard_paste(trimmed.to_string(), target_app, "Overlay paste")
+            .await
+    }
+
+    /// Execute an already decided `ClipboardPaste`: activate the latched
+    /// target, confirm it owns focus, borrow the clipboard for one Cmd+V.
+    ///
+    /// Destination selection stays in [`resolve_delivery_route`]; this is
+    /// transport only. Focus counts as confirmed when the bounded wait saw the
+    /// target frontmost **or** the target is observed frontmost afterwards
+    /// (an accepted-but-unconfirmed activation of an app that already owned
+    /// focus). An unconfirmed ambulance or a denied event tap parks Paste
+    /// Here and leaves the user's pasteboard alone.
+    async fn execute_clipboard_paste(
+        &self,
+        paste_text: String,
+        target_app: Option<String>,
+        context: &'static str,
+    ) -> Result<OverlayPasteResult> {
         let focus_confirmed = target_app
             .as_deref()
             .map(str::trim)
@@ -1331,21 +1399,29 @@ impl RecordingController {
                             Duration::from_millis(250),
                         ))
             });
+        let frontmost = crate::os::selection::current_frontmost_app_name();
+        let target_observed_frontmost = matches!(
+            (target_app.as_deref(), frontmost.as_deref()),
+            (Some(target), Some(front)) if front.trim().eq_ignore_ascii_case(target.trim())
+        );
         debug!(
             target = ?target_app,
+            frontmost = ?frontmost,
             focus_confirmed,
-            "Overlay paste target activation"
+            target_observed_frontmost,
+            "{context}: paste target activation"
         );
 
         let config = self.get_config().await;
-        let paste_text = trimmed.to_string();
-        let frontmost = crate::os::selection::current_frontmost_app_name();
         let preflight = clipboard::synthetic_paste_preflight();
 
         let mut deferred_insert_shortcut = None;
         let mut deferred_insert_failure = None;
-        let delivery = if focus_confirmed && preflight.can_post_events() {
-            clipboard::paste_and_restore(&paste_text).context("Failed to paste overlay text")?;
+        let delivery = if (focus_confirmed || target_observed_frontmost)
+            && preflight.can_post_events()
+        {
+            clipboard::paste_and_restore(&paste_text)
+                .with_context(|| format!("{context}: failed to paste"))?;
             OverlayPasteDelivery::Pasted
         } else {
             warn!(
@@ -1354,7 +1430,7 @@ impl RecordingController {
                 cg_post_event_access = preflight.cg_post_event_access,
                 ax_trusted = preflight.ax_trusted,
                 focus_confirmed,
-                "Overlay paste could not execute the selected clipboard route; arming deferred insert"
+                "{context}: could not execute the selected clipboard route; arming deferred insert"
             );
             self.arm_or_copy_deferred_payload(
                 paste_text,
@@ -1371,6 +1447,83 @@ impl RecordingController {
             deferred_insert_shortcut,
             deferred_insert_failure,
         })
+    }
+
+    /// Stop-path delivery: the committed live document goes where the session
+    /// intent froze it at start. One `delivery_route:` line per take.
+    ///
+    /// `seal_refused` marks a degraded delivery: the ledger refused the
+    /// terminal seal, history keeps its `failed` verdict, and the text is the
+    /// same committed document the overlay already shows. Nothing here writes
+    /// the ledger or invents a witness. `live_stream_session` and
+    /// `commit_required` have no producer on this path today and are false by
+    /// construction.
+    async fn deliver_stop_transcript(
+        &self,
+        take_id: Option<&str>,
+        text: &str,
+        assistive: bool,
+        force_ai: bool,
+        seal_refused: bool,
+    ) {
+        let trimmed = text.trim();
+        let config = self.get_config().await;
+        let notes_save_only = config.quick_notes_enabled && config.quick_notes_save_only;
+        let intent = delivery_intent_from_session(assistive, force_ai, notes_save_only);
+        let latched_target = self.pre_overlay_frontmost_app.read().await.clone();
+        let decision = resolve_delivery_route(
+            intent,
+            DeliveryFacts {
+                has_text: !trimmed.is_empty(),
+                no_speech: false,
+                auto_paste_enabled: config.auto_paste_enabled,
+                overlay_enabled: config.transcription_overlay_enabled,
+                live_stream_session: false,
+                commit_required: false,
+                latched_target_is_self: false,
+            },
+        );
+        info!(
+            seal_refused,
+            "{}",
+            format_delivery_route_line(intent, decision, latched_target.as_deref())
+        );
+        if !matches!(
+            decision.route,
+            DeliveryRoute::ClipboardPaste | DeliveryRoute::DeferredInsert
+        ) {
+            return;
+        }
+        if cfg!(test) {
+            info!("stop-path paste skipped in tests");
+            return;
+        }
+        {
+            let mut delivered = self.delivered_take.lock().await;
+            if !claim_take_delivery(&mut delivered, take_id) {
+                info!(take_id = ?take_id, "stop-path delivery skipped: take already delivered");
+                return;
+            }
+        }
+        let outcome = if decision.route == DeliveryRoute::DeferredInsert {
+            self.arm_overlay_text(trimmed, latched_target, Some("Codescribe".to_string()))
+                .await
+        } else {
+            self.execute_clipboard_paste(trimmed.to_string(), latched_target, "Stop-path paste")
+                .await
+        };
+        match outcome {
+            Ok(result) => info!(
+                delivery = ?result.delivery,
+                target = ?result.target_app_name,
+                frontmost = ?result.frontmost_app_name,
+                shortcut = ?result.deferred_insert_shortcut,
+                failure = ?result.deferred_insert_failure,
+                seal_refused,
+                "stop-path delivery finished"
+            ),
+            Err(err) => warn!(seal_refused, "stop-path delivery failed: {err:#}"),
+        }
     }
 
     /// Degrade path when a synthetic paste is not safe to post: park the payload
@@ -3237,6 +3390,7 @@ impl RecordingController {
         info!("Stopping toggle recording with final-pass adjudication");
 
         let assistive = *self.assistive_mode.read().await;
+        let force_ai = *self.force_ai_mode.read().await;
 
         // Self-deadlock guard (Rust 2024): the read guard temporary from an
         // if-let chain scrutinee outlives the chain body. Inlining the read
@@ -3283,7 +3437,22 @@ impl RecordingController {
             // The session is over whichever way `stop()` went; the engine that
             // served it is the same on a clean stop and on a refused seal.
             Self::publish_live_serving_verdict(serving_engine);
-            let (streaming_text, raw_audio_path_opt) = stopped?;
+            let (streaming_text, raw_audio_path_opt) = match stopped {
+                Ok(stopped) => stopped,
+                Err(err) => {
+                    if let Some(refusal) = err.downcast_ref::<TerminalSealRefused>() {
+                        self.deliver_stop_transcript(
+                            session_id_snapshot.as_deref(),
+                            &refusal.committed_text,
+                            assistive,
+                            force_ai,
+                            true,
+                        )
+                        .await;
+                    }
+                    return Err(err);
+                }
+            };
             info!(
                 "stop_toggle_inner: PHASE 2 — recorder.stop() returned in {:?} (streaming_text={} chars, has_wav={})",
                 phase2.elapsed(),
@@ -3302,6 +3471,14 @@ impl RecordingController {
                     ),
                 );
             }
+            self.deliver_stop_transcript(
+                session_id_snapshot.as_deref(),
+                &streaming_text,
+                assistive,
+                force_ai,
+                false,
+            )
+            .await;
             phase3_secs = phase3.elapsed().as_secs_f64();
             info!(
                 "stop_toggle_inner: PHASE 3 — reducer handoff completed in {:?}",
@@ -3502,7 +3679,22 @@ impl RecordingController {
         Self::clear_recorder_callbacks(recorder);
         drop(recorder_guard); // Release lock
         Self::publish_live_serving_verdict(serving_engine);
-        let (streaming_text, raw_audio_path_opt) = stopped?;
+        let (streaming_text, raw_audio_path_opt) = match stopped {
+            Ok(stopped) => stopped,
+            Err(err) => {
+                if let Some(refusal) = err.downcast_ref::<TerminalSealRefused>() {
+                    self.deliver_stop_transcript(
+                        take_id.as_deref(),
+                        &refusal.committed_text,
+                        assistive,
+                        force_ai,
+                        true,
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
 
         if let Some(path) = raw_audio_path_opt.as_deref() {
             retain_session_audio(
@@ -3513,7 +3705,18 @@ impl RecordingController {
                 ),
             );
         }
-        let _ = (assistive, hold_mode, force_raw, force_ai);
+        // Ctrl-hold literal (`force_raw`) and the hold flavour are sink-time
+        // facts already consumed when the emitter was built; delivery reads
+        // only the frozen intent.
+        let _ = (hold_mode, force_raw);
+        self.deliver_stop_transcript(
+            take_id.as_deref(),
+            &streaming_text,
+            assistive,
+            force_ai,
+            false,
+        )
+        .await;
         Ok(ProcessRecordingOutcome {
             transcript_present: !streaming_text.trim().is_empty(),
             ..ProcessRecordingOutcome::default()
