@@ -65,11 +65,6 @@ pub fn install_thermal_probe() {
     }
 }
 
-/// Last thermal level published by this process observer.
-pub fn current_thermal_level() -> ThermalLevel {
-    current_process_thermal_level()
-}
-
 /// Objective-C selector target for `NSProcessInfoThermalStateDidChangeNotification`.
 #[cfg(target_os = "macos")]
 extern "C" fn thermal_state_did_change(_this: &Object, _sel: Sel, _notification: *mut Object) {
@@ -184,9 +179,9 @@ mod tests {
         // second call must be a guarded no-op and must not panic. This proves
         // the probe remains wired at runtime bootstrap without a scheduler.
         install_thermal_probe();
-        let first = current_thermal_level();
+        let first = current_process_thermal_level();
         install_thermal_probe();
-        let second = current_thermal_level();
+        let second = current_process_thermal_level();
         assert_eq!(
             first, second,
             "thermal level must be stable across idempotent probe installs"

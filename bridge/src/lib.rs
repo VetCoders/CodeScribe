@@ -174,14 +174,3 @@ impl From<CsLanguage> for codescribe_core::config::Language {
         }
     }
 }
-
-impl CsLanguage {
-    /// Two-letter code (`"pl"` / `"en"`) as the core uses it.
-    pub fn as_code(&self) -> &'static str {
-        match self {
-            CsLanguage::Auto => "auto",
-            CsLanguage::Polish => "pl",
-            CsLanguage::English => "en",
-        }
-    }
-}

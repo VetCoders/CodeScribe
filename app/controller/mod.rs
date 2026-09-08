@@ -47,8 +47,8 @@ pub(crate) use delivery_route::{
     TranscriptProjectionAvailability, resolve_transcript_projection_availability,
 };
 pub use helpers::{
-    is_assistive_session, is_conversation_session, publish_recording_indicator,
-    set_assistive_session, set_assistive_target_thread, set_conversation_session,
+    is_assistive_session, publish_recording_indicator, set_assistive_session,
+    set_assistive_target_thread,
 };
 pub use types::{HotkeyAction, HotkeyInput, HotkeyType, State};
 
@@ -2255,9 +2255,6 @@ impl RecordingController {
         let generation = self.conversation_generation.fetch_add(1, Ordering::SeqCst) + 1;
         info!("Starting conversation session generation {}", generation);
 
-        // 4. Set conversation session flag
-        helpers::set_conversation_session(true);
-
         // 5. Transition to CONVERSATION state
         self.set_state(State::Conversation).await;
         info!("STATE TRANSITION: IDLE → CONVERSATION");
@@ -2324,9 +2321,8 @@ impl RecordingController {
                 Err(error) => {
                     error!("Conversation mode unavailable: {error}");
                     drop(rec_guard);
-                    // Full cleanup on failure: state, session flag, badge
+                    // Full cleanup on failure: state and badge
                     Self::set_state_with_broadcast(&state, &event_broadcast, State::Idle).await;
-                    helpers::set_conversation_session(false);
                     codescribe_core::memory::release_freed_heap();
                     return;
                 }
@@ -2337,9 +2333,8 @@ impl RecordingController {
 
             if let Err(e) = rec.recorder.start().await {
                 error!("Failed to start recorder for conversation: {}", e);
-                // Full cleanup on failure: state, session flag, badge
+                // Full cleanup on failure: state and badge
                 Self::set_state_with_broadcast(&state, &event_broadcast, State::Idle).await;
-                helpers::set_conversation_session(false);
                 codescribe_core::memory::release_freed_heap();
                 return;
             }
@@ -2354,7 +2349,6 @@ impl RecordingController {
                     error!("Conversation mode aborted: {error}");
                     drop(rec_guard);
                     Self::set_state_with_broadcast(&state, &event_broadcast, State::Idle).await;
-                    helpers::set_conversation_session(false);
                     codescribe_core::memory::release_freed_heap();
                     return;
                 }
@@ -2493,7 +2487,6 @@ impl RecordingController {
             stop_flag.store(true, Ordering::SeqCst);
 
             Self::set_state_with_broadcast(&state, &event_broadcast, State::Idle).await;
-            helpers::set_conversation_session(false);
             // Return freed host memory to the OS after a conversation session
             // (the dictation stop path already does this; conversation exits did
             // not, leaving malloc retention). Memory-lifecycle only.
@@ -2521,9 +2514,6 @@ impl RecordingController {
 
         // 1. Signal stop
         self.conversation_stop_flag.store(true, Ordering::SeqCst);
-
-        // 2. Clear conversation session flag (before any cleanup)
-        helpers::set_conversation_session(false);
 
         // 3. Stop recorder BEFORE waiting for task (prevents leak on abort)
         {

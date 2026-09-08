@@ -46,14 +46,6 @@ struct CopiedSelectionPayload {
     image_png: Option<Vec<u8>>,
 }
 
-/// A cached context plus the instant it was captured, so staleness can be
-/// judged at read time rather than by a background sweep.
-#[derive(Debug, Clone)]
-struct TimedAssistiveContext {
-    captured_at: std::time::Instant,
-    ctx: AssistiveContext,
-}
-
 /// One foreign frontmost-app observation. The name is useful only while an
 /// overlay is taking focus; retaining it across unrelated takes can paste into
 /// the wrong application.
@@ -64,51 +56,6 @@ struct TimedFrontmostApp {
 }
 
 const LAST_FOREIGN_FRONTMOST_MAX_AGE: Duration = Duration::from_secs(3);
-
-/// Process-wide slot holding at most one recent capture. A poisoned lock is
-/// recovered rather than propagated — losing context must never panic a
-/// recording.
-fn recent_assistive_context_store() -> &'static Mutex<Option<TimedAssistiveContext>> {
-    /// Process-wide once-cell for the most recent timed assistive context.
-    static STORE: OnceLock<Mutex<Option<TimedAssistiveContext>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(None))
-}
-
-/// Store the latest assistive context for short-lived follow-up prompts in chat.
-pub fn store_recent_assistive_context(ctx: &AssistiveContext) {
-    let mut guard = recent_assistive_context_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *guard = Some(TimedAssistiveContext {
-        captured_at: std::time::Instant::now(),
-        ctx: ctx.clone(),
-    });
-}
-
-/// Return the latest assistive context if it is still fresh.
-pub fn get_recent_assistive_context(max_age: Duration) -> Option<AssistiveContext> {
-    let mut guard = recent_assistive_context_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let entry = guard.as_ref()?;
-
-    if entry.captured_at.elapsed() <= max_age {
-        return Some(entry.ctx.clone());
-    }
-
-    // Drop stale data to avoid leaking old context into later prompts.
-    *guard = None;
-    None
-}
-
-/// Drop the cached context so one test cannot observe another's capture.
-#[cfg(test)]
-fn clear_recent_assistive_context_for_tests() {
-    let mut guard = recent_assistive_context_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    *guard = None;
-}
 
 /// Injected OS selection for unit tests (production capture is skipped).
 #[cfg(test)]
@@ -1272,43 +1219,5 @@ mod tests {
 
         assert_eq!(app.as_deref(), Some("Codescribe"));
         assert!(!should_restore);
-    }
-
-    /// Fresh cache TTL returns the stored context unchanged.
-    #[test]
-    #[serial]
-    fn recent_assistive_context_roundtrips_while_fresh() {
-        clear_recent_assistive_context_for_tests();
-
-        let ctx = AssistiveContext {
-            frontmost_app: Some("Safari".to_string()),
-            selected_text: Some("selected".to_string()),
-        };
-        store_recent_assistive_context(&ctx);
-
-        assert_eq!(
-            get_recent_assistive_context(Duration::from_secs(1)),
-            Some(ctx)
-        );
-    }
-
-    /// Expired cache entry is dropped so later prompts cannot leak old context.
-    #[test]
-    #[serial]
-    fn stale_recent_assistive_context_is_cleared() {
-        clear_recent_assistive_context_for_tests();
-
-        let ctx = AssistiveContext {
-            frontmost_app: Some("Codescribe".to_string()),
-            selected_text: Some("old".to_string()),
-        };
-        store_recent_assistive_context(&ctx);
-
-        assert_eq!(get_recent_assistive_context(Duration::ZERO), None);
-        assert_eq!(
-            get_recent_assistive_context(Duration::from_secs(1)),
-            None,
-            "stale entry should be cleared from the cache"
-        );
     }
 }

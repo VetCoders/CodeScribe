@@ -630,11 +630,6 @@ pub type ProjectionObserver = Arc<dyn Fn(&TranscriptBusEvidenceEvent) + Send + S
 pub struct PresentationEmitter {
     cmd_tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmitterCmd>>>,
     cmd_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Optional callback for VAD stop detection.
-    vad_start_callback: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Optional callback for VAD end/silence boundary detection.
-    vad_end_callback: Option<Arc<dyn Fn() + Send + Sync>>,
-    vad_start_emitted: std::sync::atomic::AtomicBool,
     /// One occurrence-keyed committed document plus volatile overlay paint.
     session_state: std::sync::Mutex<TranscriptReducer>,
     /// Durable observer of this exact reducer's committed/final truth.
@@ -713,26 +708,11 @@ impl PresentationEmitter {
         Self {
             cmd_tx: std::sync::Mutex::new(Some(tx)),
             cmd_handle,
-            vad_start_callback: None,
-            vad_end_callback: None,
-            vad_start_emitted: std::sync::atomic::AtomicBool::new(false),
             session_state: std::sync::Mutex::new(TranscriptReducer::default()),
             transcript_bus,
             acoustic_ledger,
             projection_callback,
         }
-    }
-
-    /// Install the speech-start callback. Fired once per speech run — the
-    /// emitter de-duplicates repeated `VadStart` events until a `VadEnd`
-    /// re-arms it.
-    pub fn set_vad_start_callback(&mut self, cb: Option<Arc<dyn Fn() + Send + Sync>>) {
-        self.vad_start_callback = cb;
-    }
-
-    /// Install the silence-boundary callback, fired on every `VadEnd`.
-    pub fn set_vad_end_callback(&mut self, cb: Option<Arc<dyn Fn() + Send + Sync>>) {
-        self.vad_end_callback = cb;
     }
 
     /// Signal the emitter to finish after every queued reducer revision.
@@ -993,22 +973,7 @@ impl EventSink for PresentationEmitter {
                     }
                 }
             }
-            EngineEvent::VadStart { .. } => {
-                if !self
-                    .vad_start_emitted
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-                    && let Some(cb) = &self.vad_start_callback
-                {
-                    cb();
-                }
-            }
-            EngineEvent::VadEnd { .. } => {
-                self.vad_start_emitted
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                if let Some(cb) = &self.vad_end_callback {
-                    cb();
-                }
-            }
+            EngineEvent::VadStart { .. } | EngineEvent::VadEnd { .. } => {}
             EngineEvent::SidebandEvidence { evidence } => {
                 debug!(
                     sequence = evidence.sequence,

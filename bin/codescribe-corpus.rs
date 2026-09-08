@@ -41,14 +41,12 @@ use sha2::{Digest, Sha256};
 
 const REPORT_SCHEMA: &str = CORPUS_REPORT_SCHEMA;
 const AUDIO_EXTENSIONS: [&str; 3] = ["wav", "m4a", "mp3"];
-const CONTROLLED_ENV: [&str; 14] = [
+const CONTROLLED_ENV: [&str; 12] = [
     "CODESCRIBE_STT_ENGINE",
     "CODESCRIBE_LAYERED_TRANSCRIPTION",
     "STT_TAIL_PROVIDER",
     "CODESCRIBE_SILERO_FUSION",
     "CODESCRIBE_SILERO_FUSION_CONTEXT",
-    "CODESCRIBE_SPAN_IDEMPOTENCE",
-    "CODESCRIBE_INLINE_FORMAT",
     "CODESCRIBE_STT_INITIAL_PROMPT_ENABLED",
     "FINAL_PASS_MODE",
     "CODESCRIBE_FINAL_PASS_MODE",
@@ -225,10 +223,6 @@ impl ReplayProfile {
             Self::AppleLayer1FusionStablePrompt => "stable_prompt",
             _ => "utterance_only",
         }
-    }
-
-    const fn idempotence(self) -> bool {
-        matches!(self, Self::AppleLayer1FusionIdempotent)
     }
 
     const fn stop_lane(self) -> ProductionReplayLane {
@@ -976,11 +970,6 @@ fn configure_profile_environment(
             if profile.fusion() { "on" } else { "off" },
         )
         .env("CODESCRIBE_SILERO_FUSION_CONTEXT", profile.fusion_context())
-        .env(
-            "CODESCRIBE_SPAN_IDEMPOTENCE",
-            if profile.idempotence() { "on" } else { "off" },
-        )
-        .env("CODESCRIBE_INLINE_FORMAT", "off")
         .env("CODESCRIBE_STT_INITIAL_PROMPT_ENABLED", "off")
         .env("CODESCRIBE_APPLE_STT_ALLOW_DOWNLOAD", "0")
         .env(
@@ -1449,11 +1438,6 @@ fn validate_worker_environment(profile: ReplayProfile, apple_bridge: &Path) -> R
             "CODESCRIBE_SILERO_FUSION",
             if profile.fusion() { "on" } else { "off" },
         ),
-        (
-            "CODESCRIBE_SPAN_IDEMPOTENCE",
-            if profile.idempotence() { "on" } else { "off" },
-        ),
-        ("CODESCRIBE_INLINE_FORMAT", "off"),
         ("CODESCRIBE_DISABLE_KEYCHAIN", "1"),
         ("CODESCRIBE_APPLE_STT_ALLOW_DOWNLOAD", "0"),
         ("CODESCRIBE_BRIDGE_DISCLAIM", "1"),
