@@ -282,7 +282,7 @@ extension OverlayIntent {
     case .insertPaste: "arrow.down.doc"
     case .retranscribe: "arrow.clockwise"
     case .format: "textformat"
-    case .close: "xmark"
+    case .close: "circle.fill"
     }
   }
   var helpText: String { accessibilityLabel }
