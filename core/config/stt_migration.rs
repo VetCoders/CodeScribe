@@ -2,26 +2,61 @@
 use super::settings::UserSettings;
 use crate::stt::{SttLane, validate_stt_endpoint};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SttV2Legacy {
     pub cloud_transcription_endpoint: Option<String>,
+    file_transcription_endpoint: Option<String>,
+    live_transcription_endpoint: Option<String>,
 }
+
+fn optional_json_str(raw: &serde_json::Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| raw.pointer(pointer))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 impl SttV2Legacy {
     pub fn from_json(raw: &serde_json::Value) -> Self {
         Self {
-            cloud_transcription_endpoint: raw
-                .pointer("/speech/engine/cloud_transcription_endpoint")
-                .or_else(|| raw.pointer("/stt_endpoint"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
+            cloud_transcription_endpoint: optional_json_str(
+                raw,
+                &[
+                    "/speech/engine/cloud_transcription_endpoint",
+                    "/stt_endpoint",
+                ],
+            ),
+            file_transcription_endpoint: optional_json_str(
+                raw,
+                &["/speech/engine/file_transcription_endpoint"],
+            ),
+            live_transcription_endpoint: optional_json_str(
+                raw,
+                &["/speech/engine/live_transcription_endpoint"],
+            ),
         }
     }
     pub(crate) fn from_endpoint(raw: &str) -> Self {
         Self {
             cloud_transcription_endpoint: Some(raw.into()),
+            ..Self::default()
         }
     }
+    /// True only when the legacy URL is still present *and* at least one
+    /// destination lane would be written. Presence of the retired key after
+    /// file/live rows already exist is not a migration: launch repair can
+    /// re-seed `cloud_transcription_endpoint` from the operator pack, and
+    /// treating `is_some()` as the trigger saved the file on every load.
     pub fn needs_migration(&self) -> bool {
-        self.cloud_transcription_endpoint.is_some()
+        let mut probe = UserSettings {
+            stt_file_endpoint: self.file_transcription_endpoint.clone(),
+            stt_live_endpoint: self.live_transcription_endpoint.clone(),
+            ..UserSettings::default()
+        };
+        !migrate_legacy_stt_lanes(self, &mut probe).0.is_empty()
     }
 }
 pub struct SttMigrationStep {
@@ -118,7 +153,10 @@ pub fn migrate_legacy_stt_lanes_once(settings: &mut UserSettings) {
         .unwrap_or(serde_json::Value::Null);
     let legacy = SttV2Legacy::from_json(&raw);
     let (steps, targets) = migrate_legacy_stt_lanes(&legacy, settings);
-    if !legacy.needs_migration() {
+    if steps.is_empty() {
+        // A write here would serialize SettingsV2 (no cloud key) and let the
+        // next load's pack-seed repair put the key back — the 2026-09-08
+        // `Saved settings` / `Migrated legacy STT lanes rows=0` storm.
         return;
     }
     // Copy the retired `STT_API_KEY` into both lanes at the migration moment
@@ -178,6 +216,7 @@ mod tests {
             let mut settings = UserSettings::default();
             let legacy = SttV2Legacy {
                 cloud_transcription_endpoint: Some(raw.into()),
+                ..SttV2Legacy::default()
             };
             migrate_legacy_stt_lanes(&legacy, &mut settings);
             if raw.contains("8446") {
@@ -277,5 +316,208 @@ mod tests {
         );
         assert!(!bundle.contains_key("STT_FILE_API_KEY"));
         assert!(!bundle.contains_key("STT_LIVE_API_KEY"));
+    }
+
+    struct IsolatedSettings {
+        _dir: tempfile::TempDir,
+        previous_data: Option<std::ffi::OsString>,
+        previous_pack: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedSettings {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let previous_data = std::env::var_os("CODESCRIBE_DATA_DIR");
+            let previous_pack = std::env::var_os("CODESCRIBE_VOICE_LAB_SRC");
+            // SAFETY: serial tests; Drop restores both variables.
+            unsafe {
+                std::env::set_var("CODESCRIBE_DATA_DIR", dir.path());
+                std::env::remove_var("CODESCRIBE_VOICE_LAB_SRC");
+            }
+            std::fs::create_dir_all(UserSettings::settings_dir()).unwrap();
+            Self {
+                _dir: dir,
+                previous_data,
+                previous_pack,
+            }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            UserSettings::settings_path()
+        }
+    }
+
+    impl Drop for IsolatedSettings {
+        fn drop(&mut self) {
+            // SAFETY: same serialized environment scope as `new`.
+            unsafe {
+                match &self.previous_data {
+                    Some(value) => std::env::set_var("CODESCRIBE_DATA_DIR", value),
+                    None => std::env::remove_var("CODESCRIBE_DATA_DIR"),
+                }
+                match &self.previous_pack {
+                    Some(value) => std::env::set_var("CODESCRIBE_VOICE_LAB_SRC", value),
+                    None => std::env::remove_var("CODESCRIBE_VOICE_LAB_SRC"),
+                }
+            }
+        }
+    }
+
+    /// The 2026-09-08 storm shape: W2 lanes already populated, retired key still
+    /// on disk (repair re-seeds it). A load must not rewrite the file.
+    fn storm_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 3,
+            "speech": {
+                "engine": {
+                    "cloud_transcription_endpoint": FOUNDER,
+                    "file_transcription_endpoint": "https://api.libraxis.cloud/v1/audio/transcriptions",
+                    "live_transcription_endpoint": FOUNDER
+                }
+            }
+        })
+    }
+
+    fn with_save_log_count<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::field::{Field, Visit};
+
+        struct Counter(Arc<AtomicUsize>);
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_owned();
+                }
+            }
+        }
+        impl tracing::Subscriber for Counter {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                if message.0.contains("Saved settings") {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = Counter(count.clone());
+        let result = tracing::subscriber::with_default(subscriber, f);
+        (result, count.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn empty_legacy_key_does_not_need_migration() {
+        let blank = SttV2Legacy::from_json(&serde_json::json!({
+            "speech": {"engine": {"cloud_transcription_endpoint": ""}}
+        }));
+        assert!(!blank.needs_migration());
+        let already = SttV2Legacy::from_json(&storm_settings_json());
+        assert!(
+            !already.needs_migration(),
+            "legacy present AND targets present is already migrated"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn migrate_legacy_stt_lanes_once_with_empty_steps_performs_no_write() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        std::fs::write(&path, storm_settings_json().to_string()).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+        let mut settings = UserSettings {
+            stt_file_endpoint: Some("https://api.libraxis.cloud/v1/audio/transcriptions".into()),
+            stt_live_endpoint: Some(FOUNDER.into()),
+            ..UserSettings::default()
+        };
+        let (_, saves) = with_save_log_count(|| migrate_legacy_stt_lanes_once(&mut settings));
+        assert_eq!(saves, 0);
+        assert_eq!(bytes_before, std::fs::read(&path).unwrap());
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_of_legacy_key_with_targets_is_pure_on_second_pass() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        std::fs::write(&path, storm_settings_json().to_string()).unwrap();
+        let (first, first_saves) = with_save_log_count(UserSettings::load);
+        let bytes_after_first = std::fs::read(&path).unwrap();
+        let mtime_after_first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            !SttV2Legacy::from_json(&serde_json::from_slice(&bytes_after_first).unwrap())
+                .needs_migration()
+        );
+        assert_eq!(first.stt_live_endpoint.as_deref(), Some(FOUNDER));
+        let (second, second_saves) = with_save_log_count(UserSettings::load);
+        assert_eq!(first, second);
+        assert_eq!(second_saves, 0, "second load must not emit Saved settings");
+        assert_eq!(bytes_after_first, std::fs::read(&path).unwrap());
+        assert_eq!(
+            mtime_after_first,
+            std::fs::metadata(&path).unwrap().modified().unwrap()
+        );
+        assert_eq!(
+            first_saves, 0,
+            "targets already present: first load must not save either"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_snapshot_load_loop_is_read_only_and_survives_unreadable_file() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        std::fs::write(&path, storm_settings_json().to_string()).unwrap();
+        let _ = crate::config::Config::load_runtime_snapshot();
+        let bytes = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        for _ in 0..50 {
+            let snapshot = crate::config::Config::load_runtime_snapshot();
+            assert!(snapshot.is_ok());
+        }
+        assert_eq!(bytes, std::fs::read(&path).unwrap());
+        assert_eq!(mtime, std::fs::metadata(&path).unwrap().modified().unwrap());
+
+        let mode = std::fs::metadata(&path).unwrap().permissions();
+        let mut locked = mode.clone();
+        locked.set_readonly(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            locked.set_mode(0o000);
+        }
+        std::fs::set_permissions(&path, locked).unwrap();
+        let result = std::panic::catch_unwind(|| {
+            for _ in 0..50 {
+                let _ = crate::config::Config::load_runtime_snapshot();
+            }
+        });
+        std::fs::set_permissions(&path, mode).unwrap();
+        assert!(
+            result.is_ok(),
+            "unreadable settings must not panic the loader"
+        );
     }
 }
