@@ -483,12 +483,6 @@ impl StreamingRecorder {
         Ok((transcript, audio_path))
     }
 
-    /// Legacy alias for [`Self::stop_and_discard_path`].
-    #[deprecated(note = "use stop_and_discard_path instead")]
-    pub async fn stop_without_saving(&mut self) -> Result<String> {
-        self.stop_and_discard_path().await
-    }
-
     /// Stop the session and return only the transcript.
     ///
     /// Same ordered shutdown as [`Self::stop`], but the WAV path is dropped.

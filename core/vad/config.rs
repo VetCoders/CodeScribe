@@ -72,22 +72,9 @@ impl Default for VadConfig {
 }
 
 impl VadConfig {
-    /// Create config with custom threshold
-    pub fn with_threshold(threshold: f32) -> Self {
-        Self {
-            threshold,
-            ..Default::default()
-        }
-    }
-
     /// Get min speech duration in milliseconds (for Silero API)
     pub fn min_speech_ms(&self) -> u64 {
         (self.min_speech_duration_sec * 1000.0) as u64
-    }
-
-    /// Get max silence duration in milliseconds (for Silero API)
-    pub fn max_silence_ms(&self) -> u64 {
-        (self.max_silence_duration_sec * 1000.0) as u64
     }
 
     /// More sensitive detection (catches quiet speech, more false positives)

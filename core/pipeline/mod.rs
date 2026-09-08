@@ -1,6 +1,6 @@
 //! Transcription pipeline: the event contracts every stage speaks, the sinks
-//! that fan those events out to consumers, overlap dedup, streaming session
-//! management, and the post-processing passes applied to emitted text.
+//! that fan those events out to consumers, the acoustic ledger that records
+//! occurrence identity, highlight spans, and streaming session management.
 
 /// Acoustic occurrence identity, observation identity, and mutation receipts.
 pub mod acoustic_ledger;

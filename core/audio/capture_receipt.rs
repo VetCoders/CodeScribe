@@ -168,14 +168,6 @@ pub fn last_open_capture_path() -> Option<CapturePathMeta> {
         .clone()
 }
 
-/// Last finalized capture receipt in this process, if any.
-pub fn last_capture_level_receipt() -> Option<CaptureLevelReceipt> {
-    last_receipt_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-}
-
 fn remember_last(receipt: &CaptureLevelReceipt) {
     *last_receipt_slot()
         .lock()

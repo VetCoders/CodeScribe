@@ -144,11 +144,6 @@ impl Layer1Decision {
         )
     }
 
-    /// Whether the generic provider fan-out lane (Cloud) is armed.
-    pub fn is_provider_armed(&self) -> bool {
-        matches!(self, Self::Armed(_))
-    }
-
     /// Recording-start local tail-patch disposition, when local power was the
     /// selected product mode.
     pub fn local_tail_patch_disposition(&self) -> Option<LocalTailPatchDisposition> {

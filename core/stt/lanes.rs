@@ -46,9 +46,6 @@ impl SttLane {
             Self::Live => "wss://…/v1/audio/transcribe",
         }
     }
-    pub fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|lane| lane.id() == id)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

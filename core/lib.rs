@@ -72,8 +72,8 @@ pub mod llm;
 pub mod mcp;
 /// Process memory hygiene after heavy STT/TTS work returns buffers.
 pub mod memory;
-/// Transcription pipeline: engine contracts, streaming, dedup, post-processing,
-/// and event sinks.
+/// Transcription pipeline: engine contracts, streaming, the acoustic ledger,
+/// highlight spans, and event sinks.
 pub mod pipeline;
 /// Transcript quality: overlay scoring, the qube daemon and its report, and the
 /// teacher merge between live and Whisper text.

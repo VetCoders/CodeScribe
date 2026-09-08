@@ -857,18 +857,6 @@ impl Recorder {
             duration_sec,
         }))
     }
-
-    /// Current sample count in the buffer.
-    ///
-    /// Use as `from_offset` for the next `snapshot_wav` call when you want to
-    /// start a fresh segment without saving anything yet. Returns 0 on poisoned
-    /// lock (recoverable).
-    pub fn current_sample_offset(&self) -> usize {
-        let buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
-        self.buffer_start_offset
-            .load(Ordering::SeqCst)
-            .saturating_add(buf.len())
-    }
 }
 
 impl Default for Recorder {

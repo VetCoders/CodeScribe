@@ -178,25 +178,6 @@ fn get_client() -> &'static Client {
     })
 }
 
-/// Check if local Whisper engine is ready.
-///
-/// Returns:
-/// - `Ok(true)` if the engine is initialized (or initializes successfully)
-/// - `Ok(false)` if initialization fails
-pub async fn check_health() -> Result<bool> {
-    if crate::stt::whisper::singleton::is_initialized() {
-        return Ok(true);
-    }
-
-    match crate::stt::whisper::init() {
-        Ok(()) => Ok(true),
-        Err(e) => {
-            warn!("Whisper engine not ready: {}", e);
-            Ok(false)
-        }
-    }
-}
-
 /// Transcribe audio file using external STT with retry logic
 ///
 /// # Arguments

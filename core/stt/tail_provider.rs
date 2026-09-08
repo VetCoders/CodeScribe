@@ -20,7 +20,7 @@ use reqwest::blocking::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::{Message, accept, client};
 
-use crate::pipeline::contracts::{RawTranscript, TranscriptSegment};
+use crate::pipeline::contracts::RawTranscript;
 
 /// Environment key selecting the tail-patch provider.
 pub const STT_TAIL_PROVIDER_ENV: &str = "STT_TAIL_PROVIDER";
@@ -152,13 +152,6 @@ impl TailSampleRange {
             && self.capture_epoch == other.capture_epoch
             && self.sample_start < other.sample_end
             && other.sample_start < self.sample_end
-    }
-
-    /// Same epoch, no shared samples. Identical lexical text is still two observations.
-    pub fn is_disjoint(&self, other: &Self) -> bool {
-        self.session == other.session
-            && self.capture_epoch == other.capture_epoch
-            && !self.overlaps(other)
     }
 }
 
@@ -305,30 +298,6 @@ impl TailProviderPayload {
             bail!("tail provider confidence disagrees with typed evidence");
         }
         Ok(())
-    }
-
-    /// Adapter back to the legacy seconds-based pipeline contract.
-    pub fn into_raw_transcript(self, sample_rate: u32) -> Result<RawTranscript> {
-        if sample_rate == 0 {
-            bail!("tail provider sample_rate must be non-zero");
-        }
-        self.validate()?;
-        let request_start = self.identity.range.sample_start;
-        let rate = sample_rate as f64;
-        Ok(RawTranscript {
-            text: self.text,
-            segments: self
-                .segments
-                .into_iter()
-                .map(|segment| TranscriptSegment {
-                    text: segment.text,
-                    start_ts: ((segment.range.sample_start - request_start) as f64 / rate) as f32,
-                    end_ts: ((segment.range.sample_end - request_start) as f64 / rate) as f32,
-                })
-                .collect(),
-            avg_logprob: self.avg_logprob,
-            compression_ratio: self.compression_ratio,
-        })
     }
 }
 

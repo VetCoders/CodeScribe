@@ -252,10 +252,6 @@ pub fn is_clock_lie(chars: usize, duration_secs: f32) -> bool {
 /// Grapheme ticks inside a word range are an even split, never a measurement.
 pub const LETTER_TIMING: &str = "interpolation_not_measurement";
 
-/// Directory Voice Lab scans. Corpus atlas HTML must land here (or under
-/// `$CODESCRIBE_ARTIFACTS_DIR`) or the operator never sees it.
-pub const VOICE_LAB_ARTIFACTS_ROOT: &str = "~/.vibecrafted/artifacts/vetcoders/codescribe";
-
 /// How Voice Lab labels a discovered HTML. Mirrors `discover_quality_reports`
 /// in voice-lab `server.py` — change both or the catalog lies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

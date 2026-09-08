@@ -59,19 +59,6 @@ impl WorkMode {
     pub fn is_assistive(&self) -> bool {
         matches!(self, Self::Assistive)
     }
-
-    /// Whether the mode pastes by default. Assistive sends to the agent, so it
-    /// never auto-pastes; the user preference and controller-owned vetoes still
-    /// apply on top of this (see [`Config::auto_paste_enabled`]).
-    pub fn defaults_to_auto_paste(&self) -> bool {
-        !self.is_assistive()
-    }
-
-    /// Whether the mode requires an LLM round-trip regardless of the global AI
-    /// formatting switch: formatting rewrites the text, assistive answers it.
-    pub fn forces_ai(&self) -> bool {
-        matches!(self, Self::Formatting | Self::Assistive)
-    }
 }
 
 impl FromStr for WorkMode {

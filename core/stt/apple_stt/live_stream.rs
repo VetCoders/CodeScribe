@@ -205,11 +205,6 @@ impl LiveStreamSession {
         out
     }
 
-    /// Blocking wait for at least one event (or timeout).
-    pub fn recv_event_timeout(&mut self, timeout: Duration) -> Option<LiveStreamEvent> {
-        self.events_rx.recv_timeout(timeout).ok()
-    }
-
     /// Close stdin (EOF), wait for reader + child, return remaining events incl. summary.
     pub fn finish(mut self) -> Result<Vec<LiveStreamEvent>> {
         // EOF ends the stream session on the bridge side.
