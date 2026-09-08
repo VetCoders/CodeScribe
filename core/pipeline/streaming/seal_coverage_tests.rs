@@ -120,3 +120,36 @@ fn recovery_new_gap_formatter_work_prevents_terminal_seal() {
             .is_err()
     );
 }
+
+#[test]
+fn recovery_closed_occurrence_submits_owned_tail_job() {
+    let mut state = state();
+    state.audio.push(&vec![0.25; 32_000]);
+    let mut fusion = SileroIngress::new(16_000, state.session_id.clone(), 1);
+    fusion
+        .ledger_mut()
+        .open_or_extend(&state.session_id, 1, 0, 32_000);
+    fusion.ledger_mut().close_open(32_000);
+    state.fusion = Some(fusion);
+    state.fusion_seal_armed = true;
+    let (tail, mut jobs) = mpsc::channel(TAIL_PATCH_QUEUE_CAP);
+    state.tail_patch = Some(tail);
+    let (tx, _) = mpsc::unbounded_channel();
+    assert!(seal_sliced_by_silero(
+        &mut state,
+        &tx,
+        &[TranscriptSegment {
+            text: "Iwo".into(),
+            start_ts: 0.1,
+            end_ts: 1.8,
+        }]
+    ));
+    state.flush_layer1_coalesce(&tx);
+    let job = jobs
+        .try_recv()
+        .expect("armed local lane must submit real PCM work");
+    assert_eq!(job.audio.len(), 32_000);
+    assert_eq!(job.provider_request.identity.range.sample_start, 0);
+    assert_eq!(job.provider_request.identity.range.sample_end, 32_000);
+    assert_eq!(state.tail_patch_awaiting_completion, 1);
+}

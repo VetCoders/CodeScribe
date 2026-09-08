@@ -962,6 +962,8 @@ struct AppleSealState {
     /// back to Apple's own segment boundaries.
     fusion_seal_armed: bool,
     fusion_context: FusionContextMode,
+    pending_silero_words: BTreeMap<u64, Vec<FusionWord>>,
+    reconciled_silero: BTreeSet<u64>,
     /// Shared one-throne ledger.
     acoustic_ledger: Arc<Mutex<AcousticLedger>>,
     /// Measured threshold frozen into the same settings snapshot. Absence is a
@@ -1009,6 +1011,8 @@ impl AppleSealState {
             fusion: None,
             fusion_seal_armed: false,
             fusion_context: FusionContextMode::UtteranceOnly,
+            pending_silero_words: BTreeMap::new(),
+            reconciled_silero: BTreeSet::new(),
             acoustic_ledger: Arc::new(Mutex::new(AcousticLedger::new())),
             energy_calibration: None,
         }
@@ -1887,7 +1891,7 @@ fn seal_sliced_by_silero(
     let apple_words = apple_segments_on_pcm_clock(state, disjoint);
     let fusion_words: Vec<FusionWord> = apple_words.iter().map(FusionWord::from_timed).collect();
     let (sliced, leftover) = slice_apple_words(&ledger, &fusion_words);
-    if sliced.is_empty() {
+    if sliced.is_empty() && state.pending_silero_words.is_empty() {
         if !leftover.is_empty() {
             let _ = ev_tx.send(EngineEvent::Warning {
                 code: SkipReasonCode::NoTimeOverlap.as_str().to_string(),
@@ -1915,15 +1919,44 @@ fn seal_sliced_by_silero(
     let long_silence = (super::silero_fusion::LONG_SILENCE_FENCE_SECS * rate).round() as u64;
     let context = state.fusion_context;
 
-    for (utterance_id, words) in sliced {
-        let Some(silero) = ledger
-            .utterances()
-            .iter()
-            .find(|utterance| utterance.id == utterance_id)
-            .cloned()
-        else {
+    // Candidate labels remain paint until the physical extent closes. Retain
+    // every observation until reconciliation; equality of text is irrelevant.
+    for (id, words) in sliced {
+        if !state.reconciled_silero.contains(&id) {
+            state
+                .pending_silero_words
+                .entry(id)
+                .or_default()
+                .extend(words);
+        }
+    }
+    for silero in ledger
+        .utterances()
+        .iter()
+        .filter(|utterance| utterance.closed)
+    {
+        let utterance_id = silero.id;
+        let Some(candidates) = state.pending_silero_words.remove(&utterance_id) else {
             continue;
         };
+        // Replayed exact word coordinates revise that word, not a second
+        // acoustic occurrence. Disjoint equal words survive independently.
+        let mut by_range = BTreeMap::new();
+        for word in candidates {
+            by_range.insert((word.sample_start, word.sample_end), word);
+        }
+        let words = by_range.into_values().collect::<Vec<_>>();
+        if words
+            .windows(2)
+            .any(|pair| pair[0].sample_end > pair[1].sample_start)
+        {
+            let _ = ev_tx.send(EngineEvent::Warning {
+                code: "apple_closed_occurrence_ambiguous_word_ranges".into(),
+                message: format!("utterance={utterance_id} requires fresh exact-PCM evidence"),
+            });
+            continue;
+        }
+        state.reconciled_silero.insert(utterance_id);
         let text = words
             .iter()
             .map(|word| word.text.as_str())
@@ -2563,6 +2596,7 @@ fn seal_utterance_final(
             fusion
                 .ledger()
                 .utterance_enclosing(span_sample_start, span_sample_end)
+                .filter(|utterance| utterance.closed)
         }) {
         Some(utterance) => (utterance.range.clone(), true),
         None => (apple_range, false),
@@ -3063,6 +3097,9 @@ fn apple_stream_worker(
                         });
                     }
                 }
+                if state.fusion_seal_armed {
+                    seal_sliced_by_silero(&mut state, &ev_tx, &[]);
+                }
                 let speech_live = silero_ingest.is_some_and(|ingest| ingest.speech_live);
                 let audio_secs = samples_seen as f32 / sample_rate.max(1) as f32;
                 match epoch.feed_pcm(&samples, samples_seen, speech_live) {
@@ -3153,6 +3190,10 @@ fn apple_stream_worker(
             epoch_base_secs(epoch_base_samples, sample_rate),
         );
         emit_stream_events(trailing, &ev_tx, &mut state, audio_secs);
+    }
+
+    if state.fusion_seal_armed {
+        seal_sliced_by_silero(&mut state, &ev_tx, &[]);
     }
 
     // Seal open partial that never got a phrase final (stop mid-phrase).
