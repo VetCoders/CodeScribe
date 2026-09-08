@@ -1724,7 +1724,7 @@ final class OverlayStateTests: XCTestCase {
     let splitPath = overlayDir.appendingPathComponent("OverlaySplitPrimaryAction.swift").path
 
     XCTAssertFalse(FileManager.default.fileExists(atPath: splitPath))
-    XCTAssertFalse(overlaySource.contains("overlay-auto-paste"))
+    XCTAssertTrue(overlaySource.contains("overlay-auto-paste"))
     XCTAssertTrue(overlaySource.contains("OverlayPlacementMenu"))
     XCTAssertFalse(overlaySource.contains("private var placementMenu"))
     XCTAssertFalse(overlaySource.contains("performPrimaryAction"))

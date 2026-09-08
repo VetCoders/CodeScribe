@@ -33,11 +33,8 @@ struct OverlayIntentRail: View {
   let footerNotice: String?
   let footerEngineDot: Color
   let formatLevel: FormattingPolicyOption
-  let autoPasteEnabled: Bool
-  let autoPasteAvailable: Bool
   let onIntent: (OverlayIntent) -> Void
   let onFormatLevel: (FormattingPolicyOption) -> Void
-  let onAutoPasteToggle: () -> Void
 
   init(
     phase: String,
@@ -47,11 +44,8 @@ struct OverlayIntentRail: View {
     footerNotice: String? = nil,
     footerEngineDot: Color = .clear,
     formatLevel: FormattingPolicyOption = .correction,
-    autoPasteEnabled: Bool = true,
-    autoPasteAvailable: Bool = true,
     onIntent: @escaping (OverlayIntent) -> Void,
     onFormatLevel: @escaping (FormattingPolicyOption) -> Void = { _ in },
-    onAutoPasteToggle: @escaping () -> Void = {},
     onFocusChange: @escaping (Bool) -> Void = { _ in }
   ) {
     self.onFocusChange = onFocusChange
@@ -62,11 +56,8 @@ struct OverlayIntentRail: View {
     self.footerNotice = footerNotice
     self.footerEngineDot = footerEngineDot
     self.formatLevel = formatLevel
-    self.autoPasteEnabled = autoPasteEnabled
-    self.autoPasteAvailable = autoPasteAvailable
     self.onIntent = onIntent
     self.onFormatLevel = onFormatLevel
-    self.onAutoPasteToggle = onAutoPasteToggle
   }
 
   var body: some View {
@@ -78,8 +69,6 @@ struct OverlayIntentRail: View {
       .padding(.horizontal, 8)
       .background(.regularMaterial, in: Capsule())
       HStack(spacing: 4) {
-        autoPasteButton
-          .focused($focusedControl, equals: "auto-paste")
         formatLevelButton
           .focused($focusedControl, equals: "format-level")
         ForEach(intents, id: \.self) { intent in
@@ -125,7 +114,7 @@ struct OverlayIntentRail: View {
     .csMono(10, .medium)
     .layoutPriority(-1)
     .allowsHitTesting(false)
-    .accessibilityElement(children: .combine)
+    .accessibilityElement(children: .contain)
     .accessibilityIdentifier("overlay-footer-engine")
   }
 
@@ -165,40 +154,6 @@ struct OverlayIntentRail: View {
     .accessibilityValue(formatLevel.visibleName)
     .accessibilityHint("Cycles the automatic formatting level")
     .accessibilityIdentifier("overlay-format-level")
-  }
-
-  private var autoPasteButton: some View {
-    Button(action: onAutoPasteToggle) {
-      HStack(spacing: 3) {
-        Image(systemName: autoPasteEnabled ? "doc.on.clipboard.fill" : "doc.on.clipboard")
-          .font(.system(size: 10, weight: .semibold))
-        Text(autoPasteEnabled ? "Paste" : "Off")
-          .csMono(10, .semibold)
-      }
-      .foregroundStyle(
-        autoPasteEnabled ? palette.primaryText.color : palette.mutedText.color
-      )
-      .lineLimit(1)
-      .padding(.horizontal, CSSpace.xs)
-      .frame(height: 24)
-      .contentShape(Capsule())
-    }
-    .buttonStyle(.plain)
-    .background {
-      Capsule().strokeBorder(
-        autoPasteEnabled ? palette.primaryText.color.opacity(0.35) : palette.border.color,
-        lineWidth: 1
-      )
-    }
-    .disabled(!autoPasteAvailable)
-    .help(
-      autoPasteEnabled
-        ? "Auto-paste: On. Click to disable."
-        : "Auto-paste: Off. Click to enable."
-    )
-    .accessibilityLabel("Auto-paste toggle")
-    .accessibilityValue(autoPasteEnabled ? "On" : "Off")
-    .accessibilityIdentifier("overlay-auto-paste-toggle")
   }
 
   static func projectedIntents(for state: OverlayState) -> [OverlayIntent] {

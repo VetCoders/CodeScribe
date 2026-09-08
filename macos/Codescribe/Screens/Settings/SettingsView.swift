@@ -48,7 +48,6 @@ struct SettingsView: View {
       }
     }
     .csFocusPolicy()
-    .developerPowerCorner(padding: 12)
     .frame(minWidth: 880, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
     .background(SettingsWindowCapabilities())
     // The panels still paint hand-picked dark tokens, so the window stays

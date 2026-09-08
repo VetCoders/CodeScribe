@@ -688,16 +688,38 @@ final class OverlayState {
         "The previous recording is no longer available", notice: "no recording")
       return
     }
+    let settings = CodescribeConfig().loadSettings()
+    let asrMode = (settings.asrMode ?? "apple_only").lowercased()
+    let prefix = asrMode == "cloud" ? "cloud:" : "hq:"
+    let prefixedPath = "\(prefix)\(path)"
+
+    cancelAutoHide()
     showFooterNotice("retranscribing…", persists: true)
-    Task { @MainActor in
+    Task { @MainActor [weak self] in
+      guard let self else { return }
       do {
-        // The file pass proves the product FFI route. Its returned candidate
-        // deliberately does not overwrite reducer-owned transcript truth.
-        _ = try await engine.transcribeFile(path: path)
+        let result = try await engine.transcribeFile(path: prefixedPath)
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+          if let projection = self.latestTranscriptProjection {
+            _ = try? await engine.commitUserRevision(
+              sessionId: projection.sessionId,
+              sourceRevision: projection.reducerRevision,
+              renderedText: text
+            )
+          } else {
+            self.revisionDraft = text
+          }
+          if self.mode == .noSpeech {
+            self.mode = .formatted
+          }
+        }
         self.showFooterNotice("retranscribed")
+        self.restartAutoHideCountdown()
       } catch {
         self.presentActionFailure(
           "Couldn't retranscribe recording: \(error)", notice: "retranscribe failed")
+        self.restartAutoHideCountdown()
       }
     }
   }

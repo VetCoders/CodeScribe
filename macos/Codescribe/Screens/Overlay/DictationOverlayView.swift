@@ -44,11 +44,8 @@ struct DictationOverlayView: View {
           footerNotice: state.toast,
           footerEngineDot: footerEngineDot,
           formatLevel: state.autoFormatLevel,
-          autoPasteEnabled: state.autoPasteEnabled,
-          autoPasteAvailable: state.autoPasteControlAvailable,
           onIntent: state.relayIntent,
           onFormatLevel: { state.setAutoFormatLevel($0) },
-          onAutoPasteToggle: { state.setAutoPasteEnabled(!state.autoPasteEnabled) },
           onFocusChange: { actionsFocused = $0 }
         )
       )
@@ -65,7 +62,6 @@ struct DictationOverlayView: View {
     // already falls outside the borderless window (never rendered), so this
     // clip costs nothing visually.
     .clipShape(RoundedRectangle(cornerRadius: CSRadius.window, style: .continuous))
-    .developerPowerCorner(padding: 10)
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.toast)
     .onHover { inside in
       pointerInside = inside
@@ -155,7 +151,7 @@ struct DictationOverlayView: View {
           state.relayIntent(.close)
         } label: {
           ModeDot(color: palette.statusToken(for: state.mode).color, size: 7)
-            .contentShape(Circle().inset(by: -6))
+            .contentShape(Circle().inset(by: -3))
         }
         .buttonStyle(.plain)
         .help(OverlayIntent.close.helpText)
@@ -166,6 +162,7 @@ struct DictationOverlayView: View {
           .font(CSFont.ui(compact ? 12 : 15, .bold))
           .tracking(-0.3)
           .foregroundStyle(palette.primaryText.color)
+          .allowsHitTesting(false)
       }
       .fixedSize()
       .accessibilityElement(children: .contain)
@@ -181,6 +178,7 @@ struct DictationOverlayView: View {
         .accessibilityIdentifier("overlay-header-center")
 
       HStack(spacing: compact ? 4 : 8) {
+        autoPasteControl
         sessionTimer
           .allowsHitTesting(false)
         OverlayPlacementMenu(state: state, palette: palette)
@@ -191,23 +189,31 @@ struct DictationOverlayView: View {
     }
   }
 
-  @ViewBuilder
-  private func phaseStatus(text: String) -> some View {
-    // One phase pill only — do not also paint RECORDING/tag/meta rows. Swap the
-    // whole view type on live vs idle so repeatForever tears down after capture.
-    if state.statusRippling {
-      StatusPill(text: text, color: palette.statusToken(for: state.mode).color, rippling: true)
-        .fixedSize(horizontal: true, vertical: false)
-        .allowsHitTesting(false)
-        .accessibilityLabel(state.statusText)
-        .accessibilityIdentifier("overlay-phase-status")
-    } else {
-      StaticStatusPill(text: text, color: palette.statusToken(for: state.mode).color)
-        .fixedSize(horizontal: true, vertical: false)
-        .allowsHitTesting(false)
-        .accessibilityLabel(state.statusText)
-        .accessibilityIdentifier("overlay-phase-status")
+  /// Compact header auto-paste control: discrete icon + indicator dot.
+  private var autoPasteControl: some View {
+    Button {
+      state.setAutoPasteEnabled(!state.autoPasteEnabled)
+    } label: {
+      HStack(spacing: 4) {
+        Image(systemName: state.autoPasteEnabled ? "doc.on.clipboard.fill" : "doc.on.clipboard")
+          .font(.system(size: 10, weight: .semibold))
+        Circle()
+          .fill(state.autoPasteEnabled ? CSColor.oliveLight : CSColor.textFaint)
+          .frame(width: 5, height: 5)
+      }
+      .foregroundStyle(palette.mutedText.color)
+      .padding(.horizontal, 6)
+      .padding(.vertical, 4)
+      .background(CSColor.surfaceRaised(0.04))
+      .overlay(Capsule().strokeBorder(palette.border.color, lineWidth: 1))
+      .clipShape(Capsule())
     }
+    .buttonStyle(.plain)
+    .disabled(!state.autoPasteControlAvailable)
+    .help("Auto-paste: \(state.autoPasteEnabled ? "On" : "Off")")
+    .accessibilityLabel("Auto-paste toggle")
+    .accessibilityValue(state.autoPasteEnabled ? "On" : "Off")
+    .accessibilityIdentifier("overlay-auto-paste")
   }
 
   /// Audio-evidence strip in the primary bar. Amplitude/VAD only — word/PCM

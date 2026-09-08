@@ -263,7 +263,7 @@ final class OverlayIntentRailTests: XCTestCase {
     state.relayIntent(.retranscribe)
 
     await fulfillment(of: [reached], timeout: 0.2)
-    XCTAssertEqual(engine.receivedTranscribePath, "/tmp/overlay-intent-boundary.wav")
+    XCTAssertEqual(engine.receivedTranscribePath, "hq:/tmp/overlay-intent-boundary.wav")
     XCTAssertEqual(state.toast, "retranscribed")
   }
 

@@ -94,7 +94,7 @@ final class OverlayResizeHitTests: XCTestCase {
       ("after-brand", 150),
       ("center-waveform", root.bounds.midX),
       ("before-timer", root.bounds.maxX - 150),
-      ("between-timer-and-menu", root.bounds.maxX - 75),
+      ("between-waveform-and-controls", root.bounds.maxX - 110),
     ]
     for (region, x) in probes {
       let point = NSPoint(x: x, y: y)
