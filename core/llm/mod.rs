@@ -21,3 +21,6 @@ pub mod provider;
 pub mod responses_streaming_manager;
 /// Vendor wire specifications (one self-contained module per pinned vendor).
 pub mod vendors;
+
+/// Vendor speech synthesis, credentials and cancellable playback (independent of CSM).
+pub mod speech;
