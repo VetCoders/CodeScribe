@@ -130,8 +130,15 @@ struct DictationOverlayView: View {
     .frame(maxWidth: .infinity, alignment: .leading)
     .padding(.horizontal, 16)
     .padding(.vertical, 10)
-    .modifier(OverlayHeaderChrome(palette: palette))
+    // Drag region BETWEEN the content and the chrome. `OverlayHeaderChrome` is
+    // `glassEffect` on macOS 26, and a glass surface is hit-testable: with the
+    // region attached after the modifier it sat under the glass, so every
+    // header point outside the brand block answered `NSHostingView` and the
+    // window's drag intercept never fired (Founder, build 849: "header chrome
+    // overlaya nadal nie oferuje drag area"). Falsifier:
+    // OverlayResizeHitTests.testHeaderIsAWindowDragHandleAcrossItsWidth.
     .background { OverlayWindowDragRegion(identifier: "overlay-header-drag-region") }
+    .modifier(OverlayHeaderChrome(palette: palette))
   }
 
   private var fullHeader: some View { justifiedHeader(compact: false) }

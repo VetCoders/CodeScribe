@@ -64,6 +64,50 @@ final class OverlayResizeHitTests: XCTestCase {
     )
   }
 
+  /// Founder 2026-09-08 (build 849, chrome v3): "header chrome overlaya nadal nie
+  /// oferuje drag area". The header is justified edge to edge now, so the old
+  /// x=28 probe only proves the brand block. Every non-control point across the
+  /// header width must be a window drag handle.
+  @MainActor
+  func testHeaderIsAWindowDragHandleAcrossItsWidth() throws {
+    let state = OverlayState.previewListening()
+    let panel = try XCTUnwrap(
+      DictationOverlayWindow.make(
+        state: state,
+        textScale: TextScaleController(key: "OverlayResizeHitTests.headerWidth.textScale")
+      ) as? FloatingOverlayPanel
+    )
+    defer {
+      panel.orderOut(nil)
+      panel.invalidatePresence()
+    }
+    panel.setContentSize(NSSize(width: 470, height: 280))
+    panel.orderFrontRegardless()
+    let root = try XCTUnwrap(panel.contentView)
+    root.layoutSubtreeIfNeeded()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    root.layoutSubtreeIfNeeded()
+
+    let y = root.bounds.maxY - 22
+    let probes: [(String, CGFloat)] = [
+      ("brand", 28),
+      ("after-brand", 150),
+      ("center-waveform", root.bounds.midX),
+      ("before-timer", root.bounds.maxX - 150),
+      ("between-timer-and-menu", root.bounds.maxX - 75),
+    ]
+    for (region, x) in probes {
+      let point = NSPoint(x: x, y: y)
+      let hit = try XCTUnwrap(root.hitTest(point))
+      let chain = hitChain(from: hit)
+      print("CHROME_V3_HEADER_DRAG region=\(region) x=\(x) dragHit=\(panel.isWindowDragHit(at: point)) chain=\(chain)")
+      XCTAssertTrue(
+        panel.isWindowDragHit(at: point),
+        "header \(region) at x=\(x) is not a window drag handle: \(chain)"
+      )
+    }
+  }
+
   @MainActor
   func testRealOverlayHierarchyRoutesDragControlsAndTranscriptIndependently() throws {
     let state = OverlayState.previewListening()
