@@ -189,23 +189,17 @@ impl AgentProvider for AnthropicProvider {
             !api_key.trim().is_empty(),
             "Anthropic API key (assistive) is required. Set LLM_ANTHROPIC_API_KEY."
         );
-        let anthropic_version = self.anthropic_version.clone();
-        let initial_response_timeout = self.initial_response_timeout;
-        let inter_chunk_timeout = self.inter_chunk_timeout;
+        let transport = AnthropicStreamTransport {
+            client,
+            endpoint,
+            api_key,
+            anthropic_version: self.anthropic_version.clone(),
+            initial_response_timeout: self.initial_response_timeout,
+            inter_chunk_timeout: self.inter_chunk_timeout,
+        };
 
         tokio::spawn(async move {
-            if let Err(error) = run_anthropic_stream(
-                client,
-                endpoint,
-                api_key,
-                anthropic_version,
-                initial_response_timeout,
-                inter_chunk_timeout,
-                body,
-                tx.clone(),
-            )
-            .await
-            {
+            if let Err(error) = run_anthropic_stream(transport, body, tx.clone()).await {
                 let _ = tx.send(AgentEvent::Error(error.to_string())).await;
             }
         });
@@ -517,6 +511,20 @@ fn role_str(role: Role) -> &'static str {
 
 // allow(too_many_arguments): task entry point for one Anthropic SSE stream; all
 // values are owned moves into the spawned task.
+/// Everything one spawned Anthropic SSE turn owns about its transport.
+///
+/// Bundled because the task entry point took eight positional arguments; the
+/// six transport values always travel together and are moved into the task as
+/// a unit, so a struct is the honest shape.
+struct AnthropicStreamTransport {
+    client: Client,
+    endpoint: String,
+    api_key: String,
+    anthropic_version: String,
+    initial_response_timeout: Duration,
+    inter_chunk_timeout: Duration,
+}
+
 /// Drive one Messages SSE stream, emitting [`AgentEvent`]s onto `tx`.
 ///
 /// Reads the byte stream line by line, keying off each `data:` payload's own
@@ -531,17 +539,19 @@ fn role_str(role: Role) -> &'static str {
 /// # Errors
 /// Returns an error for an invalid endpoint, a failed or non-2xx request, a
 /// read failure, or any of the three timeouts firing.
-#[allow(clippy::too_many_arguments)]
 async fn run_anthropic_stream(
-    client: Client,
-    endpoint: String,
-    api_key: String,
-    anthropic_version: String,
-    initial_response_timeout: Duration,
-    inter_chunk_timeout: Duration,
+    transport: AnthropicStreamTransport,
     request_body: Value,
     tx: mpsc::Sender<AgentEvent>,
 ) -> Result<()> {
+    let AnthropicStreamTransport {
+        client,
+        endpoint,
+        api_key,
+        anthropic_version,
+        initial_response_timeout,
+        inter_chunk_timeout,
+    } = transport;
     let endpoint_url =
         validate_anthropic_endpoint(&endpoint).context("Invalid Anthropic endpoint URL")?;
     let request_builder = client

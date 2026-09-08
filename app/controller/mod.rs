@@ -505,6 +505,20 @@ pub struct RecordingController {
     event_broadcast: broadcast::Sender<IpcEvent>,
 }
 
+/// The shared handles one conversation audio loop moves into its task.
+///
+/// Named fields keep the set of handles crossing the thread boundary explicit;
+/// the loop destructures it on entry so the body reads exactly as before.
+struct ConversationLoopHandles {
+    engine: Arc<Mutex<Option<ConversationEngine>>>,
+    player: Arc<Mutex<Option<AudioPlayer>>>,
+    recorder: Arc<Mutex<Option<StreamingRecorder>>>,
+    stop_flag: Arc<AtomicBool>,
+    generation_counter: Arc<AtomicU64>,
+    state: Arc<RwLock<State>>,
+    event_broadcast: broadcast::Sender<IpcEvent>,
+}
+
 impl RecordingController {
     /// One phrasing for "there is no recorder", logged and returned together so
     /// a caller cannot report the failure in a way the log does not corroborate.
@@ -2257,18 +2271,18 @@ impl RecordingController {
         let recorder = Arc::clone(&self.recorder);
         let event_broadcast = self.event_broadcast.clone();
 
+        let handles = ConversationLoopHandles {
+            engine,
+            player,
+            recorder,
+            stop_flag,
+            generation_counter: generation_arc,
+            state,
+            event_broadcast,
+        };
+
         let task = tokio::spawn(async move {
-            Self::conversation_audio_loop(
-                engine,
-                player,
-                recorder,
-                stop_flag,
-                generation_arc,
-                generation,
-                state,
-                event_broadcast,
-            )
-            .await;
+            Self::conversation_audio_loop(handles, generation).await;
         });
 
         *self.conversation_task.lock().await = Some(task);
@@ -2279,20 +2293,16 @@ impl RecordingController {
     /// The main conversation audio processing loop
     ///
     /// Runs in a background task: captures audio → ConversationEngine → speaker
-    // allow(too_many_arguments): spawn boundary of the conversation loop — each
-    // Arc/channel is moved into the task; bundling into a struct would hide
-    // which shared handles cross the thread boundary.
-    #[allow(clippy::too_many_arguments)]
-    async fn conversation_audio_loop(
-        engine: Arc<Mutex<Option<ConversationEngine>>>,
-        player: Arc<Mutex<Option<AudioPlayer>>>,
-        recorder: Arc<Mutex<Option<StreamingRecorder>>>,
-        stop_flag: Arc<AtomicBool>,
-        generation_counter: Arc<AtomicU64>,
-        my_generation: u64,
-        state: Arc<RwLock<State>>,
-        event_broadcast: broadcast::Sender<IpcEvent>,
-    ) {
+    async fn conversation_audio_loop(handles: ConversationLoopHandles, my_generation: u64) {
+        let ConversationLoopHandles {
+            engine,
+            player,
+            recorder,
+            stop_flag,
+            generation_counter,
+            state,
+            event_broadcast,
+        } = handles;
         info!(
             "Conversation audio loop started (generation {})",
             my_generation

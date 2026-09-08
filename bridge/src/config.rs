@@ -2092,7 +2092,6 @@ fn copy_path_without_following_symlinks(source: &Path, destination: &Path) -> st
         // The destination is an app-created child of ~/.Trash, and this call
         // recreates the link itself without following or writing through its
         // target. Preserving the link is required for a recoverable reset.
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         std::os::unix::fs::symlink(target, destination)?;
         return Ok(());
     }

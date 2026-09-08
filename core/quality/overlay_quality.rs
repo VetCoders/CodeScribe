@@ -180,6 +180,16 @@ impl QualityRecord {
     /// An unavailable clock yields `timestamp_ms == 0` rather than a panic: the
     /// correction itself is the evidence, and refusing to record it because the
     /// system clock misbehaved would lose the operator's actual work.
+    // allow(too_many_arguments): WHY — ten positional parameters are the
+    // telescoping tail of `new` -> `new_with_confidence`; every one is a column
+    // of the quality JSONL row, not a behaviour switch. WHEN — re-added
+    // 2026-09-08 by the vc-prune Wave 5 silencer strip after clippy fired
+    // `too many arguments (9/7)`; the strip confirms the lint is authentic, not
+    // a false positive. WHERE — the fix is one `OverlayCorrectionInput` struct
+    // shared with `commit_overlay_correction_with_confidence` /
+    // `_with_provenance` below and threaded through `bridge/src/quality.rs:189`
+    // (the UniFFI entry). That crosses the FFI signature and was out of budget
+    // for a silencer-strip cut; it is filed as the wave's headline smell.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_confidence(
         raw_text: String,
@@ -1268,6 +1278,13 @@ pub fn commit_overlay_correction_with_level(
 
 /// Like [`commit_overlay_correction_with_level`], plus optional STT confidence
 /// fields recorded on the quality JSONL line (W11-C / LL-D).
+// allow(too_many_arguments): WHY — rung three of the four-rung telescoping
+// chain `commit_overlay_correction` -> `_with_level` -> `_with_confidence` ->
+// `_with_provenance`, each rung adding parameters rather than a payload type.
+// WHEN — re-added 2026-09-08 by the vc-prune Wave 5 silencer strip (clippy:
+// `too many arguments (10/7)`). WHERE — collapses together with
+// `new_with_confidence` and `_with_provenance` once `OverlayCorrectionInput`
+// exists; do not add a fifth rung.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_overlay_correction_with_confidence(
     raw_text: &str,
@@ -1298,6 +1315,13 @@ pub fn commit_overlay_correction_with_confidence(
 
 /// Persist one overlay receipt while keeping delivery action separate from the
 /// explicit editor provenance that alone may vote in the three-confirmation gate.
+// allow(too_many_arguments): WHY — the widest rung of the telescoping chain
+// (11 parameters) and the only one production reaches from outside this file,
+// via the UniFFI export at `bridge/src/quality.rs:189`. WHEN — re-added
+// 2026-09-08 by the vc-prune Wave 5 silencer strip (clippy: `too many
+// arguments (11/7)`). WHERE — changing this signature changes the Swift-facing
+// ABI, so the `OverlayCorrectionInput` cut must land here and in
+// `bridge/src/quality.rs` in one commit.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_overlay_correction_with_provenance(
     raw_text: &str,

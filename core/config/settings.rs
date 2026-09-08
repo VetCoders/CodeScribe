@@ -2014,7 +2014,6 @@ impl UserSettings {
             // `parent` is derived only from the canonical internal settings
             // path above; opening it read-only is the durability fsync, not a
             // request-controlled file lookup.
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
             File::open(parent)?.sync_all()?;
             Ok(())
         })();

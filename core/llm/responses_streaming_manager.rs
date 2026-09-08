@@ -452,27 +452,19 @@ impl<'a> ResponsesStreamingManager<'a> {
 
         let (tx, rx) = mpsc::channel(256);
 
-        let client = self.client.clone();
-        let endpoint = self.endpoint.to_string();
-        let api_key = self.api_key.to_string();
-        let auth_header_mode = self.auth_header_mode;
+        let transport = AgentStreamTransport {
+            client: self.client.clone(),
+            endpoint: self.endpoint.to_string(),
+            api_key: self.api_key.to_string(),
+            auth_header_mode: self.auth_header_mode,
+            initial_response_timeout: self.initial_response_timeout,
+            inter_chunk_timeout: self.inter_chunk_timeout,
+        };
         let callbacks = self.callbacks.clone();
-        let initial_response_timeout = self.initial_response_timeout;
-        let inter_chunk_timeout = self.inter_chunk_timeout;
 
         tokio::spawn(async move {
-            if let Err(error) = run_agent_stream(
-                client,
-                endpoint,
-                api_key,
-                auth_header_mode,
-                callbacks,
-                initial_response_timeout,
-                inter_chunk_timeout,
-                request_payload,
-                tx.clone(),
-            )
-            .await
+            if let Err(error) =
+                run_agent_stream(transport, callbacks, request_payload, tx.clone()).await
             {
                 let _ = tx.send(AgentEvent::Error(error.to_string())).await;
             }
@@ -640,6 +632,20 @@ impl<'a> ResponsesStreamingManager<'a> {
     }
 }
 
+/// Everything one spawned agent SSE turn owns about its transport.
+///
+/// Bundled because the task entry point took nine positional arguments; the
+/// six transport values always travel together and are moved into the task as
+/// a unit, so a struct is the honest shape.
+struct AgentStreamTransport {
+    client: Client,
+    endpoint: String,
+    api_key: String,
+    auth_header_mode: AuthHeaderMode,
+    initial_response_timeout: Duration,
+    inter_chunk_timeout: Duration,
+}
+
 /// Body of the task spawned by [`ResponsesStreamingManager::stream_agent`].
 ///
 /// Owns the socket for one agent turn: parses each SSE chunk into an
@@ -647,20 +653,20 @@ impl<'a> ResponsesStreamingManager<'a> {
 /// dirty terminal (failed / incomplete / cancelled) it emits
 /// `ResponseDone { clean: false }` so both chain-reset paths run — see
 /// `dirty_terminal_response_id`.
-// allow(too_many_arguments): task entry point for one agent SSE stream; all
-// eight values are owned moves into the spawned task.
-#[allow(clippy::too_many_arguments)]
 async fn run_agent_stream(
-    client: Client,
-    endpoint: String,
-    api_key: String,
-    auth_header_mode: AuthHeaderMode,
+    transport: AgentStreamTransport,
     callbacks: StreamCallbacks,
-    initial_response_timeout: Duration,
-    inter_chunk_timeout: Duration,
     request_payload: serde_json::Value,
     tx: mpsc::Sender<AgentEvent>,
 ) -> Result<()> {
+    let AgentStreamTransport {
+        client,
+        endpoint,
+        api_key,
+        auth_header_mode,
+        initial_response_timeout,
+        inter_chunk_timeout,
+    } = transport;
     let endpoint_url =
         validated_endpoint_url(&endpoint).context("Invalid agent streaming endpoint URL")?;
     let request_builder = apply_auth_headers(

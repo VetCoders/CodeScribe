@@ -173,6 +173,14 @@ pub struct CsTokenConfidence {
 /// stored alongside the text so later analysis can correlate corrections with how
 /// unsure the engine was.
 #[uniffi::export]
+// allow(too_many_arguments): WHY — this is the UniFFI ABI the Swift overlay
+// calls; the nine parameters are the nine columns of one quality receipt, and
+// collapsing them means exporting a new `uniffi::Record` and changing the
+// generated Swift signature at every overlay call site. WHEN — re-added
+// 2026-09-08 by the vc-prune Wave 5 silencer strip after clippy fired `too many
+// arguments (9/7)`; the lint is authentic, the fix is simply not a Rust-only
+// cut. WHERE — must land together with the `OverlayCorrectionInput` cut in
+// `core/quality/overlay_quality.rs` and the Swift callers under `macos/`.
 #[allow(clippy::too_many_arguments)]
 pub fn commit_overlay_quality_record(
     raw_text: String,
