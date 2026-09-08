@@ -60,6 +60,7 @@ struct WaveformView: View {
   /// Chrome placement uses a tighter strip so the waveform can live in the
   /// primary bar without competing with transcript words.
   var compact: Bool = false
+  var stretches: Bool = false
 
   private var barWidth: CGFloat { compact ? 1.5 : 2 }
   private var gap: CGFloat { compact ? 2 : 3 }
@@ -88,7 +89,7 @@ struct WaveformView: View {
         }
       }
     }
-    .frame(width: contentWidth, height: trackHeight, alignment: .leading)
+    .frame(width: stretches ? nil : contentWidth, height: trackHeight, alignment: .center)
   }
 
   private func waveform(at now: TimeInterval, reducedMotion: Bool) -> some View {
@@ -96,7 +97,9 @@ struct WaveformView: View {
       for i in 0..<barCount {
         let scale = barScale(index: i, now: now, reducedMotion: reducedMotion)
         let height = maxBarHeight * scale
-        let x = CGFloat(i) * (barWidth + gap)
+        let step =
+          stretches ? max(0, size.width - barWidth) / CGFloat(max(1, barCount - 1)) : barWidth + gap
+        let x = CGFloat(i) * step
         let y = (size.height - height) / 2
         let rect = CGRect(x: x, y: y, width: barWidth, height: height)
         ctx.fill(
@@ -105,7 +108,7 @@ struct WaveformView: View {
         )
       }
     }
-    .frame(width: contentWidth, height: trackHeight)
+    .frame(width: stretches ? nil : contentWidth, height: trackHeight)
   }
 
   private func barScale(index i: Int, now: TimeInterval, reducedMotion: Bool) -> CGFloat {

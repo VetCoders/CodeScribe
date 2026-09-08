@@ -1,19 +1,16 @@
 import SwiftUI
 
-/// Value-only rendering contract for the dock. Tests assert this model rather
-/// than reconstructing a second SwiftUI hierarchy or looking for source text.
-///
-/// The dock is always the toolbar. The collapsed handle / hover-reveal / pin
-/// states are gone (Founder 2026-09-08: the buttons exist so the transcript
-/// can sit flush, not as decoration — keep them visible).
+/// Action availability stays projected; chrome visibility is local presentation only.
 struct OverlayDockLayout: Equatable {
-  static let height: CGFloat = 42
   static let minimumCanvasWidth: CGFloat = 320
-
   let projectedIntents: [OverlayIntent]
+  var visibleIntents: [OverlayIntent] { projectedIntents.filter { $0 != .close } }
+}
 
-  var visibleIntents: [OverlayIntent] { projectedIntents }
-  var showsToolbar: Bool { true }
+enum OverlayChromeVisibility {
+  static func actionsVisible(pointerInside: Bool, keyboardFocus: Bool, voiceOver: Bool) -> Bool {
+    pointerInside || keyboardFocus || voiceOver
+  }
 }
 
 enum OverlayDockVisuals {
@@ -24,9 +21,11 @@ enum OverlayDockVisuals {
 
 /// The overlay's sole action surface. The reducer owns action availability;
 /// this view only renders the projected commands, the engine chip, the
-/// transient notice and the formatting-level control in one fixed-height slot.
+/// transient notice and formatting level floating over the transcript.
 @MainActor
 struct OverlayIntentRail: View {
+  @FocusState private var focusedControl: String?
+  let onFocusChange: (Bool) -> Void
   let phase: String
   let intents: [OverlayIntent]
   let palette: OverlayAppearancePalette
@@ -46,8 +45,10 @@ struct OverlayIntentRail: View {
     footerEngineDot: Color = .clear,
     formatLevel: FormattingPolicyOption = .correction,
     onIntent: @escaping (OverlayIntent) -> Void,
-    onFormatLevel: @escaping (FormattingPolicyOption) -> Void = { _ in }
+    onFormatLevel: @escaping (FormattingPolicyOption) -> Void = { _ in },
+    onFocusChange: @escaping (Bool) -> Void = { _ in }
   ) {
+    self.onFocusChange = onFocusChange
     self.phase = phase
     self.intents = intents
     self.palette = palette
@@ -60,42 +61,39 @@ struct OverlayIntentRail: View {
   }
 
   var body: some View {
-    OverlayDockSurface(palette: palette) {
+    VStack(spacing: 4) {
       HStack(spacing: CSSpace.xs) {
         engineChip
-        Spacer(minLength: CSSpace.xxs)
         footerNoticeText
+      }
+      .padding(.horizontal, 8)
+      .background(.regularMaterial, in: Capsule())
+      HStack(spacing: 4) {
         formatLevelButton
+          .focused($focusedControl, equals: "format-level")
         ForEach(intents, id: \.self) { intent in
-          if intent == .close {
-            Divider()
-              .frame(height: CSSpace.lg)
-              .overlay(palette.border.color)
-              .padding(.horizontal, 2)
-              .accessibilityHidden(true)
-          }
-          OverlayDockButton(
-            title: intent.accessibilityLabel,
-            systemImage: intent.systemImage,
-            hint: intent.accessibilityHint,
-            identifier: "overlay-intent-\(intent.rawValue)",
-            palette: palette
-          ) {
-            dispatch(intent)
+          if intent != .close {
+            OverlayDockButton(
+              title: intent.accessibilityLabel,
+              systemImage: intent.systemImage,
+              hint: intent.accessibilityHint,
+              identifier: "overlay-intent-\(intent.rawValue)",
+              palette: palette
+            ) {
+              dispatch(intent)
+            }
+            .focused($focusedControl, equals: intent.rawValue)
           }
         }
       }
-      .padding(.horizontal, CSSpace.sm)
+      .padding(6)
       .buttonStyle(.plain)
-      .frame(maxWidth: .infinity)
-      .frame(height: OverlayDockLayout.height)
-      // Everything in the dock that is not a control (engine chip, notice,
-      // spacer) drags the window. Buttons sit above this region and keep
-      // their clicks.
-      .background {
-        OverlayWindowDragRegion(identifier: "overlay-dock-inert-drag-region")
-      }
+      .background(.regularMaterial, in: Capsule())
+      .overlay { Capsule().strokeBorder(palette.border.color, lineWidth: 1) }
     }
+    .fixedSize(horizontal: false, vertical: true)
+    .frame(maxWidth: .infinity, alignment: .center)
+    .onChange(of: focusedControl) { _, control in onFocusChange(control != nil) }
     .accessibilityElement(children: .contain)
     .accessibilityLabel("Overlay actions")
     .accessibilityValue(Self.accessibilityValue(for: phase))
@@ -245,27 +243,6 @@ private struct OverlayDockButton: View {
       .accessibilityLabel(title)
       .accessibilityHint(hint)
       .accessibilityIdentifier(identifier)
-  }
-}
-
-private struct OverlayDockSurface<Content: View>: View {
-  let palette: OverlayAppearancePalette
-  @ViewBuilder let content: Content
-
-  var body: some View {
-    if #available(macOS 26.0, *) {
-      content
-        .glassEffect(
-          .regular.interactive(),
-          in: RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous)
-        )
-    } else {
-      content
-        .background(
-          palette.surfaceTint.color,
-          in: RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous)
-        )
-    }
   }
 }
 

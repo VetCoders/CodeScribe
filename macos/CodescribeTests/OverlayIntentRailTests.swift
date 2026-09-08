@@ -153,14 +153,13 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertNil(state.formatterError)
   }
 
-  func testDockAlwaysPaintsEveryProjectedIntentWithoutHoverOrPin() {
+  func testFloatingActionsKeepProjectedOrderWithCloseInHeader() {
     let intents: [OverlayIntent] = [
       .insertPaste, .copy, .retranscribe, .format, .close,
     ]
     let layout = OverlayDockLayout(projectedIntents: intents)
 
-    XCTAssertTrue(layout.showsToolbar)
-    XCTAssertEqual(layout.visibleIntents, intents, "no collapsed state hides the commands")
+    XCTAssertEqual(layout.visibleIntents, intents.filter { $0 != .close })
     XCTAssertEqual(OverlayDockLayout(projectedIntents: []).visibleIntents, [])
     XCTAssertEqual(OverlayDockLayout.minimumCanvasWidth, 320)
   }

@@ -5,7 +5,7 @@ import SwiftUI
 // Layout (top → bottom):
 //   header   brand · ONE projection phase · compact waveform · timer
 //   body     transcript is the product surface (listening / formatted / terminal)
-//   footer   ● engine chip · transient actionable notice
+//   floating actions over the transcript; no footer inset or reserved band
 //
 // Removed on purpose: duplicate RECORDING/modeMeta row, full bottom Finish/Close
 // action layer, and decorative body-top waveform competing with words.
@@ -17,6 +17,9 @@ import SwiftUI
 struct DictationOverlayView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+  @State private var pointerInside = false
+  @State private var actionsFocused = false
   @Bindable var state: OverlayState
 
   // Geometry constants local to this surface. The window is user-resizable;
@@ -42,7 +45,8 @@ struct DictationOverlayView: View {
           footerEngineDot: footerEngineDot,
           formatLevel: state.autoFormatLevel,
           onIntent: state.relayIntent,
-          onFormatLevel: { state.setAutoFormatLevel($0) }
+          onFormatLevel: { state.setAutoFormatLevel($0) },
+          onFocusChange: { actionsFocused = $0 }
         )
       )
     }
@@ -61,6 +65,7 @@ struct DictationOverlayView: View {
     .developerPowerCorner(padding: 10)
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.toast)
     .onHover { inside in
+      pointerInside = inside
       state.setPointerHovering(inside)
     }
     .onAppear {
@@ -89,13 +94,25 @@ struct DictationOverlayView: View {
           hairline(0.06)
         }
       }
-      .safeAreaInset(edge: .bottom, spacing: 0) {
-        VStack(alignment: .leading, spacing: 0) {
-          hairline(0.05)
-          intentRail
-            .background { OverlayWindowDragRegion(identifier: "overlay-dock-drag-region") }
-        }
+      .overlay(alignment: .bottom) {
+        intentRail
+          .opacity(actionsVisible ? 1 : 0)
+          .allowsHitTesting(actionsVisible)
+          .accessibilityHidden(false)
+          .padding(.horizontal, 8)
+          .padding(.bottom, 8)
+          .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: actionsVisible)
+          .accessibilityIdentifier("overlay-actions-ephemeral")
       }
+  }
+
+  private var actionsVisible: Bool {
+    OverlayChromeVisibility.actionsVisible(
+      pointerInside: pointerInside,
+      keyboardFocus: actionsFocused || state.isEditingTranscript
+        || NSApp.isFullKeyboardAccessEnabled,
+      voiceOver: voiceOverEnabled
+    )
   }
 
   /// 1px separator matching the mock's hairline borders.
@@ -117,59 +134,60 @@ struct DictationOverlayView: View {
     .background { OverlayWindowDragRegion(identifier: "overlay-header-drag-region") }
   }
 
-  private var fullHeader: some View {
-    HStack(spacing: 10) {
-      // Brand block stays inert. The trailing intent rail is the overlay's
-      // one control surface, including its projected Close command.
-      HStack(spacing: 9) {
-        ModeDot(color: CSColor.terracotta, size: 9)
-          .accessibilityHidden(true)
-        Text("codescribe")
-          .font(CSFont.ui(15, .bold))
-          .tracking(-0.3)
-          .foregroundStyle(palette.primaryText.color)
+  private var fullHeader: some View { justifiedHeader(compact: false) }
+
+  private var narrowHeader: some View { justifiedHeader(compact: true) }
+
+  private func justifiedHeader(compact: Bool) -> some View {
+    HStack(spacing: compact ? 6 : 10) {
+      VStack(alignment: .leading, spacing: 2) {
+        HStack(spacing: 5) {
+          ModeDot(color: CSColor.terracotta, size: 6)
+            .accessibilityHidden(true)
+          Text("codescribe")
+            .font(CSFont.ui(compact ? 12 : 15, .bold))
+            .tracking(-0.3)
+            .foregroundStyle(palette.primaryText.color)
+        }
+        phaseStatus(text: compact ? state.compactStatusText : state.statusText)
+      }
+      .fixedSize()
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("overlay-header-leading")
+      .overlay {
+        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
+      }
+
+      chromeWaveform(barCount: compact ? 10 : 34)
+        .frame(minWidth: compact ? 12 : 100, maxWidth: .infinity)
+        .layoutPriority(-1)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("overlay-header-center")
+
+      HStack(spacing: compact ? 4 : 8) {
+        sessionTimer
           .allowsHitTesting(false)
+        OverlayPlacementMenu(state: state, palette: palette)
+        if OverlayIntentRail.projectedIntents(for: state).contains(.close) {
+          Button {
+            state.relayIntent(.close)
+          } label: {
+            Image(systemName: "xmark")
+              .font(.system(size: 11, weight: .semibold))
+              .frame(width: 24, height: 24)
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+          .foregroundStyle(palette.mutedText.color)
+          .help(OverlayIntent.close.helpText)
+          .accessibilityLabel(OverlayIntent.close.accessibilityLabel)
+          .accessibilityIdentifier("overlay-intent-close")
+        }
       }
-      .overlay {
-        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
-      }
-      phaseStatus(text: state.statusText)
-
-      if state.mode == .listening || state.mode == .finalizing {
-        chromeWaveform(barCount: 18)
-      }
-
-      Spacer(minLength: 4)
-
-      sessionTimer
-        .allowsHitTesting(false)
-
-      OverlayPlacementMenu(state: state, palette: palette)
+      .fixedSize()
+      .accessibilityElement(children: .contain)
+      .accessibilityIdentifier("overlay-header-trailing")
     }
-    .fixedSize(horizontal: true, vertical: false)
-  }
-
-  /// Essential chrome only at the supported 320 pt window floor. Close, one
-  /// projected phase, real level evidence, and time never collapse vertically.
-  private var narrowHeader: some View {
-    HStack(spacing: 7) {
-      HStack(spacing: 7) {
-        ModeDot(color: CSColor.terracotta, size: 9)
-          .accessibilityHidden(true)
-        phaseStatus(text: state.compactStatusText)
-      }
-      .overlay {
-        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
-      }
-      if state.mode == .listening || state.mode == .finalizing {
-        chromeWaveform(barCount: 10)
-      }
-      Spacer(minLength: 0)
-      sessionTimer
-        .allowsHitTesting(false)
-      OverlayPlacementMenu(state: state, palette: palette)
-    }
-    .fixedSize(horizontal: true, vertical: false)
   }
 
   @ViewBuilder
@@ -202,7 +220,8 @@ struct DictationOverlayView: View {
       indicatorMode: state.indicatorMode,
       meter: state.levelMeter,
       inactiveColor: palette.border.color,
-      compact: true
+      compact: true,
+      stretches: true
     )
     .accessibilityIdentifier("overlay-chrome-waveform")
     .accessibilityLabel("Live audio level")
@@ -260,7 +279,7 @@ struct DictationOverlayView: View {
     .padding(.top, 4)
     .padding(.bottom, 10)
     .background { OverlayWindowDragRegion(identifier: "overlay-body-drag-region") }
-    // Transcript content must never paint into the footer during live resize.
+    // Transcript content stays inside the body during live resize.
     .clipped()
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.mode)
   }

@@ -34,12 +34,13 @@ struct OverlayPlacementMenu: View {
     } label: {
       Label("Position overlay", systemImage: "location.viewfinder")
         .labelStyle(.iconOnly)
-        .font(.system(size: 13, weight: .semibold))
+        .font(.system(size: 11, weight: .semibold))
         .foregroundStyle(palette.mutedText.color)
-        .frame(width: 28, height: 28)
+        .frame(width: 24, height: 24)
         .contentShape(Rectangle())
     }
     .menuStyle(.button)
+    .buttonStyle(.plain)
     .menuIndicator(.hidden)
     .fixedSize()
     .help("Position overlay")

@@ -88,7 +88,6 @@ final class OverlayResizeHitTests: XCTestCase {
     let dragPoints = [
       ("header", NSPoint(x: 28, y: root.bounds.maxY - 22)),
       ("body margin", NSPoint(x: 18, y: root.bounds.midY)),
-      ("footer", NSPoint(x: 28, y: 22)),
     ]
     for (region, point) in dragPoints {
       let hit = try XCTUnwrap(root.hitTest(point))
@@ -103,14 +102,8 @@ final class OverlayResizeHitTests: XCTestCase {
       )
     }
 
-    // The dock is always the toolbar (no collapsed handle since 2026-09-08);
-    // its trailing command is Close. A real control must never be a drag
-    // region, while the inert middle of the dock (spacer) drags the window.
-    let actionPoint = NSPoint(x: root.bounds.maxX - CSSpace.sm - 16, y: 20)
-    XCTAssertTrue(
-      panel.isWindowDragHit(at: NSPoint(x: root.bounds.midX, y: 20)),
-      "the inert middle of the always-visible dock must drag the window"
-    )
+    // Close lives at the trailing edge of the header; the bottom belongs to text.
+    let actionPoint = NSPoint(x: root.bounds.maxX - 28, y: root.bounds.maxY - 30)
     let actionHit = try XCTUnwrap(root.hitTest(actionPoint))
     XCTAssertFalse(
       panel.isWindowDragHit(at: actionPoint),
@@ -163,7 +156,6 @@ final class OverlayResizeHitTests: XCTestCase {
     let dragPoints = [
       ("header", NSPoint(x: 28, y: root.bounds.maxY - 22)),
       ("body-margin", NSPoint(x: 18, y: root.bounds.midY)),
-      ("footer-dock", NSPoint(x: 28, y: 22)),
     ]
 
     for (index, (region, point)) in dragPoints.enumerated() {
@@ -228,9 +220,7 @@ final class OverlayResizeHitTests: XCTestCase {
     let header = try XCTUnwrap(
       descendant(identifier: "overlay-header-drag-region", in: root)
     )
-    let dock = try XCTUnwrap(
-      descendant(identifier: "overlay-dock-drag-region", in: root)
-    )
+    XCTAssertNil(descendant(identifier: "overlay-dock-drag-region", in: root))
     let length = (transcript.string as NSString).length
     XCTAssertGreaterThan(length, 0)
     let firstLine = transcript.firstRect(
@@ -242,13 +232,12 @@ final class OverlayResizeHitTests: XCTestCase {
       actualRange: nil
     )
     let headerFrame = screenFrame(of: header, in: panel)
-    let dockFrame = screenFrame(of: dock, in: panel)
-    print(
-      "W5_T16_LAYOUT headerBottom=\(headerFrame.minY) firstLineTop=\(firstLine.maxY) "
-        + "lastLineBottom=\(lastLine.minY) dockTop=\(dockFrame.maxY)"
-    )
+    let transcriptFrame = screenFrame(of: transcript.enclosingScrollView!, in: panel)
     XCTAssertLessThanOrEqual(firstLine.maxY, headerFrame.minY + 1)
-    XCTAssertGreaterThanOrEqual(lastLine.minY, dockFrame.maxY - 1)
+    XCTAssertGreaterThanOrEqual(lastLine.minY, transcriptFrame.minY - 1)
+    XCTAssertLessThan(
+      transcriptFrame.minY - panel.frame.minY, 24,
+      "no dock or reserved action padding may consume the transcript bottom")
   }
 
   @MainActor
@@ -309,13 +298,18 @@ final class OverlayResizeHitTests: XCTestCase {
   @MainActor
   func testNativeCanvasPreservesEveryEngineByteAcrossUnicodeEquivalentUpdates() throws {
     let state = OverlayState()
-    let panel = try XCTUnwrap(DictationOverlayWindow.make(
-      state: state, textScale: TextScaleController(key: "OverlayResizeHitTests.byteExact"))
-      as? FloatingOverlayPanel)
-    defer { panel.orderOut(nil); panel.invalidatePresence() }
+    let panel = try XCTUnwrap(
+      DictationOverlayWindow.make(
+        state: state, textScale: TextScaleController(key: "OverlayResizeHitTests.byteExact"))
+        as? FloatingOverlayPanel)
+    defer {
+      panel.orderOut(nil)
+      panel.invalidatePresence()
+    }
     panel.orderFrontRegardless()
     let root = try XCTUnwrap(panel.contentView)
-    for (index, text) in ["  raz raz\né 👩‍💻  ", "  raz raz\ne\u{301} 👩‍💻  ", "", "raz raz"].enumerated() {
+    for (index, text) in ["  raz raz\né 👩‍💻  ", "  raz raz\ne\u{301} 👩‍💻  ", "", "raz raz"].enumerated()
+    {
       project(text, sequence: UInt64(index + 1), to: state)
       RunLoop.main.run(until: Date().addingTimeInterval(0.05))
       root.layoutSubtreeIfNeeded()
