@@ -341,7 +341,6 @@ bump-major:
 # gate: check class=static ci=no -- cargo fmt, prettier, clippy, semgrep, validate-envs, validate-gates; executes ZERO tests
 # gate: lint class=static ci=no -- cargo fmt --check + clippy on the workspace + verify-swift-format; no tests
 # gate: semgrep class=static ci=no -- semgrep scan --config auto --config .semgrep.yaml (semgrep.yml runs semgrep directly, not this target)
-# gate: semgrep-house class=static ci=no -- advisory house rules (.semgrep/advisory.yaml), never blocking
 # gate: verify class=hermetic ci=yes -- structural-verifier + Bus-path/install-guard instruments, workspace tests, doctests, model-promotion regression, env registry + this ledger; rust.yml runs it
 # gate: test-structural-verifier class=hermetic ci=no -- Python unit/mutant suite for the Loctree-only acoustic structural instrument; reads repo files only, no runtime
 # gate: test-transcript-bus-path class=hermetic ci=no -- shell/Python path-precedence and install-guard fail-closed tests in an isolated HOME; never installs the app
@@ -1198,6 +1197,7 @@ canary-catalog:
 semgrep:
 	@semgrep scan --config auto --error --quiet .
 
+# Not a verification target (advisory, never blocking) — deliberately absent from the GATE LEDGER.
 semgrep-house:
 	@echo "Advisory house rules (non-blocking) — see .semgrep/advisory.yaml"
 	@semgrep scan --config .semgrep/advisory.yaml --metrics=off . || true

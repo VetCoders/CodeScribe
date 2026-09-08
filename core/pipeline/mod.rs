@@ -8,6 +8,8 @@ pub mod acoustic_ledger;
 pub mod contracts;
 /// W13-6B overlay highlight layer (lexicon corrections + speech-gap pustki).
 pub mod highlight;
+/// Light+ — deterministic, idempotent sentence shaping (L2 floor, no LLM).
+pub mod light_plus;
 /// Event sink helpers: collectors and fan-out to consumers.
 pub mod sinks;
 /// Live streaming session state for partial/final engine events.

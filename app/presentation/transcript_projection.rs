@@ -406,11 +406,16 @@ impl TranscriptProjectionReader {
         true
     }
 
-    /// A user edit is allowed to append to the just-ended session because the
-    /// microphone lifecycle is already closed. It may never displace a newer
-    /// active session, and only the typed terminal manual action can reopen the
-    /// retired projection identity.
+    /// A terminal document revision belongs to its own session in two shapes:
+    /// still current (the Rust-minted Light+ revision lands between the
+    /// terminal ledger seal and `session_ended`), or just ended (a user edit or
+    /// formatter result after the microphone lifecycle closed). It may never
+    /// displace a newer active session, and only the typed terminal manual
+    /// action can reopen the retired projection identity.
     fn select_terminal_manual_revision(&mut self, session_id: &str) -> bool {
+        if self.current_session.as_deref() == Some(session_id) {
+            return true;
+        }
         self.current_session.is_none()
             && self.last_ended_session.as_deref() == Some(session_id)
             && self.retired_sessions.contains(session_id)

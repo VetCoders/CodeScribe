@@ -1893,6 +1893,9 @@ pub struct ManualEditReceipt {
 pub enum DocumentRevisionProvenance {
     UserEdit,
     Formatter,
+    /// Deterministic Light+ sentence shaping minted by Rust at the terminal
+    /// seal, before any formatter or user edit sees the document.
+    LightPlus,
 }
 
 impl DocumentRevisionProvenance {
@@ -1901,6 +1904,7 @@ impl DocumentRevisionProvenance {
         match self {
             Self::UserEdit => "user-edit",
             Self::Formatter => "formatter",
+            Self::LightPlus => "light-plus",
         }
     }
 }

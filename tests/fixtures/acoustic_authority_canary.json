@@ -365,15 +365,16 @@
     {
       "id": "authority-26-light-plus",
       "path": "core/pipeline/light_plus.rs",
-      "classification": "DELETE_FILE",
-      "authority": "second automatic post-ASR text author",
-      "removal_mode": "git rm",
-      "retained_role": "none",
+      "classification": "MECHANIC",
+      "authority": "deterministic sentence shaping of an already-sealed document",
+      "removal_mode": "none",
+      "retained_role": "restored 2026-09-08 (Founder: Light+ is the standard in live and CLI); one ledger-stamped document revision (provenance light-plus) minted by the Rust reducer at the terminal seal and by the CLI outside --raw; cannot admit, relabel an occurrence, or seal",
       "callers": [
         "core/pipeline/mod.rs",
-        "core/pipeline/streaming/progressive_seal.rs"
+        "app/presentation/emitter.rs",
+        "bin/codescribe.rs"
       ],
-      "expected_dangling": ["light_plus::apply", "apply_with_left_context"]
+      "expected_dangling": []
     },
     {
       "id": "authority-27-punctuation-transplant",

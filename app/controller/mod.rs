@@ -220,6 +220,9 @@ struct HoldStartSession {
     assistive_context: Arc<RwLock<Option<AssistiveContext>>>,
     pre_overlay_frontmost_app: Arc<RwLock<Option<String>>>,
     event_broadcast: broadcast::Sender<IpcEvent>,
+    /// Ctrl-hold literal contract: the emitter must not shape (Light+) the
+    /// terminal document for this take. Read at sink build time, not at stop.
+    force_raw_mode: Arc<RwLock<bool>>,
 }
 
 /// The recorder-facing fanout plus the retained reducer authority behind it.
@@ -2626,6 +2629,7 @@ impl RecordingController {
             assistive_context: Arc::clone(&self.assistive_context),
             pre_overlay_frontmost_app: Arc::clone(&self.pre_overlay_frontmost_app),
             event_broadcast: event_broadcast.clone(),
+            force_raw_mode: Arc::clone(&self.force_raw_mode),
         };
 
         let task = tokio::spawn(async move {
@@ -2829,6 +2833,7 @@ impl RecordingController {
                 event_broadcast.clone(),
                 transcript_bus.clone(),
             );
+            presentation.set_literal_delivery(*hold_session.force_raw_mode.read().await);
             *hold_session.active_presentation.write().await = Some(presentation);
             if !cfg!(test) {
                 let language_hint = language.whisper_hint().map(str::to_string);
@@ -2849,6 +2854,8 @@ impl RecordingController {
                             event_broadcast.clone(),
                             transcript_bus.clone(),
                         );
+                        presentation
+                            .set_literal_delivery(*hold_session.force_raw_mode.read().await);
                         *hold_session.active_presentation.write().await = Some(presentation);
                         let retry_result = rec.start_event_session(language_hint).await;
                         if let Err(retry_err) = retry_result {
@@ -3088,6 +3095,7 @@ impl RecordingController {
             self.event_broadcast.clone(),
             transcript_bus.clone(),
         );
+        presentation.set_literal_delivery(*self.force_raw_mode.read().await);
         *self.active_presentation.write().await = Some(presentation);
         // Skip actual audio stream in tests (no CoreAudio device needed)
         let language_hint = language.whisper_hint().map(str::to_string);
@@ -3109,6 +3117,7 @@ impl RecordingController {
                     self.event_broadcast.clone(),
                     transcript_bus.clone(),
                 );
+                presentation.set_literal_delivery(*self.force_raw_mode.read().await);
                 *self.active_presentation.write().await = Some(presentation);
                 if let Err(retry_err) = recorder.start_event_session(language_hint).await {
                     drop(recorder_guard);

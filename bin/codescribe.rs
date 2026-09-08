@@ -58,6 +58,9 @@ enum Command {
         /// Live: raw projection JSONL for machine consumers instead of the human view
         #[arg(long)]
         json: bool,
+        /// Literal words: skip the Light+ sentence shaping (the app's Ctrl-hold lane)
+        #[arg(long)]
+        raw: bool,
         #[command(subcommand)]
         mode: Option<TranscribeMode>,
     },
@@ -85,19 +88,20 @@ fn main() -> anyhow::Result<()> {
             stream,
             no_bus,
             json,
+            raw,
             mode,
         } => match mode {
             Some(TranscribeMode::Live) => {
                 anyhow::ensure!(
-                    files.is_empty() && !stream,
-                    "`transcribe live` does not accept a file or --stream"
+                    files.is_empty() && !stream && !raw,
+                    "`transcribe live` does not accept a file, --stream or --raw (the app decides the lane)"
                 );
                 transcribe_live(language, json)
             }
             Some(TranscribeMode::Last) => {
                 anyhow::ensure!(
-                    files.is_empty() && !stream && !json,
-                    "`transcribe last` does not accept a file, --stream or --json"
+                    files.is_empty() && !stream && !json && !raw,
+                    "`transcribe last` does not accept a file, --stream, --json or --raw"
                 );
                 transcribe_last()
             }
@@ -110,7 +114,7 @@ fn main() -> anyhow::Result<()> {
                     !files.is_empty(),
                     "missing <FILES> (or use `codescribe transcribe live`)"
                 );
-                transcribe_batch(&files, language.as_deref(), stream, !no_bus)
+                transcribe_batch(&files, language.as_deref(), stream, !no_bus, raw)
             }
         },
     }
@@ -123,6 +127,7 @@ fn transcribe_batch(
     language: Option<&str>,
     stream: bool,
     publish_bus: bool,
+    raw: bool,
 ) -> anyhow::Result<()> {
     let mut failures = Vec::new();
     for (index, file) in files.iter().enumerate() {
@@ -138,7 +143,7 @@ fn transcribe_batch(
                 println!();
             }
         }
-        if let Err(error) = transcribe(file, language, stream, publish_bus) {
+        if let Err(error) = transcribe(file, language, stream, publish_bus, raw) {
             eprintln!("FAILED {}: {error:#}", file.display());
             failures.push(file.display().to_string());
         }
@@ -469,6 +474,7 @@ fn transcribe(
     language: Option<&str>,
     stream: bool,
     publish_bus: bool,
+    raw: bool,
 ) -> anyhow::Result<()> {
     use codescribe::presentation::cli_transcript_lane::CliTranscriptLane;
     use codescribe::presentation::transcript_bus::{TranscriptMode, TranscriptSessionEndReason};
@@ -533,9 +539,17 @@ fn transcribe(
     };
     let decode_secs = started.elapsed().as_secs_f64();
     let transcript_text = verdict.text.clone();
-    // L2: previews/drafts stay raw; seal and delivery take the custom lexicon.
-    let delivered_text =
+    // L2: previews/drafts stay raw; seal and delivery take the custom lexicon,
+    // then the Light+ floor — deterministic sentence shape, the same pass the
+    // app mints at its terminal seal. Only `--raw` (≙ the Ctrl-hold literal
+    // lane) promises the words untouched.
+    let lexicon_text =
         codescribe_core::quality::overlay_quality::apply_custom_lexicon(&transcript_text);
+    let delivered_text = if raw {
+        lexicon_text
+    } else {
+        codescribe_core::pipeline::light_plus::apply(&lexicon_text)
+    };
 
     if let Some(lane) = lane.as_mut()
         && let Err(error) = lane.publish_sealed(&delivered_text, &verdict.raw.segments)
@@ -551,7 +565,7 @@ fn transcribe(
 
     // Provenance to stderr, GUI-truth style.
     eprintln!(
-        "engine={:?}/{:?} decode_secs={:.2} segments={} chars={} avg_logprob={} transcript_authority=stt_verdict",
+        "engine={:?}/{:?} decode_secs={:.2} segments={} chars={} avg_logprob={} light_plus={} transcript_authority=stt_verdict",
         verdict.engine.engine,
         verdict.engine.mode,
         decode_secs,
@@ -562,6 +576,7 @@ fn transcribe(
             .avg_logprob
             .map(|v| std::format!("{v:.2}"))
             .unwrap_or_else(|| "n/a".into()),
+        !raw,
     );
 
     if let Some(lane) = lane.as_mut() {

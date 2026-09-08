@@ -33,13 +33,14 @@ explicit operator intent
   → apple_stream_transcription_session
       ├─ Apple                                   L0 observation
       ├─ Whisper on retained PCM                 bounded L1 observation
-      ├─ Lexicon + Light+                        authorized L2 relabel
+      ├─ Lexicon                                 authorized L2 relabel
       ├─ Responses formatter                     authorized L3 relabel
       └─ Silero                                  time / energy / boundary evidence
   → AcousticLedger::admit / AcousticLedger::seal
   → EngineEvent::LedgerMutation / EngineEvent::LedgerSeal
   → PresentationEmitter / TranscriptReducer
       ├─ committed ledger revision → overlay + transcript_buffer
+      ├─ terminal Light+ revision  → provenance `light-plus`, all lanes but literal
       └─ ephemeral preview         → overlay only
   → Transcript Bus publish_revision (ledger receipts only)
   → Swift projection observer
@@ -52,16 +53,37 @@ transcript.
 
 ## 1. Machine layers and sideband evidence
 
-| Layer                    | Current role                                      | Authority boundary                                                                      |
-| ------------------------ | ------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| L0 — Apple               | First live text observer inside the Apple session | Describes PCM-bound occurrences; does not own physical identity                         |
-| L1 — Whisper             | Tail-provider observation on retained PCM         | May correct the matching authorized occurrence; does not own a parallel live dispatcher |
-| L2 — Lexicon + Light+    | Deterministic retained-text relabeling            | May relabel an authorized occurrence; equal strings are never identity                  |
-| L3 — Responses formatter | Configured Formatting-lane observation            | May format authorized text; may not mint physical speech                                |
+| Layer                    | Current role                                      | Authority boundary                                                                                                                                    |
+| ------------------------ | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| L0 — Apple               | First live text observer inside the Apple session | Describes PCM-bound occurrences; does not own physical identity                                                                                       |
+| L1 — Whisper             | Tail-provider observation on retained PCM         | May correct the matching authorized occurrence; does not own a parallel live dispatcher                                                               |
+| L2 — Lexicon + Light+    | Deterministic retained-text shaping               | Lexicon may relabel an authorized occurrence; Light+ shapes only the sealed document as one ledger-stamped revision; equal strings are never identity |
+| L3 — Responses formatter | Configured Formatting-lane observation            | May format authorized text; may not mint physical speech                                                                                              |
 
 These are the four machine layers. The Responses formatter is a proposal/repair
 observer constrained by the same occurrence-authenticated ledger as the other
 layers; it cannot mint speech, commit text directly, or dispatch delivery.
+
+Light+ (`core/pipeline/light_plus.rs`, restored 2026-09-08) is the L2 floor
+under the formatter: deterministic, idempotent sentence shape — capital at
+sentence starts, a closing period, hesitation sounds (`yyy`, `eee`, `hmm`)
+dropped, punctuation seams collapsed — with no network and no model. It never
+deletes a word and never touches an occurrence label. In live it runs once,
+in Rust, on the terminal document: `TranscriptReducer::light_plus_intent`
+(`app/presentation/emitter.rs`) computes the shaped bytes, and
+`PresentationEmitter::mint_light_plus_revision` commits them through the same
+ledger + reducer corridor as a user edit, with
+`DocumentRevisionProvenance::LightPlus` (`light-plus-…` receipt). It is gated
+twice — at the terminal `LedgerSeal` and again at `SessionFinalised` (a
+one-occurrence session's whole-session seal is indistinguishable from its
+sole occurrence seal, so the reducer becomes terminal only at lifecycle end);
+the second gate is a no-op when the first already shaped the document. The
+only lane without it is the literal contract
+(`PresentationEmitter::set_literal_delivery(true)`, the Ctrl-hold `force_raw`
+promise); auto-format "off" still gets it. The Responses formatter reads the
+document _after_ Light+ (`terminal_revision_source`), so L3 always sees
+sentence-shaped input. The CLI mirrors this: `codescribe transcribe` applies
+Light+ after the custom lexicon unless `--raw`.
 Silero is orthogonal to the numbered text layers. Its single session ingress
 supplies speech edges, range, energy, and pause evidence to the Apple session.
 It cannot admit text, seal a document, or select delivery. Final BAM is
@@ -121,8 +143,10 @@ Normal stop:
 2. seals any non-empty open partial through the same occurrence path;
 3. drains only work already admitted during capture within the bounded budget;
 4. seals remaining ledger state and emits the committed projection;
-5. emits lifecycle finality; and
-6. delivers through the route latched from explicit operator intent.
+5. mints the Light+ document revision (skipped only for the literal lane);
+6. emits lifecycle finality (`SessionFinalised`, which also mints Light+ when
+   the seal alone could not establish terminality), then `session_ended`; and
+7. delivers through the route latched from explicit operator intent.
 
 Normal stop starts no whole-file Whisper pass and no fifth text layer. Legacy
 `FINAL_PASS_MODE` spellings remain migration tokens; explicit Retranscribe owns
@@ -146,6 +170,11 @@ for that occurrence. The returned proposal must carry the same occurrence and
 re-enter ledger admission; it never writes committed text or triggers delivery
 on its own.
 
+The terminal formatter revision (`apply_formatter_revision_from_overlay`)
+reads `terminal_revision_source`, which already carries the Light+ revision:
+Light+ runs before the LLM, never after it, and a formatter result that lands
+is a further `formatter` document revision on top of the `light-plus` one.
+
 ## 6. Projection and delivery
 
 ```text
@@ -168,6 +197,13 @@ explicitly distinct routes.
 `transcript_buffer`. `PaintEphemeralPreview` only advances the visual delta
 baseline. The Bus has no draft or arbitrary-text seal API, and there is no raw-
 event delta adapter.
+
+The Bus projects the Light+ revision as `apply_manual_edit` / `formatted` /
+`terminal` with a `light-plus-…` manual-edit receipt, between the
+`record_ledger_terminal_seal` row and `session_ended`; `session_ended` copies
+it, so the terminal projection Swift and `codescribe transcribe last` hold is
+the shaped document. `TranscriptProjectionReader` accepts a terminal document
+revision for the session that is still current for exactly this reason.
 
 ## 7. Settings and runtime truth
 

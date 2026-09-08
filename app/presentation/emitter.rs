@@ -443,6 +443,32 @@ impl TranscriptReducer {
         Ok(self.committed_rendered_text())
     }
 
+    /// The Light+ revision this terminal document is owed, or `None` when
+    /// there is nothing to shape: no committed document, not yet terminal, or
+    /// the shaped text is byte-identical (Light+ is idempotent, so a second
+    /// pass — or a document a formatter already shaped — mints nothing).
+    /// Read-only: the intent enters the same corridor as a user edit.
+    pub fn light_plus_intent(&self) -> Option<UserRevisionIntent> {
+        if !self.terminal {
+            return None;
+        }
+        let session_id = self.document_by_occurrence.keys().next()?.session.clone();
+        let source = self.committed_rendered_text();
+        if source.trim().is_empty() {
+            return None;
+        }
+        let shaped = codescribe_core::pipeline::light_plus::apply(&source);
+        if shaped == source {
+            return None;
+        }
+        Some(UserRevisionIntent {
+            session_id,
+            source_revision: self.revision,
+            rendered_text: shaped,
+            provenance: DocumentRevisionProvenance::LightPlus,
+        })
+    }
+
     /// Open terminal review only after the engine lifecycle has finished. This
     /// carries no text and mints no reducer revision; it closes the one-
     /// occurrence ambiguity where a whole-session seal has the same physical
@@ -636,6 +662,11 @@ pub struct PresentationEmitter {
     transcript_bus: Option<Arc<TranscriptBus>>,
     acoustic_ledger: Option<Arc<std::sync::Mutex<AcousticLedger>>>,
     projection_callback: Option<ProjectionObserver>,
+    /// The literal contract (Ctrl-hold `force_raw`): when set, the terminal
+    /// seal mints no Light+ revision and the document stays word-for-word.
+    /// Every other lane — including auto-format "off" — gets the Light+
+    /// floor, exactly as the pre-ledger controller gated it.
+    literal_delivery: std::sync::atomic::AtomicBool,
 }
 
 impl PresentationEmitter {
@@ -712,7 +743,22 @@ impl PresentationEmitter {
             transcript_bus,
             acoustic_ledger,
             projection_callback,
+            literal_delivery: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Declare the literal contract for this take. `true` is the Ctrl-hold
+    /// `force_raw` lane: the terminal seal then delivers the ledger words
+    /// untouched. Default `false`: Light+ shapes the terminal document.
+    pub fn set_literal_delivery(&self, literal: bool) {
+        self.literal_delivery
+            .store(literal, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether this take promised literal words (see [`Self::set_literal_delivery`]).
+    pub fn literal_delivery(&self) -> bool {
+        self.literal_delivery
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Signal the emitter to finish after every queued reducer revision.
@@ -768,13 +814,25 @@ impl PresentationEmitter {
             .as_ref()
             .ok_or(UserRevisionRefusal::AuthorityUnavailable)?;
         let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+        self.commit_document_revision(&mut ledger, intent)
+    }
+
+    /// The one whole-document revision corridor: reducer mints the revision
+    /// against the ledger, the Bus observes it, the delivery buffer follows.
+    /// User edits, formatter results, and the terminal Light+ pass all enter
+    /// here; only the provenance differs.
+    fn commit_document_revision(
+        &self,
+        ledger: &mut AcousticLedger,
+        intent: UserRevisionIntent,
+    ) -> Result<UserRevisionCommit, UserRevisionRefusal> {
         let revision = self
             .session_state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .apply_user_revision(&mut ledger, &intent)?;
+            .apply_user_revision(ledger, &intent)?;
         if let Some(bus) = &self.transcript_bus {
-            let events = bus.publish_revision(&revision, &ledger);
+            let events = bus.publish_revision(&revision, ledger);
             if let Some(callback) = &self.projection_callback {
                 for event in &events {
                     callback(event);
@@ -794,6 +852,36 @@ impl PresentationEmitter {
             rendered_text: revision.rendered_text,
             provenance_receipt: receipt.receipt_id.clone(),
         })
+    }
+
+    /// Light+ floor at the terminal seal. Deterministic sentence shape for the
+    /// sealed document — capital at sentence starts, a closing period,
+    /// hesitation sounds dropped, punctuation seams collapsed — minted as one
+    /// ledger-stamped document revision with provenance `light-plus`, so the
+    /// Bus, the delivery buffer, and the formatter CAS all see the same bytes.
+    /// It runs for every lane except the literal contract and never touches
+    /// an occurrence label: the ledger stays the sole author of the words.
+    fn mint_light_plus_revision(&self, ledger: &mut AcousticLedger) {
+        if self.literal_delivery() {
+            return;
+        }
+        let intent = self
+            .session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .light_plus_intent();
+        let Some(intent) = intent else {
+            return;
+        };
+        match self.commit_document_revision(ledger, intent) {
+            Ok(commit) => debug!(
+                revision = commit.revision,
+                receipt = %commit.provenance_receipt,
+                "Light+ terminal revision committed"
+            ),
+            Err(UserRevisionRefusal::Unchanged) => {}
+            Err(refusal) => debug!(%refusal, "Light+ terminal revision refused"),
+        }
     }
 
     /// Authenticate formatter input without mutating reducer, ledger, Bus, or
@@ -892,19 +980,33 @@ impl EventSink for PresentationEmitter {
                 let Some(ledger) = &self.acoustic_ledger else {
                     return;
                 };
-                let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+                let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
                 let revision = self
                     .session_state
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
                     .apply_ledger_seal(receipt);
-                if let (Some(bus), Some(revision)) = (&self.transcript_bus, revision) {
+                let Some(revision) = revision else {
+                    return;
+                };
+                let terminal = matches!(
+                    revision.action,
+                    ReducerAction::RecordLedgerSeal { terminal: true, .. }
+                );
+                if let Some(bus) = &self.transcript_bus {
                     let events = bus.publish_revision(&revision, &ledger);
                     if let Some(callback) = &self.projection_callback {
                         for event in &events {
                             callback(event);
                         }
                     }
+                }
+                // The terminal seal closes the ledger's word authority; the
+                // Light+ floor follows immediately, before the controller
+                // publishes `session_ended`, so the terminal projection Swift
+                // holds already carries the shaped bytes and revision number.
+                if terminal {
+                    self.mint_light_plus_revision(&mut ledger);
                 }
             }
             EngineEvent::SealCoverage {
@@ -1072,6 +1174,15 @@ impl EventSink for PresentationEmitter {
                     state.committed_rendered_text()
                 };
                 self.send_cmd(EmitterCmd::PaintEphemeralPreview(canonical_text));
+                // Lifecycle end is the second Light+ gate: a one-occurrence
+                // session's whole-session seal is indistinguishable from its
+                // sole occurrence seal, so the reducer becomes terminal only
+                // here. Idempotent — a document the terminal seal already
+                // shaped yields no intent, so nothing is minted twice.
+                if let Some(ledger) = &self.acoustic_ledger {
+                    let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+                    self.mint_light_plus_revision(&mut ledger);
+                }
             }
         }
     }
@@ -1083,8 +1194,8 @@ impl EventSink for PresentationEmitter {
 mod tests {
     use super::{PresentationEmitter, TranscriptReducer, UserRevisionIntent, UserRevisionRefusal};
     use crate::presentation::transcript_bus::{
-        TranscriptBus, TranscriptMode, TranscriptProjectionPhase, TranscriptSession,
-        TranscriptSessionEndReason,
+        TranscriptBus, TranscriptBusEvidenceEvent, TranscriptMode, TranscriptProjectionPhase,
+        TranscriptSession, TranscriptSessionEndReason,
     };
     use crate::presentation::transcript_projection::TranscriptProjectionReader;
     use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
@@ -1405,13 +1516,15 @@ mod tests {
         emitter.on_event(&EngineEvent::LedgerSeal {
             receipt: terminal_seal,
         });
-        let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
-            .expect("terminal projection");
+        // Production order (controller): the session emits `SessionFinalised`
+        // inside recorder stop; `publish_ended` follows in the take reset.
         emitter.on_event(&EngineEvent::SessionFinalised {
             session_id: "revision-session".to_string(),
             layer_summary: LayerSummary::default(),
         });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
 
         let commit = emitter
             .apply_user_revision(UserRevisionIntent {
@@ -1441,8 +1554,14 @@ mod tests {
             "Tekst poprawiony przez użytkownika"
         );
         let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-        assert_eq!(ledger.manual_document_revisions().len(), 1);
-        let receipt = &ledger.manual_document_revisions()[0];
+        // Two document revisions: the terminal Light+ floor ("Tekst bazowy."),
+        // then the user edit on top of it.
+        assert_eq!(ledger.manual_document_revisions().len(), 2);
+        assert_eq!(
+            ledger.manual_document_revisions()[0].provenance,
+            "light-plus"
+        );
+        let receipt = &ledger.manual_document_revisions()[1];
         assert_eq!(receipt.provenance, "user-edit");
         assert_eq!(receipt.rendered_text, commit.rendered_text);
         assert_eq!(receipt.source_occurrences, vec![occurrence]);
@@ -1543,17 +1662,27 @@ mod tests {
         emitter.on_event(&EngineEvent::LedgerSeal {
             receipt: terminal_seal,
         });
-        let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
-            .expect("terminal projection");
+        // Production order (controller): the session emits `SessionFinalised`
+        // inside recorder stop; `publish_ended` follows in the take reset.
         emitter.on_event(&EngineEvent::SessionFinalised {
             session_id: "formatter-session".to_string(),
             layer_summary: LayerSummary::default(),
         });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
 
         let source = emitter
             .terminal_revision_source("formatter-session", terminal.reducer_revision)
             .expect("current terminal source");
+        // Light+ ran at the terminal seal, so the formatter is fed shaped text
+        // (Light+ before LLM, as the controller always ordered it).
+        assert_eq!(source, "To jest tekst wymagający formatowania.");
+        let revisions_before_failure = ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .manual_document_revisions()
+            .len();
         let bus_before_failure = std::fs::read(&bus_path).unwrap();
         let delivery_before_failure = delivery.lock().await.clone();
         let projection_count_before_failure = projected
@@ -1570,12 +1699,13 @@ mod tests {
             },
         );
         assert_eq!(failure, Err(UserRevisionRefusal::FormatterFailed));
-        assert!(
+        assert_eq!(
             ledger
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .manual_document_revisions()
-                .is_empty()
+                .len(),
+            revisions_before_failure
         );
         assert_eq!(std::fs::read(&bus_path).unwrap(), bus_before_failure);
         assert_eq!(
@@ -1587,7 +1717,7 @@ mod tests {
         );
         assert_eq!(*delivery.lock().await, delivery_before_failure);
 
-        let formatted = "To jest tekst wymagający formatowania.".to_string();
+        let formatted = "To jest tekst, który wymaga formatowania.".to_string();
         let commit = emitter
             .apply_formatter_revision(
                 "formatter-session".to_string(),
@@ -1605,9 +1735,13 @@ mod tests {
         emitter.finish().await;
         assert_eq!(delivery.lock().await.as_str(), formatted);
         let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-        assert_eq!(ledger.manual_document_revisions().len(), 1);
+        assert_eq!(ledger.manual_document_revisions().len(), 2);
         assert_eq!(
             ledger.manual_document_revisions()[0].provenance,
+            "light-plus"
+        );
+        assert_eq!(
+            ledger.manual_document_revisions()[1].provenance,
             "formatter"
         );
         drop(ledger);
@@ -1624,6 +1758,204 @@ mod tests {
                 .manual_edit_receipt
                 .as_deref(),
             Some(commit.provenance_receipt.as_str())
+        );
+    }
+
+    /// Light+ standard in live: an unpunctuated ledger document gains sentence
+    /// shape at the terminal seal, as one `light-plus` document revision that
+    /// the Bus persists, the delivery buffer carries, the formatter CAS sees
+    /// as its source, and a replay of the Bus bytes reproduces. The ledger's
+    /// occurrence labels stay untouched — Rust remains the only author.
+    #[tokio::test]
+    async fn terminal_seal_mints_light_plus_revision_before_session_end() {
+        let delivery = Arc::new(Mutex::new(String::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let bus_path = temp.path().join("light-plus.jsonl");
+        let bus = Arc::new(
+            TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: "light-plus-session".to_string(),
+                    mode: TranscriptMode::Dictation,
+                    has_latched_target: true,
+                    latched_target_is_self: false,
+                },
+                bus_path.clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        let occurrence = OccurrenceIdentity::new("light-plus-session", 6, 0, 16_000);
+        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
+        let raw_words = "to jest tekst bez interpunkcji yyy i koniec";
+        let mutation = {
+            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+            let mutation = admitted_mutation(&mut ledger, occurrence.clone(), 1, raw_words);
+            ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+            mutation
+        };
+        let projected = Arc::new(StdMutex::new(Vec::new()));
+        let projected_for_callback = Arc::clone(&projected);
+        bus.publish_started();
+        let mut emitter = PresentationEmitter::new_with_authority(
+            Arc::clone(&delivery),
+            None,
+            None,
+            Some(Arc::clone(&bus)),
+            Some(Arc::clone(&ledger)),
+            Some(Arc::new(move |event| {
+                projected_for_callback
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(event.clone());
+            })),
+        );
+        emitter.on_event(&mutation);
+        let terminal_seal = ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .seal_terminal("light-plus-session", 6)
+            .expect("closed qualified occurrence must produce terminal seal");
+        emitter.on_event(&EngineEvent::LedgerSeal {
+            receipt: terminal_seal,
+        });
+        // Production order (controller): the session emits `SessionFinalised`
+        // inside recorder stop; `publish_ended` follows in the take reset.
+        emitter.on_event(&EngineEvent::SessionFinalised {
+            session_id: "light-plus-session".to_string(),
+            layer_summary: LayerSummary::default(),
+        });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
+        emitter.finish().await;
+
+        let shaped = "To jest tekst bez interpunkcji i koniec.";
+        assert_eq!(delivery.lock().await.as_str(), shaped);
+
+        // The ledger words are untouched; the shaping is a document revision.
+        let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+        assert_eq!(ledger.text_of(&occurrence), Some(raw_words));
+        assert_eq!(ledger.manual_document_revisions().len(), 1);
+        let receipt = &ledger.manual_document_revisions()[0];
+        assert_eq!(receipt.provenance, "light-plus");
+        assert!(receipt.receipt_id.starts_with("light-plus-"));
+        assert_eq!(receipt.rendered_text, shaped);
+        assert_eq!(receipt.source_occurrences, vec![occurrence.clone()]);
+        drop(ledger);
+
+        // `session_ended` copies the Light+ revision: Swift's terminal CAS
+        // source is the shaped document, and so is the formatter's input.
+        assert_eq!(terminal.rendered_text, shaped);
+        assert_eq!(terminal.reducer_revision, receipt_revision(&projected));
+        assert_eq!(
+            emitter
+                .terminal_revision_source("light-plus-session", terminal.reducer_revision)
+                .expect("light-plus revision is the current terminal source"),
+            shaped
+        );
+
+        let projected = projected.lock().unwrap_or_else(|error| error.into_inner());
+        let light_plus_projection = projected
+            .iter()
+            .rev()
+            .find(|event| event.reducer_action == "apply_manual_edit")
+            .expect("light-plus revision projection callback");
+        assert_eq!(light_plus_projection.rendered_text, shaped);
+        assert_eq!(light_plus_projection.label, raw_words);
+        assert!(light_plus_projection.terminal);
+        assert!(
+            light_plus_projection.acoustic_receipts[0]
+                .manual_edit_receipt
+                .as_deref()
+                .is_some_and(|receipt| receipt.starts_with("light-plus-"))
+        );
+        drop(projected);
+
+        let bus_bytes = std::fs::read(bus_path).unwrap();
+        let mut reader = TranscriptProjectionReader::new();
+        let replay = reader
+            .push_bytes(&bus_bytes)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("light-plus Bus bytes must replay");
+        let replayed = replay.last().expect("replayed light-plus revision");
+        assert_eq!(replayed.rendered_text, shaped);
+        assert!(replayed.terminal);
+    }
+
+    fn receipt_revision(projected: &StdMutex<Vec<TranscriptBusEvidenceEvent>>) -> u64 {
+        projected
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .last()
+            .expect("at least one projection")
+            .reducer_revision
+    }
+
+    /// The literal contract (Ctrl-hold `force_raw`): with literal delivery
+    /// declared, the terminal seal mints no Light+ revision and the words
+    /// reach delivery exactly as the ledger holds them.
+    #[tokio::test]
+    async fn literal_delivery_keeps_terminal_words_untouched() {
+        let delivery = Arc::new(Mutex::new(String::new()));
+        let temp = tempfile::tempdir().unwrap();
+        let bus_path = temp.path().join("literal.jsonl");
+        let bus = Arc::new(
+            TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: "literal-session".to_string(),
+                    mode: TranscriptMode::Dictation,
+                    has_latched_target: true,
+                    latched_target_is_self: false,
+                },
+                bus_path,
+                None,
+            )
+            .unwrap(),
+        );
+        let occurrence = OccurrenceIdentity::new("literal-session", 7, 0, 16_000);
+        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
+        let raw_words = "słowa literalne bez kropki";
+        let mutation = {
+            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+            let mutation = admitted_mutation(&mut ledger, occurrence.clone(), 1, raw_words);
+            ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+            mutation
+        };
+        bus.publish_started();
+        let mut emitter = PresentationEmitter::new_with_authority(
+            Arc::clone(&delivery),
+            None,
+            None,
+            Some(Arc::clone(&bus)),
+            Some(Arc::clone(&ledger)),
+            None,
+        );
+        emitter.set_literal_delivery(true);
+        emitter.on_event(&mutation);
+        let terminal_seal = ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .seal_terminal("literal-session", 7)
+            .expect("closed qualified occurrence must produce terminal seal");
+        emitter.on_event(&EngineEvent::LedgerSeal {
+            receipt: terminal_seal,
+        });
+        let terminal = bus
+            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .expect("terminal projection");
+        emitter.finish().await;
+
+        assert_eq!(delivery.lock().await.as_str(), raw_words);
+        assert_eq!(terminal.rendered_text, raw_words);
+        assert!(
+            ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .manual_document_revisions()
+                .is_empty()
         );
     }
 

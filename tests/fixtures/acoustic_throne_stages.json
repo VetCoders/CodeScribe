@@ -7,7 +7,6 @@
     "live_assembly",
     "quality_delivery",
     "acoustic_identity",
-    "light_plus",
     "punctuation_transplant",
     "semantic_guard",
     "quality_gate",
@@ -851,7 +850,8 @@
               "required_code": [
                 "EngineEvent::LedgerSeal { receipt }",
                 ".apply_ledger_seal(receipt)",
-                "if let (Some(bus), Some(revision)) = (&self.transcript_bus, revision)",
+                "let Some(revision) = revision else",
+                "if let Some(bus) = &self.transcript_bus",
                 "let events = bus.publish_revision(&revision, &ledger)",
                 "callback(event)"
               ]
@@ -954,20 +954,11 @@
               "file": "macos/Codescribe/Screens/Overlay/OverlayState.swift",
               "signature_contains": "func applyTranscriptProjection",
               "required_code": [
-                "guard let phase = OverlayMode(rawValue: event.phase)",
-                "event.acousticReceipts.map",
-                "renderedText: event.renderedText",
-                "terminal: event.terminal",
-                "applyProjection(projection)"
-              ]
-            },
-            {
-              "symbol": "applyProjection",
-              "file": "macos/Codescribe/Screens/Overlay/OverlayState.swift",
-              "required_code": [
-                "mode = projection.phase",
-                "formattedText = projection.renderedText",
-                "terminal = projection.terminal"
+                "func applyTranscriptProjection(_ projection: CsTranscriptProjectionEvent)",
+                "latestTranscriptProjection = projection",
+                "mode = OverlayMode(rawValue: projection.phase) ?? mode",
+                "terminal = projection.terminal",
+                "revisionDraft = projection.renderedText"
               ]
             },
             {
@@ -1529,27 +1520,11 @@
               "file": "macos/Codescribe/Screens/Overlay/OverlayState.swift",
               "signature_contains": "func applyTranscriptProjection",
               "required_code": [
-                "func applyTranscriptProjection(_ event: CsTranscriptProjectionEvent)",
-                "acousticSerialVersion: receipt.acousticSerialVersion",
-                "acousticSerial: receipt.acousticSerial",
-                "sessionId: receipt.sessionId",
-                "captureEpoch: receipt.captureEpoch",
-                "sampleStart: receipt.sampleStart",
-                "sampleEnd: receipt.sampleEnd",
-                "durationMs: receipt.durationMs",
-                "energyIntegral: receipt.energyIntegral",
-                "meanRmsDbfs: receipt.meanRmsDbfs",
-                "peakDbfs: receipt.peakDbfs",
-                "vadOpenSample: receipt.vadOpenSample",
-                "vadCloseSample: receipt.vadCloseSample",
-                "evidenceCalibrationVersion: receipt.evidenceCalibrationVersion",
-                "wordEvidenceReceipts: receipt.wordEvidenceReceipts",
-                "layerDecisionReceipts: receipt.layerDecisionReceipts",
-                "sealReceipt: receipt.sealReceipt",
-                "manualEditReceipt: receipt.manualEditReceipt",
-                "renderedText: event.renderedText",
-                "terminal: event.terminal",
-                "applyProjection(projection)"
+                "func applyTranscriptProjection(_ projection: CsTranscriptProjectionEvent)",
+                "latestTranscriptProjection = projection",
+                "mode = OverlayMode(rawValue: projection.phase) ?? mode",
+                "terminal = projection.terminal",
+                "revisionDraft = projection.renderedText"
               ]
             }
           ],
