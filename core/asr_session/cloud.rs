@@ -125,7 +125,8 @@ impl GatewayConnection {
             || !parsed.username().is_empty()
             || parsed.password().is_some()
             || (auth_mode != crate::stt::tail_provider::SttAuthMode::Unauthenticated
-                && credential.trim().is_empty())
+                && credential.trim().is_empty()
+                && crate::llm::speech::vendor_for_endpoint(&endpoint).is_none())
         {
             return Err(AsrErrorKind::Protocol);
         }
@@ -234,6 +235,8 @@ struct VoiceLabReceiveState {
     next_event_id: u64,
     utterance_id: u64,
     revision: u64,
+    xai: bool,
+    xai_done: bool,
 }
 
 impl VoiceLabReceiveState {
@@ -243,6 +246,8 @@ impl VoiceLabReceiveState {
             next_event_id: 1,
             utterance_id: 1,
             revision: 0,
+            xai: false,
+            xai_done: false,
         }
     }
 
@@ -255,7 +260,85 @@ impl VoiceLabReceiveState {
         Ok(format!("voice-lab-{id}"))
     }
 
+    // xAI emits chunk finals and complete utterance finals. Only speech_final
+    // seals our utterance; transcript.done is session-wide accounting, never
+    // another transcript occurrence (its text repeats the whole session).
+    fn adapt_xai(&mut self, text: &str) -> Result<Option<GatewayEvent>, AsrErrorKind> {
+        let value: serde_json::Value =
+            serde_json::from_str(text).map_err(|_| AsrErrorKind::Protocol)?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("transcript.created") => Ok(None),
+            Some("transcript.done") => {
+                self.xai_done = true;
+                Ok(Some(GatewayEvent::SessionEnded {
+                    session_id: self.session_id.clone(),
+                }))
+            }
+            Some("error") => Err(AsrErrorKind::Protocol),
+            Some("transcript.partial") => {
+                let text = value
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or(AsrErrorKind::Protocol)?
+                    .to_string();
+                let is_final = value
+                    .get("is_final")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    && value
+                        .get("speech_final")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                let start = value.get("start").and_then(serde_json::Value::as_f64);
+                let duration = value.get("duration").and_then(serde_json::Value::as_f64);
+                let milliseconds = |seconds: f64| {
+                    (seconds.is_finite() && seconds >= 0.0)
+                        .then_some((seconds * 1000.0).round() as u64)
+                };
+                let start_ms = start.and_then(milliseconds);
+                let end_ms = start
+                    .zip(duration)
+                    .and_then(|(start, duration)| milliseconds(start + duration));
+                self.revision = self.revision.checked_add(1).ok_or(AsrErrorKind::Protocol)?;
+                let event_id = self.event_id()?;
+                let event = if is_final {
+                    GatewayEvent::Final {
+                        event_id,
+                        session_id: self.session_id.clone(),
+                        utterance_id: self.utterance_id,
+                        revision: self.revision,
+                        text,
+                        start_ms,
+                        end_ms,
+                    }
+                } else {
+                    GatewayEvent::Partial {
+                        event_id,
+                        session_id: self.session_id.clone(),
+                        utterance_id: self.utterance_id,
+                        revision: self.revision,
+                        text,
+                        start_ms,
+                        end_ms,
+                    }
+                };
+                if is_final {
+                    self.utterance_id = self
+                        .utterance_id
+                        .checked_add(1)
+                        .ok_or(AsrErrorKind::Protocol)?;
+                    self.revision = 0;
+                }
+                Ok(Some(event))
+            }
+            _ => Err(AsrErrorKind::Protocol),
+        }
+    }
+
     fn adapt(&mut self, text: &str) -> Result<Option<GatewayEvent>, AsrErrorKind> {
+        if self.xai {
+            return self.adapt_xai(text);
+        }
         if let Ok(event) = serde_json::from_str::<GatewayEvent>(text) {
             return Ok(Some(event));
         }
@@ -683,17 +766,37 @@ async fn run_gateway_socket(
     mut command_rx: mpsc::Receiver<GatewayCommand>,
     event_tx: &mpsc::Sender<WorkerSignal>,
 ) -> Result<(), AsrErrorKind> {
-    let mut request = connection
-        .endpoint
+    let vendor = crate::llm::speech::vendor_for_endpoint(&connection.endpoint);
+    let xai = vendor == Some(crate::llm::provider::ProviderKind::XaiResponses);
+    if vendor == Some(crate::llm::provider::ProviderKind::OpenAiResponses) {
+        return Err(AsrErrorKind::Unsupported); // OpenAI live STT is a separate protocol.
+    }
+    let auth = if let Some(vendor) = vendor {
+        Some(
+            crate::llm::speech::resolve_vendor_auth(vendor, Some(&connection.credential))
+                .await
+                .map_err(|_| AsrErrorKind::Auth)?,
+        )
+    } else {
+        None
+    };
+    let credential = auth
+        .as_ref()
+        .map_or(connection.credential.as_str(), |auth| auth.bearer.as_str());
+    let endpoint = if xai {
+        xai_live_endpoint(&connection.endpoint, &config)?
+    } else {
+        connection.endpoint.clone()
+    };
+    let mut request = endpoint
         .as_str()
         .into_client_request()
         .map_err(|_| AsrErrorKind::Protocol)?;
     match connection.auth_mode {
         crate::stt::tail_provider::SttAuthMode::Unauthenticated => {}
         crate::stt::tail_provider::SttAuthMode::Bearer => {
-            let authorization =
-                HeaderValue::from_str(&format!("Bearer {}", connection.credential.trim()))
-                    .map_err(|_| AsrErrorKind::Protocol)?;
+            let authorization = HeaderValue::from_str(&format!("Bearer {}", credential.trim()))
+                .map_err(|_| AsrErrorKind::Protocol)?;
             request.headers_mut().insert(AUTHORIZATION, authorization);
         }
         crate::stt::tail_provider::SttAuthMode::ApiKey => {
@@ -713,14 +816,24 @@ async fn run_gateway_socket(
 
     // Proven Voice Lab wire: credentials stay in the WebSocket handshake,
     // never in the JSON body. The engine start type is `set`, not `config`.
-    send_socket_message(
-        &mut socket,
-        Message::Text(voice_lab_set_message(&config).into()),
-        limits.send_timeout,
-    )
-    .await?;
+    if xai {
+        timeout(
+            limits.connect_timeout,
+            wait_xai_created(&mut socket, limits.send_timeout),
+        )
+        .await
+        .map_err(|_| AsrErrorKind::Transport)??;
+    } else {
+        send_socket_message(
+            &mut socket,
+            Message::Text(voice_lab_set_message(&config).into()),
+            limits.send_timeout,
+        )
+        .await?;
+    }
 
     let mut receive_state = VoiceLabReceiveState::new(config.session_id.clone());
+    receive_state.xai = xai;
     let mut flush = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_millis(2_500),
         Duration::from_millis(2_500),
@@ -730,6 +843,10 @@ async fn run_gateway_socket(
             command = command_rx.recv() => {
                 match command {
                     Some(GatewayCommand::Pcm(frame)) => {
+                        if xai {
+                            send_socket_message(&mut socket, Message::Binary(frame.pcm_s16le.into()), limits.send_timeout).await?;
+                            continue;
+                        }
                         let chunk = serde_json::json!({
                             "type": "chunk",
                             "audio_base64": BASE64.encode(&frame.pcm_s16le),
@@ -743,6 +860,10 @@ async fn run_gateway_socket(
                         ).await?;
                     }
                     Some(GatewayCommand::End) => {
+                        if xai {
+                            send_socket_message(&mut socket, Message::Text(r#"{"type":"audio.done"}"#.into()), limits.send_timeout).await?;
+                            return drain_gateway_tail(&mut socket, limits, event_tx, &mut receive_state).await;
+                        }
                         let flush = serde_json::json!({"type": "flush"}).to_string();
                         send_socket_message(
                             &mut socket,
@@ -768,7 +889,7 @@ async fn run_gateway_socket(
                     }
                 }
             }
-            _ = flush.tick() => {
+            _ = flush.tick(), if !xai => {
                 let message = serde_json::json!({"type": "flush"}).to_string();
                 send_socket_message(
                     &mut socket,
@@ -787,6 +908,55 @@ async fn run_gateway_socket(
                     return Err(AsrErrorKind::Transport);
                 }
             }
+        }
+    }
+}
+
+fn xai_live_endpoint(
+    endpoint: &str,
+    config: &GatewaySessionConfig,
+) -> Result<String, AsrErrorKind> {
+    let mut url = reqwest::Url::parse(endpoint).map_err(|_| AsrErrorKind::Protocol)?;
+    if url.path() != "/v1/stt" {
+        return Err(AsrErrorKind::Unsupported);
+    }
+    // The capture format belongs to the recording session, never a URL override.
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("encoding", "pcm")
+            .append_pair("sample_rate", &config.audio.sample_rate_hz.to_string())
+            .append_pair("interim_results", "true");
+        if let Some(language) = config.locale.as_deref() {
+            query.append_pair("language", language);
+        }
+    }
+    Ok(url.into())
+}
+
+async fn wait_xai_created(
+    socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    send_timeout: Duration,
+) -> Result<(), AsrErrorKind> {
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&text).map_err(|_| AsrErrorKind::Protocol)?;
+                return if value.get("type").and_then(serde_json::Value::as_str)
+                    == Some("transcript.created")
+                {
+                    Ok(())
+                } else {
+                    Err(AsrErrorKind::Protocol)
+                };
+            }
+            Some(Ok(Message::Ping(payload))) => {
+                send_socket_message(socket, Message::Pong(payload), send_timeout).await?
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            _ => return Err(AsrErrorKind::Transport),
         }
     }
 }
@@ -811,7 +981,11 @@ async fn drain_gateway_tail(
         )
         .await?
         {
-            return Ok(());
+            return if receive_state.xai && !receive_state.xai_done {
+                Err(AsrErrorKind::Transport)
+            } else {
+                Ok(())
+            };
         }
     }
 }
@@ -1420,6 +1594,68 @@ mod tests {
             start_ms: None,
             end_ms: None,
         }
+    }
+
+    #[test]
+    fn xai_receive_seals_only_complete_utterances_and_does_not_replay_done() {
+        let mut state = VoiceLabReceiveState::new("xai-test".into());
+        state.xai = true;
+        assert!(
+            state
+                .adapt(r#"{"type":"transcript.created"}"#)
+                .unwrap()
+                .is_none()
+        );
+        let chunk = state.adapt(r#"{"type":"transcript.partial","text":"one","is_final":true,"speech_final":false,"start":0,"duration":0.5}"#).unwrap().unwrap();
+        assert!(matches!(
+            chunk,
+            GatewayEvent::Partial {
+                utterance_id: 1,
+                ..
+            }
+        ));
+        let utterance = state.adapt(r#"{"type":"transcript.partial","text":"one one","is_final":true,"speech_final":true,"start":0,"duration":1.25}"#).unwrap().unwrap();
+        assert!(
+            matches!(utterance, GatewayEvent::Final { utterance_id: 1, start_ms: Some(0), end_ms: Some(1250), text, .. } if text == "one one")
+        );
+        let next = state.adapt(r#"{"type":"transcript.partial","text":"one one","is_final":true,"speech_final":true,"start":2,"duration":1}"#).unwrap().unwrap();
+        assert!(matches!(
+            next,
+            GatewayEvent::Final {
+                utterance_id: 2,
+                ..
+            }
+        ));
+        assert!(matches!(
+            state
+                .adapt(r#"{"type":"transcript.done","text":"one one one one","duration":3}"#)
+                .unwrap(),
+            Some(GatewayEvent::SessionEnded { .. })
+        ));
+    }
+
+    #[test]
+    fn xai_connection_defers_oauth_resolution_and_rejects_non_stt_path() {
+        assert!(GatewayConnection::new("wss://api.x.ai/v1/stt", "").is_ok());
+        let config = GatewaySessionConfig {
+            message_type: "session.start",
+            protocol_version: 1,
+            session_id: "test".into(),
+            locale: Some("pl".into()),
+            vocabulary: "programming",
+            audio: GatewayAudioConfig {
+                encoding: "pcm_s16le",
+                sample_rate_hz: 16000,
+                channels: 1,
+                frame_header: "sequence_u64_be",
+            },
+        };
+        let endpoint =
+            xai_live_endpoint("wss://api.x.ai/v1/stt?sample_rate=8000", &config).unwrap();
+        assert!(endpoint.contains("sample_rate=16000"));
+        assert!(endpoint.contains("encoding=pcm"));
+        assert!(endpoint.contains("language=pl"));
+        assert!(xai_live_endpoint("wss://api.x.ai/v1/realtime", &config).is_err());
     }
 
     #[test]

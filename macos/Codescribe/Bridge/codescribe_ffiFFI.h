@@ -1624,9 +1624,26 @@ RustBuffer uniffi_codescribe_ffi_fn_func_shutdown_application_runtime(RustCallSt
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_SPEAK_TEXT
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_SPEAK_TEXT
+uint64_t uniffi_codescribe_ffi_fn_func_speak_text(RustBuffer text
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_SPEECH_AVAILABILITY
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_SPEECH_AVAILABILITY
+RustBuffer uniffi_codescribe_ffi_fn_func_speech_availability(RustCallStatus *_Nonnull out_status
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_START_APPLICATION_RUNTIME
 #define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_START_APPLICATION_RUNTIME
 RustBuffer uniffi_codescribe_ffi_fn_func_start_application_runtime(RustCallStatus *_Nonnull out_status
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_STOP_SPEAKING
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_FN_FUNC_STOP_SPEAKING
+void uniffi_codescribe_ffi_fn_func_stop_speaking(RustCallStatus *_Nonnull out_status
 
 );
 #endif
@@ -1998,9 +2015,27 @@ uint16_t uniffi_codescribe_ffi_checksum_func_shutdown_application_runtime(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_SPEAK_TEXT
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_SPEAK_TEXT
+uint16_t uniffi_codescribe_ffi_checksum_func_speak_text(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_SPEECH_AVAILABILITY
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_SPEECH_AVAILABILITY
+uint16_t uniffi_codescribe_ffi_checksum_func_speech_availability(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_START_APPLICATION_RUNTIME
 #define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_START_APPLICATION_RUNTIME
 uint16_t uniffi_codescribe_ffi_checksum_func_start_application_runtime(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_STOP_SPEAKING
+#define UNIFFI_FFIDEF_UNIFFI_CODESCRIBE_FFI_CHECKSUM_FUNC_STOP_SPEAKING
+uint16_t uniffi_codescribe_ffi_checksum_func_stop_speaking(void
 
 );
 #endif

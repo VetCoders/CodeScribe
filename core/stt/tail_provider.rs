@@ -62,7 +62,8 @@ pub fn stt_auth_mode(endpoint: &str) -> SttAuthMode {
         }
         Some(host)
             if host.eq_ignore_ascii_case("api.openai.com")
-                || host.eq_ignore_ascii_case("api.libraxis.cloud") =>
+                || host.eq_ignore_ascii_case("api.libraxis.cloud")
+                || host.eq_ignore_ascii_case("api.x.ai") =>
         {
             SttAuthMode::Bearer
         }
@@ -1024,7 +1025,10 @@ impl RemoteTailProvider {
         let endpoint = endpoint.into();
         validate_remote_endpoint(&endpoint)?;
         let api_key = api_key.into();
-        if stt_auth_mode(&endpoint) != SttAuthMode::Unauthenticated && api_key.trim().is_empty() {
+        if stt_auth_mode(&endpoint) != SttAuthMode::Unauthenticated
+            && crate::llm::speech::vendor_for_endpoint(&endpoint).is_none()
+            && api_key.trim().is_empty()
+        {
             bail!("STT_FILE_API_KEY is required for remote tail provider");
         }
         Ok(Self { endpoint, api_key })
@@ -1054,16 +1058,49 @@ impl TailProvider for RemoteTailProvider {
         let started = Instant::now();
         let wav = pcm16_wav(pcm, request.sample_rate)?;
         let language = request.language.as_deref().unwrap_or("pl");
-        let model = std::env::var("WHISPER_MODEL")
-            .unwrap_or_else(|_| "mlx-community/whisper-large-v3-mlx".to_string());
+        let model = crate::llm::client::stt_model(
+            &self.endpoint,
+            std::env::var("WHISPER_MODEL").ok().as_deref(),
+        );
+        let vendor = crate::llm::speech::vendor_for_endpoint(&self.endpoint);
+        // This provider is synchronous (including reqwest::blocking below).
+        // Production enters through compute_tail_patch_job_with's spawn_blocking
+        // in pipeline/streaming/session.rs, never the async session executor.
+        // The local runtime therefore refreshes OAuth without nesting block_on.
+        let auth = if let Some(vendor) = vendor {
+            Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(crate::llm::speech::resolve_vendor_auth(
+                        vendor,
+                        Some(&self.api_key),
+                    ))?,
+            )
+        } else {
+            None
+        };
+        let bearer = auth
+            .as_ref()
+            .map_or(self.api_key.as_str(), |auth| auth.bearer.as_str());
         let file = Part::bytes(wav)
             .file_name("tail-window.wav")
             .mime_str("audio/wav")?;
         let mut form = Form::new()
             .part("file", file)
-            .text("model", model.clone())
-            .text("language", language.to_string())
-            .text("response_format", "verbose_json");
+            .text("language", language.to_string());
+        if let Some(model) = &model {
+            form = form.text("model", model.clone());
+        }
+        match vendor {
+            Some(crate::llm::provider::ProviderKind::XaiResponses) => {}
+            Some(crate::llm::provider::ProviderKind::OpenAiResponses) => {
+                form = form.text("response_format", "json");
+            }
+            _ => {
+                form = form.text("response_format", "verbose_json");
+            }
+        }
         if let Some((field, value)) =
             crate::stt::request_vocabulary::codescribe_stt_vocabulary_form_part(&self.endpoint)
         {
@@ -1076,7 +1113,7 @@ impl TailProvider for RemoteTailProvider {
             .post(&self.endpoint);
         let http_request = match stt_auth_mode(&self.endpoint) {
             SttAuthMode::Unauthenticated => http_request,
-            SttAuthMode::Bearer => http_request.bearer_auth(&self.api_key),
+            SttAuthMode::Bearer => http_request.bearer_auth(bearer),
             SttAuthMode::ApiKey => http_request.header("x-api-key", &self.api_key),
         };
         let response = http_request
@@ -1123,7 +1160,7 @@ impl TailProvider for RemoteTailProvider {
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             evidence: TailProviderEvidence {
                 source: TailEvidenceSource::Whisper,
-                revision: Some(model),
+                revision: model,
                 stability: TailEvidenceStability::Final,
                 timing_quality: TailTimingQuality::ExactSampleRange,
                 avg_logprob: response.avg_logprob,
@@ -1276,6 +1313,11 @@ mod tests {
 
     #[test]
     fn stt_auth_mode_follows_endpoint_owner() {
+        assert_eq!(
+            stt_auth_mode("https://api.x.ai/v1/stt"),
+            SttAuthMode::Bearer
+        );
+        assert_eq!(stt_auth_mode("wss://api.x.ai/v1/stt"), SttAuthMode::Bearer);
         assert_eq!(
             stt_auth_mode("https://api.openai.com/v1/audio/transcriptions"),
             SttAuthMode::Bearer

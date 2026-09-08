@@ -254,7 +254,7 @@ fn is_retryable_error(error: &anyhow::Error) -> bool {
 /// Transcribe audio using external STT API
 ///
 /// Supports multiple protocols based on endpoint URL:
-/// - WebSocket schemes -> streaming (plain for localhost dev, encrypted for production)
+/// - WebSocket schemes are rejected; they belong to the separate Live lane
 /// - URL ending with `:stream` → NDJSON streaming HTTP
 /// - Otherwise → OpenAI-compatible multipart upload
 ///
@@ -297,6 +297,14 @@ async fn transcribe_external(
     if endpoint_url.starts_with("ws") {
         anyhow::bail!("a WebSocket socket is not a file transcription endpoint: {endpoint_url}");
     }
+    // Resolve at the common file transport boundary so every caller follows
+    // the vendor's OAuth-first policy, including any direct internal callers.
+    let auth = if let Some(vendor) = super::speech::vendor_for_endpoint(endpoint_url) {
+        Some(super::speech::resolve_vendor_auth(vendor, Some(api_key)).await?)
+    } else {
+        None
+    };
+    let api_key = auth.as_ref().map_or(api_key, |auth| auth.bearer.as_str());
     if endpoint_url.ends_with(":stream") {
         // NDJSON streaming HTTP
         transcribe_ndjson(endpoint_url, api_key, buffer, lang).await
@@ -508,6 +516,26 @@ async fn transcribe_ndjson(
 /// - file: audio file
 /// - model: whisper model name
 /// - language: optional language code
+pub(crate) fn stt_model(url: &str, override_model: Option<&str>) -> Option<String> {
+    use super::provider::ProviderKind;
+    let vendor = super::speech::vendor_for_endpoint(url);
+    if vendor == Some(ProviderKind::XaiResponses) {
+        return None; // xAI STT has no model request field.
+    }
+    let default = if vendor == Some(ProviderKind::OpenAiResponses) {
+        super::vendors::openai::DEFAULT_STT_MODEL
+    } else {
+        "mlx-community/whisper-large-v3-mlx"
+    };
+    Some(
+        override_model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(default)
+            .to_string(),
+    )
+}
+
 async fn transcribe_multipart(
     url: &str,
     api_key: &str,
@@ -535,14 +563,18 @@ async fn transcribe_multipart(
             .mime_str("audio/wav")
             .context("Failed to set MIME type")?;
 
-        // Model from env WHISPER_MODEL or default to non-turbo large-v3
-        let whisper_model = std::env::var("WHISPER_MODEL")
-            .unwrap_or_else(|_| "mlx-community/whisper-large-v3-mlx".to_string());
-
+        let whisper_model = stt_model(url, std::env::var("WHISPER_MODEL").ok().as_deref());
         let mut form = Form::new()
             .part("file", file_part)
-            .text("model", whisper_model.clone())
             .text("language", language.to_string());
+        if let Some(model) = &whisper_model {
+            form = form.text("model", model.clone());
+        }
+        if super::speech::vendor_for_endpoint(url)
+            == Some(super::provider::ProviderKind::OpenAiResponses)
+        {
+            form = form.text("response_format", "json");
+        }
         if let Some((field, value)) =
             crate::stt::request_vocabulary::codescribe_stt_vocabulary_form_part(url)
         {
@@ -565,7 +597,7 @@ async fn transcribe_multipart(
                 return Ok(CloudTranscriptionVerdict::new(
                     text,
                     Some(start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
-                    Some(whisper_model.clone()),
+                    whisper_model.clone(),
                 ));
             }
             Err(e) => {
@@ -619,6 +651,10 @@ async fn transcribe_multipart_request(url: &str, api_key: &str, form: Form) -> R
 
     if !response.status().is_success() {
         let status = response.status();
+        // Vendor error bodies can echo request contents; keep diagnostics content-free.
+        if super::speech::vendor_for_endpoint(url).is_some() {
+            anyhow::bail!("Vendor STT transcription failed with status {}", status);
+        }
         let body = response
             .text()
             .await
@@ -648,6 +684,36 @@ async fn transcribe_multipart_request(url: &str, api_key: &str, form: Form) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vendor_stt_model_selection_matches_wire_contract() {
+        assert_eq!(
+            stt_model("https://api.openai.com/v1/audio/transcriptions", None).as_deref(),
+            Some("gpt-4o-mini-transcribe")
+        );
+        assert_eq!(
+            stt_model(
+                "https://api.openai.com/v1/audio/transcriptions",
+                Some("custom")
+            )
+            .as_deref(),
+            Some("custom")
+        );
+        assert_eq!(stt_model("https://api.x.ai/v1/stt", Some("ignored")), None);
+        assert_eq!(
+            stt_model("https://custom.example/stt", None).as_deref(),
+            Some("mlx-community/whisper-large-v3-mlx")
+        );
+    }
+
+    #[test]
+    fn xai_transcription_response_accepts_vendor_metadata() {
+        let response: TranscribeResponse = serde_json::from_str(
+            r#"{"text":"Repeated repeated","language":"en","duration":1.25,"words":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(response.text, "Repeated repeated");
+    }
 
     /// Empty buffer is rejected before any network call.
     #[test]

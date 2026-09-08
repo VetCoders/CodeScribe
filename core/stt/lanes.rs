@@ -37,7 +37,7 @@ impl SttLane {
     pub fn accepts(self) -> &'static str {
         match self {
             Self::File => "https multipart /v1/audio/transcriptions or NDJSON …:stream",
-            Self::Live => "wss live socket (stt-ws-v1)",
+            Self::Live => "wss live socket (stt-ws-v1 or xAI /v1/stt)",
         }
     }
     pub fn placeholder(self) -> &'static str {
@@ -117,7 +117,10 @@ pub struct ResolvedSttLane {
 }
 impl ResolvedSttLane {
     pub fn key_missing(&self) -> bool {
-        self.auth_mode != SttAuthMode::Unauthenticated
+        // Official vendors resolve OAuth (including refresh) or their vendor key at
+        // request time. This snapshot-only admission check must not open Keychain.
+        crate::llm::speech::vendor_for_endpoint(&self.endpoint).is_none()
+            && self.auth_mode != SttAuthMode::Unauthenticated
             && self
                 .api_key
                 .as_deref()
@@ -154,6 +157,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn official_vendor_admission_defers_credentials_without_reading_keychain() {
+        let config = crate::config::Config {
+            stt_file_endpoint: Some("https://api.openai.com/v1/audio/transcriptions".into()),
+            stt_live_endpoint: Some("wss://api.x.ai/v1/stt".into()),
+            ..Default::default()
+        };
+        for lane in SttLane::ALL {
+            let row = config.stt_lane(lane).unwrap();
+            assert_eq!(row.api_key, None);
+            assert!(!row.key_missing()); // Actual absence is a typed request-time error.
+        }
+    }
+
+    #[test]
     fn validates_transport_and_credential_boundaries() {
         for (lane, url) in [
             (
@@ -169,6 +186,12 @@ mod tests {
             assert!(validate_stt_endpoint(lane, url).is_err(), "{url}");
         }
         for (lane, url) in [
+            (
+                SttLane::File,
+                "https://api.openai.com/v1/audio/transcriptions",
+            ),
+            (SttLane::File, "https://api.x.ai/v1/stt"),
+            (SttLane::Live, "wss://api.x.ai/v1/stt"),
             (SttLane::File, "http://[::1]/stt"),
             (SttLane::Live, "ws://127.0.0.1/stt"),
         ] {
