@@ -504,6 +504,19 @@ fn last_good_runtime_snapshot() -> &'static Mutex<CachedRuntimeSnapshot> {
     LAST_GOOD.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(test)]
+static RUNTIME_SNAPSHOT_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Drop the last-good lane snapshot. Credential mutations (Keychain / OAuth)
+/// never touch `settings.json`, so mtime is not a sufficient cache key.
+pub(crate) fn invalidate_runtime_snapshot_cache() {
+    let mut guard = last_good_runtime_snapshot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
+}
+
 /// One loader snapshot for lane projection: reuse the last good value when the
 /// file mtime is unchanged, and never panic the UI if a transient read fails.
 fn load_runtime_snapshot_for_lane() -> RuntimeSettingsSnapshot {
@@ -519,6 +532,8 @@ fn load_runtime_snapshot_for_lane() -> RuntimeSettingsSnapshot {
             return snapshot.clone();
         }
     }
+    #[cfg(test)]
+    RUNTIME_SNAPSHOT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let snapshot = match Config::load_runtime_snapshot() {
         Ok(snapshot) => snapshot,
         Err(_) => last_good_runtime_snapshot()
@@ -1014,6 +1029,7 @@ impl CodescribeConfig {
                 })?;
                 match outcome {
                     Ok(Ok(())) => {
+                        invalidate_runtime_snapshot_cache();
                         let message = account_auth::account_status(provider).message;
                         Ok(account_login_result(provider, "signed_in", &message))
                     }
@@ -1040,6 +1056,7 @@ impl CodescribeConfig {
                 })?;
                 match outcome {
                     Ok(Ok(())) => {
+                        invalidate_runtime_snapshot_cache();
                         let message = account_auth::account_status(provider).message;
                         Ok(account_login_result(provider, "signed_in", &message))
                     }
@@ -1072,7 +1089,9 @@ impl CodescribeConfig {
         let provider = ProviderKind::from_str(&provider_id).map_err(|error| CsError::Config {
             msg: error.to_string(),
         })?;
-        account_auth::clear_account_tokens(provider).map_err(account_auth_to_cs)
+        account_auth::clear_account_tokens(provider).map_err(account_auth_to_cs)?;
+        invalidate_runtime_snapshot_cache();
+        Ok(())
     }
 
     /// Discover model options from the selected provider using the live provider
@@ -1159,6 +1178,7 @@ impl CodescribeConfig {
         save_key(&account, &secret).map_err(|error| CsError::Config {
             msg: error.to_string(),
         })?;
+        invalidate_runtime_snapshot_cache();
         crate::hotkeys::refresh_live_controller_config();
         Ok(())
     }
@@ -1170,6 +1190,7 @@ impl CodescribeConfig {
         delete_key(&account).map_err(|error| CsError::Config {
             msg: error.to_string(),
         })?;
+        invalidate_runtime_snapshot_cache();
         crate::hotkeys::refresh_live_controller_config();
         Ok(())
     }
@@ -3644,6 +3665,211 @@ mod settings_snapshot_tests {
             projected.llm_formatting_model,
             setting_string(runtime.user_settings().llm_formatting_model.clone())
                 .or_else(|| Some(runtime.llm_lanes().formatting().model().to_string()))
+        );
+    }
+}
+
+/// The last-good runtime snapshot is keyed on `settings.json` mtime. Pasting a
+/// key writes the Keychain bundle (test env: process env / bundle cache) and
+/// never touches that file, so a cached lane row must not keep saying "no key".
+#[cfg(test)]
+mod runtime_snapshot_cache_tests {
+    use super::{CodescribeConfig, CsLlmLane, KEYCHAIN_ACCOUNTS, runtime_llm_lane, save_key};
+    use codescribe_core::config::UserSettings;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::fs;
+
+    /// Same isolation shape as `core/config/stt_migration.rs` tests: a private
+    /// data dir, with Drop restoring the process env the test mutated.
+    struct IsolatedSettings {
+        _dir: tempfile::TempDir,
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl IsolatedSettings {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut keys = vec![
+                "CODESCRIBE_DATA_DIR",
+                "CODESCRIBE_VOICE_LAB_SRC",
+                "CODESCRIBE_ENV_PATH",
+                "LLM_API_KEY",
+                "LLM_FORMATTING_API_KEY",
+                "LLM_ASSISTIVE_API_KEY",
+                "LLM_FORMATTING_PROVIDER",
+                "LLM_ASSISTIVE_PROVIDER",
+            ];
+            keys.extend(KEYCHAIN_ACCOUNTS.iter().copied());
+            let previous = keys
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    // SAFETY: `#[serial]` tests; Drop restores every key.
+                    unsafe {
+                        if key == "CODESCRIBE_DATA_DIR" {
+                            std::env::set_var(key, dir.path());
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                    (key, previous)
+                })
+                .collect();
+            fs::create_dir_all(UserSettings::settings_dir()).unwrap();
+            super::invalidate_runtime_snapshot_cache();
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            UserSettings::settings_path()
+        }
+    }
+
+    impl Drop for IsolatedSettings {
+        fn drop(&mut self) {
+            // SAFETY: same serialized environment scope as `new`.
+            unsafe {
+                for (key, previous) in &self.previous {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// File/live STT rows already populated — a load must not rewrite the file
+    /// (the 2026-09-08 save-storm shape).
+    fn settled_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 3,
+            "speech": {
+                "engine": {
+                    "file_transcription_endpoint": "https://api.libraxis.cloud/v1/audio/transcriptions",
+                    "live_transcription_endpoint": "wss://api.libraxis.cloud/v1/audio/transcribe"
+                },
+                "formatting": {
+                    "llm_provider": "openai-responses",
+                    "llm_model": "gpt-4.1"
+                }
+            }
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_llm_lane_sees_a_key_saved_after_the_snapshot_was_cached() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        fs::write(&path, settled_settings_json().to_string()).unwrap();
+
+        let _settle = runtime_llm_lane(CsLlmLane::Formatting);
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let before = runtime_llm_lane(CsLlmLane::Formatting);
+        assert!(
+            !before.key_present,
+            "isolated formatting lane must start without a key"
+        );
+        assert_eq!(
+            before.key_account, "LLM_OPENAI_API_KEY",
+            "pinned openai-responses formatting lane"
+        );
+        assert_eq!(mtime, fs::metadata(&path).unwrap().modified().unwrap());
+
+        // Test-env `save_key` writes a static account into process env (custom
+        // accounts go to the bundle cache). Settings.json must not move.
+        save_key(&before.key_account, "fixture-not-a-real-key").unwrap();
+        // Settings paste goes through `set_api_key` (same Keychain write) and
+        // must drop the last-good snapshot so the next projection is live.
+        CodescribeConfig::new()
+            .set_api_key(before.key_account.clone(), "fixture-not-a-real-key".into())
+            .unwrap();
+
+        let after = runtime_llm_lane(CsLlmLane::Formatting);
+        assert_eq!(
+            mtime,
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            "saving a key must not rewrite settings.json"
+        );
+        assert!(
+            after.key_present,
+            "cached snapshot must not hide a key saved after the cache filled"
+        );
+    }
+
+    fn with_save_log_count<R>(f: impl FnOnce() -> R) -> (R, usize) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::field::{Field, Visit};
+
+        struct Counter(Arc<AtomicUsize>);
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_owned();
+                }
+            }
+        }
+        impl tracing::Subscriber for Counter {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                if message.0.contains("Saved settings") {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let subscriber = Counter(count.clone());
+        let result = tracing::subscriber::with_default(subscriber, f);
+        (result, count.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_llm_lane_loop_rebuilds_the_snapshot_once_and_does_not_save() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        fs::write(&path, settled_settings_json().to_string()).unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        super::RUNTIME_SNAPSHOT_BUILDS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (_, saves) = with_save_log_count(|| {
+            for _ in 0..50 {
+                let _ = runtime_llm_lane(CsLlmLane::Formatting);
+            }
+        });
+        assert_eq!(saves, 0, "lane projection must not emit Saved settings");
+        assert_eq!(
+            super::RUNTIME_SNAPSHOT_BUILDS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "fifty reads without a credential mutation rebuild the snapshot once"
+        );
+        assert_eq!(
+            mtime,
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            "repeated lane projection must not rewrite settings.json"
         );
     }
 }
