@@ -1475,14 +1475,27 @@ impl RecordingController {
     async fn cancel_pending_hold_start(&self) {
         let generation = self.hold_start_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let mut task_guard = self.hold_start_task.lock().await;
-        if let Some(task) = task_guard.take() {
-            if task.is_finished() {
+        let pending_start_invalidated = match task_guard.take() {
+            Some(task) if task.is_finished() => {
                 debug!("Cleared finished hold-start task (generation={generation})");
-            } else {
-                debug!("Invalidated pending hold-start task (generation={generation})");
+                false
             }
+            Some(_) => {
+                debug!("Invalidated pending hold-start task (generation={generation})");
+                true
+            }
+            None => false,
+        };
+        // The pre-overlay app is the take's delivery target, not the start
+        // task's scratch. Only a start that never became a take (hold key
+        // released before the delay elapsed) loses it here; a finished start
+        // means the take is live or sealed and the overlay Insert click that
+        // follows still needs it. Hold release runs through this path via
+        // `finish_recording`, which is exactly where the target used to vanish
+        // (`target_app=None frontmost_app=Some("vc-terminal")` in the log).
+        if pending_start_invalidated {
+            *self.pre_overlay_frontmost_app.write().await = None;
         }
-        *self.pre_overlay_frontmost_app.write().await = None;
     }
 
     /// Detach every sink and callback from the recorder.
@@ -3618,6 +3631,47 @@ mod terminal_delivery_target_falsifiers {
         );
 
         controller.reset().await;
+        assert!(controller.paste_target_app_name().await.is_none());
+    }
+
+    /// Hold release goes through `finish_recording`, which first clears the
+    /// delayed-start task. The pre-overlay app latched at hotkey press is the
+    /// take's delivery target, not the start task's scratch: the overlay Insert
+    /// click that follows the sealed canvas still needs it. Falsifier for the
+    /// `target_app=None frontmost_app=Some("vc-terminal")` lines in the log.
+    #[tokio::test]
+    async fn hold_release_after_live_start_preserves_target_latch() {
+        let controller = RecordingController::new_without_keychain();
+        *controller.pre_overlay_frontmost_app.write().await = Some("vc-terminal".to_string());
+        let started = tokio::spawn(async {});
+        while !started.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        *controller.hold_start_task.lock().await = Some(started);
+
+        controller
+            .finish_recording()
+            .await
+            .expect("finish at Idle is an ignored race, not an error");
+
+        assert_eq!(
+            controller.paste_target_app_name().await.as_deref(),
+            Some("vc-terminal"),
+            "a finished hold start is a live take; its delivery target survives release"
+        );
+    }
+
+    /// Releasing the hold key before the start delay elapsed means no take ever
+    /// existed, so the latch captured for it must go with the cancelled task.
+    #[tokio::test]
+    async fn quick_hold_release_before_start_clears_target_latch() {
+        let controller = RecordingController::new_without_keychain();
+        *controller.pre_overlay_frontmost_app.write().await = Some("vc-terminal".to_string());
+        let pending = tokio::spawn(std::future::pending::<()>());
+        *controller.hold_start_task.lock().await = Some(pending);
+
+        controller.cancel_pending_hold_start().await;
+
         assert!(controller.paste_target_app_name().await.is_none());
     }
 
