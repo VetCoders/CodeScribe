@@ -105,41 +105,14 @@ takes. They attach `vocabulary=programming` so Polish+tech speech can prefer
 `last_session.wav`. Voice Lab and CLI file passes remain diagnostic surfaces.
 The daily Overlay has no user-invoked full-file transcription action: it renders
 Bus projections and explicit human edits, never raw `transcribeFile` output.
-At terminal coverage time the live engine runs one local, in-process Whisper
-pass over the retained PCM (first measured speech sample to last). Its
-whole-session string is always comparison evidence (`SealCoverage.comparison`).
-
-**Whisper timestamp termination.** In timestamp mode, decoded words must be
-followed by a native closing timestamp before end-of-text. When the model
-prefers end-of-text inside an open span, the next token is selected from its
-remaining timestamp logits. The token watchdog and decoder context limit also
-reserve a closing-clock step. This preserves already decoded words when the
-long-file assembler consumes timestamped segments; it does not invent a time
-from the window boundary or infer timing from the text. Closed spans may end
-normally. Sampling cannot select end-of-text while a span is still open.
-Long-file decoding always requests native timestamps, including when a direct
-caller disables them for single-window output. Existing PCM-overlap ownership
-remains unchanged; text equality is never used to remove repeated words. The
-former split-and-discard path is removed: a failed window cannot
-be silently omitted from a successful file verdict.
-
-**Terminal settlement (2026-09-07, take 18bce670).** The ledger compares sealed
-occurrence coverage with measured speech and settles the session one of three
-ways. _Complete_ coverage: the occurrence document is terminal and the ledger
-mints the whole-session seal. _Incomplete_ coverage with a rendered pass: the
-pass **is** the terminal document — `AcousticLedger::record_final_pass_document`
-mints a `FinalPassDocumentReceipt` bound to the coverage receipt, the engine
-emits `EngineEvent::FinalPassDocument`, the reducer renders those bytes with
-provenance `final-pass`, and the Bus row is `apply_final_pass_document` in the
-`finalizing` phase. No whole-session seal is minted; every occurrence seal
-stays as it was. _Incomplete_ coverage with no rendered pass: the take is
-refused (`TerminalSealRefused`) and its audio retained. The earlier design —
-splicing the pass's timestamped segments into the uncovered ranges — is
-removed: Whisper's long-form segment clock crosses every committed/uncovered
-boundary, so the splice never landed once in the field and only ever produced
-the refusal while `codescribe transcribe` on the same WAV rendered the take.
-A final-pass document is an editable terminal source: user edits and the
-formatter bind to its receipt exactly as they bind to occurrence seals.
+At terminal coverage time the live engine does run a local, in-process Whisper
+pass over retained PCM. Its whole-session string is comparison evidence only;
+its timestamped segments are the sole terminal gap-repair candidates. A
+candidate enters `AcousticLedger` on its own PCM occurrence only when that
+segment is wholly contained in one material uncovered range. A segment that
+crosses the committed/uncovered boundary is refused instead of being assigned
+to the whole gap, because that assignment can replay words already owned by an
+adjacent Apple occurrence. Coarse or missing timing leaves coverage incomplete.
 
 **Legacy Overlay Format is removed (2026-08-25).** The former raw LLM
 replacement / delivery-style path no longer exists. Automatic formatting is

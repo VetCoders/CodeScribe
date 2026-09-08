@@ -17,7 +17,7 @@ use crate::asr_session::recorder::{
 };
 use crate::audio::recorder::{Recorder, RecorderConfig};
 use crate::config::{RuntimeSettingsSnapshot, UserSettings};
-use crate::pipeline::acoustic_ledger::{AcousticLedger, SealCoverageReceipt};
+use crate::pipeline::acoustic_ledger::{AcousticLedger, SealCoverageReceipt, SealCoverageStatus};
 use crate::pipeline::contracts::{EngineEvent, EventSink};
 use crate::pipeline::streaming::{
     SessionConfig, TailPatchSessionReceipt, collect_buffered_engine_events_with_config,
@@ -34,9 +34,8 @@ use tracing::{debug, info, warn};
 /// Ledger refusal of the terminal transcript after a successful capture stop.
 ///
 /// Raised by [`StreamingRecorder::stop`] when the acoustic ledger reports
-/// [`SealCoverageStatus::Incomplete`] and no whole-session final pass rendered
-/// a document: speech physically existed that no sealed occurrence covers and
-/// the file pass heard nothing, so no take text may be promoted to a terminal
+/// [`SealCoverageStatus::Incomplete`]: speech physically existed that no sealed
+/// occurrence covers, so the take text may not be promoted to a terminal
 /// transcript. The capture itself succeeded — `audio_path` is the take WAV
 /// already written to disk — which is why this is a typed error rather than a
 /// string: the stop path must retain that audio and close the take instead of
@@ -460,20 +459,19 @@ impl StreamingRecorder {
         }
         self.event_sink = None;
 
-        let refused_coverage = self.acoustic_ledger.as_ref().and_then(|ledger| {
+        let incomplete_coverage = self.acoustic_ledger.as_ref().and_then(|ledger| {
             ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .refused_terminal_coverage()
+                .latest_seal_coverage()
+                .filter(|receipt| receipt.status == SealCoverageStatus::Incomplete)
                 .cloned()
         });
-        if let Some(receipt) = refused_coverage {
+        if let Some(receipt) = incomplete_coverage {
             // The ledger refused the terminal transcript, not the capture: the
             // mic is stopped and the take WAV is already on disk. Carry that
             // path in the typed refusal so the controller can retain the audio
             // and close the take without reading this as a recorder failure.
-            // Incomplete coverage with a final-pass document is not a refusal;
-            // that document already reached the transcript buffer above.
             return Err(anyhow::Error::new(TerminalSealRefused {
                 receipt,
                 audio_path,

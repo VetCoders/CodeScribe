@@ -12,10 +12,9 @@ use std::{collections::BTreeMap, io::Write as _, sync::Arc};
 use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
 use codescribe_core::llm::inline_format::{LabelProposalDisposition, OccurrenceLabelProposal};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, DocumentRevisionProvenance, FinalPassDocumentReceipt,
-    LedgerSealReceipt, ManualDocumentRevisionReceipt, MutationReceipt, ObservationIdentity,
-    ObservationProducer, OccurrenceIdentity, SealCoverageReceipt, SealCoverageStatus,
-    TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, DocumentRevisionProvenance, LedgerSealReceipt,
+    ManualDocumentRevisionReceipt, MutationReceipt, ObservationIdentity, ObservationProducer,
+    OccurrenceIdentity, SealCoverageReceipt, SealCoverageStatus, TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
 use tokio::sync::Mutex;
@@ -98,11 +97,6 @@ pub enum ReducerAction {
     },
     ApplyUserRevision {
         receipt: ManualDocumentRevisionReceipt,
-    },
-    /// The whole-session file pass replaced the occurrence document because
-    /// sealed occurrences left measured speech uncovered.
-    ApplyFinalPassDocument {
-        receipt: FinalPassDocumentReceipt,
     },
     RecordContextMarker {
         position: usize,
@@ -212,13 +206,8 @@ pub struct TranscriptReducer {
     latest_seal_coverage: Option<SealCoverageReceipt>,
     latest_comparison: Option<TranscriptComparisonReceipt>,
     context_markers: Vec<DocumentContextMarker>,
-    /// Whole-document text that overrides the occurrence join: a user edit, a
-    /// formatter result, or the terminal final-pass document.
     manual_rendered_text: Option<String>,
     manual_document_revision_receipt: Option<String>,
-    /// Receipt of the final-pass document, when the ledger settled the
-    /// session on the whole-session pass instead of an occurrence seal.
-    final_pass_document_receipt: Option<String>,
     terminal: bool,
 }
 
@@ -416,7 +405,7 @@ impl TranscriptReducer {
         session_id: &str,
         source_revision: u64,
     ) -> Result<Vec<OccurrenceIdentity>, UserRevisionRefusal> {
-        if self.document_by_occurrence.is_empty() && self.final_pass_document_receipt.is_none() {
+        if self.document_by_occurrence.is_empty() {
             return Err(UserRevisionRefusal::NoCommittedDocument);
         }
         if !self.terminal {
@@ -477,24 +466,6 @@ impl TranscriptReducer {
         self.revision_for_action(ReducerAction::RecordSealCoverage {
             receipt: receipt.clone(),
             comparison: comparison.cloned(),
-        })
-    }
-
-    /// Project the ledger-minted terminal document from the whole-session
-    /// pass. Every occurrence entry keeps its receipts; the rendered document
-    /// becomes the pass bytes and the session is terminal, exactly as a
-    /// whole-session seal would have made it. The reducer does not decide
-    /// whether the coverage was incomplete; the ledger already did.
-    pub fn apply_final_pass_document(
-        &mut self,
-        receipt: &FinalPassDocumentReceipt,
-    ) -> TranscriptRevision {
-        self.latest_seal_coverage = Some(receipt.coverage.clone());
-        self.manual_rendered_text = Some(receipt.rendered_text.clone());
-        self.final_pass_document_receipt = Some(receipt.receipt_id.clone());
-        self.terminal = true;
-        self.revision_for_action(ReducerAction::ApplyFinalPassDocument {
-            receipt: receipt.clone(),
         })
     }
 
@@ -977,26 +948,6 @@ impl EventSink for PresentationEmitter {
                         }
                     }
                 }
-            }
-            EngineEvent::FinalPassDocument { receipt } => {
-                let Some(ledger) = &self.acoustic_ledger else {
-                    return;
-                };
-                let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-                let revision = self
-                    .session_state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .apply_final_pass_document(receipt);
-                if let Some(bus) = &self.transcript_bus {
-                    let events = bus.publish_revision(&revision, &ledger);
-                    if let Some(callback) = &self.projection_callback {
-                        for event in &events {
-                            callback(event);
-                        }
-                    }
-                }
-                self.send_cmd(EmitterCmd::PublishCommittedRevision(revision.rendered_text));
             }
             EngineEvent::OccurrenceLabelProposal { proposal } => {
                 let Some(ledger) = &self.acoustic_ledger else {
@@ -1989,204 +1940,5 @@ mod tests {
         assert_eq!(ledger.text_of(&occurrence), Some("Iwo!"));
         assert_eq!(ledger.qualified_occurrences().count(), qualified_before);
         assert_eq!(reducer.document_by_occurrence.len(), 1);
-    }
-
-    /// Take 18bce670 (2026-09-07): sealed Apple occurrences left 12 s of
-    /// measured speech uncovered, the whole-session pass rendered the whole
-    /// dictation, and the overlay delivered nothing. The ledger-minted
-    /// final-pass document is the terminal document: it reaches delivery and
-    /// the Bus row, keeps every occurrence receipt, and stays editable.
-    #[tokio::test]
-    async fn final_pass_document_is_delivered_projected_and_editable() {
-        use codescribe_core::stt::tail_provider::TailSampleRange;
-
-        const SESSION: &str = "18bce670-final-pass";
-        let delivery = Arc::new(Mutex::new(String::new()));
-        let temp = tempfile::tempdir().unwrap();
-        let bus = Arc::new(
-            TranscriptBus::open_at(
-                TranscriptSession {
-                    session_id: SESSION.to_string(),
-                    mode: TranscriptMode::Dictation,
-                    has_latched_target: true,
-                    latched_target_is_self: false,
-                },
-                temp.path().join("final-pass.jsonl"),
-                None,
-            )
-            .unwrap(),
-        );
-        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
-        let apple_occurrence = OccurrenceIdentity::new(SESSION, 1, 16_896, 154_624);
-        let mutation = {
-            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-            let mutation = admitted_mutation(&mut ledger, apple_occurrence.clone(), 1, "Agenci");
-            ledger.schedule_frontier(apple_occurrence.clone(), [ObservationProducer::Apple]);
-            assert!(ledger.note_frontier_return(&apple_occurrence, ObservationProducer::Apple));
-            ledger
-                .seal(&apple_occurrence)
-                .expect("closed occurrence seals");
-            mutation
-        };
-        let projected = Arc::new(StdMutex::new(Vec::new()));
-        let projected_for_callback = Arc::clone(&projected);
-        bus.publish_started();
-        let mut emitter = PresentationEmitter::new_with_authority(
-            Arc::clone(&delivery),
-            None,
-            None,
-            Some(Arc::clone(&bus)),
-            Some(Arc::clone(&ledger)),
-            Some(Arc::new(move |event| {
-                projected_for_callback
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push(event.clone());
-            })),
-        );
-        emitter.on_event(&mutation);
-
-        // The engine settles the session: coverage incomplete, pass rendered.
-        let speech = vec![TailSampleRange {
-            session: SESSION.to_string(),
-            capture_epoch: 1,
-            sample_start: 16_896,
-            sample_end: 1_524_224,
-        }];
-        let document = {
-            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-            let coverage = ledger.assess_seal_coverage(SESSION, 1, &speech, 12_000);
-            assert!(coverage.uncovered_speech_ranges.len() == 1);
-            assert!(ledger.record_seal_coverage(coverage));
-            ledger
-                .record_final_pass_document(
-                    &speech[0],
-                    "Agenci mają wychodzić z minusem dwustu linii, nigdy z plusem tysiąca.",
-                )
-                .expect("incomplete coverage settles on the pass")
-        };
-        emitter.on_event(&EngineEvent::FinalPassDocument {
-            receipt: document.clone(),
-        });
-
-        let source_revision = {
-            let rows = projected.lock().unwrap_or_else(|error| error.into_inner());
-            let row = rows
-                .iter()
-                .rev()
-                .find(|row| row.reducer_action == "apply_final_pass_document")
-                .expect("final-pass document reaches the canvas");
-            assert_eq!(row.rendered_text, document.rendered_text);
-            assert_eq!(row.phase, TranscriptProjectionPhase::Finalizing);
-            assert_eq!(row.sample_start, apple_occurrence.sample_start);
-            assert_eq!(row.label, "Agenci", "occurrence rows keep their own label");
-            assert_eq!(
-                row.acoustic_receipts.len(),
-                1,
-                "occurrence receipts survive"
-            );
-            assert_eq!(
-                row.seal_coverage
-                    .as_ref()
-                    .map(|coverage| coverage.status.as_str()),
-                Some("incomplete")
-            );
-            rows.last().expect("projected row").reducer_revision
-        };
-
-        let commit = emitter
-            .apply_user_revision(UserRevisionIntent {
-                session_id: SESSION.to_string(),
-                source_revision,
-                rendered_text: "Agenci mają wychodzić z minusem dwustu linii.".to_string(),
-                provenance: DocumentRevisionProvenance::UserEdit,
-            })
-            .expect("a final-pass document is an editable terminal source");
-        assert!(commit.provenance_receipt.starts_with("user-edit-"));
-        emitter.finish().await;
-        assert_eq!(
-            delivery.lock().await.as_str(),
-            "Agenci mają wychodzić z minusem dwustu linii."
-        );
-        let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-        assert!(ledger.refused_terminal_coverage().is_none());
-        assert!(
-            ledger.manual_document_revisions()[0]
-                .source_seal_receipts
-                .contains(&document.receipt_id)
-        );
-    }
-
-    /// Silero heard nothing, Apple committed nothing, Whisper heard the take:
-    /// the final-pass document settles a session with zero occurrences and
-    /// still produces one canvas row on the decoded PCM coordinates.
-    #[tokio::test]
-    async fn final_pass_document_projects_a_row_without_any_occurrence() {
-        use codescribe_core::stt::tail_provider::TailSampleRange;
-
-        const SESSION: &str = "silero-deaf-final-pass";
-        let delivery = Arc::new(Mutex::new(String::new()));
-        let temp = tempfile::tempdir().unwrap();
-        let bus = Arc::new(
-            TranscriptBus::open_at(
-                TranscriptSession {
-                    session_id: SESSION.to_string(),
-                    mode: TranscriptMode::Dictation,
-                    has_latched_target: false,
-                    latched_target_is_self: false,
-                },
-                temp.path().join("deaf.jsonl"),
-                None,
-            )
-            .unwrap(),
-        );
-        let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
-        let projected = Arc::new(StdMutex::new(Vec::new()));
-        let projected_for_callback = Arc::clone(&projected);
-        bus.publish_started();
-        let mut emitter = PresentationEmitter::new_with_authority(
-            Arc::clone(&delivery),
-            None,
-            None,
-            Some(Arc::clone(&bus)),
-            Some(Arc::clone(&ledger)),
-            Some(Arc::new(move |event| {
-                projected_for_callback
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .push(event.clone());
-            })),
-        );
-        let range = TailSampleRange {
-            session: SESSION.to_string(),
-            capture_epoch: 1,
-            sample_start: 4_800,
-            sample_end: 480_000,
-        };
-        let document = {
-            let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
-            let coverage =
-                ledger.assess_seal_coverage(SESSION, 1, std::slice::from_ref(&range), 12_000);
-            assert!(ledger.record_seal_coverage(coverage));
-            ledger
-                .record_final_pass_document(&range, "Cały take usłyszał tylko Whisper.")
-                .expect("zero-occurrence session settles on the pass")
-        };
-        emitter.on_event(&EngineEvent::FinalPassDocument {
-            receipt: document.clone(),
-        });
-        emitter.finish().await;
-
-        assert_eq!(delivery.lock().await.as_str(), document.rendered_text);
-        let rows = projected.lock().unwrap_or_else(|error| error.into_inner());
-        assert_eq!(rows.len(), 1, "exactly one canvas row for the document");
-        let row = &rows[0];
-        assert_eq!(row.reducer_action, "apply_final_pass_document");
-        assert_eq!(row.rendered_text, document.rendered_text);
-        assert_eq!(row.label, document.rendered_text);
-        assert_eq!((row.sample_start, row.sample_end), (4_800, 480_000));
-        assert!(row.acoustic_receipts.is_empty());
-        assert!(row.can_copy);
-        assert_eq!(row.phase, TranscriptProjectionPhase::Finalizing);
     }
 }

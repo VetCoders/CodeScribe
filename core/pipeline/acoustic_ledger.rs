@@ -419,7 +419,6 @@ pub struct AcousticLedger {
     manual_document_revisions: Vec<ManualDocumentRevisionReceipt>,
     derivations: Vec<OccurrenceDerivation>,
     latest_seal_coverage: Option<SealCoverageReceipt>,
-    final_pass_document: Option<FinalPassDocumentReceipt>,
 }
 
 impl AcousticLedger {
@@ -481,82 +480,6 @@ impl AcousticLedger {
 
     pub fn latest_seal_coverage(&self) -> Option<&SealCoverageReceipt> {
         self.latest_seal_coverage.as_ref()
-    }
-
-    /// Mint the terminal document from one whole-session pass.
-    ///
-    /// Refused unless the latest recorded coverage for this session/epoch is
-    /// incomplete: while sealed occurrences cover the speech, the occurrence
-    /// document is the document and no file pass may replace it. Minted once;
-    /// a second pass for the same coverage returns the receipt already held.
-    pub fn record_final_pass_document(
-        &mut self,
-        range: &TailSampleRange,
-        rendered_text: &str,
-    ) -> Result<FinalPassDocumentReceipt, &'static str> {
-        let rendered_text = rendered_text.trim();
-        if rendered_text.is_empty() {
-            return Err("final_pass_document_text_empty");
-        }
-        let coverage = self
-            .latest_seal_coverage
-            .as_ref()
-            .filter(|coverage| {
-                coverage.session_id == range.session
-                    && coverage.capture_epoch == range.capture_epoch
-            })
-            .ok_or("final_pass_document_coverage_missing")?;
-        if coverage.status != SealCoverageStatus::Incomplete {
-            return Err("final_pass_document_coverage_complete");
-        }
-        if let Some(held) = self.final_pass_document.as_ref()
-            && held.coverage == *coverage
-        {
-            return Ok(held.clone());
-        }
-        let rendered_sha256 = format!("{:x}", Sha256::digest(rendered_text.as_bytes()));
-        let receipt = FinalPassDocumentReceipt {
-            receipt_id: format!(
-                "{}-{}-{}-{}-{}-{}",
-                DocumentRevisionProvenance::FinalPass.as_str(),
-                range.session,
-                range.capture_epoch,
-                range.sample_start,
-                range.sample_end,
-                &rendered_sha256[..12],
-            ),
-            session_id: range.session.clone(),
-            capture_epoch: range.capture_epoch,
-            range: range.clone(),
-            rendered_sha256,
-            rendered_text: rendered_text.to_string(),
-            coverage: coverage.clone(),
-        };
-        self.final_pass_document = Some(receipt.clone());
-        Ok(receipt)
-    }
-
-    /// The whole-session pass that became the terminal document, if any.
-    pub fn final_pass_document(&self) -> Option<&FinalPassDocumentReceipt> {
-        self.final_pass_document.as_ref()
-    }
-
-    /// The coverage receipt that refuses the terminal transcript outright.
-    ///
-    /// Incomplete coverage alone no longer refuses a take: when the
-    /// whole-session pass rendered a document, that document is delivered and
-    /// this returns `None`. Only incomplete coverage with no final-pass
-    /// document — the pass failed or heard nothing — remains a refusal.
-    pub fn refused_terminal_coverage(&self) -> Option<&SealCoverageReceipt> {
-        let coverage = self
-            .latest_seal_coverage
-            .as_ref()
-            .filter(|coverage| coverage.status == SealCoverageStatus::Incomplete)?;
-        let documented = self
-            .final_pass_document
-            .as_ref()
-            .is_some_and(|document| document.coverage == *coverage);
-        (!documented).then_some(coverage)
     }
 
     /// Compare committed occurrence ranges with measured speech ranges on the
@@ -1162,11 +1085,7 @@ impl AcousticLedger {
         if source_revision.checked_add(1) != Some(revision) {
             return Err("manual_document_revision_nonconsecutive");
         }
-        let final_pass_source = self
-            .final_pass_document
-            .as_ref()
-            .filter(|document| document.session_id == session_id);
-        if source_occurrences.is_empty() && final_pass_source.is_none() {
+        if source_occurrences.is_empty() {
             return Err("manual_document_occurrences_missing");
         }
         if source_occurrences.iter().any(|occurrence| {
@@ -1178,13 +1097,10 @@ impl AcousticLedger {
             return Err("manual_document_occurrence_not_sealed");
         }
 
-        // A final-pass document is a terminal source in its own right: the
-        // edit binds to its receipt exactly as it binds to occurrence seals.
         let source_seal_receipts = source_occurrences
             .iter()
             .filter_map(|occurrence| self.seal_of(occurrence))
             .map(|seal| seal.receipt_id.clone())
-            .chain(final_pass_source.map(|document| document.receipt_id.clone()))
             .collect::<Vec<_>>();
         let ordinal = self.manual_document_revisions.len();
         let receipt = ManualDocumentRevisionReceipt {
@@ -1977,9 +1893,6 @@ pub struct ManualEditReceipt {
 pub enum DocumentRevisionProvenance {
     UserEdit,
     Formatter,
-    /// The whole-session Whisper pass that became the terminal document
-    /// because sealed occurrences did not cover the measured speech.
-    FinalPass,
 }
 
 impl DocumentRevisionProvenance {
@@ -1988,37 +1901,8 @@ impl DocumentRevisionProvenance {
         match self {
             Self::UserEdit => "user-edit",
             Self::Formatter => "formatter",
-            Self::FinalPass => "final-pass",
         }
     }
-}
-
-/// The terminal document minted from one whole-session Whisper pass.
-///
-/// Minted only while the latest seal coverage for the session is
-/// [`SealCoverageStatus::Incomplete`]: the ledger could not cover the measured
-/// speech with sealed occurrences, so the file pass over the retained PCM is
-/// the document the user receives — the same engine and the same audio the
-/// `codescribe transcribe` file surface renders. Every sealed occurrence keeps
-/// its own receipt; this receipt binds the replacement bytes to the coverage
-/// receipt that made them necessary instead of pretending a per-occurrence
-/// alignment exists.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FinalPassDocumentReceipt {
-    /// Stable identifier copied into the reducer revision and Bus rows.
-    pub receipt_id: String,
-    /// Recording session whose terminal document this is.
-    pub session_id: String,
-    /// Capture epoch the whole-session pass was decoded from.
-    pub capture_epoch: u64,
-    /// PCM range the pass decoded: first measured speech to last.
-    pub range: TailSampleRange,
-    /// SHA-256 of `rendered_text`, for external observers.
-    pub rendered_sha256: String,
-    /// Complete document bytes rendered by the pass.
-    pub rendered_text: String,
-    /// Coverage receipt that refused the occurrence document.
-    pub coverage: SealCoverageReceipt,
 }
 
 /// Provenance for an explicit rewrite of a complete sealed transcript.
@@ -3052,113 +2936,5 @@ mod tests {
         ledger
             .seal_terminal(SESSION, EPOCH)
             .expect("complete recorded coverage may become terminal truth");
-    }
-
-    /// Take 18bce670 (2026-09-07 16:33Z): three sealed Apple occurrences left
-    /// 13.2–25.6 s of measured speech uncovered, the in-process file pass over
-    /// the same PCM rendered the whole dictation, and the take was refused
-    /// while `codescribe transcribe` on the same WAV delivered 260 chars. The
-    /// file pass is the terminal document; only a pass with nothing to say
-    /// leaves the refusal standing.
-    #[test]
-    fn incomplete_coverage_with_a_final_pass_document_is_delivered_not_refused() {
-        const SESSION: &str = "18bce670-final-pass";
-        const EPOCH: u64 = 1;
-        let mut ledger = AcousticLedger::new();
-        let speech = vec![TailSampleRange {
-            session: SESSION.to_string(),
-            capture_epoch: EPOCH,
-            sample_start: 16_896,
-            sample_end: 1_524_224,
-        }];
-        let coverage = ledger.assess_seal_coverage(SESSION, EPOCH, &speech, 12_000);
-        assert_eq!(coverage.status, SealCoverageStatus::Incomplete);
-        assert!(ledger.record_seal_coverage(coverage.clone()));
-        assert!(ledger.refused_terminal_coverage().is_some());
-        assert_eq!(
-            ledger.record_final_pass_document(&speech[0], "   "),
-            Err("final_pass_document_text_empty")
-        );
-        assert!(ledger.refused_terminal_coverage().is_some());
-
-        let document = ledger
-            .record_final_pass_document(&speech[0], " Agenci mają wychodzić z minusem linii. ")
-            .expect("incomplete coverage admits the whole-session pass as the document");
-        assert_eq!(
-            document.rendered_text,
-            "Agenci mają wychodzić z minusem linii."
-        );
-        assert_eq!(document.coverage, coverage);
-        assert!(
-            document
-                .receipt_id
-                .starts_with("final-pass-18bce670-final-pass-1-16896-1524224-")
-        );
-        assert!(ledger.refused_terminal_coverage().is_none());
-        assert_eq!(ledger.final_pass_document(), Some(&document));
-        let again = ledger
-            .record_final_pass_document(&speech[0], "inny tekst")
-            .expect("same coverage returns the held receipt");
-        assert_eq!(again, document);
-
-        // The pass is a terminal source: a later user edit binds to its receipt
-        // even though no occurrence was ever sealed.
-        let revision = ledger
-            .record_manual_document_revision(
-                SESSION,
-                7,
-                8,
-                "Agenci mają wychodzić z minusem linii!",
-                &[],
-                DocumentRevisionProvenance::UserEdit,
-            )
-            .expect("final-pass document is an editable terminal source");
-        assert_eq!(
-            revision.source_seal_receipts,
-            vec![document.receipt_id.clone()]
-        );
-        assert_eq!(
-            ledger
-                .record_manual_document_revision(
-                    "other-session",
-                    7,
-                    8,
-                    "x",
-                    &[],
-                    DocumentRevisionProvenance::UserEdit,
-                )
-                .unwrap_err(),
-            "manual_document_occurrences_missing"
-        );
-    }
-
-    #[test]
-    fn complete_coverage_never_admits_a_final_pass_document() {
-        const SESSION: &str = "covered-take";
-        const EPOCH: u64 = 1;
-        let mut ledger = AcousticLedger::new();
-        let coverage = ledger.assess_seal_coverage(SESSION, EPOCH, &[], 12_000);
-        assert_eq!(coverage.status, SealCoverageStatus::Complete);
-        assert!(ledger.record_seal_coverage(coverage));
-        let range = TailSampleRange {
-            session: SESSION.to_string(),
-            capture_epoch: EPOCH,
-            sample_start: 0,
-            sample_end: 48_000,
-        };
-        assert_eq!(
-            ledger.record_final_pass_document(&range, "tekst"),
-            Err("final_pass_document_coverage_complete")
-        );
-        let foreign = TailSampleRange {
-            session: "another".to_string(),
-            ..range
-        };
-        assert_eq!(
-            ledger.record_final_pass_document(&foreign, "tekst"),
-            Err("final_pass_document_coverage_missing")
-        );
-        assert!(ledger.refused_terminal_coverage().is_none());
-        assert!(ledger.final_pass_document().is_none());
     }
 }
