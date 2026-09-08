@@ -113,7 +113,7 @@ pub async fn replay_production_session(
             .map_err(|error| anyhow!("runtime settings snapshot refused: {error:?}"))?,
     );
     let acoustic_ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
-    let layer1 = runtime_settings.local_tail_patch_decision();
+    let (layer1, _decision_receipt) = crate::asr_session::layer1_decision(&runtime_settings);
     let layer1_armed = layer1.is_armed();
     // `transcription_session` has one live canvas route: Apple progressive.
     // Report the route we actually enter; never reconstruct it through the
@@ -411,7 +411,7 @@ impl StreamingRecorder {
         let log_path = stream_log_path();
         let utterance_silence_sec = self.utterance_silence_sec;
 
-        let layer1 = runtime_settings.local_tail_patch_decision();
+        let (layer1, _decision_receipt) = crate::asr_session::layer1_decision(&runtime_settings);
         let (lifecycle_handle, lifecycle_events) = recorder_lifecycle_channel();
         self.lifecycle_handle = Some(lifecycle_handle);
         let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();

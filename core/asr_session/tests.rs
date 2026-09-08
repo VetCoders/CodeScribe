@@ -455,3 +455,280 @@ fn fake_provider_stream_survives_a_replayed_tail() {
         Some("trzy cztery")
     );
 }
+
+/// Restore every test overlay, including on a failed assertion.
+struct Layer1TestEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Layer1TestEnv {
+    fn new(root: &std::path::Path) -> Self {
+        let overlays = [
+            ("CODESCRIBE_DATA_DIR", root.as_os_str().to_owned()),
+            (
+                "CODESCRIBE_ENV_PATH",
+                root.join("absent.env").into_os_string(),
+            ),
+            ("CODESCRIBE_LAYERED_TRANSCRIPTION", "phase1".into()),
+            ("STT_TAIL_PROVIDER", "inprocess".into()),
+            ("STT_LIVE_ENDPOINT", "wss://gateway.invalid/live".into()),
+            ("STT_LIVE_API_KEY", "fixture-live-key".into()),
+        ];
+        let mut saved = Vec::new();
+        for (key, value) in overlays {
+            saved.push((key, std::env::var_os(key)));
+            // SAFETY: callers hold the suite's serial environment lock.
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for Layer1TestEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.iter().rev() {
+            // SAFETY: callers hold the suite's serial environment lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn production_layer1_decision_follows_resolved_asr_mode() {
+    use super::{Layer1Decision, RecorderLayer1Lane};
+    use crate::config::{Config, UserSettings};
+
+    let root = tempfile::tempdir().unwrap();
+    let _environment = Layer1TestEnv::new(root.path());
+    for (mode, consent, expected_reason, armed) in [
+        ("cloud", Some("granted"), "cloud_ready", true),
+        ("cloud", None, "consent_missing", false),
+        (
+            "local_power",
+            Some("granted"),
+            "local_helper_unavailable",
+            false,
+        ),
+    ] {
+        let settings = UserSettings {
+            asr_mode: Some(mode.into()),
+            cloud_consent: consent.map(str::to_owned),
+            layered_transcription: Some("phase1".into()),
+            stt_live_endpoint: Some("wss://gateway.invalid/live".into()),
+            ..Default::default()
+        };
+        settings.save().unwrap();
+        let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+        let mut factory_calls = 0;
+        let (decision, receipt) =
+            super::layer1_decision_with_factory(&snapshot, |snapshot, _authorization| {
+                factory_calls += 1;
+                assert_eq!(
+                    snapshot.values().stt_live_endpoint.as_deref(),
+                    Some("wss://gateway.invalid/live")
+                );
+                assert_eq!(
+                    snapshot.values().stt_live_api_key.as_deref(),
+                    Some("fixture-live-key")
+                );
+                Ok(Box::new(FakeAsrSessionProvider::with_script(
+                    RefinerMode::CloudSession,
+                    vec![partial(1, 1, "live fixture")],
+                )))
+            });
+        assert_eq!(factory_calls, usize::from(armed));
+        assert_eq!(matches!(&decision, Layer1Decision::Armed(_)), armed);
+        assert_eq!(receipt.reason, expected_reason);
+        assert_eq!(
+            receipt.consent,
+            if consent.is_some() {
+                "granted"
+            } else {
+                "missing"
+            }
+        );
+        assert_eq!(
+            receipt.refiner,
+            if armed {
+                "cloud_session"
+            } else {
+                "local_tail_patch"
+            }
+        );
+        let mut lane = RecorderLayer1Lane::open(decision, &fake_input());
+        lane.offer_pcm(&[0.1; 160]);
+        lane.poll();
+        assert_eq!(lane.telemetry().frames_forwarded, u64::from(armed));
+        assert_eq!(lane.telemetry().partials_applied, u64::from(armed));
+
+        // The public production entrypoint must share the same policy and
+        // construct a dormant real provider, without connecting in this test.
+        let (production, production_receipt) = super::layer1_decision(&snapshot);
+        assert_eq!(matches!(production, Layer1Decision::Armed(_)), armed);
+        assert_eq!(production_receipt, receipt);
+    }
+}
+
+impl Layer1TestEnv {
+    fn set(&mut self, key: &'static str, value: &str) {
+        self.saved.push((key, std::env::var_os(key)));
+        // SAFETY: callers hold the suite's serial environment lock.
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn production_layer1_refusals_never_construct_a_cloud_provider() {
+    use super::Layer1Decision;
+    use crate::config::{Config, UserSettings};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Layer1TestEnv::new(root.path());
+    for (consent, phase, reason) in [
+        ("denied", "phase1", "consent_denied"),
+        ("granted", "off", "layered_off"),
+        ("granted", "phase2", "layered_invalid"),
+    ] {
+        environment.set("CODESCRIBE_LAYERED_TRANSCRIPTION", phase);
+        UserSettings {
+            asr_mode: Some("cloud".into()),
+            cloud_consent: Some(consent.into()),
+            ..Default::default()
+        }
+        .save()
+        .unwrap();
+        let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+        let (decision, receipt) = super::layer1_decision_with_factory(&snapshot, |_, _| {
+            panic!("refused selection reached cloud construction")
+        });
+        assert!(!matches!(decision, Layer1Decision::Armed(_)));
+        assert_eq!(receipt.reason, reason);
+        assert_eq!(receipt.consent, consent);
+    }
+
+    environment.set("CODESCRIBE_LAYERED_TRANSCRIPTION", "phase1");
+    let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+    let (decision, receipt) =
+        super::layer1_decision_with_factory(&snapshot, |_, _| Err("live_connection_invalid"));
+    assert!(matches!(decision, Layer1Decision::Disarmed));
+    assert_eq!(receipt.reason, "live_connection_invalid");
+    assert_eq!(receipt.refiner, "off");
+
+    // A sealed snapshot remains authoritative after process inputs change.
+    environment.set("STT_LIVE_ENDPOINT", "not-a-websocket");
+    environment.set("STT_LIVE_API_KEY", "");
+    let (decision, receipt) = super::layer1_decision(&snapshot);
+    assert!(matches!(decision, Layer1Decision::Armed(_)));
+    assert_eq!(receipt.reason, "cloud_ready");
+}
+
+#[test]
+#[serial_test::serial]
+fn production_layer1_cloud_forwards_native_pcm_over_real_websocket() {
+    use super::{Layer1Decision, RecorderLayer1Lane};
+    use crate::config::{Config, UserSettings};
+    use std::time::{Duration, Instant};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut environment = Layer1TestEnv::new(root.path());
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "ws://{}/v1/audio/transcribe",
+        listener.local_addr().unwrap()
+    );
+    environment.set("STT_LIVE_ENDPOINT", &endpoint);
+    UserSettings {
+        asr_mode: Some("cloud".into()),
+        cloud_consent: Some("granted".into()),
+        stt_live_endpoint: Some(endpoint),
+        ..Default::default()
+    }
+    .save()
+    .unwrap();
+    let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+    let (decision, receipt) = super::layer1_decision(&snapshot);
+    assert!(matches!(decision, Layer1Decision::Armed(_)));
+    assert_eq!(receipt.refiner, "cloud_session");
+
+    let (received_tx, received_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "cloud connection never arrived");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("loopback accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut socket = tokio_tungstenite::tungstenite::accept(stream).unwrap();
+        let Message::Text(start) = socket.read().unwrap() else {
+            panic!("missing set frame")
+        };
+        let start: serde_json::Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start["type"], "set");
+        assert_eq!(start["sample_rate"], 88_200);
+        let Message::Text(chunk) = socket.read().unwrap() else {
+            panic!("missing PCM frame")
+        };
+        let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(chunk["type"], "chunk");
+        received_tx.send(()).unwrap();
+        socket
+            .send(Message::Text(
+                r#"{"type":"transcript.partial","text":"loopback fixture"}"#.into(),
+            ))
+            .unwrap();
+        while let Ok(message) = socket.read() {
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "end" {
+                    socket
+                        .send(Message::Text(
+                            r#"{"type":"session.ended","session_id":"session-a"}"#.into(),
+                        ))
+                        .unwrap();
+                    break;
+                }
+            }
+        }
+    });
+    let mut input = fake_input();
+    input.sample_rate = 88_200;
+    let mut lane = RecorderLayer1Lane::open(decision, &input);
+    assert!(lane.is_live());
+    // Native-rate 100 ms frame exceeds the old 16 kHz-only 3200-sample budget.
+    lane.offer_pcm(&[0.1; 8_820]);
+    received_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lane.telemetry().partials_applied == 0 && Instant::now() < deadline {
+        lane.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(lane.telemetry().frames_forwarded, 1);
+    assert_eq!(lane.telemetry().partials_applied, 1);
+    assert_eq!(lane.telemetry().provider_errors, 0);
+    let outcome = lane.stop();
+    assert_eq!(outcome.telemetry().frames_forwarded, 1);
+    assert_eq!(outcome.telemetry().partials_applied, 1);
+    assert_eq!(outcome.degrade_reason(), None);
+    server.join().unwrap();
+}
