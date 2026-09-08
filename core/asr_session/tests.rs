@@ -645,7 +645,7 @@ fn production_layer1_cloud_forwards_native_pcm_over_real_websocket() {
         // WHY: test-only loopback server on 127.0.0.1 with no TLS and no network egress;
         // WHEN: unit tests only; WHERE: the production lane takes the wss:// live endpoint
         // from the loader snapshot, never this literal (semgrep detect-insecure-websocket).
-        "ws://{}/v1/audio/transcribe", // nosemgrep: javascript.lang.security.detect-insecure-websocket
+        "ws://{}/v1/audio/transcribe", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         listener.local_addr().unwrap()
     );
     environment.set("STT_LIVE_ENDPOINT", &endpoint);
