@@ -49,6 +49,18 @@ pub fn liveness_probe_body(model: &str) -> Value {
     json!({"model": model, "input": "ping", "max_output_tokens": 1})
 }
 
+// Speech wire pins; vendor REST audio documentation, verified 2026-09-08.
+/// Vendor speech endpoint or Codescribe speech default.
+pub const TTS_ENDPOINT: &str = "https://api.openai.com/v1/audio/speech";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const STT_ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const DEFAULT_TTS_MODEL: &str = "gpt-4o-mini-tts-2025-12-15";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const DEFAULT_TTS_VOICE: &str = "cedar";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const DEFAULT_STT_MODEL: &str = "gpt-4o-mini-transcribe";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,55 @@
 
 ---
 
+## Agent speech synthesis (2026-09-08)
+
+Assistant turns expose an always-visible Speak action and the same action in
+its context menu; Stop cancels playback and pending synthesis. The assistive
+lane selects OpenAI or xAI. Other providers report that no speech endpoint
+exists; no alternate provider is silently chosen. Account OAuth wins over
+API keys, including when refresh fails. Availability is a local configuration
+check, not proof of server-side permissions.
+
+`core/llm/speech.rs` is independent of the disabled CSM engine. It requests
+24 kHz mono PCM16, decodes signed samples, splits text at vendor character
+caps, and caches audio under `~/.codescribe/cache/tts/<sha256>.pcm`. The hash
+covers vendor, model, voice, speed, text and PCM rate; files are atomically
+published with owner-only permissions. No credentials or text enter filenames.
+`SPEECH_TTS_*` options are defined in `ENV_REGISTRY.toml`. xAI accepts speed
+0.7–1.5; OpenAI accepts 0.25–4.0. xAI's default response is raw audio; its JSON
+base64 envelope is also supported. The UI labels the voice as AI-generated.
+
+Wire references: [OpenAI speech](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create),
+[xAI speech](https://docs.x.ai/developers/model-capabilities/audio/text-to-speech).
+
+## Vendor speech transports (2026-09-08)
+
+The file lane accepts OpenAI `https://api.openai.com/v1/audio/transcriptions`
+and xAI `https://api.x.ai/v1/stt`. File upload and remote tail requests resolve
+signed-in vendor OAuth first; an OAuth refresh failure is an error, never a
+reason to switch to an API key. Without a signed-in account, the explicit lane
+key or vendor key supplies bearer authentication. Settings loading and lane
+resolution remain snapshot-only; credentials are resolved at request time.
+OpenAI defaults to `gpt-4o-mini-transcribe` when `WHISPER_MODEL` is unset and
+requests JSON. xAI sends file and language without an unsupported model or
+response-format field. Both responses supply `text`.
+
+The existing `GatewayWebSocketTransport` has an xAI wire adapter for
+`wss://api.x.ai/v1/stt`: query-based PCM configuration, a required
+`transcript.created` readiness event, raw PCM frames, and `audio.done` followed
+by the required `transcript.done`. Chunk finals remain provisional until
+`speech_final`; terminal cumulative text is not republished as another
+occurrence. OpenAI live STT is unsupported by this adapter.
+
+**Integration boundary:** the current application has no production constructor
+of `GatewayWebSocketTransport` or `LiveCloudAsrSession`. Persisting a
+`STT_LIVE_ENDPOINT` or passing a handshake probe does not establish a working
+live transcription path in the app. The xAI adapter is transport support;
+attachment to live capture remains unfinished. Apple retains live capture's
+existing observation path.
+
+Wire reference: [xAI speech-to-text](https://docs.x.ai/developers/model-capabilities/audio/speech-to-text).
+
 ## 0. Your machine right now (why it failed) — _historical diagnosis_
 
 | Layer                                          | What you had                | Effect                             |

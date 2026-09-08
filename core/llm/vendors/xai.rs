@@ -50,6 +50,18 @@ pub fn liveness_probe_body(model: &str) -> serde_json::Value {
     })
 }
 
+// Speech wire pins; vendor REST audio documentation, verified 2026-09-08.
+/// Vendor speech endpoint or Codescribe speech default.
+pub const TTS_ENDPOINT: &str = "https://api.x.ai/v1/tts";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const STT_ENDPOINT: &str = "https://api.x.ai/v1/stt";
+/// Speech default; empty model means the vendor does not accept a model field.
+pub const DEFAULT_TTS_MODEL: &str = "";
+/// Vendor speech endpoint or Codescribe speech default.
+pub const DEFAULT_TTS_VOICE: &str = "eve";
+/// Speech default; empty model means the vendor does not accept a model field.
+pub const DEFAULT_STT_MODEL: &str = "";
+
 #[cfg(test)]
 mod tests {
     use super::*;
