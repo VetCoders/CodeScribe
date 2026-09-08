@@ -94,11 +94,11 @@ struct WaveformView: View {
 
   private func waveform(at now: TimeInterval, reducedMotion: Bool) -> some View {
     Canvas { ctx, size in
-      for i in 0..<barCount {
+      let step = barWidth + gap
+      let count = stretches ? max(4, Int((size.width + gap) / step)) : barCount
+      for i in 0..<count {
         let scale = barScale(index: i, now: now, reducedMotion: reducedMotion)
         let height = maxBarHeight * scale
-        let step =
-          stretches ? max(0, size.width - barWidth) / CGFloat(max(1, barCount - 1)) : barWidth + gap
         let x = CGFloat(i) * step
         let y = (size.height - height) / 2
         let rect = CGRect(x: x, y: y, width: barWidth, height: height)

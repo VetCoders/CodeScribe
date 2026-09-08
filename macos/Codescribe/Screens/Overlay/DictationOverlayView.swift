@@ -44,8 +44,11 @@ struct DictationOverlayView: View {
           footerNotice: state.toast,
           footerEngineDot: footerEngineDot,
           formatLevel: state.autoFormatLevel,
+          autoPasteEnabled: state.autoPasteEnabled,
+          autoPasteAvailable: state.autoPasteControlAvailable,
           onIntent: state.relayIntent,
           onFormatLevel: { state.setAutoFormatLevel($0) },
+          onAutoPasteToggle: { state.setAutoPasteEnabled(!state.autoPasteEnabled) },
           onFocusChange: { actionsFocused = $0 }
         )
       )
@@ -147,21 +150,27 @@ struct DictationOverlayView: View {
 
   private func justifiedHeader(compact: Bool) -> some View {
     HStack(spacing: compact ? 6 : 10) {
-      VStack(alignment: .leading, spacing: 2) {
-        HStack(spacing: 5) {
-          ModeDot(color: CSColor.terracotta, size: 6)
-            .accessibilityHidden(true)
-          Text("codescribe")
-            .font(CSFont.ui(compact ? 12 : 15, .bold))
-            .tracking(-0.3)
-            .foregroundStyle(palette.primaryText.color)
+      HStack(spacing: 5) {
+        Button {
+          state.relayIntent(.close)
+        } label: {
+          ModeDot(color: palette.statusToken(for: state.mode).color, size: 7)
+            .contentShape(Circle().inset(by: -6))
         }
-        phaseStatus(text: compact ? state.compactStatusText : state.statusText)
+        .buttonStyle(.plain)
+        .help(OverlayIntent.close.helpText)
+        .accessibilityLabel(OverlayIntent.close.accessibilityLabel)
+        .accessibilityIdentifier("overlay-brand-close-dot")
+
+        Text("codescribe")
+          .font(CSFont.ui(compact ? 12 : 15, .bold))
+          .tracking(-0.3)
+          .foregroundStyle(palette.primaryText.color)
       }
       .fixedSize()
       .accessibilityElement(children: .contain)
       .accessibilityIdentifier("overlay-header-leading")
-      .overlay {
+      .background {
         OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
       }
 
@@ -175,21 +184,6 @@ struct DictationOverlayView: View {
         sessionTimer
           .allowsHitTesting(false)
         OverlayPlacementMenu(state: state, palette: palette)
-        if OverlayIntentRail.projectedIntents(for: state).contains(.close) {
-          Button {
-            state.relayIntent(.close)
-          } label: {
-            Image(systemName: "xmark")
-              .font(.system(size: 11, weight: .semibold))
-              .frame(width: 24, height: 24)
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .foregroundStyle(palette.mutedText.color)
-          .help(OverlayIntent.close.helpText)
-          .accessibilityLabel(OverlayIntent.close.accessibilityLabel)
-          .accessibilityIdentifier("overlay-intent-close")
-        }
       }
       .fixedSize()
       .accessibilityElement(children: .contain)

@@ -164,9 +164,9 @@ pub(crate) struct SyntheticPastePreflight {
 }
 
 impl SyntheticPastePreflight {
-    /// Both signals must hold; either one missing means the keystroke is dropped.
+    /// Either signal holding allows synthetic event delivery.
     pub(crate) fn can_post_events(self) -> bool {
-        self.cg_post_event_access && self.ax_trusted
+        self.cg_post_event_access || self.ax_trusted
     }
 }
 

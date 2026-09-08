@@ -1404,11 +1404,17 @@ impl RecordingController {
             (target_app.as_deref(), frontmost.as_deref()),
             (Some(target), Some(front)) if front.trim().eq_ignore_ascii_case(target.trim())
         );
+        let frontmost_is_external = frontmost
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_some_and(|name| !target_is_self_app(name));
         debug!(
             target = ?target_app,
             frontmost = ?frontmost,
             focus_confirmed,
             target_observed_frontmost,
+            frontmost_is_external,
             "{context}: paste target activation"
         );
 
@@ -1417,7 +1423,7 @@ impl RecordingController {
 
         let mut deferred_insert_shortcut = None;
         let mut deferred_insert_failure = None;
-        let delivery = if (focus_confirmed || target_observed_frontmost)
+        let delivery = if (focus_confirmed || target_observed_frontmost || frontmost_is_external)
             && preflight.can_post_events()
         {
             clipboard::paste_and_restore(&paste_text)
