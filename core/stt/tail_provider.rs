@@ -1357,6 +1357,37 @@ mod tests {
     }
 
     #[test]
+    fn recovery_overlapping_segments_never_manufacture_request_witness() {
+        let range = TailSampleRange {
+            session: "synthetic".into(),
+            capture_epoch: 1,
+            sample_start: 0,
+            sample_end: 32_000,
+        };
+        let segments = vec![
+            TimedTailSegment {
+                text: "Iwo".into(),
+                range: TailSampleRange {
+                    sample_end: 20_000,
+                    ..range.clone()
+                },
+            },
+            TimedTailSegment {
+                text: "Iwo".into(),
+                range: TailSampleRange {
+                    sample_start: 16_000,
+                    ..range.clone()
+                },
+            },
+        ];
+        let result = coarsen_invalid_in_process_segments(&range, "Iwo Iwo", segments);
+        assert!(
+            result.is_empty(),
+            "invalid timing must not manufacture a whole-request occurrence"
+        );
+    }
+
+    #[test]
     fn invalid_in_process_segment_clock_coarsens_without_losing_text() {
         let range = TailSampleRange {
             session: "gap-recovery".into(),

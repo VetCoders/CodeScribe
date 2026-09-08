@@ -6794,3 +6794,7 @@ mod ledger_conservation_falsifiers {
         assert_eq!(known, 2);
     }
 }
+
+#[cfg(test)]
+#[path = "seal_coverage_tests.rs"]
+mod seal_coverage_tests;
