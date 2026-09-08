@@ -41,6 +41,8 @@ pub mod portable;
 /// On-disk prompt files (formatting, smart formatting, assistive): built-in
 /// defaults, user overrides, snapshots, and restore-to-default.
 pub mod prompts;
+/// Backup-first launch repair and its diagnostic receipt.
+pub mod repair;
 /// GUI-managed user settings JSON (regular-user tier).
 pub mod settings;
 /// Process-wide app-data I/O fence used by destructive reset.

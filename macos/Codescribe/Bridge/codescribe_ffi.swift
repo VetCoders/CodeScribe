@@ -13997,6 +13997,24 @@ public func commitOverlayQualityRecord(rawText: String, deliveredText: String, e
 })
 }
 /**
+ * Typed core actions and refusals serialized without env values or secrets.
+ */
+public func configRepairReceiptJson() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_codescribe_ffi_fn_func_config_repair_receipt_json($0
+    )
+})
+}
+/**
+ * Read the launch repair receipt without loading settings again.
+ */
+public func configRepairSummary() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_codescribe_ffi_fn_func_config_repair_summary($0
+    )
+})
+}
+/**
  * Snapshot the last serving verdict, if any stop completed in this process.
  * `None` renders as "Not yet served" Swift-side.
  */
@@ -14228,6 +14246,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_func_commit_overlay_quality_record() != 16069) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_func_config_repair_receipt_json() != 45672) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_func_config_repair_summary() != 26554) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_func_current_serving_verdict() != 14135) {

@@ -4,6 +4,7 @@ import SwiftUI
 // reports the running build and local data truth instead of inventing a profile.
 struct UserPanel: View {
   @ObservedObject var model: SettingsViewModel
+  @State private var repairSummary: String?
   @AppStorage(ActivationPing.optInDefaultsKey) private var activationPingOptIn = false
 
   private static let docsURL = URL(
@@ -15,6 +16,7 @@ struct UserPanel: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       EyebrowLabel(text: "Settings · User")
+        .onAppear { repairSummary = configRepairSummary() }
       Text("Local by design.")
         .font(CSFont.ui(26, .bold))
         .tracking(-0.5)
@@ -36,6 +38,14 @@ struct UserPanel: View {
         infoRow("Built", model.buildInfo.builtAt)
       }
       .csSettingsCard()
+
+      if let repairSummary {
+        Text(repairSummary)
+          .font(CSFont.ui(12.5))
+          .foregroundStyle(CSColor.textMutedAlt)
+          .textSelection(.enabled)
+          .padding(.top, CSSpace.control)
+      }
 
       SettingsSectionLabel("Local data")
         .padding(.top, CSSpace.section)
@@ -253,6 +263,7 @@ struct UserPanel: View {
 /// app-data reset so it cannot clear dictation, recordings, prompts or license.
 private struct ResetAgentSection: View {
   @ObservedObject var model: SettingsViewModel
+  @State private var repairSummary: String?
   @State private var confirming = false
   @State private var confirmationText = ""
 
@@ -322,6 +333,7 @@ private struct ResetAgentSection: View {
 /// editing. Data is recoverable from Trash; Keychain deletion remains opt-in.
 private struct ResetAppDataSection: View {
   @ObservedObject var model: SettingsViewModel
+  @State private var repairSummary: String?
   @State private var includeKeys = false
   @State private var includePrompts = false
   @State private var confirming = false

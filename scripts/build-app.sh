@@ -353,6 +353,27 @@ if [[ -n "$EMBEDDER_RUNTIME_SOURCE" ]]; then
 else
   echo "    MiniLM is compiled into the binary by explicit CODESCRIBE_EMBED_EMBEDDER=1."
 fi
+# Only the two non-secret engine defaults belong in the signed app bundle.
+# The app owns merging them into settings.json at launch, with a backup.
+python3 - "$APP/Contents/Resources/operator-pack/settings.json" "${CODESCRIBE_VOICE_LAB_SRC:-$REPO_ROOT/../voice-lab}" "$HOME/.codescribe/src/voice-lab" <<'PY_PACK'
+import json
+import sys
+from pathlib import Path
+
+dest, *roots = map(Path, sys.argv[1:])
+if dest.exists():
+    dest.unlink()
+for pack in (pack for root in roots for pack in sorted((root / "examples").glob("*/settings.json"))):
+    if not (pack.parent / "keys").is_dir():
+        continue
+    source = json.loads(pack.read_text()).get("speech", {}).get("engine", {})
+    engine = {k: source[k] for k in ("cloud_transcription_endpoint", "asr_mode")
+              if isinstance(source.get(k), str) and source[k].strip()}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps({"speech": {"engine": engine}}, indent=2) + "\n")
+    break
+PY_PACK
+
 AGENT_BRIDGE_BUNDLE_DIR="$APP/Contents/Resources/agent-bridge"
 stage_agent_bridge "$AGENT_BRIDGE_BUNDLE_DIR" "$STAMP_VERSION"
 echo "    Agent bridge skill tree + session helper bundled at Contents/Resources/agent-bridge."

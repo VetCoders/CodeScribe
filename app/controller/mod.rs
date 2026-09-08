@@ -565,8 +565,7 @@ impl RecordingController {
 
     /// Create a new recording controller with configuration loaded from disk
     pub fn new() -> Self {
-        let snapshot = Config::load_runtime_snapshot()
-            .unwrap_or_else(|error| panic!("runtime settings snapshot refused: {error:?}"));
+        let snapshot = Config::load_startup_runtime_snapshot(true);
         Self::with_runtime_settings(snapshot, "RecordingController::new")
     }
 
@@ -575,8 +574,7 @@ impl RecordingController {
     /// Used by the SwiftUI redesign dictation bridge: starting local recording must
     /// not ask for API-key access as an incidental side effect.
     pub fn new_without_keychain() -> Self {
-        let snapshot = Config::load_runtime_snapshot_without_keychain()
-            .unwrap_or_else(|error| panic!("runtime settings snapshot refused: {error:?}"));
+        let snapshot = Config::load_startup_runtime_snapshot(false);
         Self::with_runtime_settings(snapshot, "RecordingController::new_without_keychain")
     }
 

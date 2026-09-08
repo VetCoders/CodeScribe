@@ -1630,14 +1630,14 @@ default = ""
 type = "string"
 reload = "rebuild"
 category = "install"
-description = "Existing Voice Lab checkout used by make install-app instead of cloning (~/.codescribe/src/voice-lab)"
+description = "Existing Voice Lab checkout used by installation, bundle pack embedding, and development launch config seeding instead of cloning (~/.codescribe/src/voice-lab)"
 
 [vars.VOICE_LAB_INSTALL_SETTINGS]
 default = ""
 type = "string"
 reload = "rebuild"
 category = "install"
-description = "Voice Lab settings seed: empty=copy pack if missing and fill empty engine keys; 1=overwrite settings.json; 0=never touch Application Support"
+description = "Retired installer toggle; ignored. Codescribe now merges empty engine fields from its bundled operator pack at launch, with a backup. Installation never overwrites app settings."
 
 [vars.SPEECH_TTS_VOICE_OPENAI]
 default = "cedar"

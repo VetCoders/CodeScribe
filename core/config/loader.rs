@@ -119,18 +119,24 @@ impl Config {
     /// `settings.json` or process env during a take.
     pub fn load_runtime_snapshot()
     -> Result<RuntimeSettingsSnapshot, SettingsSnapshotValidationError> {
-        Self::load_runtime_snapshot_with_keychain_population(true)
+        Ok(Self::load_runtime_snapshot_with_keychain_population(true))
     }
 
     /// Keychain-free form of [`Self::load_runtime_snapshot`] for local capture.
     pub fn load_runtime_snapshot_without_keychain()
     -> Result<RuntimeSettingsSnapshot, SettingsSnapshotValidationError> {
-        Self::load_runtime_snapshot_with_keychain_population(false)
+        Ok(Self::load_runtime_snapshot_with_keychain_population(false))
+    }
+
+    /// Infallible launch path: config refusals remain typed in the receipt and
+    /// disarm capture while leaving Settings available for recovery.
+    pub fn load_startup_runtime_snapshot(populate_keychain: bool) -> RuntimeSettingsSnapshot {
+        Self::load_runtime_snapshot_with_keychain_population(populate_keychain)
     }
 
     fn load_runtime_snapshot_with_keychain_population(
         populate_keychain: bool,
-    ) -> Result<RuntimeSettingsSnapshot, SettingsSnapshotValidationError> {
+    ) -> RuntimeSettingsSnapshot {
         let input = SettingsLoaderInput {
             settings_path: UserSettings::settings_path(),
             allow_env_file: true,
@@ -174,10 +180,33 @@ impl Config {
             runtime_formatting_policy.as_deref(),
             user_settings.formatting_level.as_deref(),
         )
-        .map_err(|error| SettingsSnapshotValidationError::InvalidField {
-            field: "formatting_policy",
-            reason: error.to_string(),
-        })?;
+        .unwrap_or_else(|_| {
+            super::repair::record(super::repair::RepairReceipt {
+                unrepairable: vec![super::repair::ConfigUnrepairable {
+                    path: input.settings_path.clone(),
+                    reason: "invalid FORMATTING_LEVEL override; formatting disabled for this launch; fix the override".into(),
+                }],
+                ..Default::default()
+            });
+            FormattingPolicy::Off
+        });
+        if let (Some(runtime), Some(persisted)) = (
+            runtime_formatting_policy.as_deref(),
+            user_settings.formatting_level.as_deref(),
+        ) && let (Ok(runtime), Ok(persisted)) = (
+            FormattingPolicy::parse(runtime),
+            FormattingPolicy::parse(persisted),
+        ) && runtime != persisted
+        {
+            super::repair::record(super::repair::RepairReceipt {
+                actions: vec![super::repair::RepairAction::PrecedenceNote {
+                    key: "FORMATTING_LEVEL".into(),
+                }],
+                ..Default::default()
+            });
+        }
+        let seal_lane_armed =
+            seal_lane_armed && super::repair::launch_receipt().unrepairable.is_empty();
         let llm_lanes = Self::resolve_runtime_llm_lanes(&user_settings);
         let ai_execution = Self::resolve_runtime_ai_execution(formatting_policy);
         let mut digest_values = values.clone();
@@ -195,7 +224,8 @@ impl Config {
             energy_calibration.digest_material(),
         );
         let digest = SettingsSnapshotDigest::from_hex(sha256_hex(digest_material.as_bytes()));
-        RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {
+        super::repair::log_launch_once();
+        let parts = RuntimeSnapshotParts {
             values,
             user_settings,
             llm_lanes,
@@ -205,7 +235,22 @@ impl Config {
             digest,
             energy_calibration,
             seal_lane_armed,
-        })
+        };
+        let recovery = parts.clone();
+        match RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {
+            values: parts.values,
+            user_settings: parts.user_settings,
+            llm_lanes: parts.llm_lanes,
+            formatting_policy: parts.formatting_policy,
+            ai_execution: parts.ai_execution,
+            provenance: parts.provenance,
+            digest: parts.digest,
+            energy_calibration: parts.energy_calibration,
+            seal_lane_armed: parts.seal_lane_armed,
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) => RuntimeSettingsSnapshot::refused_startup(recovery, error),
+        }
     }
 
     /// Resolve the one product-owned arming value for this immutable settings
@@ -1853,58 +1898,9 @@ impl Config {
 
     /// Migrate legacy keys inside .env to the current contract.
     fn migrate_env_legacy_keys() {
-        let env_path = Self::env_path();
-        if !env_path.exists() {
-            return;
-        }
-
-        let mut vars = match Self::parse_env_file(&env_path) {
-            Ok(vars) => vars,
-            Err(e) => {
-                warn!("Failed to parse .env for migration: {}", e);
-                return;
-            }
-        };
-
-        let mut changed = false;
-
-        let put_if_missing = |key: &str, value: String, vars: &mut HashMap<String, String>| {
-            if !vars.contains_key(key) {
-                vars.insert(key.to_string(), value);
-                true
-            } else {
-                false
-            }
-        };
-
-        // Whisper-server era file endpoint → the File lane row (never the retired alias).
-        if let Some(val) = vars.remove("WHISPER_SERVER_URL") {
-            changed = true;
-            put_if_missing("STT_FILE_ENDPOINT", val, &mut vars);
-        }
-
-        // Retired LLM env (Ollama-era hosts, shared endpoint/model, provider
-        // flag): endpoints are pinned per vendor now, so these rows are dropped
-        // rather than rewritten into names nothing reads.
-        for retired in [
-            "LLM_SERVER_URL",
-            "LLM_HOST",
-            "OLLAMA_HOST",
-            "OLLAMA_MODEL",
-            "AI_PROVIDER",
-        ] {
-            if vars.remove(retired).is_some() {
-                changed = true;
-            }
-        }
-
-        if changed {
-            if let Err(e) = Self::write_env_file(&env_path, &vars) {
-                warn!("Failed to write migrated .env: {}", e);
-            } else {
-                info!("Migrated legacy keys inside .env to the current contract");
-            }
-        }
+        // Preserve every byte until the retired registry targets have live readers.
+        // Old code dropped arbitrary legacy LLM values without any backup.
+        super::repair::record(super::repair::inspect_env(&Self::env_path()));
     }
 
     /// Get the configuration directory path (`$HOME/.codescribe`).
@@ -1971,6 +1967,111 @@ mod tests {
     use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Replay launch defects through the public loader using isolated on-disk tiers.
+    #[test]
+    #[serial]
+    fn config_repair_launch_fixture_table() {
+        let _data = TestEnvGuard::unset("CODESCRIBE_DATA_DIR");
+        let _env = TestEnvGuard::unset("CODESCRIBE_ENV_PATH");
+        let _pack = TestEnvGuard::unset("CODESCRIBE_VOICE_LAB_SRC");
+        let _format = TestEnvGuard::unset("FORMATTING_LEVEL");
+        let _armed = TestEnvGuard::unset(SILERO_FUSION_ENV);
+        let cases = [
+            (
+                "zoom",
+                r#"{"schema_version":3,"ui":{"chat_zoom":9}}"#,
+                "",
+                "FieldReset",
+            ),
+            (
+                "truncated",
+                r#"{"schema_version":3,"ui":"#,
+                "",
+                "FileRecreated",
+            ),
+            (
+                "formatting",
+                r#"{"schema_version":3,"speech":{"formatting":{"level":"bogus"}}}"#,
+                "",
+                "FieldReset",
+            ),
+            (
+                "deprecated",
+                r#"{"schema_version":3}"#,
+                "WHISPER_SERVER_URL=https://example.test/asr\n",
+                "PrecedenceNote",
+            ),
+            (
+                "unknown",
+                r#"{"schema_version":3}"#,
+                "MY_PRIVATE_TOKEN=do-not-emit-this\n",
+                "UnknownEnvKey",
+            ),
+            (
+                "pack",
+                r#"{"schema_version":3,"speech":{"engine":{"asr_mode":"cloud","cloud_transcription_endpoint":""}}}"#,
+                "",
+                "SeededFromPack",
+            ),
+            (
+                "precedence",
+                r#"{"schema_version":3,"speech":{"formatting":{"level":"max"}}}"#,
+                "",
+                "PrecedenceNote",
+            ),
+        ];
+        for (name, settings, env, action) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            set_env_for_test("CODESCRIBE_DATA_DIR", dir.path());
+            remove_env_for_test("CODESCRIBE_VOICE_LAB_SRC");
+            remove_env_for_test("FORMATTING_LEVEL");
+            if name == "pack" {
+                let pack = dir.path().join("examples/operator");
+                fs::create_dir_all(pack.join("keys")).unwrap();
+                fs::write(pack.join("settings.json"), r#"{"speech":{"engine":{"cloud_transcription_endpoint":"https://example.test/asr"}}}"#).unwrap();
+                set_env_for_test("CODESCRIBE_VOICE_LAB_SRC", dir.path());
+            }
+            if name == "precedence" {
+                set_env_for_test("FORMATTING_LEVEL", "off");
+            }
+            fs::write(dir.path().join("settings.json"), settings).unwrap();
+            fs::write(dir.path().join(".env"), env).unwrap();
+            let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+            let receipt = snapshot.repair_receipt();
+            assert!(receipt.unrepairable.is_empty(), "{name}: {receipt:?}");
+            assert_eq!(receipt.actions.len(), 1, "{name}: {receipt:?}");
+            let json = serde_json::to_string(receipt).unwrap();
+            assert!(json.contains(action), "{name}: {json}");
+            assert!(!json.contains("do-not-emit-this"));
+            if name == "precedence" {
+                assert_eq!(snapshot.formatting_policy(), FormattingPolicy::Off);
+                assert_eq!(
+                    snapshot.user_settings().formatting_level.as_deref(),
+                    Some("max")
+                );
+                assert_eq!(
+                    fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+                    settings
+                );
+            }
+            assert_eq!(fs::read_to_string(dir.path().join(".env")).unwrap(), env);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        set_env_for_test("CODESCRIBE_DATA_DIR", dir.path());
+        fs::write(dir.path().join("settings.json"), r#"{"schema_version":99}"#).unwrap();
+        let refused = Config::load_startup_runtime_snapshot(false);
+        assert_eq!(refused.repair_receipt().unrepairable.len(), 1);
+        assert!(!refused.seal_lane_armed());
+
+        let dir = tempfile::tempdir().unwrap();
+        set_env_for_test("CODESCRIBE_DATA_DIR", dir.path());
+        set_env_for_test("FORMATTING_LEVEL", "invalid-policy");
+        let refused = Config::load_startup_runtime_snapshot(false);
+        assert_eq!(refused.formatting_policy(), FormattingPolicy::Off);
+        assert!(!refused.repair_receipt().unrepairable.is_empty());
+        assert!(!refused.seal_lane_armed());
+    }
 
     /// Set a var for the current test case.
     fn set_env_for_test<V: AsRef<std::ffi::OsStr>>(key: &str, value: V) {

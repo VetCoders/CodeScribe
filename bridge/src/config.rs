@@ -38,6 +38,19 @@ use directories::BaseDirs;
 
 use crate::{CsError, CsLanguage, application_runtime};
 
+/// Read the launch repair receipt without loading settings again.
+#[uniffi::export]
+pub fn config_repair_summary() -> Option<String> {
+    codescribe_core::config::repair::launch_receipt().summary()
+}
+
+/// Typed core actions and refusals serialized without env values or secrets.
+#[uniffi::export]
+pub fn config_repair_receipt_json() -> String {
+    serde_json::to_string(&codescribe_core::config::repair::launch_receipt())
+        .unwrap_or_else(|_| "{\"error\":\"receipt serialization failed\"}".into())
+}
+
 /// Stable cross-FFI marker: Swift must relaunch even though reset returned an
 /// error, because at least one app-data root has already moved and the Rust
 /// process fence is permanently latched.

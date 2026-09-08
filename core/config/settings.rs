@@ -1000,6 +1000,7 @@ impl RuntimeAiExecution {
 pub struct RuntimeSettingsSnapshot {
     /// Resolved runtime values after defaults + allowed env overlays.
     values: Config,
+    repair_receipt: super::repair::RepairReceipt,
     /// Persisted intent captured by the same loader pass for consumers whose
     /// policy constructors still accept the public settings schema.
     user_settings: UserSettings,
@@ -1027,6 +1028,7 @@ pub struct RuntimeSettingsSnapshot {
 
 /// Everything one loader pass resolved, handed to [`RuntimeSettingsSnapshot::seal_loaded`]
 /// as a unit so no part can be sealed from a different pass.
+#[derive(Clone)]
 pub(crate) struct RuntimeSnapshotParts {
     pub(crate) values: Config,
     pub(crate) user_settings: UserSettings,
@@ -1058,6 +1060,7 @@ impl RuntimeSettingsSnapshot {
         } = parts;
         SettingsSnapshotValidation::admit(&values, &provenance, &digest)?;
         Ok(Self {
+            repair_receipt: super::repair::launch_receipt(),
             values,
             user_settings,
             llm_lanes,
@@ -1068,6 +1071,49 @@ impl RuntimeSettingsSnapshot {
             energy_calibration,
             seal_lane_armed,
         })
+    }
+
+    /// A refused launch remains inspectable, but may not admit capture.
+    pub(crate) fn refused_startup(
+        mut parts: RuntimeSnapshotParts,
+        error: SettingsSnapshotValidationError,
+    ) -> Self {
+        super::repair::record(super::repair::RepairReceipt {
+            unrepairable: vec![super::repair::ConfigUnrepairable {
+                path: UserSettings::settings_path(),
+                reason: error.to_string(),
+            }],
+            ..Default::default()
+        });
+        parts.seal_lane_armed = false;
+        let RuntimeSnapshotParts {
+            values,
+            user_settings,
+            llm_lanes,
+            formatting_policy,
+            ai_execution,
+            provenance,
+            digest,
+            energy_calibration,
+            seal_lane_armed,
+        } = parts;
+        Self {
+            repair_receipt: super::repair::launch_receipt(),
+            values,
+            user_settings,
+            llm_lanes,
+            formatting_policy,
+            ai_execution,
+            provenance,
+            digest,
+            energy_calibration,
+            seal_lane_armed,
+        }
+    }
+
+    /// Repairs observed in this process before this snapshot was sealed.
+    pub fn repair_receipt(&self) -> &super::repair::RepairReceipt {
+        &self.repair_receipt
     }
 
     /// Borrow the frozen runtime values.
@@ -1959,7 +2005,7 @@ impl UserSettings {
     /// Reject a file that would load into nonsense: unsupported schema version,
     /// out-of-range zoom, or an unparseable formatting level. Runs on both read
     /// and write, so a bad value can neither be loaded nor persisted.
-    fn validate_v2(v2: &SettingsV2) -> anyhow::Result<()> {
+    pub(super) fn validate_v2(v2: &SettingsV2) -> anyhow::Result<()> {
         if v2.schema_version != 2 && v2.schema_version != 3 {
             anyhow::bail!("settings schema_version must be 2 or 3")
         }
@@ -1982,7 +2028,7 @@ impl UserSettings {
     /// Write via temp file plus rename, so a crash mid-write leaves the previous
     /// `settings.json` intact rather than a truncated one the app would treat
     /// as corrupt and silently replace with defaults.
-    fn write_json_atomic(path: &Path, json: &str) -> anyhow::Result<()> {
+    pub(super) fn write_json_atomic(path: &Path, json: &str) -> anyhow::Result<()> {
         Self::write_json_atomic_with(path, json, |from, to| fs::rename(from, to))
     }
 
@@ -2006,7 +2052,14 @@ impl UserSettings {
             Uuid::new_v4()
         ));
         let outcome = (|| -> anyhow::Result<()> {
-            let mut file = OpenOptions::new().create_new(true).write(true).open(&tmp)?;
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
             file.write_all(json.as_bytes())?;
             file.sync_all()?;
             drop(file);
@@ -2069,6 +2122,10 @@ impl UserSettings {
     /// Load while the settings transaction lock and app-data admission are held.
     fn load_unlocked() -> Self {
         let path = Self::settings_path();
+        super::repair::record(super::repair::repair_settings(
+            &path,
+            super::repair::operator_pack().as_deref(),
+        ));
         match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
                 Ok(value) => {
