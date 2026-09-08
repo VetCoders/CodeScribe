@@ -3,7 +3,7 @@ import SwiftUI
 // Slim evidence-first dictation overlay.
 //
 // Layout (top → bottom):
-//   header   brand · ONE projection phase · compact waveform · timer
+//   header   brand + close dot · compact waveform · timer · Auto Paste
 //   body     transcript is the product surface (listening / formatted / terminal)
 //   floating actions over the transcript; no footer inset or reserved band
 //
@@ -139,6 +139,9 @@ struct DictationOverlayView: View {
     // OverlayResizeHitTests.testHeaderIsAWindowDragHandleAcrossItsWidth.
     .background { OverlayWindowDragRegion(identifier: "overlay-header-drag-region") }
     .modifier(OverlayHeaderChrome(palette: palette))
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel(state.statusText)
+    .accessibilityIdentifier("overlay-header")
   }
 
   private var fullHeader: some View { justifiedHeader(compact: false) }
@@ -147,23 +150,21 @@ struct DictationOverlayView: View {
 
   private func justifiedHeader(compact: Bool) -> some View {
     HStack(spacing: compact ? 6 : 10) {
-      VStack(alignment: .leading, spacing: 2) {
-        HStack(spacing: 5) {
-          ModeDot(color: CSColor.terracotta, size: 6)
-            .accessibilityHidden(true)
-          Text("codescribe")
-            .font(CSFont.ui(compact ? 12 : 15, .bold))
-            .tracking(-0.3)
-            .foregroundStyle(palette.primaryText.color)
-        }
-        phaseStatus(text: compact ? state.compactStatusText : state.statusText)
+      HStack(spacing: 5) {
+        Text("codescribe")
+          .font(CSFont.ui(compact ? 12 : 15, .bold))
+          .tracking(-0.3)
+          .foregroundStyle(palette.primaryText.color)
+          // Only the inert wordmark owns this foreground drag region. The
+          // adjacent close control must win hit testing on its own frame.
+          .overlay {
+            OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
+          }
+        brandCloseButton
       }
       .fixedSize()
       .accessibilityElement(children: .contain)
       .accessibilityIdentifier("overlay-header-leading")
-      .overlay {
-        OverlayWindowDragRegion(identifier: "overlay-header-inert-drag-region")
-      }
 
       chromeWaveform(barCount: compact ? 10 : 34)
         .frame(minWidth: compact ? 12 : 100, maxWidth: .infinity)
@@ -175,20 +176,8 @@ struct DictationOverlayView: View {
         sessionTimer
           .allowsHitTesting(false)
         OverlayPlacementMenu(state: state, palette: palette)
-        if OverlayIntentRail.projectedIntents(for: state).contains(.close) {
-          Button {
-            state.relayIntent(.close)
-          } label: {
-            Image(systemName: "xmark")
-              .font(.system(size: 11, weight: .semibold))
-              .frame(width: 24, height: 24)
-              .contentShape(Rectangle())
-          }
-          .buttonStyle(.plain)
-          .foregroundStyle(palette.mutedText.color)
-          .help(OverlayIntent.close.helpText)
-          .accessibilityLabel(OverlayIntent.close.accessibilityLabel)
-          .accessibilityIdentifier("overlay-intent-close")
+        if state.autoPasteControlAvailable {
+          autoPasteControl
         }
       }
       .fixedSize()
@@ -197,23 +186,34 @@ struct DictationOverlayView: View {
     }
   }
 
-  @ViewBuilder
-  private func phaseStatus(text: String) -> some View {
-    // One phase pill only — do not also paint RECORDING/tag/meta rows. Swap the
-    // whole view type on live vs idle so repeatForever tears down after capture.
-    if state.statusRippling {
-      StatusPill(text: text, color: palette.statusToken(for: state.mode).color, rippling: true)
-        .fixedSize(horizontal: true, vertical: false)
-        .allowsHitTesting(false)
-        .accessibilityLabel(state.statusText)
-        .accessibilityIdentifier("overlay-phase-status")
-    } else {
-      StaticStatusPill(text: text, color: palette.statusToken(for: state.mode).color)
-        .fixedSize(horizontal: true, vertical: false)
-        .allowsHitTesting(false)
-        .accessibilityLabel(state.statusText)
-        .accessibilityIdentifier("overlay-phase-status")
+  private var brandCloseButton: some View {
+    OverlayHeaderControl(
+      symbol: "circle.fill", symbolSize: 8, tint: CSColor.terracotta,
+      label: "Close", value: nil, identifier: "overlay-brand-close",
+      help: OverlayIntent.close.helpText,
+      enabled: OverlayIntentRail.projectedIntents(for: state).contains(.close)
+    ) {
+      state.relayIntent(.close)
     }
+    .frame(width: 24, height: 24)
+  }
+
+  /// The same durable policy seam as Settings. Filled/outline artwork also
+  /// distinguishes On/Off without relying on color, at both header widths.
+  private var autoPasteControl: some View {
+    OverlayHeaderControl(
+      symbol: state.autoPasteEnabled ? "arrow.down.doc.fill" : "arrow.down.doc",
+      symbolSize: 12,
+      tint: state.autoPasteEnabled ? palette.primaryText.color : palette.mutedText.color,
+      label: "Auto Paste", value: state.autoPasteEnabled ? "On" : "Off",
+      identifier: "overlay-auto-paste",
+      help:
+        "Auto Paste: \(state.autoPasteEnabled ? "On" : "Off"). Automatically insert completed dictation in the previous app",
+      enabled: true
+    ) {
+      state.setAutoPasteEnabled(!state.autoPasteEnabled)
+    }
+    .frame(width: 24, height: 24)
   }
 
   /// Audio-evidence strip in the primary bar. Amplitude/VAD only — word/PCM
@@ -461,6 +461,50 @@ private struct OverlayHeaderChrome: ViewModifier {
         in: RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous)
       )
     }
+  }
+}
+
+/// Native hit targets in the non-activating panel. SwiftUI owns all values;
+/// the coordinator only forwards clicks and is refreshed with each render.
+private struct OverlayHeaderControl: NSViewRepresentable {
+  let symbol: String
+  let symbolSize: CGFloat
+  let tint: Color
+  let label: String
+  let value: String?
+  let identifier: String
+  let help: String
+  let enabled: Bool
+  let action: () -> Void
+
+  func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+  func makeNSView(context: Context) -> NSButton {
+    let button = NSButton(
+      title: "", target: context.coordinator, action: #selector(Coordinator.press))
+    button.isBordered = false
+    button.imagePosition = .imageOnly
+    button.setButtonType(.momentaryPushIn)
+    return button
+  }
+
+  func updateNSView(_ button: NSButton, context: Context) {
+    context.coordinator.action = action
+    button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)?
+      .withSymbolConfiguration(.init(pointSize: symbolSize, weight: .semibold))
+    button.contentTintColor = NSColor(tint)
+    button.isEnabled = enabled
+    button.toolTip = help
+    button.setAccessibilityRole(.button)
+    button.setAccessibilityLabel(label)
+    button.setAccessibilityValue(value)
+    button.setAccessibilityIdentifier(identifier)
+  }
+
+  final class Coordinator: NSObject {
+    var action: () -> Void
+    init(action: @escaping () -> Void) { self.action = action }
+    @objc func press() { action() }
   }
 }
 

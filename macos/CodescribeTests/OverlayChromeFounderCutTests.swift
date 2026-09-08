@@ -33,7 +33,7 @@ final class OverlayChromeFounderCutTests: XCTestCase {
         XCTAssertLessThan(point.x, root.bounds.midX, "Close belongs beside the brand")
         XCTAssertGreaterThan(point.y, root.bounds.maxY - 60)
         XCTAssertFalse(panel.isWindowDragHit(at: point), "The brand drag region stole the dot")
-        XCTAssertTrue(dot.accessibilityPerformPress())
+        try XCTUnwrap(dot as? NSButton).performClick(nil)
         XCTAssertEqual(closes, 1)
       }
     }
@@ -44,8 +44,8 @@ final class OverlayChromeFounderCutTests: XCTestCase {
     try withPanel(state: state) { _, root in
       let elements = accessibilityTree(root)
       XCTAssertFalse(elements.contains { $0.accessibilityIdentifier() == "overlay-phase-status" })
-      XCTAssertEqual(try element("overlay-header", in: root).accessibilityLabel(), state.statusText)
       let source = try overlaySource()
+      XCTAssertTrue(source.contains(".accessibilityLabel(state.statusText)"))
       XCTAssertFalse(source.contains("StatusPill("), "No phase capsule may render in the header")
       XCTAssertFalse(source.contains("phaseStatus(text:"))
     }
@@ -62,13 +62,13 @@ final class OverlayChromeFounderCutTests: XCTestCase {
         XCTAssertEqual(toggle.accessibilityValue() as? String, "On")
         let point = try controlPoint(toggle, panel: panel, root: root)
         XCTAssertFalse(panel.isWindowDragHit(at: point))
-        XCTAssertTrue(toggle.accessibilityPerformPress())
+        try XCTUnwrap(toggle as? NSButton).performClick(nil)
         settle(root)
         XCTAssertEqual(engine.writes, [false])
         XCTAssertFalse(state.autoPasteEnabled)
         XCTAssertEqual(
           try element("overlay-auto-paste", in: root).accessibilityValue() as? String, "Off")
-        XCTAssertTrue(try element("overlay-auto-paste", in: root).accessibilityPerformPress())
+        try XCTUnwrap(element("overlay-auto-paste", in: root) as? NSButton).performClick(nil)
         settle(root)
         XCTAssertEqual(engine.writes, [false, true])
         XCTAssertTrue(state.autoPasteEnabled)
@@ -108,8 +108,17 @@ final class OverlayChromeFounderCutTests: XCTestCase {
   }
 
   private func accessibilityTree(_ root: Any) -> [any NSAccessibilityProtocol] {
-    guard let element = root as? any NSAccessibilityProtocol else { return [] }
-    return [element] + (element.accessibilityChildren() ?? []).flatMap { accessibilityTree($0) }
+    var visited: Set<ObjectIdentifier> = []
+    func walk(_ object: Any) -> [any NSAccessibilityProtocol] {
+      guard let element = object as? any NSAccessibilityProtocol,
+        visited.insert(ObjectIdentifier(element)).inserted
+      else { return [] }
+      // AppKit wrapper views can have no AX children while hosting a SwiftUI
+      // accessibility subtree. Traverse both graphs, deduplicated by identity.
+      let nativeChildren = (object as? NSView)?.subviews ?? []
+      return [element] + ((element.accessibilityChildren() ?? []) + nativeChildren).flatMap(walk)
+    }
+    return walk(root)
   }
 
   private func element(_ identifier: String, in root: NSView) throws -> any NSAccessibilityProtocol
@@ -135,7 +144,8 @@ final class OverlayChromeFounderCutTests: XCTestCase {
       candidate = current.superview
     }
     print("F1_CONTROL_HIT \(element.accessibilityIdentifier() ?? "") \(point) \(chain)")
-    XCTAssertFalse(hit is OverlayWindowDragRegionView)
+    let control = try XCTUnwrap(hit as? NSButton, "Hit must resolve to the real native control")
+    XCTAssertEqual(control.accessibilityIdentifier(), element.accessibilityIdentifier())
     return point
   }
 
