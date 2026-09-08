@@ -42,6 +42,7 @@ CLEAN_SCHEMA = "codescribe.transcript.v1"
 EVIDENCE_SCHEMA = "codescribe.transcript-evidence.v1"
 TERMINAL_SEAL = "record_ledger_terminal_seal"
 INSTALL_INTERLOCK_FILENAME = "install-runtime.lock"
+AGENT_TURN_LEASE_FILENAME = "agent-turn.lock"
 SEALED = "transcript_sealed"
 CLI_FILE_VERDICT_SOURCE = "cli_file_verdict"
 LIVE_STATUSES = ("utterance_draft", "utterance_revised")
@@ -131,6 +132,12 @@ def install_interlock_path() -> Path:
     # process-independent per-user path so data-dir overrides cannot split the
     # installer and runtime onto different lock files.
     return Path.home() / ".codescribe" / INSTALL_INTERLOCK_FILENAME
+
+
+def agent_turn_lease_path() -> Path:
+    # Held shared by the app only while an agent turn streams or runs tools.
+    # Same invariant directory as the runtime interlock.
+    return install_interlock_path().with_name(AGENT_TURN_LEASE_FILENAME)
 
 
 def installation_idle(path: Path) -> bool:
@@ -980,6 +987,11 @@ def main() -> int:
         help="print the runtime-equivalent app/install interlock path and exit",
     )
     authority.add_argument(
+        "--print-agent-turn-lease-path",
+        action="store_true",
+        help="print the runtime-equivalent agent-turn lease path and exit",
+    )
+    authority.add_argument(
         "--assert-install-idle",
         action="store_true",
         help="exit zero only when the whole canonical Bus proves installation-safe",
@@ -1029,6 +1041,9 @@ def main() -> int:
         return 0
     if args.print_install_interlock_path:
         print(install_interlock_path())
+        return 0
+    if args.print_agent_turn_lease_path:
+        print(agent_turn_lease_path())
         return 0
     if args.assert_install_idle:
         return 0 if installation_idle(args.bus) else 2

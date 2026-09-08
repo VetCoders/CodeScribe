@@ -971,6 +971,20 @@ where
             thread_id: thread_store_id.clone(),
             user_text: user_text.clone(),
         });
+        // Hold the agent-turn lease for the rest of this function: streaming,
+        // tools, Stop, error and persistence. `make install-if-idle` probes it
+        // and refuses while a turn is in flight (a merely running app no
+        // longer blocks installation — Founder, 2026-09-08). Fail-open: the
+        // lease guards the installer, never the conversation.
+        let _agent_turn_lease = match codescribe_core::config::acquire_agent_turn_lease() {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                warn!(
+                    "Agent turn lease unavailable (install guard blind for this turn): {error:#}"
+                );
+                None
+            }
+        };
         if !image_attachments.is_empty() {
             info!(
                 "Agent send: forwarding {} image(s) as vision input",

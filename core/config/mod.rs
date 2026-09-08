@@ -66,8 +66,10 @@ pub use energy_calibration::{
     SealedEnergyCalibration, energy_calibration_path,
 };
 pub use install_interlock::{
-    AppRuntimeInstallLease, INSTALL_INTERLOCK_FILE_NAME, acquire_app_runtime_install_lease,
-    acquire_app_runtime_install_lease_at, install_interlock_path,
+    AGENT_TURN_LEASE_FILE_NAME, AgentTurnLease, AppRuntimeInstallLease,
+    INSTALL_INTERLOCK_FILE_NAME, acquire_agent_turn_lease, acquire_agent_turn_lease_at,
+    acquire_app_runtime_install_lease, acquire_app_runtime_install_lease_at, agent_turn_lease_path,
+    install_interlock_path,
 };
 pub use portable::{
     ImportPlan, PortableProfile, export_portable, import_portable_apply, import_portable_dry_run,

@@ -40,8 +40,10 @@ API changes, regenerate UniFFI Swift bindings with `make app-bindings`.
 
 ## Daily app and release cadence
 
-- After a coherent app-changing cut, run `make install-if-idle` (or
-  `make install-app` after a live-recording check).
+- After a coherent app-changing cut, run `make install-if-idle`. It refuses
+  only while a take is recording (Transcript Bus) or an agent turn is in
+  flight (`~/.codescribe/agent-turn.lock`); a merely running app does not
+  block (Founder, 2026-09-08) — the new build is picked up on restart.
 - Treat installation as the required operator handoff for every major app cut.
   Verify `/Applications/Codescribe.app` version, build, source commit,
   signature, and successful launch; then play

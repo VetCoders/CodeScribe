@@ -279,11 +279,82 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
         handle.write(json.dumps({"session_id": "closed", "status": status}) + "\n")
 PY
 
-# A running app holds a shared process-lifetime lease. The installer cannot
-# acquire its exclusive lease even when the Bus itself is closed.
+resolve_agent_turn_lease() {
+  env \
+    -u XDG_STATE_HOME \
+    -u CODESCRIBE_DATA_DIR \
+    HOME="$TEST_HOME" \
+    python3 "$DEMUX" --print-agent-turn-lease-path
+}
+if [[ "$(resolve_agent_turn_lease)" != "$TEST_HOME/.codescribe/agent-turn.lock" ]]; then
+  echo "transcript-bus-path: agent-turn lease path diverged" >&2
+  exit 1
+fi
+
+hold_shared_lock() {
+  local path="$1" ready="$2" release="$3"
+  python3 - "$path" "$ready" "$release" <<'PY' &
+import fcntl
+from pathlib import Path
+import sys
+import time
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a+") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+    Path(sys.argv[2]).touch()
+    while not Path(sys.argv[3]).exists():
+        time.sleep(0.01)
+PY
+  LOCK_HOLDER_PID=$!
+  for _ in {1..500}; do
+    [[ ! -e "$ready" ]] || break
+    sleep 0.01
+  done
+  if [[ ! -e "$ready" ]]; then
+    echo "transcript-bus-path: lock holder for $path did not start" >&2
+    exit 1
+  fi
+}
+
+# A merely running app (shared process-lifetime lease on the runtime
+# interlock) must NOT refuse installation (Founder, 2026-09-08).
 INTERLOCK_PATH="$(resolve_interlock)"
-LOCK_READY="$TEST_ROOT/app-lock.ready"
-LOCK_RELEASE="$TEST_ROOT/app-lock.release"
+hold_shared_lock "$INTERLOCK_PATH" "$TEST_ROOT/app-lock.ready" "$TEST_ROOT/app-lock.release"
+rm -f "$FAKE_MAKE_LOG"
+env \
+  -u XDG_STATE_HOME \
+  -u CODESCRIBE_DATA_DIR \
+  HOME="$TEST_HOME" \
+  PATH="$FAKE_BIN:$PATH" \
+  FAKE_MAKE_LOG="$FAKE_MAKE_LOG" \
+  CODESCRIBE_TRANSCRIPT_BUS_PATH="$CLOSED_BUS" \
+  "$INSTALL_GUARD" >"$TEST_ROOT/runtime-running.out" 2>"$TEST_ROOT/runtime-running.err"
+if [[ ! -e "$FAKE_MAKE_LOG" ]]; then
+  echo "transcript-bus-path: a running app (no take, no agent turn) blocked install" >&2
+  exit 1
+fi
+touch "$TEST_ROOT/app-lock.release"
+wait "$LOCK_HOLDER_PID"
+LOCK_HOLDER_PID=""
+
+# An agent turn in flight holds the agent-turn lease shared. The installer
+# must refuse even though the Bus is closed and the runtime lock is free.
+AGENT_TURN_LEASE_PATH="$(resolve_agent_turn_lease)"
+hold_shared_lock "$AGENT_TURN_LEASE_PATH" "$TEST_ROOT/turn-lock.ready" "$TEST_ROOT/turn-lock.release"
+assert_guard_refuses "$CLOSED_BUS" "agent-turn"
+if ! grep -q 'agent turn is in flight' "$TEST_ROOT/agent-turn.err"; then
+  echo "transcript-bus-path: agent-turn refusal did not name the agent turn" >&2
+  exit 1
+fi
+touch "$TEST_ROOT/turn-lock.release"
+wait "$LOCK_HOLDER_PID"
+LOCK_HOLDER_PID=""
+
+# Retired block kept as a marker for the diff reader: the old
+# "runtime-active" refusal case ended here.
+: <<'RETIRED'
 python3 - "$INTERLOCK_PATH" "$LOCK_READY" "$LOCK_RELEASE" <<'PY' &
 import fcntl
 from pathlib import Path
@@ -298,19 +369,7 @@ with path.open("a+") as handle:
     while not Path(sys.argv[3]).exists():
         time.sleep(0.01)
 PY
-LOCK_HOLDER_PID=$!
-for _ in {1..500}; do
-  [[ ! -e "$LOCK_READY" ]] || break
-  sleep 0.01
-done
-if [[ ! -e "$LOCK_READY" ]]; then
-  echo "transcript-bus-path: app lock holder did not start" >&2
-  exit 1
-fi
-assert_guard_refuses "$CLOSED_BUS" "runtime-active"
-touch "$LOCK_RELEASE"
-wait "$LOCK_HOLDER_PID"
-LOCK_HOLDER_PID=""
+RETIRED
 
 rm -f "$FAKE_MAKE_LOG"
 env \
