@@ -488,6 +488,7 @@ pub(crate) async fn apple_stream_transcription_session(
         utterance_silence_sec,
         layer1,
         mut lifecycle_events,
+        terminal_audio,
     } = config;
     let mut capture_level = CaptureLevelAccumulator::new();
     begin_session_energy_clock();
@@ -602,6 +603,7 @@ pub(crate) async fn apple_stream_transcription_session(
                 acoustic_ledger,
                 settings_digest,
                 utterance_silence_sec,
+                terminal_audio,
             },
         )
     });
@@ -906,6 +908,7 @@ struct AppleSealState {
     /// Bounded PCM retention, so a sealed boundary can be resolved back to the
     /// audio behind it (Layer 1 tail-patch prerequisite).
     audio: LiveAudioBuffer,
+    terminal_pcm: Option<super::live_audio_buffer::OwnedTerminalPcm>,
     /// Session time of the previous seal — the lower bound of the next
     /// utterance's audio window.
     last_sealed_end: f32,
@@ -972,6 +975,16 @@ struct AppleSealState {
 }
 
 impl AppleSealState {
+    fn owned_pcm_window(&self, start: u64, end: u64) -> Option<ResolvedAudioWindow> {
+        if let Some(archive) = &self.terminal_pcm {
+            archive.window(start, end)
+        } else {
+            self.audio
+                .window_by_samples(start, end)
+                .filter(|window| window.sample_start == start && window.sample_end == end)
+        }
+    }
+
     /// Fresh isolated seal state with Layer 1 disabled (`tail_patch: None`).
     /// Product-mode arming is injected by the session owner, not this test helper.
     #[cfg(any())]
@@ -991,6 +1004,7 @@ impl AppleSealState {
             sealed_count: 0,
             filtered_empty_drops: 0,
             audio: LiveAudioBuffer::new(sample_rate, DEFAULT_RETENTION_SECS),
+            terminal_pcm: None,
             last_sealed_end: 0.0,
             last_apple_segment_end: 0.0,
             unresolved_windows: 0,
@@ -2140,9 +2154,7 @@ fn admit_ledger_label(
         ) {
             return None;
         }
-        let window = state
-            .audio
-            .window_by_samples(occurrence.sample_start, occurrence.sample_end)?;
+        let window = state.owned_pcm_window(occurrence.sample_start, occurrence.sample_end)?;
         if window.samples.is_empty() {
             return None;
         }
@@ -2343,9 +2355,7 @@ fn repair_terminal_seal_coverage(
             sample_end: last.sample_end,
         });
     let full_pass = full_range.and_then(|range| {
-        let window = state
-            .audio
-            .window_by_samples(range.sample_start, range.sample_end)?;
+        let window = state.owned_pcm_window(range.sample_start, range.sample_end)?;
         let request = TailProviderRequest {
             identity: TailRequestIdentity {
                 request_id: u64::MAX,
@@ -2931,6 +2941,8 @@ struct AppleWorkerConfig<'a> {
     /// Product "Hands-free silence". `Some` arms the engine lifecycle (speech
     /// epochs); `None` keeps one continuous SFSpeech stream for the whole take.
     utterance_silence_sec: Option<f32>,
+    terminal_audio:
+        Option<std_mpsc::Receiver<Result<super::live_audio_buffer::FinalizedPcmArchive, String>>>,
 }
 
 /// Blocking worker: owns the SFSpeech stream(s) for the session's full lifetime.
@@ -2953,6 +2965,7 @@ fn apple_stream_worker(
         acoustic_ledger,
         settings_digest,
         utterance_silence_sec,
+        terminal_audio,
     } = config;
     debug_assert_eq!(settings_digest, runtime_settings.digest().as_str());
     // The one read of calibration truth for this session: the measured profile
@@ -3180,6 +3193,30 @@ fn apple_stream_worker(
         }
     }
 
+    if let Some(receiver) = terminal_audio {
+        let archive = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|error| anyhow::anyhow!("terminal archive handoff failed: {error}"))
+            .and_then(|receipt| receipt.map_err(anyhow::Error::msg))
+            .and_then(|receipt| {
+                receipt.load(
+                    &state.session_id,
+                    state.capture_epoch,
+                    sample_rate,
+                    samples_seen,
+                )
+            });
+        match archive {
+            Ok(pcm) => state.terminal_pcm = Some(pcm),
+            Err(error) => {
+                let _ = ev_tx.send(EngineEvent::Warning {
+                    code: "terminal_owned_pcm_unavailable".into(),
+                    message: error.to_string(),
+                });
+                return Err(error);
+            }
+        }
+    }
     let audio_secs = samples_seen as f32 / sample_rate.max(1) as f32;
     if let Some(fusion) = state.fusion.as_mut() {
         fusion.flush(samples_seen);

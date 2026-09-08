@@ -127,6 +127,7 @@ pub async fn replay_production_session(
         utterance_silence_sec,
         layer1,
         lifecycle_events: None,
+        terminal_audio: None,
     };
     let events = collect_buffered_engine_events_with_config(samples, config).await?;
     let tail_patch_receipt = TailPatchSessionReceipt::from_events(&events);
@@ -170,6 +171,12 @@ pub struct StreamingRecorder {
     /// Last capture-open epoch issued for the currently bound session.
     /// Zero means this bind has not successfully opened capture yet.
     capture_epoch: u64,
+    captured_samples: Arc<AtomicU64>,
+    terminal_audio_sender: Option<
+        std::sync::mpsc::Sender<
+            Result<crate::pipeline::streaming::live_audio_buffer::FinalizedPcmArchive, String>,
+        >,
+    >,
 }
 
 impl StreamingRecorder {
@@ -196,6 +203,8 @@ impl StreamingRecorder {
             acoustic_ledger: None,
             authority_session_id: None,
             capture_epoch: 0,
+            captured_samples: Arc::new(AtomicU64::new(0)),
+            terminal_audio_sender: None,
         })
     }
 
@@ -222,6 +231,8 @@ impl StreamingRecorder {
             acoustic_ledger: None,
             authority_session_id: None,
             capture_epoch: 0,
+            captured_samples: Arc::new(AtomicU64::new(0)),
+            terminal_audio_sender: None,
         })
     }
 
@@ -347,6 +358,7 @@ impl StreamingRecorder {
         // Clear previous transcript and reset drop counter
         *self.transcript_buffer.lock().await = String::new();
         self.dropped_chunks.store(0, Ordering::Relaxed);
+        self.captured_samples.store(0, Ordering::Relaxed);
 
         // Create channel for audio chunks. This is intentionally larger than a
         // normal live queue: cold STT initialization happens behind this buffer.
@@ -355,7 +367,9 @@ impl StreamingRecorder {
         // Setup callback to send audio data
         let dropped = Arc::clone(&self.dropped_chunks);
         let level_callback = self.level_callback.clone();
+        let captured_samples = Arc::clone(&self.captured_samples);
         self.recorder.set_callback(Box::new(move |data| {
+            captured_samples.fetch_add(data.len() as u64, Ordering::Relaxed);
             if let Some(ref level_cb) = level_callback {
                 level_cb(block_rms(data));
             }
@@ -395,6 +409,8 @@ impl StreamingRecorder {
         let layer1 = runtime_settings.local_tail_patch_decision();
         let (lifecycle_handle, lifecycle_events) = recorder_lifecycle_channel();
         self.lifecycle_handle = Some(lifecycle_handle);
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::channel();
+        self.terminal_audio_sender = Some(terminal_tx);
         self.transcription_handle = Some(tokio::spawn(async move {
             transcription_session(
                 rx,
@@ -411,6 +427,7 @@ impl StreamingRecorder {
                     utterance_silence_sec,
                     layer1,
                     lifecycle_events: Some(lifecycle_events),
+                    terminal_audio: Some(terminal_rx),
                 },
             )
             .await;
@@ -438,7 +455,24 @@ impl StreamingRecorder {
         }
 
         // 1. Stop recording (drops callback and sender)
-        let audio_path = self.recorder.stop().await?;
+        let stopped = self.recorder.stop().await;
+        if let Some(sender) = self.terminal_audio_sender.take() {
+            let receipt = match &stopped {
+                Ok(Some(path)) => Ok(
+                    crate::pipeline::streaming::live_audio_buffer::FinalizedPcmArchive {
+                        session_id: self.authority_session_id.clone().unwrap_or_default(),
+                        capture_epoch: self.capture_epoch,
+                        sample_rate: self.sample_rate,
+                        sample_count: self.captured_samples.load(Ordering::Relaxed),
+                        path: path.clone(),
+                    },
+                ),
+                Ok(None) => Err("capture finalized without a WAV archive".into()),
+                Err(error) => Err(format!("capture archive finalization failed: {error}")),
+            };
+            let _ = sender.send(receipt);
+        }
+        let audio_path = stopped?;
         self.lifecycle_handle = None;
 
         // 2. Wait for worker to finish processing remaining chunks

@@ -35,6 +35,43 @@ fn recovery_retention_head_before_120_seconds_remains_qualifiable() {
     let mut state = state();
     let pcm = vec![0.25; 16_000 * 121];
     state.audio.push(&pcm);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut wav = hound::WavWriter::create(
+        file.path(),
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    for sample in &pcm {
+        wav.write_sample((*sample * i16::MAX as f32) as i16)
+            .unwrap();
+    }
+    wav.finalize().unwrap();
+    state.terminal_pcm = Some(
+        super::super::live_audio_buffer::FinalizedPcmArchive {
+            session_id: state.session_id.clone(),
+            capture_epoch: 1,
+            sample_rate: 16_000,
+            sample_count: pcm.len() as u64,
+            path: file.path().into(),
+        }
+        .load(&state.session_id, 1, 16_000, pcm.len() as u64)
+        .unwrap(),
+    );
+    let recovered = state.owned_pcm_window(0, 16_000).unwrap();
+    assert_eq!(recovered.sample_start, 0);
+    assert_eq!(recovered.sample_end, 16_000);
+    assert!(
+        recovered
+            .samples
+            .iter()
+            .all(|sample| (*sample - 0.25).abs() <= 1.0 / i16::MAX as f32)
+    );
+
     assert!(
         state.audio.window_by_samples(0, 16_000).is_none(),
         "live retention must stay bounded"

@@ -56,6 +56,10 @@ pub struct SessionConfig {
     /// Per-recording host lifecycle boundaries. Present only for a live
     /// recorder; buffered/offline helpers have no system observer owner.
     pub lifecycle_events: Option<RecorderLifecycleEvents>,
+    /// Recorder stop publishes the complete archive before terminal closure.
+    pub terminal_audio: Option<
+        std::sync::mpsc::Receiver<Result<super::live_audio_buffer::FinalizedPcmArchive, String>>,
+    >,
 }
 
 /// Stable event code carrying the typed local tail-patch session receipt.
@@ -460,6 +464,7 @@ pub async fn collect_buffered_engine_events(
             // decision owned elsewhere.
             layer1: Layer1Decision::Disarmed,
             lifecycle_events: None,
+            terminal_audio: None,
         },
     )
     .await
