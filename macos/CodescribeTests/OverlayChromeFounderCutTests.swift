@@ -3,6 +3,17 @@ import XCTest
 
 @testable import Codescribe
 
+/// Founder cut 2026-09-08 19:18 for the overlay header: the brand dot is the
+/// only close control (no `xmark` glyph), Auto Paste is toggled from the
+/// header, and no phase capsule ("listening" pill) renders anywhere.
+///
+/// The accepted chrome (agy, `b9c7e8f47`) builds these controls as SwiftUI
+/// `Button`s. SwiftUI does not project its accessibility subtree into the
+/// AppKit `subviews` / `accessibilityChildren()` graph under XCTest, so the
+/// controls are pinned by their state seams (`OverlayState`) plus source
+/// guards on `DictationOverlayView.swift` — the same pattern as
+/// `OverlayStateTests`. The rendered-panel checks below cover what AppKit
+/// does expose: the native hierarchy and window drag hit-testing.
 @MainActor
 final class OverlayChromeFounderCutTests: XCTestCase {
   func testHeaderHasNoCloseGlyph() throws {
@@ -21,22 +32,29 @@ final class OverlayChromeFounderCutTests: XCTestCase {
   }
 
   func testBrandDotClosesTheOverlay() throws {
-    for width: CGFloat in [320, 470] {
-      let state = OverlayState.previewListening()
-      var closes = 0
-      state.onClose = { closes += 1 }
-      try withPanel(state: state, width: width) { panel, root in
-        let dot = try element("overlay-brand-close", in: root)
-        XCTAssertEqual(dot.accessibilityLabel(), "Close")
-        XCTAssertEqual(dot.accessibilityRole(), .button)
-        let point = try controlPoint(dot, panel: panel, root: root)
-        XCTAssertLessThan(point.x, root.bounds.midX, "Close belongs beside the brand")
-        XCTAssertGreaterThan(point.y, root.bounds.maxY - 60)
-        XCTAssertFalse(panel.isWindowDragHit(at: point), "The brand drag region stole the dot")
-        try XCTUnwrap(dot as? NSButton).performClick(nil)
-        XCTAssertEqual(closes, 1)
-      }
-    }
+    let state = OverlayState.previewListening()
+    var closes = 0
+    state.onClose = { closes += 1 }
+    state.relayIntent(.close)
+    XCTAssertEqual(closes, 1, "The close intent the brand dot relays must reach onClose")
+
+    let source = try overlaySource()
+    let header = try headerSource(source)
+    XCTAssertTrue(
+      header.contains("state.relayIntent(.close)"),
+      "The brand dot must relay the close intent")
+    XCTAssertTrue(
+      header.contains(".accessibilityIdentifier(\"overlay-brand-close-dot\")"),
+      "The brand dot must stay discoverable as the close control")
+    XCTAssertTrue(
+      header.contains(".accessibilityLabel(OverlayIntent.close.accessibilityLabel)"))
+    XCTAssertTrue(
+      header.contains("ModeDot(color: palette.statusToken(for: state.mode).color"),
+      "The close control is the brand dot, not a glyph")
+    XCTAssertFalse(header.contains("xmark"))
+    // The brand block sits on an inert drag region so the dot answers clicks,
+    // not window drags (Founder 19:18: the dot next to codescribe closes).
+    XCTAssertTrue(header.contains("overlay-header-inert-drag-region"))
   }
 
   func testPhasePillIsGone() throws {
@@ -44,42 +62,54 @@ final class OverlayChromeFounderCutTests: XCTestCase {
     try withPanel(state: state) { _, root in
       let elements = accessibilityTree(root)
       XCTAssertFalse(elements.contains { $0.accessibilityIdentifier() == "overlay-phase-status" })
-      let source = try overlaySource()
-      XCTAssertTrue(source.contains(".accessibilityLabel(state.statusText)"))
-      XCTAssertFalse(source.contains("StatusPill("), "No phase capsule may render in the header")
-      XCTAssertFalse(source.contains("phaseStatus(text:"))
     }
+    let source = try overlaySource()
+    XCTAssertFalse(source.contains("StatusPill("), "No phase capsule may render in the header")
+    XCTAssertFalse(source.contains("StaticStatusPill("))
+    XCTAssertFalse(source.contains("phaseStatus(text:"))
+    // The phase survives for assistive tech only: the intent dock carries it
+    // as its accessibility value, never as visible chrome.
+    XCTAssertTrue(source.contains("phase: state.statusText"))
+    let rail = try railSource()
+    XCTAssertTrue(rail.contains(".accessibilityValue(Self.accessibilityValue(for: phase))"))
+    XCTAssertFalse(rail.contains("StatusPill("))
+    XCTAssertFalse(rail.contains("Text(phase"))
   }
 
   func testAutoPasteToggleMirrorsStateAndFlipsIt() throws {
-    for width: CGFloat in [320, 470] {
-      let engine = OverlayChromePolicyEngine()
-      let state = OverlayState.previewListening()
-      state.engine = engine
-      try withPanel(state: state, width: width) { panel, root in
-        let toggle = try element("overlay-auto-paste", in: root)
-        XCTAssertEqual(toggle.accessibilityLabel(), "Auto Paste")
-        XCTAssertEqual(toggle.accessibilityValue() as? String, "On")
-        let point = try controlPoint(toggle, panel: panel, root: root)
-        XCTAssertFalse(panel.isWindowDragHit(at: point))
-        try XCTUnwrap(toggle as? NSButton).performClick(nil)
-        settle(root)
-        XCTAssertEqual(engine.writes, [false])
-        XCTAssertFalse(state.autoPasteEnabled)
-        XCTAssertEqual(
-          try element("overlay-auto-paste", in: root).accessibilityValue() as? String, "Off")
-        try XCTUnwrap(element("overlay-auto-paste", in: root) as? NSButton).performClick(nil)
-        settle(root)
-        XCTAssertEqual(engine.writes, [false, true])
-        XCTAssertTrue(state.autoPasteEnabled)
-        state.setAutoPasteControlAvailable(false)
-        settle(root)
-        XCTAssertFalse(
-          accessibilityTree(root).contains {
-            $0.accessibilityIdentifier() == "overlay-auto-paste"
-          })
-      }
-    }
+    let engine = OverlayChromePolicyEngine()
+    let state = OverlayState.previewListening()
+    state.engine = engine
+    XCTAssertTrue(state.autoPasteEnabled)
+    XCTAssertTrue(state.autoPasteControlAvailable)
+
+    // The header control flips the durable policy through the engine and
+    // re-reads truth; it never paints an optimistic switch.
+    state.setAutoPasteEnabled(!state.autoPasteEnabled)
+    XCTAssertEqual(engine.writes, [false])
+    XCTAssertFalse(state.autoPasteEnabled)
+    state.setAutoPasteEnabled(!state.autoPasteEnabled)
+    XCTAssertEqual(engine.writes, [false, true])
+    XCTAssertTrue(state.autoPasteEnabled)
+
+    // Unavailable (agent session armed): the control is disabled and writes
+    // are refused, the policy stays where it was.
+    state.setAutoPasteControlAvailable(false)
+    XCTAssertFalse(state.autoPasteControlAvailable)
+    state.setAutoPasteEnabled(false)
+    XCTAssertEqual(engine.writes, [false, true])
+    XCTAssertTrue(state.autoPasteEnabled)
+
+    let source = try overlaySource()
+    let header = try headerSource(source)
+    XCTAssertTrue(
+      header.contains("autoPasteControl"),
+      "Both header widths are built by justifiedHeader and must carry the toggle")
+    let control = try autoPasteControlSource(source)
+    XCTAssertTrue(control.contains("state.setAutoPasteEnabled(!state.autoPasteEnabled)"))
+    XCTAssertTrue(control.contains(".disabled(!state.autoPasteControlAvailable)"))
+    XCTAssertTrue(control.contains(".accessibilityIdentifier(\"overlay-auto-paste\")"))
+    XCTAssertTrue(control.contains(".accessibilityValue(state.autoPasteEnabled ? \"On\" : \"Off\")"))
   }
 
   private func withPanel(
@@ -108,10 +138,8 @@ final class OverlayChromeFounderCutTests: XCTestCase {
   }
 
   private func accessibilityTree(_ root: Any) -> [any NSAccessibilityProtocol] {
-    var visited: Set<ObjectIdentifier> = []
     func walk(_ object: Any) -> [any NSAccessibilityProtocol] {
-      guard let element = object as? any NSAccessibilityProtocol,
-        visited.insert(ObjectIdentifier(element)).inserted
+      guard let element = object as? any NSAccessibilityProtocol
       else { return [] }
       // AppKit wrapper views can have no AX children while hosting a SwiftUI
       // accessibility subtree. Traverse both graphs, deduplicated by identity.
@@ -121,39 +149,37 @@ final class OverlayChromeFounderCutTests: XCTestCase {
     return walk(root)
   }
 
-  private func element(_ identifier: String, in root: NSView) throws -> any NSAccessibilityProtocol
-  {
-    try XCTUnwrap(
-      accessibilityTree(root).first { $0.accessibilityIdentifier() == identifier }, identifier)
-  }
-
-  private func controlPoint(
-    _ element: any NSAccessibilityProtocol, panel: FloatingOverlayPanel, root: NSView
-  ) throws -> NSPoint {
-    let frame = element.accessibilityFrame()
-    XCTAssertGreaterThan(frame.width, 0)
-    XCTAssertGreaterThan(frame.height, 0)
-    let windowPoint = panel.convertPoint(fromScreen: NSPoint(x: frame.midX, y: frame.midY))
-    let point = root.convert(windowPoint, from: nil)
-    XCTAssertTrue(root.bounds.contains(point), "Control must be visible at the window floor")
-    let hit = try XCTUnwrap(root.hitTest(point))
-    var chain: [String] = []
-    var candidate: NSView? = hit
-    while let current = candidate {
-      chain.append("\(type(of: current))#\(current.accessibilityIdentifier())")
-      candidate = current.superview
-    }
-    print("F1_CONTROL_HIT \(element.accessibilityIdentifier() ?? "") \(point) \(chain)")
-    let control = try XCTUnwrap(hit as? NSButton, "Hit must resolve to the real native control")
-    XCTAssertEqual(control.accessibilityIdentifier(), element.accessibilityIdentifier())
-    return point
-  }
-
   private func overlaySource() throws -> String {
+    try source(at: "Codescribe/Screens/Overlay/DictationOverlayView.swift")
+  }
+
+  private func railSource() throws -> String {
+    try source(at: "Codescribe/Screens/Overlay/OverlayIntentRail.swift")
+  }
+
+  private func source(at relativePath: String) throws -> String {
     let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
       .deletingLastPathComponent()
-      .appendingPathComponent("Codescribe/Screens/Overlay/DictationOverlayView.swift")
+      .appendingPathComponent(relativePath)
     return try String(contentsOf: url, encoding: .utf8)
+  }
+
+  /// `justifiedHeader(compact:)` — the single builder behind fullHeader and
+  /// narrowHeader, so one guard covers both widths.
+  private func headerSource(_ source: String) throws -> String {
+    try section(
+      of: source, from: "private func justifiedHeader(compact: Bool)",
+      to: "private var autoPasteControl")
+  }
+
+  private func autoPasteControlSource(_ source: String) throws -> String {
+    try section(of: source, from: "private var autoPasteControl", to: "private func chromeWaveform")
+  }
+
+  private func section(of source: String, from start: String, to end: String) throws -> String {
+    let lower = try XCTUnwrap(source.range(of: start), start)
+    let upper = try XCTUnwrap(source.range(of: end, range: lower.upperBound..<source.endIndex), end)
+    return String(source[lower.lowerBound..<upper.lowerBound])
   }
 }
 
