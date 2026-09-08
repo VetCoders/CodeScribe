@@ -3249,6 +3249,7 @@ impl RecordingController {
             );
 
             let recorder = Self::recorder_from_guard_mut(&mut recorder_guard, "Toggle-adjudicate")?;
+            let serving_engine = recorder.streaming_engine_label();
 
             let phase2 = std::time::Instant::now();
             info!("stop_toggle_inner: PHASE 2 — calling recorder.stop() (cpal drain + WAV save)");
@@ -3259,6 +3260,9 @@ impl RecordingController {
             rec_stop_secs = phase2.elapsed().as_secs_f64();
             Self::clear_recorder_callbacks(recorder);
             drop(recorder_guard);
+            // The session is over whichever way `stop()` went; the engine that
+            // served it is the same on a clean stop and on a refused seal.
+            Self::publish_live_serving_verdict(serving_engine);
             let (streaming_text, raw_audio_path_opt) = stopped?;
             info!(
                 "stop_toggle_inner: PHASE 2 — recorder.stop() returned in {:?} (streaming_text={} chars, has_wav={})",
@@ -3320,8 +3324,38 @@ impl RecordingController {
     /// through the normal path. UI surfaces (badge, voice-chat status, overlay)
     /// are restored to Idle visuals so the user gets honest feedback that recording
     /// is no longer alive.
+    /// Publish the engine that served the take that just stopped as the
+    /// Settings "Active STT" truth (`serving_status` owner). Called once per
+    /// stop path, right after the recorder released the session, so a clean
+    /// stop and a refused seal report the same fact: the engine the live
+    /// session actually ran on. Never derived from the configured `stt_engine`.
+    fn publish_live_serving_verdict(streaming_engine_label: &str) {
+        let verdict = serving_status::LastServingVerdict::from_live_session(streaming_engine_label);
+        info!(
+            engine = %verdict.engine,
+            routing_mode = %verdict.routing_mode,
+            "serving verdict published"
+        );
+        serving_status::publish_last_serving(verdict);
+    }
+
     async fn recover_from_stuck_stop(&self) {
         warn!("Recovery: forcing controller to Idle after stuck stop");
+        // The stalled stop still ran on the live session's engine. The stop
+        // path may still hold the recorder mutex — that is what stalled — so
+        // only a free recorder is consulted; a held one leaves the last
+        // published verdict in place rather than guessing.
+        match self.recorder.try_lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(recorder) => {
+                    Self::publish_live_serving_verdict(recorder.streaming_engine_label());
+                }
+                None => warn!("Recovery: no recorder served this take; serving verdict unchanged"),
+            },
+            Err(_) => warn!(
+                "Recovery: recorder still held by the stalled stop; serving verdict unchanged"
+            ),
+        }
         self.reset_session_fields(TranscriptSessionEndReason::TranscriptionFailed)
             .await;
         set_assistive_session(false);
@@ -3443,9 +3477,11 @@ impl RecordingController {
         };
         let mut recorder_guard = self.recorder.lock().await;
         let recorder = Self::recorder_from_guard_mut(&mut recorder_guard, "Process-recording")?;
+        let serving_engine = recorder.streaming_engine_label();
         let stopped = stop_recorder_for_terminal(recorder, take_id.as_deref()).await;
         Self::clear_recorder_callbacks(recorder);
         drop(recorder_guard); // Release lock
+        Self::publish_live_serving_verdict(serving_engine);
         let (streaming_text, raw_audio_path_opt) = stopped?;
 
         if let Some(path) = raw_audio_path_opt.as_deref() {
@@ -3588,6 +3624,64 @@ mod terminal_delivery_target_falsifiers {
             .await;
 
         assert!(controller.paste_target_app_name().await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod serving_status_producer_falsifiers {
+    use super::*;
+
+    /// Settings "Active STT" reads `serving_status::current_last_serving()`.
+    /// The producer left with the old adjudicating stop path (`ac6d399b3`);
+    /// since then the row was always "Not yet served". A finished toggle stop
+    /// must publish the engine the live session actually ran on — the
+    /// recorder's label, never the configured `stt_engine`.
+    ///
+    /// `StreamingRecorder::new` opens no device, and `stop()` on a session
+    /// that never started returns an empty transcript, so this drives the real
+    /// `stop_toggle_and_adjudicate_inner` success branch without CoreAudio.
+    #[tokio::test]
+    async fn toggle_stop_publishes_the_live_session_engine() {
+        let _serialized = serving_status::test_store_lock().lock().await;
+        serving_status::clear_last_serving();
+        let controller = RecordingController::new_without_keychain();
+        assert!(
+            controller.recorder.lock().await.is_some(),
+            "test controller must own a StreamingRecorder (no device needed)"
+        );
+        controller.set_state(State::RecToggle).await;
+
+        controller
+            .stop_toggle_and_adjudicate_inner()
+            .await
+            .expect("idle recorder stops cleanly");
+
+        let verdict = serving_status::current_last_serving()
+            .expect("stop path publishes the serving verdict");
+        assert_eq!(verdict.engine, "local_apple");
+        assert_eq!(verdict.routing_mode, serving_status::LIVE_ROUTING_MODE);
+        assert_eq!(verdict.disposition, None);
+        assert!(!verdict.fallback_used);
+        assert_eq!(controller.current_state().await, State::Idle);
+        serving_status::clear_last_serving();
+    }
+
+    /// A stop that stalled past the watchdog still ran on the live session's
+    /// engine; recovery publishes it when the recorder is reachable.
+    #[tokio::test]
+    async fn stuck_stop_recovery_publishes_the_live_session_engine() {
+        let _serialized = serving_status::test_store_lock().lock().await;
+        serving_status::clear_last_serving();
+        let controller = RecordingController::new_without_keychain();
+
+        controller.recover_from_stuck_stop().await;
+
+        let verdict =
+            serving_status::current_last_serving().expect("recovery publishes the serving verdict");
+        assert_eq!(verdict.engine, "local_apple");
+        assert_eq!(verdict.routing_mode, serving_status::LIVE_ROUTING_MODE);
+        assert_eq!(controller.current_state().await, State::Idle);
+        serving_status::clear_last_serving();
     }
 }
 

@@ -66,6 +66,14 @@ impl std::error::Error for TerminalSealRefused {}
 /// Channel depth for cold Whisper load: first words queue instead of drop.
 const AUDIO_BACKLOG_CHUNKS: usize = 2048;
 
+/// Engine that owns the live canvas for every session this recorder starts.
+///
+/// `transcription_session` has exactly one live route (Apple progressive), so
+/// the label is a constant today. It is still the recorder's fact, not the
+/// controller's: a future runtime engine switch changes this owner and the
+/// stop path keeps reporting whatever the session actually ran.
+pub const LIVE_STREAMING_ENGINE_LABEL: &str = "live_apple";
+
 /// Content-free witness returned by the production PCM replay seam.
 #[derive(Debug)]
 pub struct ProductionSessionReplay {
@@ -107,7 +115,7 @@ pub async fn replay_production_session(
     // `transcription_session` has one live canvas route: Apple progressive.
     // Report the route we actually enter; never reconstruct it through the
     // deleted global engine selector.
-    let streaming_engine_label = "live_apple".to_string();
+    let streaming_engine_label = LIVE_STREAMING_ENGINE_LABEL.to_string();
     let utterance_silence_sec = settings.toggle_silence_sec.filter(|&sec| sec >= 0.5);
     let config = SessionConfig {
         session_id: uuid::Uuid::new_v4().to_string(),
@@ -303,6 +311,15 @@ impl StreamingRecorder {
                 .lifecycle_handle
                 .as_ref()
                 .is_some_and(RecorderLifecycleHandle::note_sleep_wake)
+    }
+
+    /// Engine label of the live route this recorder's sessions run on.
+    ///
+    /// The stop path publishes this as the serving truth for Settings
+    /// "Active STT"; it must never be reconstructed from the configured
+    /// `stt_engine` preference (see `controller::serving_status`).
+    pub fn streaming_engine_label(&self) -> &'static str {
+        LIVE_STREAMING_ENGINE_LABEL
     }
 
     /// Start recording with the new event-based pipeline.
