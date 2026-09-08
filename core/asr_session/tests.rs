@@ -455,3 +455,122 @@ fn fake_provider_stream_survives_a_replayed_tail() {
         Some("trzy cztery")
     );
 }
+
+/// Restore every test overlay, including on a failed assertion.
+struct Layer1TestEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl Layer1TestEnv {
+    fn new(root: &std::path::Path) -> Self {
+        let overlays = [
+            ("CODESCRIBE_DATA_DIR", root.as_os_str().to_owned()),
+            (
+                "CODESCRIBE_ENV_PATH",
+                root.join("absent.env").into_os_string(),
+            ),
+            ("CODESCRIBE_LAYERED_TRANSCRIPTION", "phase1".into()),
+            ("STT_TAIL_PROVIDER", "inprocess".into()),
+            ("STT_LIVE_ENDPOINT", "wss://gateway.invalid/live".into()),
+            ("STT_LIVE_API_KEY", "fixture-live-key".into()),
+        ];
+        let mut saved = Vec::new();
+        for (key, value) in overlays {
+            saved.push((key, std::env::var_os(key)));
+            // SAFETY: callers hold the suite's serial environment lock.
+            unsafe { std::env::set_var(key, value) };
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for Layer1TestEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.iter().rev() {
+            // SAFETY: callers hold the suite's serial environment lock.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn production_layer1_decision_follows_resolved_asr_mode() {
+    use super::{Layer1Decision, RecorderLayer1Lane};
+    use crate::config::{Config, UserSettings};
+
+    let root = tempfile::tempdir().unwrap();
+    let _environment = Layer1TestEnv::new(root.path());
+    for (mode, consent, expected_reason, armed) in [
+        ("cloud", Some("granted"), "cloud_ready", true),
+        ("cloud", None, "consent_missing", false),
+        (
+            "local_power",
+            Some("granted"),
+            "local_helper_unavailable",
+            false,
+        ),
+    ] {
+        let settings = UserSettings {
+            asr_mode: Some(mode.into()),
+            cloud_consent: consent.map(str::to_owned),
+            layered_transcription: Some("phase1".into()),
+            stt_live_endpoint: Some("wss://gateway.invalid/live".into()),
+            ..Default::default()
+        };
+        settings.save().unwrap();
+        let snapshot = Config::load_runtime_snapshot_without_keychain().unwrap();
+        let mut factory_calls = 0;
+        let (decision, receipt) =
+            super::layer1_decision_with_factory(&snapshot, |snapshot, _authorization| {
+                factory_calls += 1;
+                assert_eq!(
+                    snapshot.values().stt_live_endpoint.as_deref(),
+                    Some("wss://gateway.invalid/live")
+                );
+                assert_eq!(
+                    snapshot.values().stt_live_api_key.as_deref(),
+                    Some("fixture-live-key")
+                );
+                Ok(Box::new(FakeAsrSessionProvider::with_script(
+                    RefinerMode::CloudSession,
+                    vec![partial(1, 1, "live fixture")],
+                )))
+            });
+        assert_eq!(factory_calls, usize::from(armed));
+        assert_eq!(matches!(&decision, Layer1Decision::Armed(_)), armed);
+        assert_eq!(receipt.reason, expected_reason);
+        assert_eq!(
+            receipt.consent,
+            if consent.is_some() {
+                "granted"
+            } else {
+                "missing"
+            }
+        );
+        assert_eq!(
+            receipt.refiner,
+            if armed {
+                "cloud_session"
+            } else {
+                "local_tail_patch"
+            }
+        );
+        let mut lane = RecorderLayer1Lane::open(decision, &fake_input());
+        lane.offer_pcm(&[0.1; 160]);
+        lane.poll();
+        assert_eq!(lane.telemetry().frames_forwarded, u64::from(armed));
+        assert_eq!(lane.telemetry().partials_applied, u64::from(armed));
+
+        // The public production entrypoint must share the same policy and
+        // construct a dormant real provider, without connecting in this test.
+        let (production, production_receipt) = super::layer1_decision(&snapshot);
+        assert_eq!(matches!(production, Layer1Decision::Armed(_)), armed);
+        assert_eq!(production_receipt, receipt);
+    }
+}
