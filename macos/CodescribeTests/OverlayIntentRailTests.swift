@@ -10,6 +10,8 @@ private final class OverlayIntentBoundaryEngine: DictationEngine {
   var receivedTranscribePath: String?
   var onFormatter: (() -> Void)?
   var formatterRequests: [(sessionId: String, sourceRevision: UInt64)] = []
+  var policy = OverlayPolicySnapshot(autoPasteEnabled: true, autoFormatLevel: .correction)
+  var formatLevelWrites: [FormattingPolicyOption] = []
 
   func setListener(_ listener: CsTranscriptionListener) {}
   func startRecording(language: CsLanguage?) async throws {}
@@ -41,8 +43,13 @@ private final class OverlayIntentBoundaryEngine: DictationEngine {
   func isRecording() async -> Bool { false }
   func initModel() async throws {}
   func isModelLoaded() -> Bool { true }
-  func currentOverlayPolicy() -> OverlayPolicySnapshot? { nil }
+  func currentOverlayPolicy() -> OverlayPolicySnapshot? { policy }
   func setAutoPasteEnabled(_ enabled: Bool) {}
+  func setAutoFormatLevel(_ level: FormattingPolicyOption) {
+    formatLevelWrites.append(level)
+    policy = OverlayPolicySnapshot(
+      autoPasteEnabled: policy.autoPasteEnabled, autoFormatLevel: level)
+  }
   func pasteText(text: String) async throws -> CsPasteResult { pasteResult() }
   func deferText(text: String) async throws -> CsPasteResult { pasteResult() }
   func copyTaggedTranscript(text: String) async throws {}
@@ -146,26 +153,75 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertNil(state.formatterError)
   }
 
-  func testCollapsedDockHasOnlyHandleAndExpandedDockSwapsInProjection() {
+  func testDockAlwaysPaintsEveryProjectedIntentWithoutHoverOrPin() {
     let intents: [OverlayIntent] = [
       .insertPaste, .copy, .retranscribe, .format, .close,
     ]
-    let collapsed = OverlayDockLayout(isExpanded: false, projectedIntents: intents)
-    let expanded = OverlayDockLayout(isExpanded: true, projectedIntents: intents)
+    let layout = OverlayDockLayout(projectedIntents: intents)
 
-    XCTAssertTrue(collapsed.showsHandleOnly)
-    XCTAssertTrue(collapsed.showsCollapsedFooter)
-    XCTAssertFalse(collapsed.showsToolbar)
-    XCTAssertEqual(collapsed.visibleIntents, [])
-    XCTAssertFalse(expanded.showsCollapsedFooter)
-    XCTAssertTrue(expanded.showsToolbar)
-    XCTAssertEqual(expanded.visibleIntents, intents)
+    XCTAssertTrue(layout.showsToolbar)
+    XCTAssertEqual(layout.visibleIntents, intents, "no collapsed state hides the commands")
+    XCTAssertEqual(OverlayDockLayout(projectedIntents: []).visibleIntents, [])
     XCTAssertEqual(OverlayDockLayout.minimumCanvasWidth, 320)
+  }
+
+  func testDirtyRevisionReplacesDeliveryActionsWithCommitOrDiscard() {
+    let state = projectedState(
+      phase: "formatted",
+      text: "ledger text",
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: true,
+      terminal: true
+    )
+
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("local draft")
+
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.commitRevision, .discardRevision, .close]
+    )
+    XCTAssertEqual(state.formattedText, "ledger text")
+    XCTAssertEqual(state.canvasText, "local draft")
+  }
+
+  func testFormatLevelPickerWritesThroughEngineAndRepaintsFromTruth() {
+    let state = projectedState(
+      phase: "formatted",
+      text: "final",
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: true,
+      terminal: true
+    )
+    let engine = OverlayIntentBoundaryEngine()
+    state.engine = engine
+    state.handleRecordingPreparing()
+    XCTAssertEqual(state.autoFormatLevel, .correction)
+
+    let rail = OverlayIntentRail(
+      phase: state.statusText,
+      intents: OverlayIntentRail.projectedIntents(for: state),
+      palette: .dark,
+      formatLevel: state.autoFormatLevel,
+      onIntent: state.relayIntent,
+      onFormatLevel: state.setAutoFormatLevel
+    )
+
+    rail.cycleFormatLevel()
+
+    XCTAssertEqual(engine.formatLevelWrites, [.smart], "Correction cycles to Smart, like the tray")
+    XCTAssertEqual(state.autoFormatLevel, .smart, "repainted from the engine read, not the click")
   }
 
   func testEveryIntentHasVoiceOverCopyAndRailReportsProjectedPhase() {
     let intents: [OverlayIntent] = [
-      .finish, .copy, .insertPaste, .retranscribe, .format,
+      .finish, .commitRevision, .discardRevision, .copy, .insertPaste, .retranscribe, .format,
       .close,
     ]
 
@@ -173,6 +229,8 @@ final class OverlayIntentRailTests: XCTestCase {
       intents.map(\.accessibilityLabel),
       [
         "Finish recording",
+        "Commit transcript revision",
+        "Discard transcript draft",
         "Copy transcript",
         "Insert transcript",
         "Retranscribe recording",
@@ -185,29 +243,6 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(OverlayDockVisuals.hoverOpacity(isHovering: false), 0)
     XCTAssertGreaterThan(OverlayDockVisuals.hoverOpacity(isHovering: true), 0)
     XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: "no speech"), "no speech")
-  }
-
-  func testHoverRevealAndPinnedClickUseOneInteractionState() {
-    var interaction = OverlayDockInteraction(isExpanded: false, isPinned: false)
-
-    interaction.pointerEntered()
-    XCTAssertTrue(interaction.isExpanded)
-    interaction.pointerExited()
-    XCTAssertFalse(interaction.isExpanded)
-
-    interaction.pin()
-    interaction.pointerExited()
-    XCTAssertTrue(interaction.isExpanded)
-    interaction.collapse()
-    XCTAssertEqual(
-      interaction,
-      OverlayDockInteraction(isExpanded: false, isPinned: false)
-    )
-  }
-
-  func testReduceMotionDisablesRailAnimation() {
-    XCTAssertNil(OverlayIntentRail.revealAnimation(reduceMotion: true))
-    XCTAssertNotNil(OverlayIntentRail.revealAnimation(reduceMotion: false))
   }
 
   func testProjectedRetranscribeIntentReachesInjectedEngineBoundary() async {
@@ -254,14 +289,14 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(state.errorMessage, "Insert needs the recording engine")
   }
 
-  func testExpandedDockRendersAtWindowFloorWithRoundedCanvasCorners() throws {
+  func testDockRendersAtWindowFloorWithRoundedCanvasCorners() throws {
     let state = OverlayState.previewFormatted()
     let size = CGSize(
       width: OverlayDockLayout.minimumCanvasWidth,
       height: DictationOverlayWindow.minSize.height
     )
     let hostingView = NSHostingView(
-      rootView: DictationOverlayView(state: state, dockInitiallyExpanded: true)
+      rootView: DictationOverlayView(state: state)
         .frame(width: size.width, height: size.height)
         .preferredColorScheme(.dark)
     )

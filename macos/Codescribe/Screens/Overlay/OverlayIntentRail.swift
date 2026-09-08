@@ -2,43 +2,18 @@ import SwiftUI
 
 /// Value-only rendering contract for the dock. Tests assert this model rather
 /// than reconstructing a second SwiftUI hierarchy or looking for source text.
+///
+/// The dock is always the toolbar. The collapsed handle / hover-reveal / pin
+/// states are gone (Founder 2026-09-08: the buttons exist so the transcript
+/// can sit flush, not as decoration — keep them visible).
 struct OverlayDockLayout: Equatable {
   static let height: CGFloat = 42
   static let minimumCanvasWidth: CGFloat = 320
 
-  let isExpanded: Bool
   let projectedIntents: [OverlayIntent]
 
-  var visibleIntents: [OverlayIntent] {
-    isExpanded ? projectedIntents : []
-  }
-
-  var showsCollapsedFooter: Bool { !isExpanded }
-  var showsHandleOnly: Bool { !isExpanded }
-  var showsToolbar: Bool { isExpanded }
-}
-
-struct OverlayDockInteraction: Equatable {
-  var isExpanded: Bool
-  var isPinned: Bool
-
-  mutating func pointerEntered() {
-    isExpanded = true
-  }
-
-  mutating func pointerExited() {
-    if !isPinned { isExpanded = false }
-  }
-
-  mutating func pin() {
-    isPinned = true
-    isExpanded = true
-  }
-
-  mutating func collapse() {
-    isPinned = false
-    isExpanded = false
-  }
+  var visibleIntents: [OverlayIntent] { projectedIntents }
+  var showsToolbar: Bool { true }
 }
 
 enum OverlayDockVisuals {
@@ -48,20 +23,19 @@ enum OverlayDockVisuals {
 }
 
 /// The overlay's sole action surface. The reducer owns action availability;
-/// this view owns only transient reveal/pin state and renders the footer or the
-/// toolbar in the same fixed-height slot.
+/// this view only renders the projected commands, the engine chip, the
+/// transient notice and the formatting-level control in one fixed-height slot.
 @MainActor
 struct OverlayIntentRail: View {
-  @Environment(\.accessibilityReduceMotion) private var reduceMotion
-  @State private var interaction: OverlayDockInteraction
-
   let phase: String
   let intents: [OverlayIntent]
   let palette: OverlayAppearancePalette
   let footerEngineLabel: String
   let footerNotice: String?
   let footerEngineDot: Color
+  let formatLevel: FormattingPolicyOption
   let onIntent: (OverlayIntent) -> Void
+  let onFormatLevel: (FormattingPolicyOption) -> Void
 
   init(
     phase: String,
@@ -70,8 +44,9 @@ struct OverlayIntentRail: View {
     footerEngineLabel: String = "",
     footerNotice: String? = nil,
     footerEngineDot: Color = .clear,
-    initiallyExpanded: Bool = false,
-    onIntent: @escaping (OverlayIntent) -> Void
+    formatLevel: FormattingPolicyOption = .correction,
+    onIntent: @escaping (OverlayIntent) -> Void,
+    onFormatLevel: @escaping (FormattingPolicyOption) -> Void = { _ in }
   ) {
     self.phase = phase
     self.intents = intents
@@ -79,115 +54,70 @@ struct OverlayIntentRail: View {
     self.footerEngineLabel = footerEngineLabel
     self.footerNotice = footerNotice
     self.footerEngineDot = footerEngineDot
+    self.formatLevel = formatLevel
     self.onIntent = onIntent
-    _interaction = State(
-      initialValue: OverlayDockInteraction(
-        isExpanded: initiallyExpanded,
-        isPinned: initiallyExpanded
-      ))
+    self.onFormatLevel = onFormatLevel
   }
 
   var body: some View {
     OverlayDockSurface(palette: palette) {
-      ZStack {
-        if interaction.isExpanded {
-          HStack(spacing: CSSpace.xs) {
-            OverlayDockButton(
-              title: "Hide overlay actions",
-              systemImage: "chevron.down",
-              hint: "Collapses the overlay action toolbar",
-              identifier: "overlay-intent-dock-collapse",
-              palette: palette,
-              action: collapse
-            )
-
-            ForEach(intents, id: \.self) { intent in
-              if intent == .close {
-                Spacer(minLength: CSSpace.xxs)
-                footerNoticeText
-                Divider()
-                  .frame(height: CSSpace.lg)
-                  .overlay(palette.border.color)
-                  .padding(.horizontal, 2)
-                  .accessibilityHidden(true)
-              }
-              OverlayDockButton(
-                title: intent.accessibilityLabel,
-                systemImage: intent.systemImage,
-                hint: intent.accessibilityHint,
-                identifier: "overlay-intent-\(intent.rawValue)",
-                palette: palette
-              ) {
-                dispatch(intent)
-              }
-            }
+      HStack(spacing: CSSpace.xs) {
+        engineChip
+        Spacer(minLength: CSSpace.xxs)
+        footerNoticeText
+        formatLevelButton
+        ForEach(intents, id: \.self) { intent in
+          if intent == .close {
+            Divider()
+              .frame(height: CSSpace.lg)
+              .overlay(palette.border.color)
+              .padding(.horizontal, 2)
+              .accessibilityHidden(true)
           }
-          .padding(.horizontal, CSSpace.sm)
-          .buttonStyle(.plain)
-          .onHover(perform: setHovering)
-          .transition(reduceMotion ? .identity : .opacity)
-        } else {
-          collapsedFooter
-            .transition(reduceMotion ? .identity : .opacity)
+          OverlayDockButton(
+            title: intent.accessibilityLabel,
+            systemImage: intent.systemImage,
+            hint: intent.accessibilityHint,
+            identifier: "overlay-intent-\(intent.rawValue)",
+            palette: palette
+          ) {
+            dispatch(intent)
+          }
         }
       }
+      .padding(.horizontal, CSSpace.sm)
+      .buttonStyle(.plain)
       .frame(maxWidth: .infinity)
       .frame(height: OverlayDockLayout.height)
+      // Everything in the dock that is not a control (engine chip, notice,
+      // spacer) drags the window. Buttons sit above this region and keep
+      // their clicks.
+      .background {
+        OverlayWindowDragRegion(identifier: "overlay-dock-inert-drag-region")
+      }
     }
-    .animation(Self.revealAnimation(reduceMotion: reduceMotion), value: interaction.isExpanded)
     .accessibilityElement(children: .contain)
     .accessibilityLabel("Overlay actions")
     .accessibilityValue(Self.accessibilityValue(for: phase))
     .accessibilityIdentifier("overlay-intent-dock")
   }
 
-  private var collapsedFooter: some View {
-    ZStack(alignment: .bottom) {
-      HStack(spacing: CSSpace.sm) {
-        HStack(spacing: CSSpace.xs) {
-          Text("●")
-            .foregroundStyle(footerEngineDot)
-          Text(footerEngineLabel)
-            .foregroundStyle(palette.mutedText.color)
-          footerNoticeText
-        }
-        Spacer(minLength: 0)
-      }
-      .csMono(10, .medium)
-      .padding(.horizontal, 16)
-      .padding(.vertical, 7)
-      .allowsHitTesting(false)
-      .overlay {
-        OverlayWindowDragRegion(identifier: "overlay-dock-inert-drag-region")
-      }
-
-      OverlayDockButton(
-        title: "Show overlay actions",
-        systemImage: "chevron.up",
-        hint: "Reveals and pins the overlay action toolbar",
-        identifier: "overlay-intent-dock-toggle",
-        palette: palette,
-        action: pinExpanded
-      )
-      .frame(width: 46, height: 24)
-      .background(
-        palette.surfaceTint.color,
-        in: UnevenRoundedRectangle(
-          topLeadingRadius: CSRadius.input,
-          bottomLeadingRadius: 0,
-          bottomTrailingRadius: 0,
-          topTrailingRadius: CSRadius.input,
-          style: .continuous
-        )
-      )
-      .overlay(alignment: .top) {
-        Capsule()
-          .fill(palette.border.color)
-          .frame(width: 18, height: 1)
-          .allowsHitTesting(false)
-      }
-      .onHover(perform: setHovering)
+  /// Serving-engine evidence, inert. Truncates first when the window sits at
+  /// its 320 pt floor so the commands never do.
+  private var engineChip: some View {
+    HStack(spacing: CSSpace.xxs) {
+      Text("●")
+        .foregroundStyle(footerEngineDot)
+      Text(footerEngineLabel)
+        .foregroundStyle(palette.mutedText.color)
+        .lineLimit(1)
+        .truncationMode(.tail)
     }
+    .csMono(10, .medium)
+    .layoutPriority(-1)
+    .allowsHitTesting(false)
+    .accessibilityElement(children: .combine)
+    .accessibilityIdentifier("overlay-footer-engine")
   }
 
   @ViewBuilder
@@ -202,9 +132,38 @@ struct OverlayIntentRail: View {
     }
   }
 
+  /// Off → Correction → Smart → Max → Off, the same cycle as the tray. The
+  /// label is durable engine truth; a click writes through the engine and the
+  /// state re-reads before this repaints.
+  private var formatLevelButton: some View {
+    Button(action: cycleFormatLevel) {
+      Text(formatLevel.visibleName)
+        .csMono(10, .semibold)
+        .foregroundStyle(
+          formatLevel == .off ? palette.mutedText.color : palette.primaryText.color
+        )
+        .lineLimit(1)
+        .padding(.horizontal, CSSpace.xs)
+        .frame(height: 24)
+        .contentShape(Capsule())
+    }
+    .buttonStyle(.plain)
+    .background {
+      Capsule().strokeBorder(palette.border.color, lineWidth: 1)
+    }
+    .help("Formatting level: \(formatLevel.visibleName). Click to cycle.")
+    .accessibilityLabel("Formatting level")
+    .accessibilityValue(formatLevel.visibleName)
+    .accessibilityHint("Cycles the automatic formatting level")
+    .accessibilityIdentifier("overlay-format-level")
+  }
+
   static func projectedIntents(for state: OverlayState) -> [OverlayIntent] {
-    if state.formatterCommitPending {
+    if state.revisionCommitPending || state.formatterCommitPending {
       return []
+    }
+    if state.isRevisionDraftDirty {
+      return [.commitRevision, .discardRevision, .close]
     }
     return projectedIntents(
       phase: state.mode,
@@ -244,10 +203,6 @@ struct OverlayIntentRail: View {
     }
   }
 
-  static func revealAnimation(reduceMotion: Bool) -> Animation? {
-    reduceMotion ? nil : CSMotion.floatIn
-  }
-
   static func accessibilityValue(for phase: String) -> String {
     phase
   }
@@ -256,20 +211,8 @@ struct OverlayIntentRail: View {
     onIntent(intent)
   }
 
-  private func pinExpanded() {
-    interaction.pin()
-  }
-
-  private func collapse() {
-    interaction.collapse()
-  }
-
-  private func setHovering(_ hovering: Bool) {
-    if hovering {
-      interaction.pointerEntered()
-    } else {
-      interaction.pointerExited()
-    }
+  func cycleFormatLevel() {
+    onFormatLevel(formatLevel.next)
   }
 }
 
@@ -330,6 +273,8 @@ extension OverlayIntent {
   var accessibilityLabel: String {
     switch self {
     case .finish: "Finish recording"
+    case .commitRevision: "Commit transcript revision"
+    case .discardRevision: "Discard transcript draft"
     case .copy: "Copy transcript"
     case .insertPaste: "Insert transcript"
     case .retranscribe: "Retranscribe recording"
@@ -341,6 +286,8 @@ extension OverlayIntent {
   var accessibilityHint: String {
     switch self {
     case .finish: "Stops capture and requests the final projection"
+    case .commitRevision: "Commits this draft through the transcript ledger"
+    case .discardRevision: "Restores the latest projected transcript"
     case .copy: "Copies the projected transcript"
     case .insertPaste: "Sends the projected transcript to the selected destination"
     case .retranscribe: "Requests another transcription of this recording"
@@ -352,6 +299,8 @@ extension OverlayIntent {
   var systemImage: String {
     switch self {
     case .finish: "stop.circle"
+    case .commitRevision: "checkmark.circle"
+    case .discardRevision: "arrow.uturn.backward.circle"
     case .copy: "doc.on.doc"
     case .insertPaste: "arrow.down.doc"
     case .retranscribe: "arrow.clockwise"

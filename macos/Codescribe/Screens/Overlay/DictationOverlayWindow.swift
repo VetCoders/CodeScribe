@@ -9,8 +9,11 @@ import SwiftUI
 // with a clear background so the appearance-aware material inside the SwiftUI
 // sheet blurs whatever is underneath.
 
-/// Borderless, non-activating panel that can still become key so the overlay's
-/// buttons (Copy / Send to Agent / Close) receive clicks without stealing app focus.
+/// Borderless, non-activating panel. Buttons receive clicks without the panel
+/// ever being key; the panel becomes key ONLY while the transcript canvas is
+/// being edited (`takeKeyForEdit` / `releaseKeyAfterEdit`, driven by the
+/// canvas's first-responder transitions), and hands the keyboard back to the
+/// previous app the moment editing ends.
 final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
   var onUserMove: (() -> Void)?
   var onUserResize: (() -> Void)?
@@ -27,7 +30,31 @@ final class FloatingOverlayPanel: NSPanel, NSWindowDelegate {
 
   override var canBecomeKey: Bool { allowsKeyForEdit }
   override var canBecomeMain: Bool { false }
-  var allowsKeyForEdit = false
+  /// The single writer is the edit gate below. Any other path leaves the caret
+  /// in the previous app.
+  private(set) var allowsKeyForEdit = false
+
+  /// The transcript canvas became first responder for an edit.
+  func takeKeyForEdit() {
+    allowsKeyForEdit = true
+    if !isKeyWindow { makeKey() }
+  }
+
+  /// The canvas resigned. Drop key status so keystrokes return to the app the
+  /// user was dictating into.
+  func releaseKeyAfterEdit() {
+    guard allowsKeyForEdit else { return }
+    allowsKeyForEdit = false
+    if isKeyWindow { resignKey() }
+  }
+
+  /// Key left from outside (click in another app, panel ordered out): close
+  /// the edit by resigning the canvas, which schedules its focus-exit commit.
+  func windowDidResignKey(_ notification: Notification) {
+    guard allowsKeyForEdit else { return }
+    allowsKeyForEdit = false
+    makeFirstResponder(nil)
+  }
 
   /// A non-activating panel does not turn SwiftUI background hits into window
   /// motion, so intercept only explicit AppKit drag regions.

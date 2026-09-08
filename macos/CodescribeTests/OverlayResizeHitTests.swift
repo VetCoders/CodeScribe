@@ -103,9 +103,14 @@ final class OverlayResizeHitTests: XCTestCase {
       )
     }
 
-    // The collapsed production dock keeps its toggle centered over the inert
-    // footer copy. Its real hit must remain a control, never a drag region.
-    let actionPoint = NSPoint(x: root.bounds.midX, y: 20)
+    // The dock is always the toolbar (no collapsed handle since 2026-09-08);
+    // its trailing command is Close. A real control must never be a drag
+    // region, while the inert middle of the dock (spacer) drags the window.
+    let actionPoint = NSPoint(x: root.bounds.maxX - CSSpace.sm - 16, y: 20)
+    XCTAssertTrue(
+      panel.isWindowDragHit(at: NSPoint(x: root.bounds.midX, y: 20)),
+      "the inert middle of the always-visible dock must drag the window"
+    )
     let actionHit = try XCTUnwrap(root.hitTest(actionPoint))
     XCTAssertFalse(
       panel.isWindowDragHit(at: actionPoint),

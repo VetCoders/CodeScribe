@@ -18,7 +18,6 @@ struct DictationOverlayView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.colorScheme) private var colorScheme
   @Bindable var state: OverlayState
-  var dockInitiallyExpanded = false
 
   // Geometry constants local to this surface. The window is user-resizable;
   // content fills the frame and never goes narrower than `windowMinWidth`.
@@ -41,8 +40,9 @@ struct DictationOverlayView: View {
           footerEngineLabel: state.footerEngineLabel,
           footerNotice: state.toast,
           footerEngineDot: footerEngineDot,
-          initiallyExpanded: dockInitiallyExpanded,
-          onIntent: state.relayIntent
+          formatLevel: state.autoFormatLevel,
+          onIntent: state.relayIntent,
+          onFormatLevel: { state.setAutoFormatLevel($0) }
         )
       )
     }
@@ -243,7 +243,7 @@ struct DictationOverlayView: View {
         case .listening, .finalizing:
           EmptyView()
         case .formatted:
-          EmptyView()
+          revisionStatusRow
         case .noSpeech:
           noSpeechBody
             .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
@@ -265,8 +265,6 @@ struct DictationOverlayView: View {
     .animation(reduceMotion ? nil : CSMotion.floatIn, value: state.mode)
   }
 
-
-
   /// Native live transcript: follows the newest words until the user clicks or
   /// selects an older phrase. The `NSTextView` keeps that selection stable across
   /// ongoing stream updates, so drag selection, Cmd-C and context-menu Copy work
@@ -275,22 +273,75 @@ struct DictationOverlayView: View {
   private var transcriptScroll: some View {
     VStack(alignment: .leading, spacing: 0) {
       LiveTranscriptTextView(
-        projection: state.latestTranscriptProjection,
-        appearance: palette.appearance
+        text: state.canvasText,
+        isEditable: state.isTranscriptEditable,
+        appearance: palette.appearance,
+        onEditingChanged: { editing in
+          if editing { state.beginTranscriptEdit() } else { state.endTranscriptEdit() }
+        },
+        onTextChange: { state.updateRevisionDraft($0) },
+        onCancelEdit: { state.discardRevisionDraft() }
       )
       .modifier(OverlayScrollEdgeEffects())
       .overlay(alignment: .bottomTrailing) {
-        BlinkingCaret()
-          .padding(.trailing, 3)
-          .allowsHitTesting(false)
+        // The decorative caret yields to the real insertion point while the
+        // canvas is being edited.
+        if !state.isEditingTranscript {
+          BlinkingCaret()
+            .padding(.trailing, 3)
+            .allowsHitTesting(false)
+        }
       }
       .frame(minHeight: transcriptMinHeight)
       .accessibilityIdentifier("overlay-transcript-area")
+      .accessibilityHint(
+        state.isTranscriptEditable
+          ? "Click to edit. Edits stay local until committed to the transcript ledger."
+          : ""
+      )
     }
     .frame(maxWidth: .infinity, alignment: .leading)
   }
 
+  /// Ledger truth under the canvas: what the bytes on screen ARE — a local
+  /// draft, a revision in flight, or the reducer's projection — plus the last
+  /// commit failure. Same states as T15's editor status.
+  private var revisionStatusRow: some View {
+    VStack(alignment: .leading, spacing: CSSpace.xxs) {
+      HStack(spacing: CSSpace.xs) {
+        if state.formatterCommitPending {
+          ProgressView()
+            .controlSize(.small)
+          Text("Formatting revision…")
+        } else if state.revisionCommitPending {
+          ProgressView()
+            .controlSize(.small)
+          Text("Committing revision…")
+        } else if state.isRevisionDraftDirty {
+          Image(systemName: "pencil.line")
+          Text("Draft · not committed")
+        } else {
+          Image(systemName: "checkmark.seal")
+          Text("Ledger projection")
+        }
+      }
+      .csMono(10, .semibold)
+      .foregroundStyle(
+        state.isRevisionDraftDirty ? CSColor.terracotta : palette.mutedText.color
+      )
+      .accessibilityElement(children: .combine)
+      .accessibilityIdentifier("overlay-revision-status")
 
+      if let error = state.revisionCommitError ?? state.formatterError {
+        Label(error, systemImage: "exclamationmark.triangle")
+          .csMono(10, .medium)
+          .foregroundStyle(CSColor.terracotta)
+          .lineLimit(2)
+          .accessibilityIdentifier("overlay-revision-error")
+      }
+    }
+    .allowsHitTesting(false)
+  }
 
   /// Terminal outcome for a session that captured no usable speech. Replaces
   /// the empty editable FINAL with a calm, non-alarming notice (mic glyph +
@@ -414,27 +465,17 @@ private struct OverlayScrollEdgeEffects: ViewModifier {
   @ViewBuilder
   private func dockPreviewRow(
     _ title: String,
-    collapsedLight: OverlayState,
-    expandedLight: OverlayState,
-    collapsedDark: OverlayState,
-    expandedDark: OverlayState
+    light: OverlayState,
+    dark: OverlayState
   ) -> some View {
     Text(title)
       .font(.headline)
     overlayPreviewCanvas(width: 320, height: 260) {
-      DictationOverlayView(state: collapsedLight)
+      DictationOverlayView(state: light)
     }
     .preferredColorScheme(.light)
     overlayPreviewCanvas(width: 320, height: 260) {
-      DictationOverlayView(state: expandedLight, dockInitiallyExpanded: true)
-    }
-    .preferredColorScheme(.light)
-    overlayPreviewCanvas(width: 320, height: 260) {
-      DictationOverlayView(state: collapsedDark)
-    }
-    .preferredColorScheme(.dark)
-    overlayPreviewCanvas(width: 320, height: 260) {
-      DictationOverlayView(state: expandedDark, dockInitiallyExpanded: true)
+      DictationOverlayView(state: dark)
     }
     .preferredColorScheme(.dark)
   }
@@ -442,31 +483,12 @@ private struct OverlayScrollEdgeEffects: ViewModifier {
   #Preview("Dock matrix · 320 pt") {
     ScrollView {
       VStack(spacing: CSSpace.section) {
+        dockPreviewRow("Listening", light: .previewListening(), dark: .previewListening())
         dockPreviewRow(
-          "Listening",
-          collapsedLight: .previewListening(), expandedLight: .previewListening(),
-          collapsedDark: .previewListening(), expandedDark: .previewListening()
-        )
-        dockPreviewRow(
-          "Finalizing",
-          collapsedLight: .previewTranscribing(), expandedLight: .previewTranscribing(),
-          collapsedDark: .previewTranscribing(), expandedDark: .previewTranscribing()
-        )
-        dockPreviewRow(
-          "Formatted",
-          collapsedLight: .previewFormatted(), expandedLight: .previewFormatted(),
-          collapsedDark: .previewFormatted(), expandedDark: .previewFormatted()
-        )
-        dockPreviewRow(
-          "No speech",
-          collapsedLight: .previewNoSpeech(), expandedLight: .previewNoSpeech(),
-          collapsedDark: .previewNoSpeech(), expandedDark: .previewNoSpeech()
-        )
-        dockPreviewRow(
-          "Error",
-          collapsedLight: .previewError(), expandedLight: .previewError(),
-          collapsedDark: .previewError(), expandedDark: .previewError()
-        )
+          "Finalizing", light: .previewTranscribing(), dark: .previewTranscribing())
+        dockPreviewRow("Formatted", light: .previewFormatted(), dark: .previewFormatted())
+        dockPreviewRow("No speech", light: .previewNoSpeech(), dark: .previewNoSpeech())
+        dockPreviewRow("Error", light: .previewError(), dark: .previewError())
       }
       .padding()
     }

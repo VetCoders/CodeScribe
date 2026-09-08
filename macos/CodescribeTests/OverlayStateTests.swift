@@ -40,6 +40,8 @@ private final class OverlayStateTestEngine: DictationEngine {
   )
   var persistAutoPasteWrites = true
   var autoPasteWrites: [Bool] = []
+  var persistFormatLevelWrites = true
+  var formatLevelWrites: [FormattingPolicyOption] = []
   var policyReadCount = 0
   var sentAssistiveTexts: [String] = []
   var assistiveSendResult = true
@@ -106,6 +108,14 @@ private final class OverlayStateTestEngine: DictationEngine {
     persistedPolicy = OverlayPolicySnapshot(
       autoPasteEnabled: enabled,
       autoFormatLevel: persistedPolicy.autoFormatLevel
+    )
+  }
+  func setAutoFormatLevel(_ level: FormattingPolicyOption) {
+    formatLevelWrites.append(level)
+    guard persistFormatLevelWrites else { return }
+    persistedPolicy = OverlayPolicySnapshot(
+      autoPasteEnabled: persistedPolicy.autoPasteEnabled,
+      autoFormatLevel: level
     )
   }
   func pasteText(text: String) async throws -> CsPasteResult {
@@ -958,6 +968,214 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertEqual(state.revision, 8)
     XCTAssertEqual(state.userRevisionProvenance, "user-edit-test-7-8")
     XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [.copy, .close])
+  }
+
+  func testUserEditCommitsOnlyThroughReturnedRustProjection() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText(
+      "Tekst bazowy",
+      to: state,
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      terminal: true,
+      sessionId: "revision-session",
+      reducerRevision: 7
+    )
+    XCTAssertTrue(state.isTranscriptEditable, "a sealed formatted take is the editor")
+    XCTAssertEqual(state.canvasText, "Tekst bazowy")
+
+    state.beginTranscriptEdit()
+    XCTAssertTrue(state.isEditingTranscript)
+    state.updateRevisionDraft("Tekst poprawiony")
+    XCTAssertTrue(state.isRevisionDraftDirty)
+    XCTAssertEqual(state.canvasText, "Tekst poprawiony", "the canvas paints the local draft")
+    XCTAssertEqual(state.formattedText, "Tekst bazowy", "typing never touches projected truth")
+    XCTAssertEqual(state.activeText, "Tekst bazowy", "delivery never reads the draft")
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.commitRevision, .discardRevision, .close]
+    )
+
+    let requested = expectation(description: "revision intent reached Rust bridge")
+    engine.onRevision = { requested.fulfill() }
+    state.relayIntent(.commitRevision)
+    await fulfillment(of: [requested], timeout: 1)
+
+    XCTAssertEqual(
+      engine.revisionRequests,
+      [
+        OverlayStateTestEngine.RevisionRequest(
+          sessionId: "revision-session",
+          sourceRevision: 7,
+          renderedText: "Tekst poprawiony"
+        )
+      ]
+    )
+    XCTAssertEqual(state.formattedText, "Tekst bazowy", "FFI acknowledgement is not projection")
+    XCTAssertEqual(
+      state.canvasText, "Tekst poprawiony", "draft stays visible until the ledger answers")
+    XCTAssertEqual(state.revision, 7)
+    XCTAssertTrue(state.revisionCommitPending)
+    XCTAssertFalse(state.isTranscriptEditable, "no second edit while one is in flight")
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [])
+
+    projectText(
+      "Tekst poprawiony",
+      to: state,
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      terminal: true,
+      sessionId: "revision-session",
+      reducerRevision: 8,
+      reducerAction: "apply_manual_edit",
+      manualEditReceipt: "user-edit-revision-session-7-8-1"
+    )
+
+    XCTAssertEqual(state.formattedText, "Tekst poprawiony")
+    XCTAssertEqual(state.revisionDraft, "Tekst poprawiony")
+    XCTAssertFalse(state.isRevisionDraftDirty)
+    XCTAssertEqual(state.revision, 8)
+    XCTAssertFalse(state.revisionCommitPending)
+    XCTAssertTrue(state.isTranscriptEditable, "the new revision is editable again")
+    XCTAssertEqual(state.userRevisionProvenance, "user-edit-revision-session-7-8-1")
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.insertPaste, .copy, .close],
+      "delivery actions return only after the new ledger projection"
+    )
+
+    state.insertCaretInCodescribeProbe = { false }
+    let pasted = expectation(description: "new revision reached delivery")
+    engine.onPaste = { pasted.fulfill() }
+    state.relayIntent(.insertPaste)
+    await fulfillment(of: [pasted], timeout: 1)
+    XCTAssertEqual(engine.pastedText, "Tekst poprawiony")
+  }
+
+  func testFocusExitCommitsDirtyDraftAfterClickGrace() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText("Ledger text", to: state, terminal: true, reducerRevision: 3)
+
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Focus-exit draft")
+    state.endTranscriptEdit()
+    XCTAssertFalse(state.isEditingTranscript)
+    XCTAssertTrue(engine.revisionRequests.isEmpty, "a focus exit waits one click before FFI")
+
+    let requested = expectation(description: "focus-exit commit crossed the bridge")
+    engine.onRevision = { requested.fulfill() }
+    await fulfillment(of: [requested], timeout: 2)
+    XCTAssertEqual(engine.revisionRequests.map(\.renderedText), ["Focus-exit draft"])
+    XCTAssertTrue(state.revisionCommitPending)
+    XCTAssertEqual(state.formattedText, "Ledger text", "still the ledger's bytes until projection")
+  }
+
+  func testDiscardAndCloseCancelDraftWithoutCreatingRevision() async {
+    let state = OverlayState()
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    projectText("Ledger text", to: state, terminal: true, reducerRevision: 3)
+
+    // Escape: the canvas discards, then resigns.
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Escaped draft")
+    state.discardRevisionDraft()
+    state.endTranscriptEdit()
+    XCTAssertEqual(state.revisionDraft, "Ledger text")
+    XCTAssertEqual(state.canvasText, "Ledger text")
+
+    // Focus exit, then an explicit Discard inside the grace window.
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Focus-exit draft")
+    state.endTranscriptEdit()
+    state.discardRevisionDraft()
+    XCTAssertEqual(state.revisionDraft, "Ledger text")
+
+    // Close with a dirty draft.
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Close draft")
+    state.close()
+    XCTAssertEqual(state.formattedText, "Ledger text")
+    XCTAssertEqual(state.revisionDraft, "Ledger text")
+
+    try? await Task.sleep(
+      nanoseconds: OverlayState.focusExitCommitGraceNanoseconds + 200_000_000)
+    XCTAssertTrue(
+      engine.revisionRequests.isEmpty,
+      "discard and close must cancel every deferred focus commit"
+    )
+    XCTAssertFalse(state.revisionCommitPending)
+  }
+
+  func testListeningCanvasIsReadOnlyAndTheDraftFollowsProjection() {
+    let state = OverlayState()
+    projectText("live words", to: state)
+    XCTAssertFalse(state.isTranscriptEditable)
+    state.beginTranscriptEdit()
+    XCTAssertFalse(state.isEditingTranscript, "a live take never takes the keyboard")
+    state.updateRevisionDraft("typed into a live take")
+    XCTAssertEqual(state.canvasText, "live words")
+    XCTAssertFalse(state.isRevisionDraftDirty)
+
+    projectText("live words and more", to: state)
+    XCTAssertEqual(state.canvasText, "live words and more")
+    projectText("sealed words", to: state, terminal: true)
+    XCTAssertTrue(state.isTranscriptEditable)
+    XCTAssertEqual(state.revisionDraft, "sealed words", "the seal seeds the draft")
+    XCTAssertEqual(state.canvasText, "sealed words")
+  }
+
+  func testEditingAndDirtyDraftHoldAutoHide() {
+    let clock = OverlayStateTestClock()
+    let state = makeFinalizedState(clock: clock)
+    let engine = OverlayStateTestEngine()
+    state.engine = engine
+    var closeCount = 0
+    state.onClose = { closeCount += 1 }
+
+    clock.now = 1
+    state.beginTranscriptEdit()
+    clock.now = 100
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closeCount, 0, "a caret in the canvas holds the panel")
+
+    state.updateRevisionDraft("ready transcript, corrected")
+    state.discardRevisionDraft()
+    state.endTranscriptEdit()
+    clock.now = 101
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closeCount, 0)
+    clock.now = 200
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closeCount, 1, "a clean canvas re-arms the usual countdown")
+  }
+
+  func testAutoFormatLevelWriteRefreshesFromEngineTruthWithoutOptimisticSwap() {
+    for persists in [true, false] {
+      let state = OverlayState()
+      let engine = OverlayStateTestEngine()
+      engine.persistedPolicy = OverlayPolicySnapshot(
+        autoPasteEnabled: true,
+        autoFormatLevel: .off
+      )
+      engine.persistFormatLevelWrites = persists
+      state.engine = engine
+      state.handleRecordingPreparing()
+      XCTAssertEqual(state.autoFormatLevel, .off)
+
+      state.setAutoFormatLevel(.smart)
+
+      XCTAssertEqual(engine.formatLevelWrites, [.smart])
+      XCTAssertEqual(state.autoFormatLevel, persists ? .smart : .off)
+      XCTAssertEqual(engine.policyReadCount, 2, "level repaints from a fresh engine read")
+      XCTAssertTrue(state.autoPasteEnabled)
+    }
   }
 
   func testFormatCommitsOnlyThroughFormatterProjectionAndFailureStaysVisible() async {
