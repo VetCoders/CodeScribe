@@ -7,7 +7,7 @@
 .PHONY: all build release release-codescribe release-codescribe-embedded release-qube app app-bindings install install-no-embed config install-app install-if-idle install-voice-lab \
         start stop restart status logs logs-follow \
         bump bump-patch bump-minor bump-major version \
-        lint format test test-quick test-e2e test-e2e-real test-sse test-sse-release test-responses-live test-sse-heavy test-formatting test-structural-verifier test-transcript-bus-path test-all \
+        lint format test test-quick test-e2e test-e2e-real test-e2e-roundtrip test-sse test-sse-release test-responses-live test-sse-heavy test-formatting test-structural-verifier test-transcript-bus-path test-all \
         test-engine test-engine-apple test-engine-candle test-teacher \
         demo demo-raw demo-assistive check verify semgrep fix clean help corpus-census test-corpus-parity \
         dist-preflight dist-preflight-signed verify-canaries smoke-canaries \
@@ -355,6 +355,7 @@ bump-major:
 # gate: test-all class=operator ci=no -- test + ignored + STT pipeline + SSE streaming; needs LLM keys
 # gate: test-e2e class=operator ci=no -- e2e tests in release profile; sources the operator dotenv
 # gate: test-e2e-real class=operator ci=no -- e2e against real LLM APIs; needs LLM_API_KEY and LLM_ASSISTIVE_API_KEY
+# gate: test-e2e-roundtrip class=operator ci=no -- #[ignore] lanes of e2e_vad_flow (private data_assets corpus) + e2e_round_trip (TTS/CSM, Whisper, MiniLM models; sets CODESCRIBE_E2E_ROUNDTRIP=1); no LLM keys; fails, never skips, when a model or clip is missing
 # gate: test-sse class=operator ci=no -- live SSE streaming against a real endpoint
 # gate: test-sse-release class=operator ci=no -- test-sse in the release profile
 # gate: test-sse-heavy class=operator ci=no -- test-sse release + Responses chain/resume
@@ -513,6 +514,22 @@ test-e2e-real:
 	echo "Requires: LLM_API_KEY, LLM_ASSISTIVE_API_KEY" | tee -a "$$LOG"; \
 	$(ENV_LOAD); $(APPLY_TEST_LLM); \
 	cargo test e2e --release -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
+	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
+	echo "Done. Log: $$LOG" | tee -a "$$LOG"
+
+# Opt-in lanes that plain `cargo test` reports as `ignored`. Both suites fail
+# loudly when their inputs are missing (no silent `return Ok(())`), so a green
+# run here means the models and the corpus were actually exercised.
+test-e2e-roundtrip:
+	@$(TEST_SETUP); \
+	set -o pipefail; \
+	echo "=== VAD flow (private corpus, --ignored) ===" | tee -a "$$LOG"; \
+	$(ENV_LOAD); \
+	cargo test --test e2e_vad_flow -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
+	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
+	echo "=== Round-trip TTS→STT→embed (--ignored) ===" | tee -a "$$LOG"; \
+	$(ENV_LOAD); CODESCRIBE_E2E_ROUNDTRIP=1 \
+	cargo test --test e2e_round_trip -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
 	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
 	echo "Done. Log: $$LOG" | tee -a "$$LOG"
 
@@ -1280,6 +1297,7 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'smoke-macos27' 'Host smoke after an OS/Xcode bump (SMOKE_ARGS=--with-inference)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-e2e' 'Run E2E tests (mock)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-e2e-real' 'Run E2E tests with real API (needs LLM_*_API_KEY)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-e2e-roundtrip' 'Run #[ignore] VAD corpus + TTS/STT/embed round-trip lanes (local models, no LLM keys)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-sse' 'Run SSE streaming tests (real API)'
 	@printf '%s\n' '  make test-formatting Run AI formatting tests'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-engine' 'Core freezed+append unit bar (fast, no STT)'
