@@ -476,13 +476,6 @@ reload = "restart"
 category = "stt"
 description = "Bounded-context A/B for W13-3B Whisper windows: utterance (default), left_pad, or stable_prompt. Left pad never crosses a Silero-sized silence fence."
 
-[vars.CODESCRIBE_SPAN_IDEMPOTENCE]
-default = "1"
-type = "bool"
-reload = "restart"
-category = "stt"
-description = "Sealed-span replay refusal + in-span loop fence. Default ON: the live seal path refuses a replayed PCM-range / request identity and fences non-progressing timestamps or decode failure. Content-similar offers on a new identity are WARN-preserved. Set 0/false/off only as a diagnostic escape hatch."
-
 [vars.CODESCRIBE_WHISPER_IDLE_UNLOAD_SECS]
 default = "1800"
 type = "u64"
@@ -581,27 +574,6 @@ type = "bool"
 reload = "hot"
 category = "llm"
 description = "W13-1 live inline-format buffer master switch. Default OFF; a default flip is an operator decision."
-
-[vars.CODESCRIBE_INLINE_FORMAT_CHUNK_TIMEOUT_MS]
-default = "10000"
-type = "int"
-reload = "hot"
-category = "llm"
-description = "Per-chunk inline-format LLM timeout in milliseconds; timeout keeps the raw chunk."
-
-[vars.CODESCRIBE_INLINE_FORMAT_FLUSH_TIMEOUT_MS]
-default = "2500"
-type = "int"
-reload = "hot"
-category = "llm"
-description = "Stop-path budget in milliseconds for draining queued inline-format chunks."
-
-[vars.CODESCRIBE_INLINE_FORMAT_TAIL_TIMEOUT_MS]
-default = "15000"
-type = "int"
-reload = "hot"
-category = "llm"
-description = "Stop-path budget in milliseconds for the final inline-format tail request."
 
 [vars.CODESCRIBE_RESPONSES_PROBE_URL]
 default = ""

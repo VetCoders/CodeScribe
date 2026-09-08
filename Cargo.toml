@@ -61,10 +61,6 @@ codescribe_core = { package = "codescribe-core", path = "core" }
 # Async runtime
 tokio = { version = "1", features = ["full", "test-util"] }
 
-# System tray
-tray-icon = "0.21"
-muda = "0.17"  # Menu for tray
-tao = "0.34"   # Event loop for tray (required on macOS)
 
 # Global hotkeys - using core-graphics CGEventTap directly
 # rdev = "0.5"  # DISABLED - crashes on macOS 26.2 (TSMGetInputSourceProperty from wrong thread)
