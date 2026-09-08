@@ -980,6 +980,12 @@ struct AppleSealState {
     fusion_context: FusionContextMode,
     pending_silero_words: BTreeMap<u64, Vec<FusionWord>>,
     unmatched_silero_words: Vec<FusionWord>,
+    /// Session PCM identity, never text equality: repeated labels may be speech.
+    warned_unmatched_words: BTreeSet<(u64, u64)>,
+    no_time_overlap_warnings: u64,
+    /// Silero only appends utterances and extends/closes its last range.
+    /// Keep the last slice input so unchanged ticks do not clone/scan words.
+    silero_slice_revision: Option<(usize, Option<super::silero_fusion::SileroUtterance>)>,
     reconciled_silero: BTreeSet<u64>,
     /// Shared one-throne ledger.
     acoustic_ledger: Arc<Mutex<AcousticLedger>>,
@@ -1041,6 +1047,9 @@ impl AppleSealState {
             fusion_context: FusionContextMode::UtteranceOnly,
             pending_silero_words: BTreeMap::new(),
             unmatched_silero_words: Vec::new(),
+            warned_unmatched_words: BTreeSet::new(),
+            no_time_overlap_warnings: 0,
+            silero_slice_revision: None,
             reconciled_silero: BTreeSet::new(),
             acoustic_ledger: Arc::new(Mutex::new(AcousticLedger::new())),
             energy_calibration: None,
@@ -1911,35 +1920,53 @@ fn seal_sliced_by_silero(
     ev_tx: &mpsc::UnboundedSender<EngineEvent>,
     disjoint: &[TranscriptSegment],
 ) -> bool {
-    let Some(ledger) = state.fusion.as_ref().map(|fusion| fusion.ledger().clone()) else {
+    let Some(fusion) = state.fusion.as_ref() else {
         return false;
     };
+    let utterances = fusion.ledger().utterances();
+    if disjoint.is_empty()
+        && state
+            .silero_slice_revision
+            .as_ref()
+            .is_some_and(|(len, last)| {
+                *len == utterances.len() && last.as_ref() == utterances.last()
+            })
+    {
+        return true;
+    }
+    // Check before cloning the ledger or converting/copying retained words.
+    // A newly opened, extended or closed range must still retry the leftovers
+    // and reconcile pending words, including the terminal flush.
+    state.silero_slice_revision = Some((utterances.len(), utterances.last().cloned()));
+    let ledger = fusion.ledger().clone();
     let apple_words = apple_segments_on_pcm_clock(state, disjoint);
     let mut fusion_words = std::mem::take(&mut state.unmatched_silero_words);
     fusion_words.extend(apple_words.iter().map(FusionWord::from_timed));
     let (sliced, leftover) = slice_apple_words(&ledger, &fusion_words);
-    state.unmatched_silero_words = leftover.clone();
-    if sliced.is_empty() && state.pending_silero_words.is_empty() {
-        if !leftover.is_empty() {
-            let _ = ev_tx.send(EngineEvent::Warning {
-                code: SkipReasonCode::NoTimeOverlap.as_str().to_string(),
-                message: format!(
-                    "apple words={} had no Silero utterance overlap",
-                    leftover.len()
-                ),
-            });
+    let mut newly_unmatched = 0;
+    for word in &leftover {
+        if state
+            .warned_unmatched_words
+            .insert((word.sample_start, word.sample_end))
+        {
+            newly_unmatched += 1;
         }
-        return true;
     }
-    if !leftover.is_empty() {
+    if newly_unmatched > 0 {
+        state.no_time_overlap_warnings += 1;
         let _ = ev_tx.send(EngineEvent::Warning {
             code: SkipReasonCode::NoTimeOverlap.as_str().to_string(),
             message: format!(
-                "apple leftover_words={} sliced_utterances={}",
+                "apple leftover_words={} new_unmatched_words={} sliced_utterances={}",
                 leftover.len(),
+                newly_unmatched,
                 sliced.len()
             ),
         });
+    }
+    state.unmatched_silero_words = leftover;
+    if sliced.is_empty() && state.pending_silero_words.is_empty() {
+        return true;
     }
 
     let rate = state.sample_rate.max(1) as f32;
@@ -3372,6 +3399,14 @@ fn apple_stream_worker(
     repair_terminal_seal_coverage(&mut state, &ev_tx, language);
     drain_formatter_observers(&mut state, &ev_tx, &formatter_done)?;
     let seal_coverage = publish_terminal_coverage(&state, &ev_tx);
+    info!(
+        session_id = %state.session_id,
+        capture_epoch = state.capture_epoch,
+        no_time_overlap_warnings = state.no_time_overlap_warnings,
+        unmatched_word_identities = state.warned_unmatched_words.len(),
+        retained_unmatched_words = state.unmatched_silero_words.len(),
+        "apple_fusion_session_receipt"
+    );
     if seal_coverage.status == SealCoverageStatus::Incomplete {
         let _ = ev_tx.send(EngineEvent::Warning {
             code: "terminal_seal_coverage_incomplete".to_string(),
@@ -7092,6 +7127,40 @@ mod storm_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn no_time_overlap_retries_on_silero_extension_and_close() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = AppleSealState::new_for_session(TEST_SAMPLE_RATE, "storm-test".into(), 0);
+        arm_fusion_slice_admission(&mut state);
+        seal_sliced_by_silero(&mut state, &tx, &[segment("later", 9.0, 9.1)]);
+        while rx.try_recv().is_ok() {}
+        let fusion = state.fusion.as_mut().unwrap();
+        let start = fusion
+            .ledger()
+            .utterances()
+            .last()
+            .unwrap()
+            .range
+            .sample_start;
+        fusion.observe(Some((start, at(10.0))), false, at(10.0));
+        seal_sliced_by_silero(&mut state, &tx, &[]);
+        assert!(state.unmatched_silero_words.is_empty());
+        assert!(!state.pending_silero_words.is_empty());
+        state.fusion.as_mut().unwrap().observe(None, true, at(10.0));
+        seal_sliced_by_silero(&mut state, &tx, &[]);
+        assert!(state.pending_silero_words.is_empty());
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, EngineEvent::LedgerMutation { .. }))
+        );
+        assert!(!events.iter().any(|event| matches!(event,
+            EngineEvent::Warning { code, .. } if code == "no_time_overlap")));
+        assert_eq!(state.no_time_overlap_warnings, 1);
+        assert_eq!(state.warned_unmatched_words.len(), 1);
     }
 
     #[test]
