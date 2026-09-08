@@ -32,6 +32,12 @@ pub struct LifecycleRow {
     pub session_id: String,
     pub status: String,
     #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub rendered_text: Option<String>,
+    #[serde(default)]
     pub phase: Option<TranscriptProjectionPhase>,
     #[serde(default)]
     pub can_paste: bool,
@@ -91,6 +97,8 @@ pub enum TranscriptProjectionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptProjection {
     pub schema: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     pub kind: TranscriptProjectionKind,
     pub session_id: String,
     pub sequence: u64,
@@ -138,7 +146,7 @@ impl std::error::Error for ProjectionReadError {}
 struct SessionProjectionState {
     last_sequence: Option<u64>,
     last_reducer_revision: Option<u64>,
-    last_evidence: Option<EvidenceRow>,
+    last_projection: Option<TranscriptProjection>,
     terminal_emitted: bool,
 }
 
@@ -231,15 +239,50 @@ impl TranscriptProjectionReader {
         } else if self.current_session.as_deref() != Some(row.session_id.as_str()) {
             return None;
         }
-        if !self.accept_sequence(&row.session_id, row.sequence) || row.status != "session_ended" {
+        if !self.accept_sequence(&row.session_id, row.sequence) {
             return None;
         }
 
         let state = self.sessions.entry(row.session_id.clone()).or_default();
+        if row.source.as_deref() == Some(super::cli_transcript_lane::CLI_FILE_VERDICT_SOURCE)
+            && matches!(row.status.as_str(), "utterance_draft" | "transcript_sealed")
+        {
+            // Legacy seals already contain a full document; legacy segment drafts do not.
+            let rendered_text = row
+                .rendered_text
+                .or_else(|| (row.status == "transcript_sealed").then_some(row.text))?;
+            let projection = TranscriptProjection {
+                schema: PROJECTION_SCHEMA,
+                source: row.source,
+                kind: TranscriptProjectionKind::LiveRevision,
+                session_id: row.session_id,
+                sequence: row.sequence,
+                reducer_revision: 0,
+                reducer_action: row.status,
+                occurrence_session_id: String::new(),
+                capture_epoch: 0,
+                sample_start: 0,
+                sample_end: 0,
+                document_index: 0,
+                rendered_text,
+                phase: row.phase.unwrap_or_default(),
+                can_paste: row.can_paste,
+                can_insert: row.can_insert,
+                can_copy: row.can_copy,
+                can_retranscribe: row.can_retranscribe,
+                can_format: row.can_format,
+                terminal: row.terminal,
+            };
+            state.last_projection = Some(projection.clone());
+            return Some(projection);
+        }
+        if row.status != "session_ended" {
+            return None;
+        }
         if std::mem::replace(&mut state.terminal_emitted, true) {
             return None;
         }
-        let last = state.last_evidence.clone();
+        let last = state.last_projection.clone();
         self.current_session = None;
         self.retired_sessions.insert(row.session_id.clone());
         self.last_ended_session = Some(row.session_id.clone());
@@ -264,50 +307,39 @@ impl TranscriptProjectionReader {
             row.can_format
         };
 
-        Some(match last {
-            Some(last) => TranscriptProjection {
-                schema: PROJECTION_SCHEMA,
-                kind: TranscriptProjectionKind::TerminalSeal,
-                session_id: row.session_id,
-                sequence: row.sequence,
-                reducer_revision: last.reducer_revision,
-                reducer_action: "session_ended".to_string(),
-                occurrence_session_id: last.occurrence_session_id,
-                capture_epoch: last.capture_epoch,
-                sample_start: last.sample_start,
-                sample_end: last.sample_end,
-                document_index: last.document_index,
-                rendered_text: last.rendered_text,
-                phase,
-                can_paste: row.can_paste,
-                can_insert: row.can_insert,
-                can_copy,
-                can_retranscribe: row.can_retranscribe,
-                can_format,
-                terminal: true,
-            },
-            None => TranscriptProjection {
-                schema: PROJECTION_SCHEMA,
-                kind: TranscriptProjectionKind::TerminalSeal,
-                session_id: row.session_id,
-                sequence: row.sequence,
-                reducer_revision: 0,
-                reducer_action: "session_ended".to_string(),
-                occurrence_session_id: String::new(),
-                capture_epoch: 0,
-                sample_start: 0,
-                sample_end: 0,
-                document_index: 0,
-                rendered_text: String::new(),
-                phase,
-                can_paste: row.can_paste,
-                can_insert: row.can_insert,
-                can_copy,
-                can_retranscribe: row.can_retranscribe,
-                can_format,
-                terminal: true,
-            },
-        })
+        let mut projection = last.unwrap_or_else(|| TranscriptProjection {
+            schema: PROJECTION_SCHEMA,
+            source: row.source,
+            kind: TranscriptProjectionKind::TerminalSeal,
+            session_id: row.session_id,
+            sequence: row.sequence,
+            reducer_revision: 0,
+            reducer_action: String::new(),
+            occurrence_session_id: String::new(),
+            capture_epoch: 0,
+            sample_start: 0,
+            sample_end: 0,
+            document_index: 0,
+            rendered_text: String::new(),
+            phase,
+            can_paste: false,
+            can_insert: false,
+            can_copy: false,
+            can_retranscribe: false,
+            can_format: false,
+            terminal: true,
+        });
+        projection.kind = TranscriptProjectionKind::TerminalSeal;
+        projection.sequence = row.sequence;
+        projection.reducer_action = "session_ended".to_string();
+        projection.phase = phase;
+        projection.can_paste = row.can_paste;
+        projection.can_insert = row.can_insert;
+        projection.can_copy = can_copy;
+        projection.can_retranscribe = row.can_retranscribe;
+        projection.can_format = can_format;
+        projection.terminal = true;
+        Some(projection)
     }
 
     fn project_evidence(&mut self, row: EvidenceRow) -> Option<TranscriptProjection> {
@@ -335,9 +367,9 @@ impl TranscriptProjectionReader {
                     revision.max(row.reducer_revision)
                 }),
         );
-        state.last_evidence = Some(row.clone());
-        Some(TranscriptProjection {
+        let projection = TranscriptProjection {
             schema: PROJECTION_SCHEMA,
+            source: None,
             kind: TranscriptProjectionKind::LiveRevision,
             session_id: row.session_id,
             sequence: row.sequence,
@@ -356,7 +388,9 @@ impl TranscriptProjectionReader {
             can_retranscribe: row.can_retranscribe,
             can_format: row.can_format,
             terminal: row.terminal,
-        })
+        };
+        state.last_projection = Some(projection.clone());
+        Some(projection)
     }
 
     fn select_session(&mut self, session_id: &str) -> bool {
@@ -606,6 +640,36 @@ mod tests {
                     .expect("serializable projection")
             })
             .collect()
+    }
+
+    #[test]
+    fn legacy_cli_seal_survives_empty_end_without_admitting_raw_app_text() {
+        for source in ["cli_file_verdict", "raw_engine"] {
+            let input = ["session_started", "transcript_sealed", "session_ended"]
+                .iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    serde_json::json!({
+                        "schema": LIFECYCLE_SCHEMA, "session_id": "legacy", "sequence": index + 1,
+                        "source": source, "status": status,
+                        "text": if index == 1 { "  pełny pełny\ntranskrypt  " } else { "" }
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let output = replay(&input);
+            let last: serde_json::Value = serde_json::from_str(output.last().unwrap()).unwrap();
+            assert_eq!(
+                last["rendered_text"],
+                if source == "cli_file_verdict" {
+                    "  pełny pełny\ntranskrypt  "
+                } else {
+                    ""
+                }
+            );
+        }
     }
 
     #[test]

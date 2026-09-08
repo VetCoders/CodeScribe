@@ -22,58 +22,6 @@ import SwiftUI
 
 // MARK: - Engine seam (orchestrator injects the real adapter in App.swift)
 
-/// Read-only evidence copied from the bridge projection. Overlay code must not
-/// reinterpret it as admission or finality authority.
-private struct OverlayProjectedAcousticReceipt: Equatable {
-  let acousticSerialVersion: UInt16
-  let acousticSerial: String
-  let sessionId: String
-  let captureEpoch: UInt64
-  let sampleStart: UInt64
-  let sampleEnd: UInt64
-  let durationMs: UInt64
-  let energyIntegral: Double
-  let meanRmsDbfs: Float
-  let peakDbfs: Float
-  let vadOpenSample: UInt64
-  let vadCloseSample: UInt64
-  let evidenceCalibrationVersion: String
-  let wordEvidenceReceipts: [String]
-  let layerDecisionReceipts: [String]
-  let sealReceipt: String?
-  let manualEditReceipt: String?
-}
-
-/// One immutable reducer projection for display. It is an event value, not a
-/// Swift-owned committed document, and has no admit/reconcile/seal operation.
-///
-/// Input: `CsTranscriptProjectionEvent`. Output: visible overlay text and
-/// evidence affordances.
-private struct OverlayTranscriptProjection: Equatable {
-  let schema: String
-  let sequence: UInt64
-  let emittedAt: String
-  let sessionId: String
-  let mode: String
-  let phase: OverlayMode
-  let reducerRevision: UInt64
-  let reducerAction: String
-  let occurrenceSessionId: String
-  let captureEpoch: UInt64
-  let sampleStart: UInt64
-  let sampleEnd: UInt64
-  let documentIndex: UInt64
-  let label: String
-  let renderedText: String
-  let canPaste: Bool
-  let canInsert: Bool
-  let canCopy: Bool
-  let canRetranscribe: Bool
-  let canFormat: Bool
-  let terminal: Bool
-  let acousticReceipts: [OverlayProjectedAcousticReceipt]
-}
-
 /// Minimal slice of the controller-backed dictation surface the overlay needs.
 /// Kept as a protocol so the view-model + preview compile without a live Rust core.
 @MainActor
@@ -81,9 +29,6 @@ protocol DictationEngine: AnyObject {
   func setListener(_ listener: CsTranscriptionListener)
   func startRecording(language: CsLanguage?) async throws
   func stopRecording() async throws -> String
-  func commitUserRevision(
-    sessionId: String, sourceRevision: UInt64, renderedText: String
-  ) async throws -> CsUserRevisionResult
   func commitFormatterRevision(
     sessionId: String, sourceRevision: UInt64
   ) async throws -> CsUserRevisionResult
@@ -141,8 +86,6 @@ enum OverlayMode: String, Equatable {
 /// carrying a second copy of reducer or delivery policy.
 enum OverlayIntent: String, Equatable, Hashable {
   case finish
-  case commitRevision = "commit-revision"
-  case discardRevision = "discard-revision"
   case copy
   case insertPaste = "insert-paste"
   case retranscribe
@@ -223,14 +166,10 @@ final class OverlayState {
   // MARK: Published state
   private(set) var transcriptMode = "dictation"
   private(set) var mode: OverlayMode = .listening
-  private(set) var formattedText = ""
-  /// View-local editor payload. It is never delivery or transcript truth; only
-  /// `formattedText`, repainted from Rust projection, feeds downstream actions.
-  var revisionDraft = ""
+  var formattedText: String { latestTranscriptProjection?.renderedText ?? "" }
   private(set) var revision: UInt64 = 0
-  private(set) var revisionCommitPending = false
   private(set) var formatterCommitPending = false
-  private(set) var revisionCommitError: String?
+  private(set) var formatterError: String?
   private(set) var userRevisionProvenance: String?
   private(set) var canPaste = false
   private(set) var canInsert = false
@@ -362,13 +301,12 @@ final class OverlayState {
   private var qualityCapturedProvenance: String?
   private var pendingRevisionSessionId: String?
   private var pendingRevisionSource: UInt64?
-  private var revisionFocusCommitTask: Task<Void, Never>?
   /// Last reducer-owned projection painted by Swift. The reducer owns ordering
   /// and finality; the overlay does not second-guess an event that reached it.
   private var finalized = false
   /// Latest immutable projection event only; Rust `TranscriptRevision` remains
   /// the document owner and Rust `AcousticSerial` remains evidence authority.
-  private var latestTranscriptProjection: OverlayTranscriptProjection?
+  private(set) var latestTranscriptProjection: CsTranscriptProjectionEvent?
   private var agentSessionArmed = false
   private var agentFinalTranscriptAppeared = false
   private var agentAutoSendCancelled = false
@@ -483,45 +421,17 @@ final class OverlayState {
     return engine
   }
 
-  /// Rust-rendered transcript bytes from the latest admitted projection.
-  private var rawLiveText: String {
-    formattedText
-  }
-
-  var liveText: String {
-    rawLiveText
-  }
-
-  /// Text shown in the listening/finalizing body.
-  ///
-  /// CAPTURED WORDS ALWAYS WIN OVER PHASE. The previous shape let the
-  /// transcribing phase replace the live canvas with "transcribing…", so
-  /// stopping a recording made the user's own words vanish behind a spinner
-  /// until the final text swapped in — the Founder dictated the bug report
-  /// into the very canvas that then ate it (2026-08-09 20:13): "wyłączenie
-  /// nagrywania zastępuje tekst … i podmienia dopiero ostateczny tekst a tego
-  /// ma nie być". The overlay doctrine forbids exactly this class: never drop
-  /// visible transcript. Phase placeholders render only on an EMPTY canvas;
-  /// the header pill carries the phase otherwise.
-  var listeningDisplay: String {
-    if !liveText.isEmpty { return liveText }
-    return mode == .finalizing ? "finalizing…" : "listening…"
-  }
-
   /// Timer is mandatory for any session that has started, including the
   /// frozen value after stop.
   var showsSessionTimer: Bool {
     captureStartedAtUptime != nil
   }
 
-  /// Exact rendered bytes for non-canvas consumers such as copy/delivery.
+  /// Exact engine text shared by the canvas, sizing, copy, and delivery.
   var activeText: String {
     formattedText
   }
 
-  var isRevisionDraftDirty: Bool {
-    mode == .formatted && terminal && revisionDraft != formattedText
-  }
 
   /// Post-take review owns the floating panel. The formatted / no-speech
   /// surface must not yield to an Assistive tray tick — that path calls
@@ -657,8 +567,7 @@ final class OverlayState {
     freezeCaptureClock()
     levelMeter.reset()
     do {
-      // The controller bridge returns "" here; the authoritative transcript
-      // is the id-ordered assembly of `UtteranceFinal` events (see liveText).
+      // Stop acknowledges lifecycle; transcript projections own the text.
       _ = try await engine.stopRecording()
       recording = false
       isFinalPass = false
@@ -679,10 +588,6 @@ final class OverlayState {
     switch intent {
     case .finish:
       stop()
-    case .commitRevision:
-      commitRevisionDraft()
-    case .discardRevision:
-      discardRevisionDraft()
     case .copy:
       relayCopyIntent()
     case .insertPaste:
@@ -839,7 +744,6 @@ final class OverlayState {
   }
 
   func close() {
-    discardRevisionDraft()
     // P0-D: capture user correction on FINAL for quality loop + lexicon learning.
     captureQualityIfEdited(action: "close")
     cancelWarmupWatchdog()
@@ -988,93 +892,6 @@ final class OverlayState {
         await MainActor.run {
           self?.showToast(acknowledgement)
         }
-      }
-    }
-  }
-
-  /// User typing is local draft activity: keep the review panel alive without
-  /// mutating projected text or any delivery source.
-  func noteRevisionDraftActivity() {
-    revisionCommitError = nil
-    if isRevisionDraftDirty {
-      cancelAutoHide()
-    } else if terminal {
-      restartAutoHideCountdown()
-    }
-  }
-
-  /// Commit on a genuine focus exit, but yield once so an explicit Discard or
-  /// Close click can cancel the scheduled commit before it crosses FFI.
-  func scheduleRevisionCommitAfterFocusExit() {
-    revisionFocusCommitTask?.cancel()
-    revisionFocusCommitTask = Task { @MainActor [weak self] in
-      await Task.yield()
-      guard !Task.isCancelled else { return }
-      self?.commitRevisionDraft()
-    }
-  }
-
-  func discardRevisionDraft() {
-    revisionFocusCommitTask?.cancel()
-    revisionFocusCommitTask = nil
-    guard !revisionCommitPending, !formatterCommitPending else { return }
-    revisionDraft = formattedText
-    revisionCommitError = nil
-    if terminal { restartAutoHideCountdown() }
-  }
-
-  /// Send an immutable compare-and-swap request to Rust. This method never
-  /// changes `formattedText`; the draft remains pending until the matching
-  /// reducer projection returns through `applyTranscriptProjection`.
-  func commitRevisionDraft() {
-    revisionFocusCommitTask?.cancel()
-    revisionFocusCommitTask = nil
-    guard mode == .formatted, terminal, isRevisionDraftDirty, !revisionCommitPending,
-      !formatterCommitPending
-    else {
-      return
-    }
-    let proposed = revisionDraft
-    guard !proposed.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-      revisionCommitError = "A transcript revision cannot be empty"
-      return
-    }
-    guard let projection = latestTranscriptProjection, let engine else {
-      revisionCommitError = "Transcript revision authority is unavailable"
-      return
-    }
-    revisionCommitPending = true
-    revisionCommitError = nil
-    pendingRevisionSessionId = projection.sessionId
-    pendingRevisionSource = projection.reducerRevision
-    cancelAutoHide()
-    Task { @MainActor [weak self] in
-      guard let self else { return }
-      do {
-        let receipt = try await engine.commitUserRevision(
-          sessionId: projection.sessionId,
-          sourceRevision: projection.reducerRevision,
-          renderedText: proposed
-        )
-        guard receipt.sessionId == projection.sessionId,
-          receipt.sourceRevision == projection.reducerRevision,
-          receipt.revision > receipt.sourceRevision,
-          receipt.renderedText == proposed,
-          receipt.provenanceReceipt.hasPrefix("user-edit-")
-        else {
-          revisionCommitPending = false
-          pendingRevisionSessionId = nil
-          pendingRevisionSource = nil
-          revisionCommitError = "Transcript revision receipt was inconsistent"
-          return
-        }
-        // The callback can arrive before this acknowledgement. Either way,
-        // projection — never this receipt — owns the visible state transition.
-      } catch {
-        revisionCommitPending = false
-        pendingRevisionSessionId = nil
-        pendingRevisionSource = nil
-        revisionCommitError = "Couldn't commit transcript revision: \(error)"
       }
     }
   }
@@ -1386,10 +1203,8 @@ final class OverlayState {
       calibrationVersion: event.calibrationVersion
     )
     presentationStatus = status
-    latestTranscriptProjection = nil
-    deliveredText = ""
-    formattedText = ""
-    revision = 0
+    // Status is a sibling message, not a replacement transcript document.
+    // Only a subsequent transcript projection may change the displayed bytes.
     canPaste = false
     canInsert = false
     canCopy = false
@@ -1404,81 +1219,18 @@ final class OverlayState {
     if event.terminal { restartAutoHideCountdown() }
   }
 
-  /// Parse one reducer-owned projection, then paint every contract field 1:1.
-  /// Ordering, admission, availability and terminal decisions have already
-  /// happened in Rust; this method never reconstructs them from text or receipts.
-  func applyTranscriptProjection(_ event: CsTranscriptProjectionEvent) {
-    guard let phase = OverlayMode(rawValue: event.phase) else {
-      assertionFailure("Unknown transcript projection phase: \(event.phase)")
-      return
-    }
-    let acousticReceipts = event.acousticReceipts.map { receipt in
-      OverlayProjectedAcousticReceipt(
-        acousticSerialVersion: receipt.acousticSerialVersion,
-        acousticSerial: receipt.acousticSerial,
-        sessionId: receipt.sessionId,
-        captureEpoch: receipt.captureEpoch,
-        sampleStart: receipt.sampleStart,
-        sampleEnd: receipt.sampleEnd,
-        durationMs: receipt.durationMs,
-        energyIntegral: receipt.energyIntegral,
-        meanRmsDbfs: receipt.meanRmsDbfs,
-        peakDbfs: receipt.peakDbfs,
-        vadOpenSample: receipt.vadOpenSample,
-        vadCloseSample: receipt.vadCloseSample,
-        evidenceCalibrationVersion: receipt.evidenceCalibrationVersion,
-        wordEvidenceReceipts: receipt.wordEvidenceReceipts,
-        layerDecisionReceipts: receipt.layerDecisionReceipts,
-        sealReceipt: receipt.sealReceipt,
-        manualEditReceipt: receipt.manualEditReceipt
-      )
-    }
-    let projection = OverlayTranscriptProjection(
-      schema: event.schema,
-      sequence: event.sequence,
-      emittedAt: event.emittedAt,
-      sessionId: event.sessionId,
-      mode: event.mode,
-      phase: phase,
-      reducerRevision: event.reducerRevision,
-      reducerAction: event.reducerAction,
-      occurrenceSessionId: event.occurrenceSessionId,
-      captureEpoch: event.captureEpoch,
-      sampleStart: event.sampleStart,
-      sampleEnd: event.sampleEnd,
-      documentIndex: event.documentIndex,
-      label: event.label,
-      renderedText: event.renderedText,
-      canPaste: event.canPaste,
-      canInsert: event.canInsert,
-      canCopy: event.canCopy,
-      canRetranscribe: event.canRetranscribe,
-      canFormat: event.canFormat,
-      terminal: event.terminal,
-      acousticReceipts: acousticReceipts
-    )
-    applyProjection(projection)
-    onTranscriptPresentationChanged?()
-  }
-
-  private func applyProjection(_ projection: OverlayTranscriptProjection) {
+  /// Paint the engine document directly. An unfamiliar chrome phase must not
+  /// prevent text delivery; retain the current chrome until a known phase arrives.
+  func applyTranscriptProjection(_ projection: CsTranscriptProjectionEvent) {
+    defer { onTranscriptPresentationChanged?() }
     let priorProjection = latestTranscriptProjection
     let isNewSession = priorProjection?.sessionId != projection.sessionId
-    let draftWasDirty =
-      mode == .formatted && terminal && revisionDraft != formattedText
     let revisionReceipt = projection.acousticReceipts
       .compactMap(\.manualEditReceipt)
       .first(where: { $0.hasPrefix("user-edit-") })
     let formatterReceipt = projection.acousticReceipts
       .compactMap(\.manualEditReceipt)
       .first(where: { $0.hasPrefix("formatter-") })
-    let completesPendingRevision =
-      revisionCommitPending
-      && projection.reducerAction == "apply_manual_edit"
-      && projection.terminal
-      && projection.sessionId == pendingRevisionSessionId
-      && projection.reducerRevision > (pendingRevisionSource ?? UInt64.max)
-      && revisionReceipt != nil
     let completesPendingFormatter =
       formatterCommitPending
       && projection.reducerAction == "apply_manual_edit"
@@ -1487,7 +1239,7 @@ final class OverlayState {
       && projection.reducerRevision > (pendingRevisionSource ?? UInt64.max)
       && formatterReceipt != nil
     let signalsFirstSuccessfulTerminal =
-      !terminal && projection.terminal && projection.phase == .formatted
+      !terminal && projection.terminal && projection.phase == OverlayMode.formatted.rawValue
     if projection.terminal {
       // Release capture before flipping `finalized`; abort uses the previous
       // value to decide whether the app-level stopped callback is still owed.
@@ -1498,9 +1250,8 @@ final class OverlayState {
       markTranscriptActivity()
     }
     transcriptMode = projection.mode
-    mode = projection.phase
+    mode = OverlayMode(rawValue: projection.phase) ?? mode
     revision = projection.reducerRevision
-    formattedText = projection.renderedText
     canPaste = projection.canPaste
     canInsert = projection.canInsert
     canCopy = projection.canCopy
@@ -1514,29 +1265,19 @@ final class OverlayState {
       deliveredTextSessionId = nil
       qualityCapturedProvenance = nil
       userRevisionProvenance = nil
-      revisionCommitPending = false
       formatterCommitPending = false
       pendingRevisionSessionId = nil
       pendingRevisionSource = nil
-      revisionCommitError = nil
+      formatterError = nil
     }
 
-    if completesPendingRevision {
-      revisionCommitPending = false
-      pendingRevisionSessionId = nil
-      pendingRevisionSource = nil
-      revisionCommitError = nil
-      userRevisionProvenance = revisionReceipt
-      revisionDraft = projection.renderedText
-    } else if completesPendingFormatter {
+    userRevisionProvenance = revisionReceipt
+    if completesPendingFormatter {
       formatterCommitPending = false
       pendingRevisionSessionId = nil
       pendingRevisionSource = nil
-      revisionCommitError = nil
-      revisionDraft = projection.renderedText
+      formatterError = nil
       showFooterNotice("formatted")
-    } else if !draftWasDirty || isNewSession {
-      revisionDraft = projection.renderedText
     }
 
     if projection.terminal {
@@ -1544,31 +1285,30 @@ final class OverlayState {
         deliveredText = projection.renderedText
         deliveredTextSessionId = projection.sessionId
       }
-      agentFinalTranscriptAppeared = projection.phase == .formatted
+      agentFinalTranscriptAppeared = projection.phase == OverlayMode.formatted.rawValue
       if signalsFirstSuccessfulTerminal {
         onSuccessfulDictation?()
       }
-      if projection.phase == .noSpeech {
+      if projection.phase == OverlayMode.noSpeech.rawValue {
         noSpeechNotice = pendingNoSpeechMessage ?? OverlayState.defaultNoSpeechNotice
       }
       restartAutoHideCountdown()
-      if completesPendingRevision {
+      if revisionReceipt != nil {
         captureQualityIfEdited(action: "revision")
       }
     }
   }
 
   private func relayFormatIntent() {
-    guard mode == .formatted, terminal, canFormat, !isRevisionDraftDirty,
-      !revisionCommitPending, !formatterCommitPending
+    guard mode == .formatted, terminal, canFormat, !formatterCommitPending
     else { return }
     guard let projection = latestTranscriptProjection, let engine else {
-      revisionCommitError = "Transcript formatter authority is unavailable"
+      formatterError = "Transcript formatter authority is unavailable"
       showFooterNotice("format unavailable")
       return
     }
     formatterCommitPending = true
-    revisionCommitError = nil
+    formatterError = nil
     pendingRevisionSessionId = projection.sessionId
     pendingRevisionSource = projection.reducerRevision
     cancelAutoHide()
@@ -1589,7 +1329,7 @@ final class OverlayState {
           formatterCommitPending = false
           pendingRevisionSessionId = nil
           pendingRevisionSource = nil
-          revisionCommitError = "Formatter revision receipt was inconsistent"
+          formatterError = "Formatter revision receipt was inconsistent"
           showFooterNotice("format failed")
           restartAutoHideCountdown()
           return
@@ -1600,7 +1340,7 @@ final class OverlayState {
         formatterCommitPending = false
         pendingRevisionSessionId = nil
         pendingRevisionSource = nil
-        revisionCommitError = "Couldn't format transcript: \(error)"
+        formatterError = "Couldn't format transcript: \(error)"
         showFooterNotice("format failed")
         restartAutoHideCountdown()
       }
@@ -1698,7 +1438,7 @@ final class OverlayState {
   /// Seeded view model for #Preview in the listening state.
   static func previewListening() -> OverlayState {
     let s = OverlayState()
-    s.applyProjection(
+    s.applyTranscriptProjection(
       previewProjection(
         "add a rate limiter to the login route and write a test for it",
         phase: .listening,
@@ -1712,7 +1452,7 @@ final class OverlayState {
   /// Seeded view model for #Preview in the post-capture transcribing phase.
   static func previewTranscribing() -> OverlayState {
     let s = OverlayState()
-    s.applyProjection(
+    s.applyTranscriptProjection(
       previewProjection(
         "add a rate limiter to the login route and write a test for it",
         phase: .finalizing,
@@ -1727,7 +1467,7 @@ final class OverlayState {
   /// without any usable text).
   static func previewNoSpeech() -> OverlayState {
     let s = OverlayState()
-    s.applyProjection(previewProjection("", phase: .noSpeech, terminal: true))
+    s.applyTranscriptProjection(previewProjection("", phase: .noSpeech, terminal: true))
     s.noSpeechNotice = OverlayState.defaultNoSpeechNotice
     return s
   }
@@ -1735,7 +1475,7 @@ final class OverlayState {
   /// Seeded view model for #Preview in the finalized state.
   static func previewFormatted() -> OverlayState {
     let s = OverlayState()
-    s.applyProjection(
+    s.applyTranscriptProjection(
       previewProjection(
         "Add a rate limiter to the login route and write a test that covers the throttle window. Keep the existing error shape.",
         phase: .formatted,
@@ -1748,7 +1488,7 @@ final class OverlayState {
   /// Seeded view model for the terminal error phase.
   static func previewError() -> OverlayState {
     let s = OverlayState()
-    s.applyProjection(
+    s.applyTranscriptProjection(
       previewProjection("", phase: .error, terminal: true)
     )
     s.errorMessage = "The transcription engine could not finish this take."
@@ -1759,14 +1499,14 @@ final class OverlayState {
     _ renderedText: String,
     phase: OverlayMode,
     terminal: Bool
-  ) -> OverlayTranscriptProjection {
+  ) -> CsTranscriptProjectionEvent {
     let isFormatted = phase == .formatted
-    return OverlayTranscriptProjection(
+    return CsTranscriptProjectionEvent(
       schema: "preview", sequence: 1, emittedAt: "preview", sessionId: "preview", mode: "dictation",
-      phase: phase, reducerRevision: 1, reducerAction: "preview_fixture",
+      reducerRevision: 1, reducerAction: "preview_fixture",
       occurrenceSessionId: "preview",
       captureEpoch: 0, sampleStart: 0, sampleEnd: 0, documentIndex: 0, label: renderedText,
-      renderedText: renderedText, canPaste: isFormatted, canInsert: isFormatted,
+      renderedText: renderedText, phase: phase.rawValue, canPaste: isFormatted, canInsert: isFormatted,
       canCopy: !renderedText.isEmpty, canRetranscribe: phase == .noSpeech || isFormatted,
       canFormat: isFormatted,
       terminal: terminal, acousticReceipts: [])
@@ -1789,15 +1529,6 @@ final class ControllerDictationEngine: DictationEngine {
   func stopRecording() async throws -> String {
     try await hotkeys.stopRecording()
     return ""
-  }
-  func commitUserRevision(
-    sessionId: String, sourceRevision: UInt64, renderedText: String
-  ) async throws -> CsUserRevisionResult {
-    try await hotkeys.commitUserRevision(
-      sessionId: sessionId,
-      sourceRevision: sourceRevision,
-      renderedText: renderedText
-    )
   }
   func commitFormatterRevision(
     sessionId: String, sourceRevision: UInt64
@@ -1856,17 +1587,6 @@ final class ControllerDictationEngine: DictationEngine {
     func setListener(_ listener: CsTranscriptionListener) {}
     func startRecording(language: CsLanguage?) async throws {}
     func stopRecording() async throws -> String { "" }
-    func commitUserRevision(
-      sessionId: String, sourceRevision: UInt64, renderedText: String
-    ) async throws -> CsUserRevisionResult {
-      CsUserRevisionResult(
-        sessionId: sessionId,
-        sourceRevision: sourceRevision,
-        revision: sourceRevision + 1,
-        renderedText: renderedText,
-        provenanceReceipt: "user-edit-preview"
-      )
-    }
     func commitFormatterRevision(
       sessionId: String, sourceRevision: UInt64
     ) async throws -> CsUserRevisionResult {

@@ -26,7 +26,7 @@ host, date, room, or control-plane path is embedded in Codescribe.
 
 ## Event families
 
-`codescribe.transcript.v1` now carries lifecycle only. `publish_started` emits
+App `codescribe.transcript.v1` rows carry lifecycle only. `publish_started` emits
 one empty `session_started` event for the controller-owned session, and
 `publish_ended` emits one empty `session_ended` event when the controller
 leaves that session (every path back to Idle, including zero-seal takes and
@@ -34,6 +34,13 @@ stop-timeout recovery). Neither can publish document text. The terminal row
 does carry the already-resolved projection phase and action availability so a
 file tailer can combine it with the last authenticated render without inventing
 UI policy.
+
+CLI file rows use the same schema with `source=cli_file_verdict`. Draft rows
+retain per-segment `text` and supply an engine-assembled `rendered_text` snapshot;
+seals supply the exact final document. Readers copy snapshots without joining
+segments. Legacy CLI seals already carry the full document in `text`.
+`session_ended` preserves the preceding document. CLI projections retain their
+source and never claim occurrence or acoustic ledger receipts.
 
 One microphone: the live app take is the most recently started app session
 that has no later `session_ended` (or legacy `transcript_sealed`) for that
@@ -46,11 +53,13 @@ and the process-lifetime runtime lock. Never tear down the app mid-take;
 never refuse install forever because an old session lacked an end line.
 
 `session_ended` carries one typed `end_reason` (`TranscriptSessionEndReason`):
-`completed` for a take that reached the serialized stop path,
+`completed` for a take whose serialized stop and transcript processing succeeded,
 `start_superseded` when a key-up or reschedule invalidated a hold start after
 `session_started` and before the take became an active recording, and
 `start_failed` when the recorder could not be started after the session was
-announced. CLI file sessions use `transcription_failed` when decoding or
+announced. App refusal, stop timeout, and forced recovery use
+`transcription_failed`; returning the recorder to Idle does not imply transcript
+success. CLI file sessions use `transcription_failed` when decoding or
 stream output fails after publishing a draft; the partial text is never sealed
 as a completed document. The controller has exactly one terminal publisher
 (`end_transcript_bus`); the delayed hold start unwinds every pre-active exit
@@ -120,9 +129,11 @@ coverage is not incomplete. No arbitrary string can close committed Bus truth.
 
 ### Terminal document revisions
 
-The formatted canvas may hold a local, visibly uncommitted edit draft. Commit
-sends `session_id + source_revision + rendered_text` across FFI; it does not
-paint Swift state. `TranscriptReducer::apply_user_revision` accepts only the
+The overlay canvas is read-only in every phase and displays the exact engine
+projection, including empty text. Status messages and unfamiliar chrome phases
+never replace or reject its document. A user-revision request sends
+`session_id + source_revision + rendered_text` across FFI; it does not paint
+Swift state. `TranscriptReducer::apply_user_revision` accepts only the
 exact current terminal revision, and `AcousticLedger` appends a
 `ManualDocumentRevisionReceipt` with `provenance=user-edit`, the source
 occurrence/seal set, and the replacement bytes. A whole-document edit does not
@@ -133,8 +144,7 @@ projection carries the ledger's `user-edit-*` receipt in each source occurrence
 row and is the only event that replaces the formatted canvas and delivery
 buffer. It may follow `session_ended` because microphone lifecycle is already
 closed. Replay accepts that terminal revision only for the just-ended session;
-once a newer session is active, an older edit cannot displace it. Esc, Discard,
-and Close delete only the local draft and write no ledger or Bus revision.
+once a newer session is active, an older edit cannot displace it.
 
 The Format dock command is the sibling route, not a second reducer. Rust reads
 the exact current terminal document under the same `session_id + source_revision` CAS, runs `format_text_with_status_for_policy`, and admits only

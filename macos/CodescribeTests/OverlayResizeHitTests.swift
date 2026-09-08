@@ -301,6 +301,25 @@ final class OverlayResizeHitTests: XCTestCase {
     XCTAssertEqual(panel.frame.height, manualHeight, accuracy: 0.5)
   }
 
+  @MainActor
+  func testNativeCanvasPreservesEveryEngineByteAcrossUnicodeEquivalentUpdates() throws {
+    let state = OverlayState()
+    let panel = try XCTUnwrap(DictationOverlayWindow.make(
+      state: state, textScale: TextScaleController(key: "OverlayResizeHitTests.byteExact"))
+      as? FloatingOverlayPanel)
+    defer { panel.orderOut(nil); panel.invalidatePresence() }
+    panel.orderFrontRegardless()
+    let root = try XCTUnwrap(panel.contentView)
+    for (index, text) in ["  raz raz\né 👩‍💻  ", "  raz raz\ne\u{301} 👩‍💻  ", "", "raz raz"].enumerated() {
+      project(text, sequence: UInt64(index + 1), to: state)
+      RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+      root.layoutSubtreeIfNeeded()
+      let canvas = try XCTUnwrap(descendant(of: LiveTranscriptNativeTextView.self, in: root))
+      XCTAssertEqual(Array(canvas.string.utf8), Array(text.utf8), "projection \(index + 1)")
+      XCTAssertFalse(canvas.isEditable)
+    }
+  }
+
   func testPersistedContentSizeRoundTripsThroughDefaults() throws {
     let suiteName = "OverlayResizeHitTests.\(UUID().uuidString)"
     let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

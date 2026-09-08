@@ -27,7 +27,7 @@ enum LiveTranscriptSelectionPolicy {
 /// chain instead: drag selection, Cmd-C, Select All and the standard context
 /// menu keep working while the recording and transcript updates continue.
 struct LiveTranscriptTextView: NSViewRepresentable {
-  let text: String
+  let projection: CsTranscriptProjectionEvent?
   let appearance: OverlayAppearance
   @Environment(\.csTextScale) private var textScale
 
@@ -83,7 +83,8 @@ struct LiveTranscriptTextView: NSViewRepresentable {
     coordinator: Coordinator
   ) {
     let rendered = attributedTranscript()
-    guard textView.attributedString() != rendered else { return }
+    guard !textView.string.utf8.elementsEqual(rendered.string.utf8)
+      || textView.attributedString() != rendered else { return }
 
     let previousSelection = textView.selectedRange()
     let wasFollowingTail = coordinator.followsTail
@@ -127,7 +128,7 @@ struct LiveTranscriptTextView: NSViewRepresentable {
       .foregroundColor: OverlayAppearancePalette.resolve(appearance).bodyText.nsColor,
       .paragraphStyle: paragraph,
     ]
-    result.append(NSAttributedString(string: text, attributes: attributes))
+    result.append(NSAttributedString(string: projection?.renderedText ?? "", attributes: attributes))
     return result
   }
 

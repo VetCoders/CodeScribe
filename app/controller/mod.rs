@@ -1514,7 +1514,7 @@ impl RecordingController {
     /// Ordering note (P2.2): every satellite flag is cleared before
     /// `set_state(State::Idle)` so cross-thread readers (e.g. the VAD monitor
     /// polling `current_state`) never observe Idle alongside stale flags.
-    async fn reset_session_fields(&self) {
+    async fn reset_session_fields(&self, reason: TranscriptSessionEndReason) {
         *self.assistive_mode.write().await = false;
         *self.hold_mode.write().await = HoldMode::Raw;
         *self.force_raw_mode.write().await = false;
@@ -1528,7 +1528,7 @@ impl RecordingController {
         // from "the take is live" even when zero occurrences sealed.
         Self::end_transcript_bus(
             &self.active_transcript_bus,
-            TranscriptSessionEndReason::Completed,
+            reason,
             session_wav_exists,
             &self.event_broadcast,
         )
@@ -1604,15 +1604,20 @@ impl RecordingController {
         warn!("{context}: resetting controller flags after failed start");
         *self.active_presentation.write().await = None;
         *self.pre_overlay_frontmost_app.write().await = None;
-        self.reset_session_fields().await;
+        self.reset_session_fields(TranscriptSessionEndReason::StartFailed)
+            .await;
         set_assistive_session(false);
     }
 
     /// Unwind session state after a recording that completed. Telemetry is kept
     /// (unlike the start-failure path) — the finished session's stats are still
     /// being read by the result handler.
-    async fn reset_finished_recording_state(&self) {
-        self.reset_session_fields().await;
+    async fn reset_finished_recording_state(&self, result: &Result<ProcessRecordingOutcome>) {
+        let reason = match result {
+            Ok(_) => TranscriptSessionEndReason::Completed,
+            Err(_) => TranscriptSessionEndReason::TranscriptionFailed,
+        };
+        self.reset_session_fields(reason).await;
         set_assistive_session(false);
     }
 
@@ -3289,7 +3294,7 @@ impl RecordingController {
         self.toggle_user_has_text.store(false, Ordering::SeqCst);
         self.toggle_assistant_has_text
             .store(false, Ordering::SeqCst);
-        self.reset_finished_recording_state().await;
+        self.reset_finished_recording_state(&result).await;
         self.handle_processed_recording_result(assistive, &result)
             .await;
         let cleanup_secs = phase4.elapsed().as_secs_f64();
@@ -3317,7 +3322,9 @@ impl RecordingController {
     /// is no longer alive.
     async fn recover_from_stuck_stop(&self) {
         warn!("Recovery: forcing controller to Idle after stuck stop");
-        self.reset_finished_recording_state().await;
+        self.reset_session_fields(TranscriptSessionEndReason::TranscriptionFailed)
+            .await;
+        set_assistive_session(false);
     }
 
     /// Stop the current recording on behalf of a non-hotkey surface (tray, the
@@ -3399,7 +3406,7 @@ impl RecordingController {
             }
         };
 
-        self.reset_finished_recording_state().await;
+        self.reset_finished_recording_state(&result).await;
         self.handle_processed_recording_result(assistive, &result)
             .await;
 
@@ -3470,7 +3477,8 @@ impl RecordingController {
     async fn reset_state(&self) {
         *self.active_presentation.write().await = None;
         *self.pre_overlay_frontmost_app.write().await = None;
-        self.reset_session_fields().await;
+        self.reset_session_fields(TranscriptSessionEndReason::TranscriptionFailed)
+            .await;
 
         info!("State reset to IDLE complete");
     }
@@ -3500,6 +3508,52 @@ impl Default for RecordingController {
 mod terminal_delivery_target_falsifiers {
     use super::*;
 
+    #[tokio::test]
+    async fn failed_stop_publishes_failure_instead_of_completed() {
+        use crate::presentation::transcript_bus::{
+            CleanTranscriptEvent, TranscriptMode, TranscriptProjectionPhase, TranscriptSession,
+        };
+        for timeout in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("events.jsonl");
+            let controller = RecordingController::new_without_keychain();
+            let bus = TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: "failed-stop".to_string(),
+                    mode: TranscriptMode::Dictation,
+                    has_latched_target: false,
+                    latched_target_is_self: false,
+                },
+                path.clone(),
+                None,
+            )
+            .unwrap();
+            bus.publish_started();
+            *controller.active_transcript_bus.write().await = Some(Arc::new(bus));
+
+            if timeout {
+                controller.recover_from_stuck_stop().await;
+            } else {
+                controller
+                    .reset_finished_recording_state(&Err(anyhow::anyhow!("terminal seal refused")))
+                    .await;
+            }
+
+            let rows: Vec<CleanTranscriptEvent> = std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[1].end_reason,
+                Some(TranscriptSessionEndReason::TranscriptionFailed)
+            );
+            assert_eq!(rows[1].phase, TranscriptProjectionPhase::Error);
+            assert_eq!(controller.current_state().await, State::Idle);
+        }
+    }
+
     /// A completed take returns the recorder to Idle before the overlay Insert
     /// click. Its foreign caret must survive that transition, while explicit
     /// recovery still clears the latch so a later take cannot inherit it.
@@ -3508,7 +3562,9 @@ mod terminal_delivery_target_falsifiers {
         let controller = RecordingController::new_without_keychain();
         *controller.pre_overlay_frontmost_app.write().await = Some("Ghostty".to_string());
 
-        controller.reset_finished_recording_state().await;
+        controller
+            .reset_finished_recording_state(&Ok(ProcessRecordingOutcome::default()))
+            .await;
 
         assert_eq!(controller.current_state().await, State::Idle);
         assert_eq!(

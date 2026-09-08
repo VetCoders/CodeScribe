@@ -329,6 +329,33 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertTrue(state.showsSessionTimer)
   }
 
+  func testCanvasPreservesEmptyAndExactEngineTextWithoutLifecyclePlaceholders() {
+    let state = OverlayState()
+    XCTAssertEqual(state.activeText, "")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertEqual(state.activeText, "")
+
+    let text = "  raz raz\nZażółć — e\u{301} 👩‍💻  "
+    projectText(text, to: state)
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    state.handleRecordingFinalising()
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+
+    projectText("", to: state)
+    XCTAssertEqual(state.activeText, "")
+  }
+
+  func testUnknownChromePhaseCannotRejectEngineText() {
+    let state = OverlayState()
+    let text = "  raz raz\nZażółć — e\u{301} 👩‍💻  "
+    projectText(text, to: state, phase: "future_engine_phase")
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    projectText("", to: state, phase: "future_engine_phase", terminal: true)
+    XCTAssertEqual(state.activeText, "")
+    XCTAssertTrue(state.terminal)
+  }
+
   func testCanonicalProjectionOwnsCanvasAndCopyFromFirstAdmittedRevision() {
     let state = OverlayState()
     XCTAssertFalse(state.canCopy)
@@ -341,12 +368,12 @@ final class OverlayStateTests: XCTestCase {
     projectText("analyze the repo", to: state)
     XCTAssertTrue(state.canCopy)
     XCTAssertEqual(state.activeText, "analyze the repo")
-    XCTAssertEqual(state.liveText, "analyze the repo")
+    XCTAssertEqual(state.activeText, "analyze the repo")
 
     projectText("analyze the repo for duplicate dispatch", to: state)
     XCTAssertTrue(state.canCopy)
     XCTAssertEqual(state.activeText, "analyze the repo for duplicate dispatch")
-    XCTAssertEqual(state.listeningDisplay, "analyze the repo for duplicate dispatch")
+    XCTAssertEqual(state.activeText, "analyze the repo for duplicate dispatch")
   }
 
   func testAdmittedProjectionPaintsWithoutSwiftRevalidatingReceipts() {
@@ -921,71 +948,16 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertNil(state.errorMessage)
   }
 
-  func testUserEditCommitsOnlyThroughReturnedRustProjection() async {
+  func testEngineRevisionReplacesTerminalDocumentWithoutALocalEdit() {
     let state = OverlayState()
-    let engine = OverlayStateTestEngine()
-    state.engine = engine
-    projectText(
-      "Tekst bazowy",
-      to: state,
-      canPaste: true,
-      canInsert: true,
-      canCopy: true,
-      terminal: true,
-      sessionId: "revision-session",
-      reducerRevision: 7
-    )
-    state.revisionDraft = "Tekst poprawiony"
-    let requested = expectation(description: "revision intent reached Rust bridge")
-    engine.onRevision = { requested.fulfill() }
-
-    state.relayIntent(.commitRevision)
-    await fulfillment(of: [requested], timeout: 1)
-
-    XCTAssertEqual(
-      engine.revisionRequests,
-      [
-        OverlayStateTestEngine.RevisionRequest(
-          sessionId: "revision-session",
-          sourceRevision: 7,
-          renderedText: "Tekst poprawiony"
-        )
-      ]
-    )
-    XCTAssertEqual(state.formattedText, "Tekst bazowy", "FFI acknowledgement is not projection")
-    XCTAssertEqual(state.revision, 7)
-    XCTAssertTrue(state.revisionCommitPending)
-
-    projectText(
-      "Tekst poprawiony",
-      to: state,
-      canPaste: true,
-      canInsert: true,
-      canCopy: true,
-      terminal: true,
-      sessionId: "revision-session",
-      reducerRevision: 8,
-      reducerAction: "apply_manual_edit",
-      manualEditReceipt: "user-edit-revision-session-7-8-1"
-    )
-
-    XCTAssertEqual(state.formattedText, "Tekst poprawiony")
-    XCTAssertEqual(state.revisionDraft, "Tekst poprawiony")
+    projectText("Tekst bazowy", to: state, terminal: true, reducerRevision: 7)
+    let text = "  Tekst poprawiony\nraz raz  "
+    projectText(text, to: state, canCopy: true, terminal: true, reducerRevision: 8,
+      reducerAction: "apply_manual_edit", manualEditReceipt: "user-edit-test-7-8")
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
     XCTAssertEqual(state.revision, 8)
-    XCTAssertFalse(state.revisionCommitPending)
-    XCTAssertEqual(state.userRevisionProvenance, "user-edit-revision-session-7-8-1")
-    XCTAssertEqual(
-      OverlayIntentRail.projectedIntents(for: state),
-      [.insertPaste, .copy, .close],
-      "delivery actions return only after the new ledger projection"
-    )
-
-    state.insertCaretInCodescribeProbe = { false }
-    let pasted = expectation(description: "new revision reached delivery")
-    engine.onPaste = { pasted.fulfill() }
-    state.relayIntent(.insertPaste)
-    await fulfillment(of: [pasted], timeout: 1)
-    XCTAssertEqual(engine.pastedText, "Tekst poprawiony")
+    XCTAssertEqual(state.userRevisionProvenance, "user-edit-test-7-8")
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [.copy, .close])
   }
 
   func testFormatCommitsOnlyThroughFormatterProjectionAndFailureStaysVisible() async {
@@ -1028,9 +1000,8 @@ final class OverlayStateTests: XCTestCase {
     )
 
     XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
-    XCTAssertEqual(state.revisionDraft, engine.formatterRenderedText)
     XCTAssertFalse(state.formatterCommitPending)
-    XCTAssertNil(state.revisionCommitError)
+    XCTAssertNil(state.formatterError)
     XCTAssertNil(state.userRevisionProvenance, "formatter is not a human correction")
 
     engine.formatterShouldFail = true
@@ -1042,28 +1013,7 @@ final class OverlayStateTests: XCTestCase {
 
     XCTAssertFalse(state.formatterCommitPending)
     XCTAssertEqual(state.formattedText, engine.formatterRenderedText)
-    XCTAssertTrue(state.revisionCommitError?.contains("gateway unavailable") == true)
-  }
-
-  func testDiscardAndCloseCancelDraftWithoutCreatingRevision() async {
-    let state = OverlayState()
-    let engine = OverlayStateTestEngine()
-    state.engine = engine
-    projectText("Ledger text", to: state, terminal: true, reducerRevision: 3)
-
-    state.revisionDraft = "Focus-exit draft"
-    state.scheduleRevisionCommitAfterFocusExit()
-    state.discardRevisionDraft()
-    await Task.yield()
-    XCTAssertEqual(state.revisionDraft, "Ledger text")
-    XCTAssertTrue(engine.revisionRequests.isEmpty, "discard must cancel deferred focus commit")
-
-    state.revisionDraft = "Close draft"
-    state.close()
-    await Task.yield()
-    XCTAssertEqual(state.formattedText, "Ledger text")
-    XCTAssertEqual(state.revisionDraft, "Ledger text")
-    XCTAssertTrue(engine.revisionRequests.isEmpty, "close must not create a document revision")
+    XCTAssertTrue(state.formatterError?.contains("gateway unavailable") == true)
   }
 
   func testCloseIsImmediateAndAgentButtonUsesControllerDelivery() async {
@@ -1118,7 +1068,7 @@ final class OverlayStateTests: XCTestCase {
     state.handleRecordingPreparing()
     state.handleRecordingStarted()
     projectText("alpha {selection_1} beta", to: state)
-    XCTAssertEqual(state.liveText, "alpha {selection_1} beta")
+    XCTAssertEqual(state.activeText, "alpha {selection_1} beta")
 
     projectText("alpha {selection_1} beta", to: state, terminal: true)
     state.finishControllerRecording()
@@ -1327,6 +1277,15 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertEqual(visibleCallbacks, 1)
   }
 
+  func testStatusCannotEraseTheEngineTranscript() {
+    let state = OverlayState()
+    let text = "  silnik\nraz raz 👩‍💻  "
+    projectText(text, to: state)
+    state.applyPresentationStatus(refusalStatus())
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+  }
+
   func testCalibrationSuccessProjectionCarriesNewProfileVersion() {
     let state = OverlayState()
     state.applyPresentationStatus(
@@ -1406,7 +1365,7 @@ final class OverlayStateTests: XCTestCase {
 
     XCTAssertNotEqual(state.mode, .error, "an error with a draft must not discard the take")
     XCTAssertEqual(state.activeText, "zdanie pierwsze zdanie drugie")
-    XCTAssertEqual(state.liveText, "zdanie pierwsze zdanie drugie")
+    XCTAssertEqual(state.activeText, "zdanie pierwsze zdanie drugie")
   }
 
   func testTerminalFailureSidebandEndsCaptureWithoutRewritingProjection() {
@@ -1743,12 +1702,12 @@ final class OverlayStateTests: XCTestCase {
       terminal: true
     )
     state.finishControllerRecording()
-    XCTAssertEqual(state.liveText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
 
     state.handleRecordingStarted()
 
     XCTAssertEqual(state.mode, .formatted)
-    XCTAssertEqual(state.liveText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
     XCTAssertEqual(state.formattedText, "tekst poprzedniego nagrania")
 
     projectSessionText(
