@@ -1,7 +1,7 @@
 import Foundation
 import SwiftUI
 
-// 34-bar listening waveform — Canvas + per-bar `eq` animation with staggered delays.
+// Width-adaptive listening waveform — Canvas + per-bar `eq` animation with staggered delays.
 //
 // AMPLITUDE-DRIVEN when the engine provides it: `on_audio_level` streams the
 // capture RMS per audio block into `AudioLevelMeter`, and the bars scale with the
@@ -45,6 +45,7 @@ final class AudioLevelMeter {
 
 struct WaveformView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+  /// Minimum bar count and source silhouette resolution.
   var barCount: Int = 34
   var active: Bool = true
   /// Post-capture "transcribing" phase. Overrides `active`: instead of the
@@ -72,34 +73,73 @@ struct WaveformView: View {
     CGFloat(barCount) * (barWidth + gap) - gap
   }
 
+  /// Fit fixed-width bars and gaps; an unspecified width keeps the caller's minimum.
+  static func effectiveBarCount(
+    width: CGFloat, barWidth: CGFloat, gap: CGFloat, minimum: Int
+  ) -> Int {
+    let minimum = max(0, minimum)
+    let step = barWidth + gap
+    guard width.isFinite, barWidth > 0, gap >= 0, step.isFinite else { return minimum }
+    let fitted = floor((width + gap) / step)
+    guard fitted.isFinite, fitted > CGFloat(minimum), fitted < CGFloat(Int.max) else {
+      return minimum
+    }
+    return Int(fitted)
+  }
+
+  /// Interpolate the existing silhouette, preserving both ends at any display density.
+  static func resampledLevels(_ samples: [CGFloat], count: Int) -> [CGFloat] {
+    guard count > 0 else { return [] }
+    guard let first = samples.first else { return Array(repeating: 0, count: count) }
+    guard samples.count > 1, count > 1 else { return Array(repeating: first, count: count) }
+    if samples.count == count { return samples }
+    return (0..<count).map { index in
+      let position = CGFloat(index) / CGFloat(count - 1) * CGFloat(samples.count - 1)
+      let lower = min(Int(position), samples.count - 1)
+      let upper = min(lower + 1, samples.count - 1)
+      return samples[lower] + (samples[upper] - samples[lower]) * (position - CGFloat(lower))
+    }
+  }
+
   var body: some View {
-    Group {
-      if reduceMotion, active, meter?.gain != nil {
-        // Essential data feedback still updates, but at a calm 5 Hz with no
-        // decorative phase sweep. Shape changes only with measured RMS.
-        TimelineView(.periodic(from: .now, by: 0.2)) { timeline in
-          waveform(at: timeline.date.timeIntervalSinceReferenceDate, reducedMotion: true)
-        }
-      } else if reduceMotion {
-        waveform(at: 0, reducedMotion: true)
-      } else {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !(active || transcribing))) {
-          timeline in
-          waveform(at: timeline.date.timeIntervalSinceReferenceDate, reducedMotion: false)
+    GeometryReader { geometry in
+      let count = Self.effectiveBarCount(
+        width: geometry.size.width, barWidth: barWidth, gap: gap, minimum: barCount)
+      Group {
+        if reduceMotion, active, meter?.gain != nil {
+          // Essential data feedback still updates, but at a calm 5 Hz with no
+          // decorative phase sweep. Shape changes only with measured RMS.
+          TimelineView(.periodic(from: .now, by: 0.2)) { timeline in
+            waveform(
+              at: timeline.date.timeIntervalSinceReferenceDate, reducedMotion: true, count: count)
+          }
+        } else if reduceMotion {
+          waveform(at: 0, reducedMotion: true, count: count)
+        } else {
+          TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !(active || transcribing))) {
+            timeline in
+            waveform(
+              at: timeline.date.timeIntervalSinceReferenceDate, reducedMotion: false, count: count)
+          }
         }
       }
     }
-    .frame(width: stretches ? nil : contentWidth, height: trackHeight, alignment: .center)
+    .frame(idealWidth: contentWidth, maxWidth: stretches ? .infinity : nil)
+    .frame(height: trackHeight)
+    .clipped()
   }
 
-  private func waveform(at now: TimeInterval, reducedMotion: Bool) -> some View {
+  private func waveform(at now: TimeInterval, reducedMotion: Bool, count: Int) -> some View {
     Canvas { ctx, size in
-      for i in 0..<barCount {
-        let scale = barScale(index: i, now: now, reducedMotion: reducedMotion)
+      // The meter supplies one gain, not a sample buffer. Resample the existing
+      // phase silhouette so resizing changes density without changing its motion.
+      let samples = (0..<max(1, barCount)).map {
+        barScale(index: $0, now: now, reducedMotion: reducedMotion)
+      }
+      let levels = Self.resampledLevels(samples, count: count)
+      for (i, scale) in levels.enumerated() {
         let height = maxBarHeight * scale
-        let step =
-          stretches ? max(0, size.width - barWidth) / CGFloat(max(1, barCount - 1)) : barWidth + gap
-        let x = CGFloat(i) * step
+        let x = CGFloat(i) * (barWidth + gap)
         let y = (size.height - height) / 2
         let rect = CGRect(x: x, y: y, width: barWidth, height: height)
         ctx.fill(
@@ -108,7 +148,7 @@ struct WaveformView: View {
         )
       }
     }
-    .frame(width: stretches ? nil : contentWidth, height: trackHeight)
+    .frame(height: trackHeight)
   }
 
   private func barScale(index i: Int, now: TimeInterval, reducedMotion: Bool) -> CGFloat {
