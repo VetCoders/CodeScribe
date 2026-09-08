@@ -118,12 +118,15 @@ pub fn migrate_legacy_stt_lanes_once(settings: &mut UserSettings) {
         .unwrap_or(serde_json::Value::Null);
     let legacy = SttV2Legacy::from_json(&raw);
     let (steps, targets) = migrate_legacy_stt_lanes(&legacy, settings);
-    // Retry key migration even after a previous settings save; the source account
-    // itself is the durable pending marker if Keychain was unavailable.
-    super::keychain::fan_out_key("STT_API_KEY", &targets);
     if !legacy.needs_migration() {
         return;
     }
+    // Copy the retired `STT_API_KEY` into both lanes at the migration moment
+    // only. A plain load must never open the Keychain by itself: an unsigned
+    // CLI binary blocks on the authorization dialog (bisect 2026-09-08). The
+    // retry after a Keychain outage lives in `keychain::populate_env_from_keychain`,
+    // where the bundle is already open.
+    super::keychain::fan_out_key("STT_API_KEY", &targets);
     match settings.save_unlocked() {
         Ok(()) => {
             *settings = UserSettings::from_v2(settings.to_v2());
@@ -230,5 +233,49 @@ mod tests {
                 !SttV2Legacy::from_json(&serde_json::from_slice(&bytes).unwrap()).needs_migration()
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn load_of_migrated_settings_never_opens_the_keychain() {
+        // Bisect 2026-09-08: an unsigned `target/debug/codescribe transcribe`
+        // hung in `SecItemCopyMatching` because every load retried the
+        // `STT_API_KEY` fan-out. A migrated file must load without touching
+        // the bundle; the retry belongs to the loader's Keychain step.
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("CODESCRIBE_DATA_DIR");
+        // SAFETY: serialized test; restore the isolated data root after the witness.
+        unsafe {
+            std::env::set_var("CODESCRIBE_DATA_DIR", dir.path());
+        }
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: same serialized environment scope.
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("CODESCRIBE_DATA_DIR", v),
+                        None => std::env::remove_var("CODESCRIBE_DATA_DIR"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(previous);
+        std::fs::create_dir_all(UserSettings::settings_dir()).unwrap();
+        let migrated = serde_json::json!({"schema_version":3,"speech":{"engine":{
+            "file_transcription_endpoint":"https://api.libraxis.cloud/v1/audio/transcriptions",
+            "live_transcription_endpoint":FOUNDER}}});
+        std::fs::write(UserSettings::settings_path(), migrated.to_string()).unwrap();
+        let _bundle =
+            super::super::keychain::test_support::install_bundle(&[("STT_API_KEY", "retired")]);
+        let loaded = UserSettings::load();
+        assert_eq!(loaded.stt_live_endpoint.as_deref(), Some(FOUNDER));
+        let bundle = super::super::keychain::test_support::snapshot_bundle().unwrap();
+        assert_eq!(
+            bundle.get("STT_API_KEY").map(String::as_str),
+            Some("retired")
+        );
+        assert!(!bundle.contains_key("STT_FILE_API_KEY"));
+        assert!(!bundle.contains_key("STT_LIVE_API_KEY"));
     }
 }

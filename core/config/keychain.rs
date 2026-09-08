@@ -492,6 +492,11 @@ pub(crate) mod test_support {
         BundleCacheGuard { previous }
     }
 
+    /// Current bundle cache as plain account → secret pairs.
+    pub(crate) fn snapshot_bundle() -> Option<std::collections::HashMap<String, String>> {
+        read_bundle_cache().map(|bundle| bundle.keys.into_iter().collect())
+    }
+
     impl Drop for BundleCacheGuard {
         fn drop(&mut self) {
             write_bundle_cache(self.previous.take());
@@ -591,6 +596,17 @@ pub fn delete_key(account: &str) -> Result<()> {
     }
 }
 
+/// A retired `STT_API_KEY` still in the bundle means the STT lane migration
+/// ran while the Keychain was unavailable. Finish the fan-out here, where the
+/// bundle is already open, so no settings load ever has to.
+pub(crate) fn retry_stt_key_fan_out() -> usize {
+    use crate::stt::SttLane;
+    fan_out_key(
+        "STT_API_KEY",
+        &[SttLane::File.key_account(), SttLane::Live.key_account()],
+    )
+}
+
 /// Populates environment variables from Keychain for any static account not
 /// already set. Custom-provider keys and OAuth records stay in the bundle.
 ///
@@ -606,7 +622,8 @@ pub fn populate_env_from_keychain() {
             debug!("Keychain bundle missing; skipping population");
             return;
         }
-        let bundle = bundle.unwrap();
+        retry_stt_key_fan_out();
+        let bundle = read_bundle_cache().unwrap_or_else(|| bundle.unwrap());
         for &account in KEYCHAIN_ACCOUNTS {
             if std::env::var(account).is_err()
                 && let Some(value) = bundle.keys.get(account)
@@ -781,6 +798,24 @@ mod tests {
 #[cfg(test)]
 mod stt_tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn retry_fan_out_finishes_a_migration_the_keychain_outage_left_behind() {
+        let _bundle = test_support::install_bundle(&[("STT_API_KEY", "retired")]);
+        assert_eq!(super::retry_stt_key_fan_out(), 3);
+        let bundle = read_bundle_cache().unwrap();
+        assert_eq!(
+            bundle.keys.get("STT_FILE_API_KEY").map(String::as_str),
+            Some("retired")
+        );
+        assert_eq!(
+            bundle.keys.get("STT_LIVE_API_KEY").map(String::as_str),
+            Some("retired")
+        );
+        assert!(!bundle.keys.contains_key("STT_API_KEY"));
+        assert_eq!(super::retry_stt_key_fan_out(), 0);
+    }
 
     #[test]
     #[serial_test::serial]
