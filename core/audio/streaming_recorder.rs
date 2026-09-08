@@ -12,9 +12,7 @@
 //! seconds) before releasing the sink. Dropping the sink early truncates the
 //! tail of the delivered text.
 
-use crate::asr_session::recorder::{
-    Layer1Decision, RecorderLifecycleHandle, recorder_lifecycle_channel,
-};
+use crate::asr_session::recorder::{RecorderLifecycleHandle, recorder_lifecycle_channel};
 use crate::audio::recorder::{Recorder, RecorderConfig};
 use crate::config::{RuntimeSettingsSnapshot, UserSettings};
 use crate::pipeline::acoustic_ledger::{AcousticLedger, SealCoverageReceipt, SealCoverageStatus};
@@ -110,7 +108,7 @@ pub async fn replay_production_session(
             .map_err(|error| anyhow!("runtime settings snapshot refused: {error:?}"))?,
     );
     let acoustic_ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
-    let layer1 = Layer1Decision::Disarmed;
+    let layer1 = runtime_settings.local_tail_patch_decision();
     let layer1_armed = layer1.is_armed();
     // `transcription_session` has one live canvas route: Apple progressive.
     // Report the route we actually enter; never reconstruct it through the
@@ -161,8 +159,6 @@ pub struct StreamingRecorder {
     /// block (linear, 0..~1). Runs on the CoreAudio callback thread — keep it
     /// cheap and non-blocking (a broadcast send, an atomic store).
     level_callback: Option<Arc<dyn Fn(f32) + Send + Sync>>,
-    /// Single-use Layer 1 decision consumed when the next session starts.
-    layer1_decision: StdMutex<Layer1Decision>,
     /// O(1) host lifecycle signal for the currently active session.
     lifecycle_handle: Option<RecorderLifecycleHandle>,
     /// Session-frozen runtime truth. Set once by the controller before start.
@@ -195,7 +191,6 @@ impl StreamingRecorder {
             dropped_chunks: Arc::new(AtomicU64::new(0)),
             event_sink: None,
             level_callback: None,
-            layer1_decision: StdMutex::new(Layer1Decision::Disarmed),
             lifecycle_handle: None,
             runtime_settings: None,
             acoustic_ledger: None,
@@ -222,7 +217,6 @@ impl StreamingRecorder {
             dropped_chunks: Arc::new(AtomicU64::new(0)),
             event_sink: None,
             level_callback: None,
-            layer1_decision: StdMutex::new(Layer1Decision::Disarmed),
             lifecycle_handle: None,
             runtime_settings: None,
             acoustic_ledger: None,
@@ -398,11 +392,7 @@ impl StreamingRecorder {
         let log_path = stream_log_path();
         let utterance_silence_sec = self.utterance_silence_sec;
 
-        let layer1 = std::mem::take(
-            self.layer1_decision
-                .get_mut()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let layer1 = runtime_settings.local_tail_patch_decision();
         let (lifecycle_handle, lifecycle_events) = recorder_lifecycle_channel();
         self.lifecycle_handle = Some(lifecycle_handle);
         self.transcription_handle = Some(tokio::spawn(async move {

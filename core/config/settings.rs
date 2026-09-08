@@ -1024,6 +1024,7 @@ pub struct RuntimeSettingsSnapshot {
     /// Effective mandatory-lane verdict after `settings.json` plus the optional
     /// power-user env override. Consumers never re-read either source.
     seal_lane_armed: bool,
+    local_tail_patch: crate::asr_session::recorder::LocalTailPatchDisposition,
 }
 
 /// Everything one loader pass resolved, handed to [`RuntimeSettingsSnapshot::seal_loaded`]
@@ -1039,6 +1040,7 @@ pub(crate) struct RuntimeSnapshotParts {
     pub(crate) digest: SettingsSnapshotDigest,
     pub(crate) energy_calibration: SealedEnergyCalibration,
     pub(crate) seal_lane_armed: bool,
+    pub(crate) local_tail_patch: crate::asr_session::recorder::LocalTailPatchDisposition,
 }
 
 impl RuntimeSettingsSnapshot {
@@ -1057,6 +1059,7 @@ impl RuntimeSettingsSnapshot {
             digest,
             energy_calibration,
             seal_lane_armed,
+            local_tail_patch,
         } = parts;
         SettingsSnapshotValidation::admit(&values, &provenance, &digest)?;
         Ok(Self {
@@ -1070,6 +1073,7 @@ impl RuntimeSettingsSnapshot {
             digest,
             energy_calibration,
             seal_lane_armed,
+            local_tail_patch,
         })
     }
 
@@ -1096,6 +1100,7 @@ impl RuntimeSettingsSnapshot {
             digest,
             energy_calibration,
             seal_lane_armed,
+            local_tail_patch,
         } = parts;
         Self {
             repair_receipt: super::repair::launch_receipt(),
@@ -1108,12 +1113,18 @@ impl RuntimeSettingsSnapshot {
             digest,
             energy_calibration,
             seal_lane_armed,
+            local_tail_patch,
         }
     }
 
     /// Repairs observed in this process before this snapshot was sealed.
     pub fn repair_receipt(&self) -> &super::repair::RepairReceipt {
         &self.repair_receipt
+    }
+
+    /// Recording-start local Whisper decision, frozen by the sole loader.
+    pub fn local_tail_patch_decision(&self) -> crate::asr_session::recorder::Layer1Decision {
+        crate::asr_session::recorder::Layer1Decision::LocalTailPatch(self.local_tail_patch)
     }
 
     /// Borrow the frozen runtime values.

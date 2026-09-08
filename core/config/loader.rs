@@ -175,6 +175,12 @@ impl Config {
             energy_calibration_path,
             energy_calibration_sha256: energy_calibration.sha256().map(str::to_owned),
         };
+        let phase_override = Self::config_runtime_env_var("CODESCRIBE_LAYERED_TRANSCRIPTION").ok();
+        let local_tail_patch = resolve_local_tail_patch(
+            phase_override
+                .as_deref()
+                .or(user_settings.layered_transcription.as_deref()),
+        );
         let runtime_formatting_policy = Self::config_runtime_env_var("FORMATTING_LEVEL").ok();
         let formatting_policy = FormattingPolicy::resolve(
             runtime_formatting_policy.as_deref(),
@@ -217,7 +223,7 @@ impl Config {
             *key = key.as_ref().map(|_| "<redacted:present>".to_string());
         }
         let digest_material = format!(
-            "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\n{}\n{}\n{}",
+            "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\nlocal_tail_patch={local_tail_patch:?}\n{}\n{}\n{}",
             formatting_policy.as_str(),
             llm_lanes.digest_material(),
             ai_execution.digest_material(),
@@ -235,6 +241,7 @@ impl Config {
             digest,
             energy_calibration,
             seal_lane_armed,
+            local_tail_patch,
         };
         let recovery = parts.clone();
         match RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {
@@ -247,6 +254,7 @@ impl Config {
             digest: parts.digest,
             energy_calibration: parts.energy_calibration,
             seal_lane_armed: parts.seal_lane_armed,
+            local_tail_patch: parts.local_tail_patch,
         }) {
             Ok(snapshot) => snapshot,
             Err(error) => RuntimeSettingsSnapshot::refused_startup(recovery, error),
@@ -3318,5 +3326,37 @@ mod tests {
         );
 
         remove_env_for_test("AI_FORMATTING_ENABLED");
+    }
+}
+
+/// One local producer policy; no inference or environment reads in the session.
+fn resolve_local_tail_patch(
+    phase: Option<&str>,
+) -> crate::asr_session::recorder::LocalTailPatchDisposition {
+    use crate::asr_session::recorder::LocalTailPatchDisposition as D;
+    match phase.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        None | Some("") => D::ArmedDefault,
+        Some("phase1" | "1") => D::ArmedPhase(1),
+        Some("off" | "0" | "false" | "no") => D::DegradedExplicitOff,
+        Some(_) => D::DegradedInvalidOverride,
+    }
+}
+
+#[cfg(test)]
+mod local_tail_decision_tests {
+    use super::*;
+    #[test]
+    fn recording_start_local_tail_policy_is_explicit() {
+        use crate::asr_session::recorder::LocalTailPatchDisposition as D;
+        assert_eq!(resolve_local_tail_patch(Some("phase1")), D::ArmedPhase(1));
+        assert_eq!(resolve_local_tail_patch(None), D::ArmedDefault);
+        assert_eq!(
+            resolve_local_tail_patch(Some("off")),
+            D::DegradedExplicitOff
+        );
+        assert_eq!(
+            resolve_local_tail_patch(Some("phase2")),
+            D::DegradedInvalidOverride
+        );
     }
 }
