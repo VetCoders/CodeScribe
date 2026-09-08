@@ -153,7 +153,14 @@ private struct ThreadDetail: View {
     VStack(spacing: 0) {
       chrome
       if let thread = store.currentThread {
-        MessageList(threadID: thread.id, messages: thread.messages) { messageID in
+        MessageList(
+          threadID: thread.id,
+          messages: thread.messages,
+          speechUnavailableReason: store.speechUnavailableReason,
+          speakingMessageID: store.speakingMessageID,
+          onSpeak: { message in Task { await store.speak(message) } },
+          onStopSpeaking: { store.stopSpeaking() }
+        ) { messageID in
           store.toggleRenderMode(messageID: messageID, in: thread.id)
         }
       } else {
@@ -186,6 +193,17 @@ private struct ThreadDetail: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .background(CSColor.glassBase)
+    .alert(
+      "Speech unavailable",
+      isPresented: Binding(
+        get: { store.speechError != nil },
+        set: { if !$0 { store.speechError = nil } }
+      )
+    ) {
+      Button("OK") { store.speechError = nil }
+    } message: {
+      Text(store.speechError ?? "")
+    }
     .alert("Rename thread", isPresented: $isRenaming) {
       TextField("Thread title", text: $renameText)
       Button("Rename") {

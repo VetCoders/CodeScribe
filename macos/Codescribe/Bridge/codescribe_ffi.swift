@@ -10090,6 +10090,83 @@ public func FfiConverterTypeCsSettings_lower(_ value: CsSettings) -> RustBuffer 
 
 
 /**
+ * Outcome of an explicitly requested spoken assistant turn.
+ */
+public struct CsSpeechResult: Equatable, Hashable {
+    /**
+     * `played` or `stopped`; failures use the bridge error channel.
+     */
+    public var outcome: String
+    /**
+     * Duration of synthesized PCM (zero if cancelled during synthesis).
+     */
+    public var durationMs: UInt64
+    /**
+     * Whether synthesis used the disk cache.
+     */
+    public var cached: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * `played` or `stopped`; failures use the bridge error channel.
+         */outcome: String,
+        /**
+         * Duration of synthesized PCM (zero if cancelled during synthesis).
+         */durationMs: UInt64,
+        /**
+         * Whether synthesis used the disk cache.
+         */cached: Bool) {
+        self.outcome = outcome
+        self.durationMs = durationMs
+        self.cached = cached
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsSpeechResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsSpeechResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsSpeechResult {
+        return
+            try CsSpeechResult(
+                outcome: FfiConverterString.read(from: &buf),
+                durationMs: FfiConverterUInt64.read(from: &buf),
+                cached: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsSpeechResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.outcome, into: &buf)
+        FfiConverterUInt64.write(value.durationMs, into: &buf)
+        FfiConverterBool.write(value.cached, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSpeechResult_lift(_ buf: RustBuffer) throws -> CsSpeechResult {
+    return try FfiConverterTypeCsSpeechResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSpeechResult_lower(_ value: CsSpeechResult) -> RustBuffer {
+    return FfiConverterTypeCsSpeechResult.lower(value)
+}
+
+
+/**
  * One STT endpoint and its credential presence; secrets never leave Keychain.
  */
 public struct CsSttLane: Equatable, Hashable {
@@ -14076,6 +14153,32 @@ public func shutdownApplicationRuntime()throws  -> CsApplicationRuntimeSnapshot 
 })
 }
 /**
+ * Speak the turn through the provider currently selected for the assistive lane.
+ */
+public func speakText(text: String)async throws  -> CsSpeechResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_func_speak_text(FfiConverterString.lower(text)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCsSpeechResult_lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
+}
+/**
+ * None means locally configured; server permissions are checked by speak_text.
+ */
+public func speechAvailability() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_codescribe_ffi_fn_func_speech_availability($0
+    )
+})
+}
+/**
  * Start the one process-owned async runtime. Idempotent while running; once
  * shut down it cannot be restarted in the same process.
  */
@@ -14084,6 +14187,14 @@ public func startApplicationRuntime()throws  -> CsApplicationRuntimeSnapshot  {
     uniffi_codescribe_ffi_fn_func_start_application_runtime($0
     )
 })
+}
+/**
+ * Cancel current playback and invalidate pending synthesis.
+ */
+public func stopSpeaking()  {try! rustCall() {
+    uniffi_codescribe_ffi_fn_func_stop_speaking($0
+    )
+}
 }
 /**
  * Snapshot Whisper availability without constructing a dictation session.
@@ -14161,7 +14272,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_func_shutdown_application_runtime() != 56989) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_codescribe_ffi_checksum_func_speak_text() != 26939) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_func_speech_availability() != 63382) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_codescribe_ffi_checksum_func_start_application_runtime() != 55152) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_func_stop_speaking() != 21833) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_func_whisper_model_status() != 33505) {

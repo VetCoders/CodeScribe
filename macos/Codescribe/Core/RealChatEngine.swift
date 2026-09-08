@@ -20,6 +20,14 @@ final class RealChatEngine: AgentChatEngine {
 
   func isAvailable() -> Bool { agent.isAvailable() }
 
+  func speechAvailability() -> String? { bridgeSpeechAvailability() }
+
+  func speak(text: String) async throws {
+    _ = try await speakText(text: text)
+  }
+
+  func stopSpeaking() { bridgeStopSpeaking() }
+
   func setAssistiveTargetThread(backendId: String?) {
     assistiveRouting.setAssistiveTargetThread(backendId: backendId)
   }
@@ -274,3 +282,7 @@ final class VoiceDeliveryListener: CsAgentDeliveryListener, VoiceTurnCancelling,
     consumer.cancel()
   }
 }
+
+// File-scope adapters disambiguate generated global functions from the engine seam.
+private func bridgeSpeechAvailability() -> String? { speechAvailability() }
+private func bridgeStopSpeaking() { stopSpeaking() }

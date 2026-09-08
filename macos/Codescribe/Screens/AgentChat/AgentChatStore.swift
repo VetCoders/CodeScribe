@@ -41,6 +41,9 @@ protocol AgentChatEngine: AnyObject {
   /// `nil` when a send can proceed. Names the missing lane/endpoint/key so
   /// the chat renders honest guidance instead of a generic "add an API key".
   func availabilityDetail() -> String?
+  func speechAvailability() -> String?
+  func speak(text: String) async throws
+  func stopSpeaking()
   /// Generate one isolated title from the raw first textual turn. This is a
   /// sibling request to the assistive stream and carries no conversation state.
   func generateThreadTitle(_ text: String) async throws -> String?
@@ -83,6 +86,16 @@ protocol AgentChatEngine: AnyObject {
 }
 
 extension AgentChatEngine {
+  func speechAvailability() -> String? { "Speech is unavailable in this preview." }
+  func speak(text: String) async throws {
+    throw NSError(
+      domain: "Codescribe.Speech", code: 1,
+      userInfo: [
+        NSLocalizedDescriptionKey: speechAvailability() ?? "Speech is unavailable."
+      ])
+  }
+  func stopSpeaking() {}
+
   func installToolApprovalHandler(
     _ handler: @escaping @MainActor (PendingToolApproval) -> Void
   ) {}
@@ -640,6 +653,38 @@ final class AgentChatStore: ObservableObject {
 
   /// Injected by W2-01. `nil` until then; `send` degrades gracefully.
   var engine: AgentChatEngine?
+
+  @Published var speechError: String?
+  @Published private(set) var speakingMessageID: UUID?
+
+  var speechUnavailableReason: String? {
+    guard let engine else { return "Speech engine is unavailable." }
+    return engine.speechAvailability()
+  }
+
+  func speak(_ message: ChatMessage) async {
+    guard message.role == .assistant, !message.text.isEmpty,
+      !message.isThinking, !message.isStreaming, speakingMessageID == nil
+    else { return }
+    guard let engine else {
+      speechError = "Speech engine is unavailable."
+      return
+    }
+    if let reason = engine.speechAvailability() {
+      speechError = reason
+      return
+    }
+    speechError = nil
+    speakingMessageID = message.id
+    defer { speakingMessageID = nil }
+    do {
+      try await engine.speak(text: message.text)
+    } catch {
+      speechError = error.localizedDescription
+    }
+  }
+
+  func stopSpeaking() { engine?.stopSpeaking() }
 
   /// Injected provider for persisted threads. `nil` → falls back to mock seed.
   var threadsProvider: ChatThreadsProviding?

@@ -193,6 +193,10 @@ struct MessageList: View {
   let messages: [ChatMessage]
   /// Flips a bubble between raw mono and rich markdown. State lives in the
   /// store (per-message `renderMode`), never in this view.
+  var speechUnavailableReason: String? = "Speech engine is unavailable."
+  var speakingMessageID: UUID?
+  var onSpeak: (ChatMessage) -> Void = { _ in }
+  var onStopSpeaking: () -> Void = {}
   var onToggleRenderMode: (UUID) -> Void = { _ in }
 
   /// Follow-tail with pause-on-scroll (the overlay transcript pattern): auto-scroll
@@ -386,7 +390,11 @@ struct MessageList: View {
         message: message,
         containerWidth: containerWidth,
         mode: mode,
-        onToggleRenderMode: onToggleRenderMode
+        onToggleRenderMode: onToggleRenderMode,
+        speechUnavailableReason: speechUnavailableReason,
+        speakingMessageID: speakingMessageID,
+        onSpeak: onSpeak,
+        onStopSpeaking: onStopSpeaking
       )
     }
   }
@@ -1249,6 +1257,28 @@ private struct AssistantTurn: View {
   let containerWidth: CGFloat
   let mode: ChatWidthMode
   let onToggleRenderMode: (UUID) -> Void
+  let speechUnavailableReason: String?
+  let speakingMessageID: UUID?
+  let onSpeak: (ChatMessage) -> Void
+  let onStopSpeaking: () -> Void
+
+  private var speechReason: String? {
+    speechUnavailableReason
+      ?? (message.isThinking || message.isStreaming ? "Wait for this response to finish." : nil)
+      ?? (message.text.isEmpty ? "This response has no text to speak." : nil)
+      ?? (speakingMessageID != nil && speakingMessageID != message.id
+        ? "Another response is being spoken." : nil)
+  }
+
+  private var speechButton: some View {
+    AssistantSpeechButton(
+      messageID: message.id,
+      isSpeaking: speakingMessageID == message.id,
+      unavailableReason: speechReason
+    ) {
+      if speakingMessageID == message.id { onStopSpeaking() } else { onSpeak(message) }
+    }
+  }
 
   var body: some View {
     VStack(alignment: .leading, spacing: 5) {
@@ -1256,6 +1286,7 @@ private struct AssistantTurn: View {
         Text("Assistant · \(message.timestamp)")
           .font(CSFont.mono(10, .medium))
           .foregroundStyle(CSColor.textFaintAlt)
+        speechButton
         if !message.isThinking {
           CopyMessageButton(text: message.text)
           if !message.text.isEmpty {
@@ -1342,7 +1373,10 @@ private struct AssistantTurn: View {
           style: .continuous
         )
       )
-      .contextMenu { CopyButton(text: message.text) }
+      .contextMenu {
+        CopyButton(text: message.text)
+        speechButton
+      }
       .clipped()
     }
     .frame(
@@ -1552,5 +1586,29 @@ private struct PulseDot: View {
       .frame(width: 6, height: 6)
       .opacity(pulse ? 1 : 0.6)
       .onAppear { withAnimation(CSMotion.softpulse) { pulse = true } }
+  }
+}
+
+/// Shared by the permanent turn action and its context-menu entry.
+struct AssistantSpeechButton: View {
+  let messageID: UUID
+  let isSpeaking: Bool
+  let unavailableReason: String?
+  let action: () -> Void
+
+  var isDisabled: Bool { !isSpeaking && unavailableReason != nil }
+  var help: String { unavailableReason ?? "Speak this response. AI-generated voice." }
+
+  var body: some View {
+    Button(
+      isSpeaking ? "Stop speaking" : "Speak",
+      systemImage: isSpeaking ? "stop.fill" : "speaker.wave.2", action: action
+    )
+    .buttonStyle(.plain)
+    .font(CSFont.mono(10, .medium))
+    .foregroundStyle(CSColor.textMuted)
+    .disabled(isDisabled)
+    .help(help)
+    .accessibilityIdentifier("assistant-speak-\(messageID)")
   }
 }
