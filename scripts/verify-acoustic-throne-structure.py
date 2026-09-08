@@ -1718,9 +1718,14 @@ def normalized_repo_path(path: Path) -> str:
 
 def module_candidates(source: str, module: str) -> list[str]:
     source_path = Path(source)
-    if source_path.name not in STANDARD_MODULE_SOURCE_NAMES:
-        return []
-    direct = source_path.parent
+    if source_path.name in STANDARD_MODULE_SOURCE_NAMES:
+        direct = source_path.parent
+    else:
+        # Rust 2018 file module: `foo.rs` declares `mod bar;` and rustc looks
+        # in `foo/bar.rs` or `foo/bar/mod.rs` (e.g. core/llm/speech.rs ->
+        # core/llm/speech/tests.rs). Before this arm the verifier reported
+        # such declarations as unresolved although cargo compiled them.
+        direct = source_path.parent / source_path.stem
     candidates = [
         direct / f"{module}.rs",
         direct / module / "mod.rs",

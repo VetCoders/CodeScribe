@@ -1717,6 +1717,34 @@ class RustModuleResolutionTests(unittest.TestCase):
         self.assertEqual(unresolved[0]["module"], "missing")
         self.assertEqual(unresolved[0]["file"], "core/mod.rs")
 
+    def test_resolves_child_of_rust_2018_file_module(self) -> None:
+        # core/llm/speech.rs declares `mod tests;` and rustc resolves it to
+        # core/llm/speech/tests.rs. The verifier used to return no candidates
+        # for any source that is not lib.rs/main.rs/mod.rs and reported the
+        # declaration as unresolved although cargo compiled it (2026-09-08).
+        module_payload = regex_payload(
+            occurrence("mod tests;", file="core/llm/speech.rs", line=440),
+            query=VERIFIER.RUST_MODULE_DECLARATION_PATTERN,
+            indexed_files=2,
+        )
+        path_payload = regex_payload(
+            query=VERIFIER.RUST_PATH_ATTRIBUTE_PATTERN,
+            indexed_files=2,
+        )
+        inventory_payload = [
+            {"path": "core/llm/speech.rs", "imports": []},
+            {"path": "core/llm/speech/tests.rs", "imports": []},
+        ]
+
+        self.assertEqual(
+            VERIFIER.module_candidates("core/llm/speech.rs", "tests"),
+            ["core/llm/speech/tests.rs", "core/llm/speech/tests/mod.rs"],
+        )
+        unresolved = VERIFIER.unresolved_module_declarations(
+            module_payload, path_payload, inventory_payload
+        )
+        self.assertEqual(unresolved, [])
+
     def test_honours_explicit_path_attribute(self) -> None:
         module_payload = regex_payload(
             occurrence("mod oracle;", file="app/lib.rs", line=2),
