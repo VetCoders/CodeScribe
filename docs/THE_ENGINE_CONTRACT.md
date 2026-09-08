@@ -499,8 +499,13 @@ in the durable report. Compiler and runtime are `NOT_ASSESSED`.
 - The Bus has one committed writer family, `publish_revision`, and terminal
   ledger seal closes it. Draft/arbitrary-text seal APIs and the raw-event delta
   adapter no longer exist.
-- Normal product stop has no automatic whole-file pass. Explicit Retranscribe
-  remains a separate operator action.
+- Normal product stop has no automatic whole-document pass. The
+  [2026-09-08 amendment](SEAL_COVERAGE_AMENDMENT_2026-09-08.md) permits local
+  acoustic recovery from the recorder's finalized owned PCM, one uncovered
+  range at a time. Qualified segment observations must close their formatter
+  slots before final coverage and terminal seal. The 250 ms tolerance and
+  ledger qualification remain unchanged. Explicit human retranscription is
+  a separate action.
 
 This is structural source evidence, not a compiler or runtime claim.
 
@@ -588,7 +593,11 @@ to the resolved defects; this section is not a work queue.
   `AcousticLedger::admit` records the decision, `decide_observation` refuses a
   repeated observation identity, and ledger mutation/seal events reach the
   reducer.
-- **Resolved: in-process timing admits its compacted grain.** The local Whisper
+- **Historical timing receipt, superseded 2026-09-08:** the account below
+  records the previous request-wide coarsening behavior. Current recovery
+  rejects that manufactured witness and retains only validated source-mapped
+  segments; see the dated amendment.
+- **Resolved at the time: in-process timing admits its compacted grain.** The local Whisper
   provider emits `CompactedSpeechRelative`, not `ExactSampleRange`, because it
   decodes VAD-compacted audio before mapping segments back through
   `map_compacted_sample_range`. If long-window seams make that fine segment

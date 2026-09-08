@@ -154,14 +154,13 @@ takes. They attach `vocabulary=programming` so Polish+tech speech can prefer
 `last_session.wav`. Voice Lab and CLI file passes remain diagnostic surfaces.
 The daily Overlay has no user-invoked full-file transcription action: it renders
 Bus projections and explicit human edits, never raw `transcribeFile` output.
-At terminal coverage time the live engine does run a local, in-process Whisper
-pass over retained PCM. Its whole-session string is comparison evidence only;
-its timestamped segments are the sole terminal gap-repair candidates. A
-candidate enters `AcousticLedger` on its own PCM occurrence only when that
-segment is wholly contained in one material uncovered range. A segment that
-crosses the committed/uncovered boundary is refused instead of being assigned
-to the whole gap, because that assignment can replay words already owned by an
-adjacent Apple occurrence. Coarse or missing timing leaves coverage incomplete.
+**2026-09-08 amendment:** terminal recovery reads the recorder-owned finalized
+archive with validated session, epoch, rate and sample count. It requests local
+Whisper evidence from each material uncovered PCM range. Only source-mapped
+segments wholly contained in a gap may enter calibrated ledger admission.
+Neither a whole-session comparison string nor a request-wide substitute segment
+can create coverage. Straddling, coarse or missing timing remains a refusal.
+See [the dated one-throne amendment](SEAL_COVERAGE_AMENDMENT_2026-09-08.md).
 
 **Legacy Overlay Format is removed (2026-08-25).** The former raw LLM
 replacement / delivery-style path no longer exists. Automatic formatting is
@@ -250,17 +249,17 @@ Code: `core/config/loader.rs` · `core/stt/mod.rs::selected_engine()` · `reconc
 
 **Final pass vs layered (orthogonal):**
 
-| Setting               | Env                                | Default    | Role                                                                                                                                               |
-| --------------------- | ---------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Final pass            | `FINAL_PASS_MODE`                  | legacy     | No routing effect on normal stop; terminal coverage always uses local retained-PCM Whisper evidence; explicit file surfaces keep their own actions |
-| Layered compatibility | `CODESCRIBE_LAYERED_TRANSCRIPTION` | mode-owned | Local Power + Apple/Auto: unset or `phase1` arms; explicit off/invalid degrades. No parallel VAD/scheduler live route remains                      |
+| Setting               | Env                                | Default    | Role                                                                                                                                    |
+| --------------------- | ---------------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Final pass            | `FINAL_PASS_MODE`                  | legacy     | No routing effect on normal stop; terminal gaps use local owned-archive Whisper evidence; explicit file surfaces keep their own actions |
+| Layered compatibility | `CODESCRIBE_LAYERED_TRANSCRIPTION` | mode-owned | Local Power + Apple/Auto: unset or `phase1` arms; explicit off/invalid degrades. No parallel VAD/scheduler live route remains           |
 
 Normal capture ignores legacy final-pass routing and never uploads the
-completed WAV for seal coverage. At stop, the engine compares the Apple-lane
-document with one local Whisper pass over retained PCM, then offers only that
-pass's PCM-contained segments for gap admission. It never performs a second,
-context-starved decode of an uncovered slice. Layered phase tokens (`phase1`…)
-select live refinement; explicit file actions remain separate product surfaces.
+completed WAV for seal coverage. Stop uses the finalized owned archive to
+recover material uncovered ranges locally. It does not compare or replace the
+whole document automatically. A fresh gap request never clips text from a
+segment that crosses existing coverage. Local phase and provider selection are
+frozen in the recording snapshot; explicit file actions remain separate.
 
 ---
 
@@ -274,13 +273,11 @@ select live refinement; explicit file actions remain separate product surfaces.
 | Double Left Option (formatting) | `formatting = double_left_option`   | same                             | hold/toggle + force AI format path                               | STT same, then `core/llm` formatting         |
 | Double Right Option (assistive) | `assistive = double_right_option`   | same                             | assistive session                                                | STT same, then agent lane                    |
 
-**Stop** drains the live recorder/session, calculates occurrence-union coverage
-against the capture energy ladder, and delivers only the committed transcript
-(paste / overlay / agent). A gap over 250 ms blocks terminal truth until local
-Whisper supplies a qualified segment-range occurrence from the whole-session
-pass. The comparison string never writes into the document, and boundary-
-straddling or coarse evidence cannot close coverage. The completed WAV is never
-uploaded for this decision.
+**Stop** settles live observers, admits qualified source-mapped gap occurrences
+from the owned archive, drains formatter slots they created, then recomputes
+occurrence-union coverage. A gap over 250 ms blocks terminal truth. Only after a
+terminal ledger seal may the existing Light+, projection and delivery owners
+publish the final transcript. The WAV is never uploaded for this decision.
 
 ### 3.2 Settings UI → config
 

@@ -8,8 +8,12 @@ Mode changes only the downstream delivery consumer.
 
 This Bus never opens a microphone, scrapes SwiftUI, re-transcribes audio,
 folds raw engine events, or reconstructs text from overlay deltas. It can copy
-the ledger's seal-coverage receipt and the engine's local final-pass comparison
-receipt; neither gives the Bus mutation authority.
+the ledger's seal-coverage receipt and historical optional comparison
+receipts; neither gives the Bus mutation authority. Under the
+[2026-09-08 amendment](SEAL_COVERAGE_AMENDMENT_2026-09-08.md), current normal
+stop repairs exact uncovered PCM from the owned archive, drains newly scheduled
+occurrence formatter work, then publishes final coverage and the terminal seal.
+It does not produce an automatic whole-document comparison.
 
 ## Path contract
 
@@ -101,7 +105,8 @@ contains:
   counts, uncovered PCM ranges, ratio, threshold, and `complete|incomplete`;
 - optional additive `comparison`: SHA-256, character count, and rendered text
   for the pre-repair Apple-lane document and the whole-session local Whisper
-  pass. These fields remain inside `codescribe.transcript-evidence.v1`; older
+  pass (historical/diagnostic; absent on the current normal stop path).
+  These fields remain inside `codescribe.transcript-evidence.v1`; older
   readers may ignore them and Rust decoding defaults them to absent.
 - the complete canvas contract: `phase`, `can_paste`, `can_insert`,
   `can_copy`, `can_retranscribe`, `can_format`, and `terminal`.

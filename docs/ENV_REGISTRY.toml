@@ -25,6 +25,13 @@ reload = "restart"
 category = "cli"
 description = "Optional Finder Quick Action CLI executable override; normally resolves ~/.local/bin/codescribe then ~/.cargo/bin/codescribe"
 
+[vars.CODESCRIBE_REPLAY_WAV]
+default = ""
+type = "string"
+reload = "restart"
+category = "test"
+description = "Private local archived WAV for explicitly ignored acoustic and live-producer recovery benches; never a production capture source or an upload."
+
 [vars.CODESCRIBE_STREAM_TEST_WAV]
 default = ""
 type = "string"
@@ -587,7 +594,7 @@ default = "inprocess"
 type = "string"
 reload = "hot"
 category = "stt"
-description = "Tail-patch provider selector: inprocess | sidecar | remote. Sidecar and remote fall back to inprocess with typed receipts. Default remains inprocess; flipping it is an operator decision."
+description = "Tail-patch provider selector: inprocess | sidecar | remote. Sidecar and remote fall back to inprocess with typed receipts. Selection is frozen in the recording settings snapshot; changes apply to the next snapshot. Default remains inprocess."
 
 [vars.CODESCRIBE_STT_SIDECAR_BIN]
 default = ""
