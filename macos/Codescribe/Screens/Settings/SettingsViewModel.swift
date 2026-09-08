@@ -671,7 +671,7 @@ enum SettingsDeepLink {
 /// The two request lanes (D4: no Main fallback lane). A lane binds a provider
 /// reference (`vendor id` | `custom:<id>`) and a model; the endpoint is the
 /// provider's, never the lane's.
-enum LLMLane: String, CaseIterable, Identifiable {
+enum LLMLane: String, CaseIterable, Identifiable, Hashable {
   case assistive
   case formatting
 
@@ -1052,6 +1052,9 @@ final class SettingsViewModel: ObservableObject {
   private let hotkeys: HotkeysEngine?
   private let licenseService: LicenseService
   private let runtimeLlmLaneProvider: (CsLlmLane) -> CsRuntimeLlmLane
+  /// Sealed runtime lane projections for this refresh. `llmLane` is read from
+  /// SwiftUI `body` (once per menu item); the FFI load is not.
+  private var runtimeLaneCache: [LLMLane: CsRuntimeLlmLane] = [:]
   private var modelDiscoveryGenerations: [String: Int] = [:]
 
   init(
@@ -1628,7 +1631,14 @@ final class SettingsViewModel: ObservableObject {
   /// Effective lane state: loader-sealed runtime truth + registry row +
   /// discovery for THAT lane's provider (vendor or custom alike, D2).
   func llmLane(_ lane: LLMLane) -> LLMLaneModel {
-    let runtime = runtimeLlmLaneProvider(lane.bridgeLane)
+    let runtime: CsRuntimeLlmLane
+    if let cached = runtimeLaneCache[lane] {
+      runtime = cached
+    } else {
+      let loaded = runtimeLlmLaneProvider(lane.bridgeLane)
+      runtimeLaneCache[lane] = loaded
+      runtime = loaded
+    }
     let configuredModel =
       settings[keyPath: lane.modelPath]?
       .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -2258,6 +2268,7 @@ final class SettingsViewModel: ObservableObject {
     deferredInsertShortcut = DeferredInsertShortcutOption(
       wireId: loaded.deferredInsertShortcut
     )
+    runtimeLaneCache.removeAll()
   }
 
   // MARK: - Keys (Keychain-backed; secrets never read back)

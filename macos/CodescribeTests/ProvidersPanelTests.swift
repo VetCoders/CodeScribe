@@ -194,4 +194,42 @@ final class ProvidersPanelTests: XCTestCase {
     XCTAssertEqual(writes.count, 2, "an unknown lane id writes nothing (two lanes, not three)")
     XCTAssertNil(model.lastError)
   }
+
+  /// LLMLaneEditor.body reads `llmLane` per menu item; the FFI loader must not.
+  func testLlmLaneHitsRuntimeProviderOncePerLanePerRefresh() {
+    var assistiveHits = 0
+    var formattingHits = 0
+    let store = MockProviderStore()
+    let model = SettingsViewModel(
+      engine: MockSettingsEngine(providerStore: store),
+      runtimeLlmLaneProvider: { lane in
+        if lane == .assistive {
+          assistiveHits += 1
+        } else {
+          formattingHits += 1
+        }
+        return store.runtimeLane(lane)
+      }
+    )
+
+    for _ in 0..<25 {
+      for lane in LLMLane.allCases {
+        let projected = model.llmLane(lane)
+        _ = projected.providerId
+        _ = projected.resolvedModel
+        _ = projected.providerDisplayName
+      }
+    }
+    XCTAssertEqual(assistiveHits, 1)
+    XCTAssertEqual(formattingHits, 1)
+
+    model.setFormattingEnabled(true)
+    for _ in 0..<10 {
+      for lane in LLMLane.allCases {
+        _ = model.llmLane(lane)
+      }
+    }
+    XCTAssertEqual(assistiveHits, 2)
+    XCTAssertEqual(formattingHits, 2)
+  }
 }
