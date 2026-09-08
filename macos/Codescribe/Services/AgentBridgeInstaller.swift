@@ -190,28 +190,48 @@ final class RealAgentBridgeInstaller: AgentBridgeInstalling {
       return .unavailable
     }
 
-    guard let receipt = try? decode(AgentBridgeReceipt.self, from: receiptURL),
-      receipt.schema == Self.receiptSchema
-    else {
-      return AgentBridgeInstallationStatus(
-        payloadAvailable: true,
-        bundleVersion: manifest.bundleVersion,
-        installedClients: [],
-        installedPaths: [],
-        detail: "Ready to install after you select an agent client."
-      )
+    let receipt = validReceipt()
+    var clients: [AgentBridgeClient] = []
+    var paths: [String] = []
+    var details: [String] = []
+    for client in AgentBridgeClient.allCases.sorted(by: { $0.rawValue < $1.rawValue }) {
+      let destination = client.skillDirectory(home: homeDirectory)
+      let marker = managedMarker(destination: destination, client: client)
+      let recorded = receipt?.selectedClients.contains(client) == true
+      guard recorded || marker != nil else { continue }
+      clients.append(client)
+      paths.append(
+        marker != nil
+          ? destination.standardizedFileURL.path
+          : receipt?.installedPaths[client.rawValue] ?? destination.standardizedFileURL.path)
+      let evidence: String
+      if let marker {
+        if let receipt {
+          if recorded, receipt.managedID == marker.managedID,
+            receipt.installedPaths[client.rawValue] == destination.standardizedFileURL.path
+          {
+            evidence = "receipt and managed folder found."
+          } else {
+            evidence = "managed folder found, receipt differs — Update will re-adopt it."
+          }
+        } else {
+          evidence =
+            "managed folder found, receipt missing or unreadable — Update will re-adopt it."
+        }
+      } else {
+        evidence =
+          "receipt found, managed folder missing or invalid — existing unowned folders will not be overwritten."
+      }
+      details.append("\(client.displayName): \(evidence)")
     }
-
-    let clients = receipt.selectedClients.sorted { $0.rawValue < $1.rawValue }
-    let paths = clients.compactMap { receipt.installedPaths[$0.rawValue] }
     return AgentBridgeInstallationStatus(
       payloadAvailable: true,
-      bundleVersion: receipt.bundleVersion,
+      bundleVersion: receipt?.bundleVersion ?? manifest.bundleVersion,
       installedClients: clients,
       installedPaths: paths,
-      detail: clients.isEmpty
-        ? "No agent client is currently managed by Codescribe."
-        : "Installed for \(clients.map(\.displayName).joined(separator: ", "))."
+      detail: details.isEmpty
+        ? "Ready to install after you select an agent client."
+        : details.joined(separator: "\n")
     )
   }
 
@@ -231,7 +251,7 @@ final class RealAgentBridgeInstaller: AgentBridgeInstalling {
     )
     try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: bridgeRoot.path)
 
-    let previousReceipt = try? decode(AgentBridgeReceipt.self, from: receiptURL)
+    let previousReceipt = validReceipt()
     let managedID = previousReceipt?.managedID ?? UUID().uuidString.lowercased()
     let selected = selectedClients.sorted { $0.rawValue < $1.rawValue }
     let previouslySelected = Set(previousReceipt?.selectedClients ?? [])
@@ -243,9 +263,7 @@ final class RealAgentBridgeInstaller: AgentBridgeInstalling {
       if fileManager.fileExists(atPath: destination.path) {
         try requireManaged(
           destination: destination,
-          client: client,
-          managedID: managedID,
-          receipt: previousReceipt
+          client: client
         )
       }
     }
@@ -254,9 +272,7 @@ final class RealAgentBridgeInstaller: AgentBridgeInstalling {
       if fileManager.fileExists(atPath: destination.path) {
         try requireManaged(
           destination: destination,
-          client: client,
-          managedID: managedID,
-          receipt: previousReceipt
+          client: client
         )
       }
     }
@@ -441,32 +457,40 @@ final class RealAgentBridgeInstaller: AgentBridgeInstalling {
     return result
   }
 
-  private func requireManaged(
+  private func validReceipt() -> AgentBridgeReceipt? {
+    guard let receipt = try? decode(AgentBridgeReceipt.self, from: receiptURL),
+      receipt.schema == Self.receiptSchema
+    else { return nil }
+    return receipt
+  }
+
+  private func managedMarker(
     destination: URL,
-    client: AgentBridgeClient,
-    managedID: String,
-    receipt: AgentBridgeReceipt?
-  ) throws {
-    guard let receipt,
-      receipt.schema == Self.receiptSchema,
-      receipt.managedID == managedID,
-      receipt.installedPaths[client.rawValue] == destination.standardizedFileURL.path
-    else {
-      throw AgentBridgeInstallationError.conflict(
-        path: destination.path,
-        reason: "the existing skill folder is not present in the Codescribe receipt"
-      )
-    }
+    client: AgentBridgeClient
+  ) -> AgentBridgeManagedMarker? {
     let markerURL = destination.appendingPathComponent(".codescribe-managed.json")
-    guard let marker = try? decode(AgentBridgeManagedMarker.self, from: markerURL),
+    guard
+      let values = try? destination.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+      values.isDirectory == true, values.isSymbolicLink != true,
+      let markerValues = try? markerURL.resourceValues(forKeys: [
+        .isRegularFileKey, .isSymbolicLinkKey,
+      ]),
+      markerValues.isRegularFile == true, markerValues.isSymbolicLink != true,
+      let marker = try? decode(AgentBridgeManagedMarker.self, from: markerURL),
       marker.schema == Self.markerSchema,
-      marker.managedID == managedID,
       marker.client == client,
       marker.agentBridgeRoot == bridgeRoot.standardizedFileURL.path
-    else {
+    else { return nil }
+    return marker
+  }
+
+  /// Read-only ownership preflight, shared by updates and deselection.
+  func requireManaged(destination: URL, client: AgentBridgeClient) throws {
+    guard managedMarker(destination: destination, client: client) != nil else {
       throw AgentBridgeInstallationError.conflict(
         path: destination.path,
-        reason: "the Codescribe-managed marker is missing or does not match the receipt"
+        reason:
+          "the Codescribe-managed marker is missing or does not match this client and bridge root"
       )
     }
   }

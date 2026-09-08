@@ -168,7 +168,7 @@ final class AgentBridgeInstallerTests: XCTestCase {
     )
   }
 
-  func testOnboardingUsesPolishCopyAndNeverInstallsUntilSelectionAndClick() {
+  func testOnboardingUsesEnglishCopyWithPolishDictationAndNeverInstallsUntilSelectionAndClick() {
     let engine = MockOnboardingEngine(progress: 11)
     engine.mode = "agentic"
     engine.language = .polish
@@ -183,8 +183,9 @@ final class AgentBridgeInstallerTests: XCTestCase {
 
     XCTAssertEqual(bridge.installCalls, [])
     XCTAssertTrue(model.selectedAgentClients.isEmpty)
-    XCTAssertTrue(model.agentBridgeUsesPolishCopy)
-    XCTAssertTrue(model.agentBridgeExplanation.contains("szkice na żywo"))
+    XCTAssertEqual(model.agentBridgeTitle, "Connect Codescribe to your agent.")
+    XCTAssertEqual(model.agentBridgeButtonTitle, "Install selected")
+    XCTAssertTrue(model.agentBridgeExplanation.contains("live drafts"))
     XCTAssertTrue(model.agentBridgeExplanation.contains("transcript_sealed"))
 
     let fallbackEngine = MockOnboardingEngine(progress: 11)
@@ -197,7 +198,7 @@ final class AgentBridgeInstallerTests: XCTestCase {
       agentBridge: RecordingAgentBridgeInstaller(),
       probe: MockPermissionProbe(.allGranted)
     )
-    XCTAssertFalse(fallbackModel.agentBridgeUsesPolishCopy)
+    XCTAssertEqual(fallbackModel.agentBridgeTitle, model.agentBridgeTitle)
     XCTAssertTrue(fallbackModel.agentBridgeExplanation.contains("live drafts"))
     XCTAssertTrue(fallbackModel.agentBridgeExplanation.contains("transcript_sealed"))
 
@@ -205,9 +206,103 @@ final class AgentBridgeInstallerTests: XCTestCase {
     XCTAssertEqual(bridge.installCalls, [])
 
     model.toggleAgentClient(.codex)
+    XCTAssertEqual(bridge.installCalls, [])
     model.installAgentBridge()
+    XCTAssertEqual(model.agentBridgeButtonTitle, "Update selected")
     XCTAssertEqual(bridge.installCalls, [[.codex]])
     XCTAssertEqual(model.agentBridgeStatus.installedClients, [.codex])
+  }
+
+  func testManagedFoldersRecoverFromMissingUnreadableOrForeignReceipt() throws {
+    let payload = try makePayload()
+    for drift in ["missing", "unreadable", "foreign-id", "foreign-schema"] {
+      let home = scratch.appendingPathComponent(drift)
+      let root = scratch.appendingPathComponent("bridge-" + drift)
+      let installer = RealAgentBridgeInstaller(
+        resourceRoot: payload, homeDirectory: home,
+        environment: ["CODESCRIBE_AGENT_BRIDGE_HOME": root.path]
+      )
+      _ = try installer.install(selectedClients: [.codex, .claudeCode])
+      let receiptURL = root.appendingPathComponent("receipt.json")
+      var receipt = try jsonObject(receiptURL)
+      let oldID = try XCTUnwrap(receipt["managed_id"] as? String)
+      switch drift {
+      case "missing": try FileManager.default.removeItem(at: receiptURL)
+      case "unreadable": try Data("invalid json".utf8).write(to: receiptURL)
+      default:
+        receipt[drift == "foreign-id" ? "managed_id" : "schema"] = "foreign"
+        try JSONSerialization.data(withJSONObject: receipt).write(to: receiptURL)
+      }
+      let skills = [".codex/skills/codescribe", ".claude/skills/codescribe"]
+        .map { home.appendingPathComponent($0) }
+      for skill in skills {
+        try Data("outdated".utf8).write(to: skill.appendingPathComponent("SKILL.md"))
+      }
+      let status = installer.status()
+      XCTAssertEqual(Set(status.installedClients), [.codex, .claudeCode])
+      XCTAssertEqual(Set(status.installedPaths), Set(skills.map(\.path)))
+      XCTAssertTrue(status.detail.contains("Update will re-adopt it."), status.detail)
+      XCTAssertTrue(status.detail.contains("Claude Code: managed folder found"))
+      XCTAssertTrue(status.detail.contains("Codex: managed folder found"))
+
+      let updated = try installer.install(selectedClients: [.codex, .claudeCode])
+      XCTAssertEqual(Set(updated.installedClients), [.codex, .claudeCode])
+      XCTAssertTrue(updated.detail.contains("receipt and managed folder found"))
+      let newID = try XCTUnwrap(try jsonObject(receiptURL)["managed_id"] as? String)
+      XCTAssertNotEqual(newID, oldID)
+      if drift == "foreign-id" { XCTAssertEqual(newID, "foreign") }
+      for skill in skills {
+        XCTAssertEqual(
+          try jsonObject(skill.appendingPathComponent(".codescribe-managed.json"))["managed_id"]
+            as? String, newID)
+        for file in ["SKILL.md", "README.md"] {
+          XCTAssertEqual(
+            try Data(contentsOf: skill.appendingPathComponent(file)),
+            try Data(contentsOf: payload.appendingPathComponent("skills/codescribe/" + file)))
+        }
+      }
+    }
+  }
+
+  func testReceiptEvidenceSurvivesMissingFoldersAndUpdateRestoresThem() throws {
+    let payload = try makePayload()
+    let home = scratch.appendingPathComponent("receipt-only")
+    let installer = RealAgentBridgeInstaller(
+      resourceRoot: payload, homeDirectory: home, environment: [:])
+    _ = try installer.install(selectedClients: [.codex])
+    let receiptURL = home.appendingPathComponent(".codescribe/agent-bridge/receipt.json")
+    let managedID = try jsonObject(receiptURL)["managed_id"] as? String
+    try FileManager.default.removeItem(at: home.appendingPathComponent(".codex/skills/codescribe"))
+    XCTAssertEqual(installer.status().installedClients, [.codex])
+    XCTAssertTrue(
+      installer.status().detail.contains("receipt found, managed folder missing or invalid"))
+    _ = try installer.install(selectedClients: [.codex])
+    XCTAssertEqual(try jsonObject(receiptURL)["managed_id"] as? String, managedID)
+  }
+
+  func testInvalidOwnershipMarkersRefuseUpdateWithoutMutation() throws {
+    let payload = try makePayload()
+    for field in ["schema", "client", "agent_bridge_root"] {
+      let home = scratch.appendingPathComponent(field)
+      let installer = RealAgentBridgeInstaller(
+        resourceRoot: payload, homeDirectory: home, environment: [:])
+      _ = try installer.install(selectedClients: [.codex])
+      let destination = home.appendingPathComponent(".codex/skills/codescribe")
+      let markerURL = destination.appendingPathComponent(".codescribe-managed.json")
+      var marker = try jsonObject(markerURL)
+      marker[field] = field == "client" ? "claude-code" : "foreign"
+      let markerData = try JSONSerialization.data(withJSONObject: marker)
+      try markerData.write(to: markerURL)
+      let receiptURL = home.appendingPathComponent(".codescribe/agent-bridge/receipt.json")
+      try FileManager.default.removeItem(at: receiptURL)
+      let skillURL = destination.appendingPathComponent("SKILL.md")
+      let skillData = try Data(contentsOf: skillURL)
+      XCTAssertTrue(installer.status().installedClients.isEmpty)
+      XCTAssertThrowsError(try installer.install(selectedClients: [.codex]))
+      XCTAssertEqual(try Data(contentsOf: markerURL), markerData)
+      XCTAssertEqual(try Data(contentsOf: skillURL), skillData)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: receiptURL.path))
+    }
   }
 
   private func makePayload() throws -> URL {

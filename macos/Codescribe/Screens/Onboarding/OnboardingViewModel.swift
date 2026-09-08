@@ -190,28 +190,15 @@ final class OnboardingViewModel: ObservableObject {
     providers.first { $0.id == selectedProviderId } ?? providers.first
   }
 
-  var agentBridgeUsesPolishCopy: Bool { selectedLanguage == .polish }
-
-  var agentBridgeTitle: String {
-    agentBridgeUsesPolishCopy
-      ? "Połącz Codescribe z agentem."
-      : "Connect Codescribe to your agent."
-  }
+  var agentBridgeTitle: String { "Connect Codescribe to your agent." }
 
   var agentBridgeExplanation: String {
-    if agentBridgeUsesPolishCopy {
-      return "Agent słyszy szkice na żywo tylko wtedy, gdy zwracasz się do niego po imieniu. "
-        + "Może odpowiedzieć w przerwie, ale instalację, commit, usuwanie i inne zmiany "
-        + "wykonuje dopiero po transcript_sealed."
-    }
-    return "The named agent can hear live drafts and reply during the pause. Installation, "
+    "The named agent can hear live drafts and reply during the pause. Installation, "
       + "commits, deletion, and every other state-changing action wait for transcript_sealed."
   }
 
   var agentBridgeButtonTitle: String {
-    agentBridgeStatus.installedClients.isEmpty
-      ? (agentBridgeUsesPolishCopy ? "Zainstaluj wybrane" : "Install selected")
-      : (agentBridgeUsesPolishCopy ? "Zainstaluj ponownie" : "Reinstall selected")
+    agentBridgeStatus.installedClients.isEmpty ? "Install selected" : "Update selected"
   }
 
   // MARK: - Lifecycle refresh
