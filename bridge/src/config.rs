@@ -3647,3 +3647,137 @@ mod settings_snapshot_tests {
         );
     }
 }
+
+/// The last-good runtime snapshot is keyed on `settings.json` mtime. Pasting a
+/// key writes the Keychain bundle (test env: process env / bundle cache) and
+/// never touches that file, so a cached lane row must not keep saying "no key".
+#[cfg(test)]
+mod runtime_snapshot_cache_tests {
+    use super::{CodescribeConfig, CsLlmLane, KEYCHAIN_ACCOUNTS, runtime_llm_lane, save_key};
+    use codescribe_core::config::UserSettings;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::fs;
+
+    /// Same isolation shape as `core/config/stt_migration.rs` tests: a private
+    /// data dir, with Drop restoring the process env the test mutated.
+    struct IsolatedSettings {
+        _dir: tempfile::TempDir,
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl IsolatedSettings {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut keys = vec![
+                "CODESCRIBE_DATA_DIR",
+                "CODESCRIBE_VOICE_LAB_SRC",
+                "CODESCRIBE_ENV_PATH",
+                "LLM_API_KEY",
+                "LLM_FORMATTING_API_KEY",
+                "LLM_ASSISTIVE_API_KEY",
+                "LLM_FORMATTING_PROVIDER",
+                "LLM_ASSISTIVE_PROVIDER",
+            ];
+            keys.extend(KEYCHAIN_ACCOUNTS.iter().copied());
+            let previous = keys
+                .into_iter()
+                .map(|key| {
+                    let previous = std::env::var_os(key);
+                    // SAFETY: `#[serial]` tests; Drop restores every key.
+                    unsafe {
+                        if key == "CODESCRIBE_DATA_DIR" {
+                            std::env::set_var(key, dir.path());
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                    (key, previous)
+                })
+                .collect();
+            fs::create_dir_all(UserSettings::settings_dir()).unwrap();
+            Self {
+                _dir: dir,
+                previous,
+            }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            UserSettings::settings_path()
+        }
+    }
+
+    impl Drop for IsolatedSettings {
+        fn drop(&mut self) {
+            // SAFETY: same serialized environment scope as `new`.
+            unsafe {
+                for (key, previous) in &self.previous {
+                    match previous {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// File/live STT rows already populated — a load must not rewrite the file
+    /// (the 2026-09-08 save-storm shape).
+    fn settled_settings_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 3,
+            "speech": {
+                "engine": {
+                    "file_transcription_endpoint": "https://api.libraxis.cloud/v1/audio/transcriptions",
+                    "live_transcription_endpoint": "wss://api.libraxis.cloud/v1/audio/transcribe"
+                },
+                "formatting": {
+                    "llm_provider": "openai-responses",
+                    "llm_model": "gpt-4.1"
+                }
+            }
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_llm_lane_sees_a_key_saved_after_the_snapshot_was_cached() {
+        let isolated = IsolatedSettings::new();
+        let path = isolated.path();
+        fs::write(&path, settled_settings_json().to_string()).unwrap();
+
+        let _settle = runtime_llm_lane(CsLlmLane::Formatting);
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        let before = runtime_llm_lane(CsLlmLane::Formatting);
+        assert!(
+            !before.key_present,
+            "isolated formatting lane must start without a key"
+        );
+        assert_eq!(
+            before.key_account, "LLM_OPENAI_API_KEY",
+            "pinned openai-responses formatting lane"
+        );
+        assert_eq!(mtime, fs::metadata(&path).unwrap().modified().unwrap());
+
+        // Test-env `save_key` writes a static account into process env (custom
+        // accounts go to the bundle cache). Settings.json must not move.
+        save_key(&before.key_account, "fixture-not-a-real-key").unwrap();
+        // The Settings paste path is `set_api_key` (same Keychain write). It
+        // currently does not drop the last-good snapshot, so the next
+        // projection still reports no key.
+        CodescribeConfig::new()
+            .set_api_key(before.key_account.clone(), "fixture-not-a-real-key".into())
+            .unwrap();
+
+        let after = runtime_llm_lane(CsLlmLane::Formatting);
+        assert_eq!(
+            mtime,
+            fs::metadata(&path).unwrap().modified().unwrap(),
+            "saving a key must not rewrite settings.json"
+        );
+        assert!(
+            after.key_present,
+            "cached snapshot must not hide a key saved after the cache filled"
+        );
+    }
+}
