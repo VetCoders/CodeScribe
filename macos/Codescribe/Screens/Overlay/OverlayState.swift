@@ -6,7 +6,7 @@ import SwiftUI
 // bridge (`CodescribeHotkeys` / `CsTranscriptionListener`).
 //
 // The view talks only to the thin `DictationEngine` protocol below, so #Preview
-// renders standalone against `MockDictationEngine`.
+// renders standalone against seeded view models (`OverlayState.previewListening()`).
 //
 // TRANSCRIPT MODEL (one-throne bridge semantics):
 //   on_transcript_projection → complete Rust-reduced document plus acoustic
@@ -386,19 +386,6 @@ final class OverlayState {
   var compactStatusText: String {
     statusText
   }
-  var statusColor: Color {
-    if let presentationStatus {
-      return presentationStatus.isError ? CSColor.terracotta : CSColor.oliveLight
-    }
-    switch mode {
-    case .listening: return CSColor.terracotta
-    case .finalizing: return CSColor.amber
-    case .formatted: return CSColor.oliveLight
-    case .noSpeech: return CSColor.textMuted
-    case .error: return CSColor.terracotta
-    }
-  }
-
   /// Only a reducer-projected listening phase may ripple.
   var statusRippling: Bool {
     mode == .listening
@@ -438,10 +425,6 @@ final class OverlayState {
   /// `hide()` and arms Agent auto-send.
   var blocksAssistiveOverlayHide: Bool {
     presentationStatus != nil || mode == .formatted || mode == .noSpeech
-  }
-
-  var autoPasteAccessibilityValue: String {
-    autoPasteEnabled ? "On" : "Off"
   }
 
   var audioLevelAccessibilityValue: String {
@@ -1578,56 +1561,3 @@ final class ControllerDictationEngine: DictationEngine {
     try await hotkeys.transcribeFile(path: path)
   }
 }
-
-// MARK: - Mock engine for #Preview
-
-#if DEBUG
-  @MainActor
-  final class MockDictationEngine: DictationEngine {
-    func setListener(_ listener: CsTranscriptionListener) {}
-    func startRecording(language: CsLanguage?) async throws {}
-    func stopRecording() async throws -> String { "" }
-    func commitFormatterRevision(
-      sessionId: String, sourceRevision: UInt64
-    ) async throws -> CsUserRevisionResult {
-      CsUserRevisionResult(
-        sessionId: sessionId,
-        sourceRevision: sourceRevision,
-        revision: sourceRevision + 1,
-        renderedText: "Formatted preview",
-        provenanceReceipt: "formatter-preview"
-      )
-    }
-    func isRecording() async -> Bool { false }
-    func initModel() async throws {}
-    func isModelLoaded() -> Bool { true }
-    func currentOverlayPolicy() -> OverlayPolicySnapshot? {
-      OverlayPolicySnapshot(autoPasteEnabled: true, autoFormatLevel: .correction)
-    }
-    func setAutoPasteEnabled(_ enabled: Bool) {}
-    func pasteText(text: String) async throws -> CsPasteResult {
-      CsPasteResult(
-        outcome: .pasted,
-        targetAppName: nil,
-        frontmostAppName: nil,
-        deferredInsertShortcut: nil,
-        deferredInsertFailure: nil
-      )
-    }
-    func deferText(text: String) async throws -> CsPasteResult {
-      CsPasteResult(
-        outcome: .deferredInsertArmed,
-        targetAppName: nil,
-        frontmostAppName: "Codescribe",
-        deferredInsertShortcut: "⌘⌥V",
-        deferredInsertFailure: nil
-      )
-    }
-    func copyTaggedTranscript(text: String) async throws {}
-    func pasteTargetAppName() async -> String? { nil }
-    func sendAssistiveTranscript(text: String) async throws -> Bool { true }
-    func transcribeFile(path: String) async throws -> CsTranscription {
-      CsTranscription(text: "", language: "en")
-    }
-  }
-#endif

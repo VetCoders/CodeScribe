@@ -10,7 +10,6 @@ enum ChatPalette {
   static var activeThreadSub: Color { CSColor.chromeAccent.opacity(0.78) }
   static let toolBody = Color(hex: 0x9AA093)  // tool-activity detail text
   static let thinking = Color(hex: 0x8A8D87)  // "thinking…" label
-  static let sendGlyph = Color(hex: 0x0A0A0A)
 }
 
 enum ComposerMicVisualState: CaseIterable, Equatable {

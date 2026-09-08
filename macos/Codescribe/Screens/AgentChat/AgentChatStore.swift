@@ -2207,15 +2207,6 @@ final class AgentChatStore: ObservableObject {
     }
   }
 
-  /// Surface a completed tool call as a `.tool` activity turn placed immediately
-  /// before the streaming assistant bubble (matches the mock's "What I checked").
-  private func recordToolActivity(
-    name: String, isError: Bool, reason: String, before assistantID: UUID, in threadID: UUID
-  ) {
-    recordToolResult(
-      name: name, callID: nil, isError: isError, reason: reason, before: assistantID, in: threadID)
-  }
-
   private func recordToolStarted(
     name: String, callID rawCallID: String, before assistantID: UUID, in threadID: UUID
   ) {

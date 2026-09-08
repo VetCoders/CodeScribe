@@ -694,11 +694,6 @@ enum LLMLane: String, CaseIterable, Identifiable {
 
   // Spelled out as `if` on purpose: the ternary over two key-path literals
   // crashes the type checker ("failed to produce diagnostic", Xcode 27).
-  var providerPath: WritableKeyPath<CsSettings, String?> {
-    if self == .assistive { return \CsSettings.llmAssistiveProvider }
-    return \CsSettings.llmFormattingProvider
-  }
-
   var modelPath: WritableKeyPath<CsSettings, String?> {
     if self == .assistive { return \CsSettings.llmAssistiveModel }
     return \CsSettings.llmFormattingModel
@@ -2056,10 +2051,6 @@ final class SettingsViewModel: ObservableObject {
     }
   }
 
-  /// Legacy stop-file-pass token. Settings no longer exposes Always/Smart/Off.
-  /// If a value must persist, write `off` — `smart` is a dead migration token.
-  var finalPassModeId: String { "off" }
-
   func setFinalPassMode(_ id: String) {
     _ = id
     settings.finalPassMode = "off"
@@ -2539,8 +2530,6 @@ final class SettingsViewModel: ObservableObject {
 
   // MARK: - Prompts (editable BASE prompts)
 
-  func formattingPrompt() -> String { formattingPromptSnapshot().content }
-  func assistivePrompt() -> String { assistivePromptSnapshot().content }
   func formattingPromptSnapshot() -> CsPromptSnapshot {
     engine?.formattingPromptSnapshot() ?? .sampleFormatting
   }
