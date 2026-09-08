@@ -176,11 +176,23 @@ impl Config {
             energy_calibration_sha256: energy_calibration.sha256().map(str::to_owned),
         };
         let phase_override = Self::config_runtime_env_var("CODESCRIBE_LAYERED_TRANSCRIPTION").ok();
-        let local_tail_patch = resolve_local_tail_patch(
+        let mut local_tail_patch = resolve_local_tail_patch(
             phase_override
                 .as_deref()
                 .or(user_settings.layered_transcription.as_deref()),
         );
+        let tail_provider =
+            match Self::config_runtime_env_var(crate::stt::tail_provider::STT_TAIL_PROVIDER_ENV) {
+                Ok(value) => crate::stt::tail_provider::TailProviderId::parse(&value).ok(),
+                Err(VarError::NotPresent) => {
+                    Some(crate::stt::tail_provider::TailProviderId::InProcess)
+                }
+                Err(_) => None,
+            };
+        if tail_provider.is_none() {
+            local_tail_patch =
+                crate::asr_session::recorder::LocalTailPatchDisposition::DegradedInvalidOverride;
+        }
         let runtime_formatting_policy = Self::config_runtime_env_var("FORMATTING_LEVEL").ok();
         let formatting_policy = FormattingPolicy::resolve(
             runtime_formatting_policy.as_deref(),
@@ -223,7 +235,7 @@ impl Config {
             *key = key.as_ref().map(|_| "<redacted:present>".to_string());
         }
         let digest_material = format!(
-            "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\nlocal_tail_patch={local_tail_patch:?}\n{}\n{}\n{}",
+            "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\nlocal_tail_patch={local_tail_patch:?}\ntail_provider={tail_provider:?}\n{}\n{}\n{}",
             formatting_policy.as_str(),
             llm_lanes.digest_material(),
             ai_execution.digest_material(),
@@ -242,6 +254,7 @@ impl Config {
             energy_calibration,
             seal_lane_armed,
             local_tail_patch,
+            tail_provider,
         };
         let recovery = parts.clone();
         match RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {
@@ -255,6 +268,7 @@ impl Config {
             energy_calibration: parts.energy_calibration,
             seal_lane_armed: parts.seal_lane_armed,
             local_tail_patch: parts.local_tail_patch,
+            tail_provider: parts.tail_provider,
         }) {
             Ok(snapshot) => snapshot,
             Err(error) => RuntimeSettingsSnapshot::refused_startup(recovery, error),

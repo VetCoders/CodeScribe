@@ -245,18 +245,24 @@ struct AppleTailPatchLane {
     jobs: FuturesOrdered<BoxFuture<'static, Result<TailPatchJobResult>>>,
     language: Option<String>,
     config: TailPatchConfig,
+    provider: crate::stt::tail_provider::TailProviderId,
 }
 
 impl AppleTailPatchLane {
     /// Open an empty lane. `TailPatchConfig::from_env` is read once here so the
     /// whole session judges every patch against the same thresholds, even if the
     /// env flips mid-hold.
-    fn new(_sample_rate: u32, language: Option<String>) -> Self {
+    fn new(
+        _sample_rate: u32,
+        language: Option<String>,
+        provider: crate::stt::tail_provider::TailProviderId,
+    ) -> Self {
         Self {
             jobs: FuturesOrdered::new(),
             language,
             // F2: thresholds stay exactly where the shared primitive puts them.
             config: TailPatchConfig::from_env(),
+            provider,
         }
     }
 
@@ -272,6 +278,7 @@ impl AppleTailPatchLane {
             req.audio,
             req.provider_request,
             self.config,
+            self.provider,
         );
         self.push_job(Box::pin(job));
     }
@@ -553,7 +560,13 @@ pub(crate) async fn apple_stream_transcription_session(
         );
         emit_local_tail_patch_degraded_warning(event_sink.as_ref(), disposition.as_token());
     }
-    let mut tail_patch_lane = AppleTailPatchLane::new(sample_rate, language.clone());
+    let mut tail_patch_lane = AppleTailPatchLane::new(
+        sample_rate,
+        language.clone(),
+        runtime_settings
+            .tail_provider()
+            .unwrap_or(crate::stt::tail_provider::TailProviderId::InProcess),
+    );
     // At-most-one-in-flight gate (F1), tracked outside the lane so the admit
     // branch's guard does not borrow what the collect branch holds mutably.
     let mut tail_patch_in_flight = false;
@@ -966,6 +979,7 @@ struct AppleSealState {
     fusion_seal_armed: bool,
     fusion_context: FusionContextMode,
     pending_silero_words: BTreeMap<u64, Vec<FusionWord>>,
+    unmatched_silero_words: Vec<FusionWord>,
     reconciled_silero: BTreeSet<u64>,
     /// Shared one-throne ledger.
     acoustic_ledger: Arc<Mutex<AcousticLedger>>,
@@ -975,7 +989,7 @@ struct AppleSealState {
 }
 
 impl AppleSealState {
-    fn owned_pcm_window(&self, start: u64, end: u64) -> Option<ResolvedAudioWindow> {
+    fn window_by_samples(&self, start: u64, end: u64) -> Option<ResolvedAudioWindow> {
         if let Some(archive) = &self.terminal_pcm {
             archive.window(start, end)
         } else {
@@ -1026,6 +1040,7 @@ impl AppleSealState {
             fusion_seal_armed: false,
             fusion_context: FusionContextMode::UtteranceOnly,
             pending_silero_words: BTreeMap::new(),
+            unmatched_silero_words: Vec::new(),
             reconciled_silero: BTreeSet::new(),
             acoustic_ledger: Arc::new(Mutex::new(AcousticLedger::new())),
             energy_calibration: None,
@@ -1899,12 +1914,11 @@ fn seal_sliced_by_silero(
     let Some(ledger) = state.fusion.as_ref().map(|fusion| fusion.ledger().clone()) else {
         return false;
     };
-    if ledger.utterances().is_empty() {
-        return false;
-    }
     let apple_words = apple_segments_on_pcm_clock(state, disjoint);
-    let fusion_words: Vec<FusionWord> = apple_words.iter().map(FusionWord::from_timed).collect();
+    let mut fusion_words = std::mem::take(&mut state.unmatched_silero_words);
+    fusion_words.extend(apple_words.iter().map(FusionWord::from_timed));
     let (sliced, leftover) = slice_apple_words(&ledger, &fusion_words);
+    state.unmatched_silero_words = leftover.clone();
     if sliced.is_empty() && state.pending_silero_words.is_empty() {
         if !leftover.is_empty() {
             let _ = ev_tx.send(EngineEvent::Warning {
@@ -1915,7 +1929,7 @@ fn seal_sliced_by_silero(
                 ),
             });
         }
-        return false;
+        return true;
     }
     if !leftover.is_empty() {
         let _ = ev_tx.send(EngineEvent::Warning {
@@ -2046,9 +2060,7 @@ fn seal_sliced_by_silero(
             })
             .unwrap_or(0);
         let request_range = bound_context_range(&silero.range, fence, context, pad_samples);
-        let window = state
-            .audio
-            .window_by_samples(request_range.sample_start, request_range.sample_end);
+        let window = state.window_by_samples(request_range.sample_start, request_range.sample_end);
         let _current_piece_owned = if apple_admitted.is_some()
             && let Some(window) = window
         {
@@ -2154,7 +2166,7 @@ fn admit_ledger_label(
         ) {
             return None;
         }
-        let window = state.owned_pcm_window(occurrence.sample_start, occurrence.sample_end)?;
+        let window = state.window_by_samples(occurrence.sample_start, occurrence.sample_end)?;
         if window.samples.is_empty() {
             return None;
         }
@@ -2310,19 +2322,7 @@ fn admit_full_pass_gap_segments(
     admitted
 }
 
-/// Compare committed occurrence coverage with the existing Silero speech
-/// ledger (or the capture energy ladder when Silero produced no spans), then
-/// offer timestamped evidence from one context-preserving whole-session
-/// Whisper pass to every material hole. Gap text enters only through exact
-/// segment PCM occurrences; the pass's unscoped rendered string remains
-/// comparison evidence.
-fn repair_terminal_seal_coverage(
-    state: &mut AppleSealState,
-    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
-    language: Option<&str>,
-) -> SealCoverageReceipt {
-    let threshold_samples =
-        u64::from(state.sample_rate).saturating_mul(SEAL_COVERAGE_INCOMPLETE_MS) / 1_000;
+fn coverage_speech_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
     let vad_ranges = state
         .fusion
         .as_ref()
@@ -2336,30 +2336,100 @@ fn repair_terminal_seal_coverage(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let speech_ranges = if vad_ranges.is_empty() {
+    if vad_ranges.is_empty() {
         session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)
     } else {
         vad_ranges
-    };
-    let initial = state
+    }
+}
+
+fn publish_terminal_coverage(
+    state: &AppleSealState,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+) -> SealCoverageReceipt {
+    let speech = coverage_speech_ranges(state);
+    let mut ledger = state
         .acoustic_ledger
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .assess_seal_coverage(
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let receipt = ledger.assess_seal_coverage(
+        &state.session_id,
+        state.capture_epoch,
+        &speech,
+        u64::from(state.sample_rate) * SEAL_COVERAGE_INCOMPLETE_MS / 1_000,
+    );
+    ledger.record_seal_coverage(receipt.clone());
+    let _ = ev_tx.send(EngineEvent::SealCoverage {
+        receipt: receipt.clone(),
+        comparison: None,
+    });
+    receipt
+}
+
+fn drain_formatter_observers(
+    state: &mut AppleSealState,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    done: &std_mpsc::Receiver<FormatterCompletion>,
+) -> Result<()> {
+    while state.formatter_awaiting_completion > 0 {
+        let completion = done.recv().map_err(|error| {
+            anyhow::anyhow!(
+                "formatter completion channel closed with outstanding occurrences: {error}"
+            )
+        })?;
+        anyhow::ensure!(
+            state.complete_formatter(ev_tx, completion),
+            "formatter completion did not return its emitter-sealed exact occurrence"
+        );
+    }
+    Ok(())
+}
+
+/// Compare committed occurrence coverage with the existing Silero speech
+/// ledger (or the capture energy ladder when Silero produced no spans), then
+/// request local Whisper evidence from each material uncovered PCM range.
+/// Only mapped segments enter the ledger. Unscoped text, uncertain timing and
+/// ranges crossing existing coverage cannot manufacture occurrence evidence.
+fn repair_terminal_seal_coverage(
+    state: &mut AppleSealState,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    language: Option<&str>,
+) -> SealCoverageReceipt {
+    let threshold_samples =
+        u64::from(state.sample_rate).saturating_mul(SEAL_COVERAGE_INCOMPLETE_MS) / 1_000;
+    let speech_ranges = state
+        .fusion
+        .as_ref()
+        .map(|fusion| {
+            fusion
+                .ledger()
+                .utterances()
+                .iter()
+                .filter(|utterance| utterance.closed)
+                .map(|utterance| utterance.range.clone())
+                .collect::<Vec<_>>()
+        })
+        .filter(|ranges| !ranges.is_empty())
+        .unwrap_or_else(|| {
+            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)
+        });
+    let initial = {
+        let ledger = state
+            .acoustic_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ledger.assess_seal_coverage(
             &state.session_id,
             state.capture_epoch,
             &speech_ranges,
             threshold_samples,
-        );
+        )
+    };
     state
         .acoustic_ledger
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .record_seal_coverage(initial.clone());
-    let _ = ev_tx.send(EngineEvent::SealCoverage {
-        receipt: initial.clone(),
-        comparison: None,
-    });
     if initial.status == SealCoverageStatus::Complete {
         return initial;
     }
@@ -2367,11 +2437,12 @@ fn repair_terminal_seal_coverage(
     // Decode only authenticated uncovered speech PCM. A gap request's rendered
     // text is never itself a witness: each original mapped segment must pass
     // the same containment, qualification and ledger corridor as before.
+    let mut initial_published = false;
     for (ordinal, range) in initial.uncovered_speech_ranges.iter().enumerate() {
         if range.sample_end.saturating_sub(range.sample_start) <= threshold_samples {
             continue;
         }
-        let Some(window) = state.owned_pcm_window(range.sample_start, range.sample_end) else {
+        let Some(window) = state.window_by_samples(range.sample_start, range.sample_end) else {
             let _ = ev_tx.send(EngineEvent::Warning {
                 code: "seal_coverage_gap_pcm_unavailable".into(),
                 message: format!(
@@ -2389,7 +2460,15 @@ fn repair_terminal_seal_coverage(
             sample_rate: state.sample_rate,
             language: language.map(str::to_owned),
         };
-        match InProcessTailProvider.transcribe(&request, &window.samples) {
+        let result = InProcessTailProvider.transcribe(&request, &window.samples);
+        if !initial_published {
+            let _ = ev_tx.send(EngineEvent::SealCoverage {
+                receipt: initial.clone(),
+                comparison: None,
+            });
+            initial_published = true;
+        }
+        match result {
             Ok(payload) if payload.identity == request.identity => {
                 admit_full_pass_gap_segments(
                     state,
@@ -2492,6 +2571,19 @@ fn seal_utterance_final(
 ) -> bool {
     const BOUNDARY_EPSILON_SECS: f32 = 0.002;
 
+    // The physical lane reconciles every timed candidate, including revised
+    // earlier coordinates. The legacy cursor must not discard them first.
+    if state.fusion_seal_armed {
+        if segments.is_empty() {
+            let _ = ev_tx.send(EngineEvent::Warning {
+                code: "apple_final_without_pcm_timing".into(),
+                message: "untimed Apple text cannot create an occurrence".into(),
+            });
+            return false;
+        }
+        seal_sliced_by_silero(state, ev_tx, &segments);
+        return true;
+    }
     let callback_text = raw.trim().to_string();
     let original_segment_count = segments.len();
     let mut disjoint = Vec::with_capacity(original_segment_count);
@@ -2574,9 +2666,6 @@ fn seal_utterance_final(
     // identical words with one span per copy is speech; only a run longer than
     // the audio can account for is a decoder loop.
     let after_lexicon = crate::quality::overlay_quality::apply_custom_lexicon(raw_text.trim());
-    if state.fusion_seal_armed && seal_sliced_by_silero(state, ev_tx, &disjoint) {
-        return true;
-    }
     let apple_words = apple_segments_on_pcm_clock(state, &disjoint);
     let request_id = state.utterance_id.saturating_add(1);
     let captured_end = state.audio.session_sample_end();
@@ -3272,19 +3361,7 @@ fn apple_stream_worker(
     // its exact slot is scheduled, stop drains the typed completion without a
     // second deadline or force-seal; the emitter returns the slot and seals the
     // occurrence before this acknowledgement can arrive.
-    while state.formatter_awaiting_completion > 0 {
-        let completion = formatter_done.recv().map_err(|error| {
-            anyhow::anyhow!(
-                "formatter completion channel closed with {} exact occurrence job(s) outstanding: {error}",
-                state.formatter_awaiting_completion,
-            )
-        })?;
-        if !state.complete_formatter(&ev_tx, completion) {
-            return Err(anyhow::anyhow!(
-                "formatter stop drain received a completion without an emitter-sealed exact occurrence",
-            ));
-        }
-    }
+    drain_formatter_observers(&mut state, &ev_tx, &formatter_done)?;
 
     // Capture is over: no later Apple callback can revise a span and no further
     // Whisper window can arrive, so both double-close gates are satisfied by
@@ -3292,7 +3369,9 @@ fn apple_stream_worker(
     // path — the machine's own span timestamps are the clock, because the audio
     // clock is frozen at EOF and can sit milliseconds behind them.
     state.seal_remaining_at_session_end(&ev_tx);
-    let seal_coverage = repair_terminal_seal_coverage(&mut state, &ev_tx, language);
+    repair_terminal_seal_coverage(&mut state, &ev_tx, language);
+    drain_formatter_observers(&mut state, &ev_tx, &formatter_done)?;
+    let seal_coverage = publish_terminal_coverage(&state, &ev_tx);
     if seal_coverage.status == SealCoverageStatus::Incomplete {
         let _ = ev_tx.send(EngineEvent::Warning {
             code: "terminal_seal_coverage_incomplete".to_string(),
@@ -5606,7 +5685,11 @@ mod tests {
     /// belongs to the seal owner after its rewrite fence accepts the result.
     #[test]
     fn finishing_tail_patch_only_hands_identity_to_the_seal_owner() {
-        let mut lane = AppleTailPatchLane::new(TEST_SAMPLE_RATE, None);
+        let mut lane = AppleTailPatchLane::new(
+            TEST_SAMPLE_RATE,
+            None,
+            crate::stt::tail_provider::TailProviderId::InProcess,
+        );
         let outcome = compute_tail_patch(
             "ala ma kota w domu",
             "ala ma kota w domu swoim",

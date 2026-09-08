@@ -1025,6 +1025,7 @@ pub struct RuntimeSettingsSnapshot {
     /// power-user env override. Consumers never re-read either source.
     seal_lane_armed: bool,
     local_tail_patch: crate::asr_session::recorder::LocalTailPatchDisposition,
+    tail_provider: Option<crate::stt::tail_provider::TailProviderId>,
 }
 
 /// Everything one loader pass resolved, handed to [`RuntimeSettingsSnapshot::seal_loaded`]
@@ -1041,6 +1042,7 @@ pub(crate) struct RuntimeSnapshotParts {
     pub(crate) energy_calibration: SealedEnergyCalibration,
     pub(crate) seal_lane_armed: bool,
     pub(crate) local_tail_patch: crate::asr_session::recorder::LocalTailPatchDisposition,
+    pub(crate) tail_provider: Option<crate::stt::tail_provider::TailProviderId>,
 }
 
 impl RuntimeSettingsSnapshot {
@@ -1060,6 +1062,7 @@ impl RuntimeSettingsSnapshot {
             energy_calibration,
             seal_lane_armed,
             local_tail_patch,
+            tail_provider,
         } = parts;
         SettingsSnapshotValidation::admit(&values, &provenance, &digest)?;
         Ok(Self {
@@ -1074,6 +1077,7 @@ impl RuntimeSettingsSnapshot {
             energy_calibration,
             seal_lane_armed,
             local_tail_patch,
+            tail_provider,
         })
     }
 
@@ -1101,6 +1105,7 @@ impl RuntimeSettingsSnapshot {
             energy_calibration,
             seal_lane_armed,
             local_tail_patch,
+            tail_provider,
         } = parts;
         Self {
             repair_receipt: super::repair::launch_receipt(),
@@ -1114,6 +1119,7 @@ impl RuntimeSettingsSnapshot {
             energy_calibration,
             seal_lane_armed,
             local_tail_patch,
+            tail_provider,
         }
     }
 
@@ -1125,6 +1131,11 @@ impl RuntimeSettingsSnapshot {
     /// Recording-start local Whisper decision, frozen by the sole loader.
     pub fn local_tail_patch_decision(&self) -> crate::asr_session::recorder::Layer1Decision {
         crate::asr_session::recorder::Layer1Decision::LocalTailPatch(self.local_tail_patch)
+    }
+
+    /// Frozen transport selection. Invalid configuration disarms the local lane.
+    pub fn tail_provider(&self) -> Option<crate::stt::tail_provider::TailProviderId> {
+        self.tail_provider
     }
 
     /// Borrow the frozen runtime values.

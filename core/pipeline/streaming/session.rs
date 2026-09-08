@@ -250,6 +250,7 @@ pub(super) async fn compute_tail_patch_job(
     audio: Vec<f32>,
     request: TailProviderRequest,
     config: TailPatchConfig,
+    provider: crate::stt::tail_provider::TailProviderId,
 ) -> Result<TailPatchJobResult> {
     compute_tail_patch_job_with(
         utterance_id,
@@ -258,7 +259,7 @@ pub(super) async fn compute_tail_patch_job(
         audio,
         request,
         config,
-        crate::stt::tail_provider::transcribe_configured,
+        move |request, pcm| crate::stt::tail_provider::transcribe_selected(provider, request, pcm),
     )
     .await
 }

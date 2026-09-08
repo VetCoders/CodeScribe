@@ -1232,6 +1232,16 @@ pub fn transcribe_configured(
         Err(std::env::VarError::NotPresent) => TailProviderId::InProcess,
         Err(error) => return Err(error.into()),
     };
+    transcribe_selected(provider_id, request, pcm)
+}
+
+/// Execute the transport selected by the recording snapshot without rereading
+/// the provider selector between jobs or during terminal closure.
+pub(crate) fn transcribe_selected(
+    provider_id: TailProviderId,
+    request: &TailProviderRequest,
+    pcm: &[f32],
+) -> Result<TailProviderPayload> {
     let inprocess = InProcessTailProvider;
     let outcome = match provider_id {
         TailProviderId::InProcess => {

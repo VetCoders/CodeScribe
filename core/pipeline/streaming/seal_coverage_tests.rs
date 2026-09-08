@@ -62,7 +62,7 @@ fn recovery_retention_head_before_120_seconds_remains_qualifiable() {
         .load(&state.session_id, 1, 16_000, pcm.len() as u64)
         .unwrap(),
     );
-    let recovered = state.owned_pcm_window(0, 16_000).unwrap();
+    let recovered = state.window_by_samples(0, 16_000).unwrap();
     assert_eq!(recovered.sample_start, 0);
     assert_eq!(recovered.sample_end, 16_000);
     assert!(
@@ -189,4 +189,300 @@ fn recovery_closed_occurrence_submits_owned_tail_job() {
     assert_eq!(job.provider_request.identity.range.sample_start, 0);
     assert_eq!(job.provider_request.identity.range.sample_end, 32_000);
     assert_eq!(state.tail_patch_awaiting_completion, 1);
+}
+
+#[test]
+fn recovery_formatter_created_by_gap_closes_before_coverage_and_terminal_seal() {
+    let mut state = state();
+    state.audio.push(&vec![0.25; 16_000]);
+    let mut fusion = SileroIngress::new(16_000, state.session_id.clone(), 1);
+    fusion
+        .ledger_mut()
+        .open_or_extend(&state.session_id, 1, 0, 16_000);
+    fusion.ledger_mut().close_open(16_000);
+    state.fusion = Some(fusion);
+    let (formatter, mut requests) = mpsc::channel(FORMATTER_QUEUE_CAP);
+    state.formatter = Some(formatter);
+    let (tx, _) = mpsc::unbounded_channel();
+    observe(&mut state, &tx, 0, 16_000, 1).unwrap();
+    assert_eq!(
+        publish_terminal_coverage(&state, &tx).status,
+        SealCoverageStatus::Complete
+    );
+    assert!(
+        state
+            .acoustic_ledger
+            .lock()
+            .unwrap()
+            .seal_terminal(&state.session_id, 1)
+            .is_err(),
+        "coverage is not formatter finality"
+    );
+    let request = requests.try_recv().unwrap();
+    let occurrence = request.occurrence.clone();
+    let completion = FormatterCompletion::from_result(
+        request,
+        AiFormatResult {
+            text: "Iwo".into(),
+            reasoning_text: None,
+            status: AiFormatStatus::Skipped,
+        },
+    );
+    // Model the emitter's synchronous no-change return before its worker ACK.
+    {
+        let mut ledger = state.acoustic_ledger.lock().unwrap();
+        assert!(ledger.note_frontier_return(&occurrence, LedgerObservationProducer::Formatter));
+        ledger.seal(&occurrence).unwrap();
+    }
+    let (ack, done) = std_mpsc::channel();
+    ack.send(completion.clone()).unwrap();
+    drain_formatter_observers(&mut state, &tx, &done).unwrap();
+    assert!(
+        !state.complete_formatter(&tx, completion),
+        "duplicate completion cannot close twice"
+    );
+    assert_eq!(
+        publish_terminal_coverage(&state, &tx).status,
+        SealCoverageStatus::Complete
+    );
+    state
+        .acoustic_ledger
+        .lock()
+        .unwrap()
+        .seal_terminal(&state.session_id, 1)
+        .unwrap();
+    assert_eq!(state.formatter_awaiting_completion, 0);
+}
+
+/// Local acoustic-recovery bench, not a microphone/history/delivery witness.
+/// Requires an archived take whose logged device calibration can be recovered.
+#[test]
+#[ignore = "private local WAV and measured capture calibration required"]
+fn private_archive_acoustic_recovery_bench() {
+    let path =
+        std::path::PathBuf::from(std::env::var("CODESCRIBE_REPLAY_WAV").expect("local WAV path"));
+    let session = path.file_stem().unwrap().to_str().unwrap().to_owned();
+    let log = std::fs::read_to_string(
+        directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .join(".codescribe/logs/codescribe.log"),
+    )
+    .unwrap();
+    let line = log
+        .lines()
+        .find(|line| {
+            line.contains("acoustic admission calibration sealed for session")
+                && line.contains(&format!("session={session}"))
+        })
+        .expect("archived session capture receipt");
+    let device = line
+        .split("device=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("recorded device identity");
+    let reader = hound::WavReader::open(&path).unwrap();
+    let rate = reader.spec().sample_rate;
+    let count = u64::from(reader.duration());
+    let snapshot = crate::config::Config::load_runtime_snapshot_without_keychain().unwrap();
+    let calibration = snapshot
+        .energy_calibration_for_capture(device, rate)
+        .expect("measured profile for actual archived device");
+    assert!(
+        line.contains(&format!("calibration_version={}", calibration.version)),
+        "calibration generation must match the archived capture"
+    );
+    let owned = super::super::live_audio_buffer::FinalizedPcmArchive {
+        session_id: session.clone(),
+        capture_epoch: 1,
+        sample_rate: rate,
+        sample_count: count,
+        path,
+    }
+    .load(&session, 1, rate, count)
+    .unwrap();
+    let mut state = AppleSealState::new_for_session(rate, session.clone(), 1);
+    state.energy_calibration = Some(calibration);
+    let mut fusion = SileroIngress::new(rate, session, 1);
+    assert!(fusion.vad_available());
+    let mut cursor = 0;
+    for chunk in owned
+        .window(0, count)
+        .unwrap()
+        .samples
+        .chunks((rate / 10) as usize)
+    {
+        cursor += chunk.len() as u64;
+        state.audio.push(chunk);
+        fusion.ingest(chunk, cursor);
+    }
+    fusion.flush(count);
+    state.fusion = Some(fusion);
+    state.terminal_pcm = Some(owned);
+    let (tx, _) = mpsc::unbounded_channel();
+    let before = publish_terminal_coverage(&state, &tx);
+    repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+    let after = publish_terminal_coverage(&state, &tx);
+    let mut ledger = state.acoustic_ledger.lock().unwrap();
+    let terminal = if after.status == SealCoverageStatus::Complete {
+        ledger.seal_terminal(&state.session_id, 1).is_ok()
+    } else {
+        false
+    };
+    println!(
+        "LOCAL_ACOUSTIC_BENCH samples={count} rate={rate} before={}/{} max_gap={} after={}/{} max_gap={} threshold={} terminal={} chars={}",
+        before.covered_samples,
+        before.speech_samples,
+        before.max_uncovered_samples,
+        after.covered_samples,
+        after.speech_samples,
+        after.max_uncovered_samples,
+        after.incomplete_threshold_samples,
+        terminal,
+        ledger.rendered_text().chars().count()
+    );
+    assert!(
+        after.speech_samples > 0,
+        "zero-occurrence replay is not evidence"
+    );
+    assert!(terminal, "real PCM did not achieve terminal coverage");
+}
+
+#[tokio::test]
+#[ignore = "private archived capture provenance; isolated formatting-off settings required"]
+async fn private_archive_live_producer_bench() {
+    let path =
+        std::path::PathBuf::from(std::env::var("CODESCRIBE_REPLAY_WAV").expect("local WAV path"));
+    let session = path.file_stem().unwrap().to_str().unwrap().to_owned();
+    let log = std::fs::read_to_string(
+        directories::BaseDirs::new()
+            .unwrap()
+            .home_dir()
+            .join(".codescribe/logs/codescribe.log"),
+    )
+    .unwrap();
+    let line = log
+        .lines()
+        .find(|line| {
+            line.contains("acoustic admission calibration sealed for session")
+                && line.contains(&format!("session={session}"))
+        })
+        .expect("archived capture receipt");
+    let device = line
+        .split("device=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_owned();
+    let reader = hound::WavReader::open(&path).unwrap();
+    let rate = reader.spec().sample_rate;
+    let count = u64::from(reader.duration());
+    let pcm = reader
+        .into_samples::<i16>()
+        .map(|s| f32::from(s.unwrap()) / f32::from(i16::MAX))
+        .collect::<Vec<_>>();
+    let snapshot =
+        Arc::new(crate::config::Config::load_runtime_snapshot_without_keychain().unwrap());
+    assert_eq!(
+        snapshot.formatting_policy(),
+        FormattingPolicy::Off,
+        "private audio may not reach a remote formatter"
+    );
+    assert_eq!(
+        snapshot.tail_provider(),
+        Some(crate::stt::tail_provider::TailProviderId::InProcess)
+    );
+    assert!(snapshot.seal_lane_armed());
+    let calibration = snapshot
+        .energy_calibration_for_capture(&device, rate)
+        .unwrap();
+    assert!(line.contains(&format!("calibration_version={}", calibration.version)));
+    let layer1 = snapshot.local_tail_patch_decision();
+    assert!(layer1.is_armed());
+    let ledger = Arc::new(Mutex::new(AcousticLedger::new()));
+    let (archive, terminal_audio) = std_mpsc::channel();
+    archive
+        .send(Ok(super::super::live_audio_buffer::FinalizedPcmArchive {
+            session_id: session.clone(),
+            capture_epoch: 1,
+            sample_rate: rate,
+            sample_count: count,
+            path,
+        }))
+        .unwrap();
+    let events = super::super::session::collect_buffered_engine_events_with_config(
+        &pcm,
+        SessionConfig {
+            session_id: session.clone(),
+            capture_epoch: 1,
+            runtime_settings: snapshot,
+            acoustic_ledger: ledger.clone(),
+            sample_rate: rate,
+            capture_device_name: Some(device),
+            language: Some("pl".into()),
+            stream_log_path: None,
+            utterance_silence_sec: None,
+            layer1,
+            lifecycle_events: None,
+            terminal_audio: Some(terminal_audio),
+        },
+    )
+    .await
+    .unwrap();
+    let tail = TailPatchSessionReceipt::from_events(&events).expect("production tail receipt");
+    let terminal = events.iter().any(|event| matches!(event, EngineEvent::LedgerSeal { receipt } if !receipt.is_occurrence_seal()));
+    let ledger = ledger.lock().unwrap();
+    if ledger.latest_seal_coverage().is_none() {
+        for event in &events {
+            match event {
+                EngineEvent::NoSpeech { reason } => {
+                    let classification = [
+                        "permission",
+                        "authorized",
+                        "timed out",
+                        "timeout",
+                        "deadline",
+                        "bridge",
+                        "EOF",
+                        "archive",
+                        "mismatch",
+                        "formatter",
+                        "Speech",
+                        "worker",
+                    ]
+                    .into_iter()
+                    .filter(|token| {
+                        reason
+                            .to_ascii_lowercase()
+                            .contains(&token.to_ascii_lowercase())
+                    })
+                    .collect::<Vec<_>>();
+                    println!(
+                        "LOCAL_PRODUCER_FAILURE classification={classification:?} reason_chars={}",
+                        reason.chars().count()
+                    );
+                }
+                EngineEvent::Warning { code, .. } => println!("LOCAL_PRODUCER_WARNING code={code}"),
+                _ => {}
+            }
+        }
+    }
+    let coverage = ledger
+        .latest_seal_coverage()
+        .expect("production coverage receipt");
+    println!(
+        "LOCAL_PRODUCER_BENCH samples={count} rate={rate} covered={}/{} max_gap={} threshold={} terminal={} armed={} submitted={} chars={}",
+        coverage.covered_samples,
+        coverage.speech_samples,
+        coverage.max_uncovered_samples,
+        coverage.incomplete_threshold_samples,
+        terminal,
+        tail.armed,
+        tail.submitted,
+        ledger.rendered_text().chars().count()
+    );
+    assert!(coverage.speech_samples > 0);
+    assert!(tail.armed && tail.submitted > 0);
+    assert_eq!(coverage.status, SealCoverageStatus::Complete);
+    assert!(terminal);
 }
