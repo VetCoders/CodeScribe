@@ -61,6 +61,14 @@ final class ThreadsRefreshTests: XCTestCase {
     wait(for: [drained], timeout: 2)
   }
 
+  private func postWindowActivation() {
+    // AppKit observers require the notification object to be an NSWindow.
+    // A nil stand-in can crash NSRemoteView before the store assertions run.
+    let window = NSWindow(
+      contentRect: .zero, styleMask: [], backing: .buffered, defer: true)
+    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: window)
+  }
+
   // MARK: C1 — refresh on window activation, and ONLY on a trigger
 
   func testWindowActivationRefreshesRailAndNoTriggerDoesNot() {
@@ -79,7 +87,7 @@ final class ThreadsRefreshTests: XCTestCase {
 
     // Window activation → the rail re-reads disk truth on the next
     // main-queue tick (coalesced out of the notification callout).
-    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+    postWindowActivation()
     drainMainQueue()
     XCTAssertTrue(
       backendIds(store).contains("t_overlay"),
@@ -113,7 +121,7 @@ final class ThreadsRefreshTests: XCTestCase {
     store.ingestVoiceTurn(threadId: "t_voice", userText: "hello")
     provider.stubbed.insert(("t_other", "Other"), at: 0)
 
-    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+    postWindowActivation()
     drainMainQueue()
     XCTAssertFalse(
       backendIds(store).contains("t_other"),
@@ -159,7 +167,7 @@ final class ThreadsRefreshTests: XCTestCase {
     XCTAssertEqual(store.currentThread?.backendId, "t_old")
 
     provider.stubbed.insert(("t_fresh", "Fresh overlay reply"), at: 0)
-    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+    postWindowActivation()
     drainMainQueue()
 
     XCTAssertEqual(
@@ -185,7 +193,7 @@ final class ThreadsRefreshTests: XCTestCase {
     let baseline = provider.listCalls
 
     for _ in 0..<10 {
-      NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+      postWindowActivation()
     }
     drainMainQueue()
 
@@ -211,7 +219,7 @@ final class ThreadsRefreshTests: XCTestCase {
     let subscription = store.objectWillChange.sink { _ in publishes += 1 }
     defer { subscription.cancel() }
 
-    NotificationCenter.default.post(name: NSWindow.didBecomeKeyNotification, object: nil)
+    postWindowActivation()
     drainMainQueue()
 
     XCTAssertEqual(
