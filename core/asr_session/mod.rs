@@ -93,3 +93,126 @@ pub use recorder::{
     RecorderLayer1Lane, RecorderLifecycleEvent, RecorderLifecycleEvents, RecorderLifecycleHandle,
     apply_recorder_lifecycle_event, recorder_lifecycle_channel,
 };
+
+/// Content-free recording-start decision. Endpoints and credentials never
+/// enter this receipt, even when provider construction is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layer1DecisionReceipt {
+    pub asr_mode: &'static str,
+    pub refiner: &'static str,
+    pub reason: &'static str,
+    pub consent: &'static str,
+}
+
+/// Resolve and log Layer 1 exactly once before the recording lane opens.
+/// Both microphone capture and production replay consume this entrypoint.
+pub fn layer1_decision(
+    snapshot: &crate::config::RuntimeSettingsSnapshot,
+) -> (Layer1Decision, Layer1DecisionReceipt) {
+    let (decision, receipt) = layer1_decision_with_factory(snapshot, |snapshot, authorization| {
+        let values = snapshot.values();
+        let endpoint = values
+            .stt_live_endpoint
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("live_endpoint_missing")?;
+        let key = values
+            .stt_live_api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("live_key_missing")?;
+        // This baseline speaks the Voice Lab live WebSocket directly. The
+        // connection is constructed from the loader's live lane, never env or the
+        // file-upload lane. Construction is dormant; open starts its worker.
+        let connection =
+            GatewayConnection::new(endpoint, key).map_err(|_| "live_connection_invalid")?;
+        let limits = CloudSessionLimits {
+            // Capture is native-rate, not necessarily 16 kHz: retain the
+            // bounded 200 ms frame budget through 192 kHz capture/replay.
+            max_frame_samples: 38_400,
+            ..CloudSessionLimits::default()
+        };
+        let transport = GatewayWebSocketTransport::new(connection, limits)
+            .map_err(|_| "cloud_transport_invalid")?;
+        let provider = LiveCloudAsrSession::new(transport, limits, authorization)
+            .map_err(|_| "cloud_provider_invalid")?;
+        Ok(Box::new(provider))
+    });
+    tracing::info!(
+        asr_mode = receipt.asr_mode,
+        refiner = receipt.refiner,
+        reason = receipt.reason,
+        consent = receipt.consent,
+        "layer1_decision"
+    );
+    (decision, receipt)
+}
+
+/// One policy body; tests replace only dormant cloud transport construction.
+fn layer1_decision_with_factory(
+    snapshot: &crate::config::RuntimeSettingsSnapshot,
+    cloud_factory: impl FnOnce(
+        &crate::config::RuntimeSettingsSnapshot,
+        CloudEgressAuthorization,
+    ) -> Result<Box<dyn AsrSessionProvider + Send>, &'static str>,
+) -> (Layer1Decision, Layer1DecisionReceipt) {
+    use crate::config::cloud_asr::{AudioEgressConsent, ModeDerivation};
+
+    // resolved_asr_mode delegates to the single resolve_asr_product_mode law.
+    let resolved = snapshot.user_settings().resolved_asr_mode();
+    let mut receipt = Layer1DecisionReceipt {
+        asr_mode: resolved.mode.as_str(),
+        refiner: "off",
+        reason: "layered_off",
+        consent: match resolved.consent {
+            AudioEgressConsent::Granted(_) => "granted",
+            AudioEgressConsent::Denied => "denied",
+            AudioEgressConsent::Unanswered => "missing",
+        },
+    };
+    let fallback = snapshot.local_tail_patch_decision();
+    if !fallback.is_armed() {
+        receipt.reason = match fallback.local_tail_patch_disposition() {
+            Some(LocalTailPatchDisposition::DegradedInvalidOverride) => "layered_invalid",
+            _ => "layered_off",
+        };
+        return (Layer1Decision::Disarmed, receipt);
+    }
+    match refiner_for(&resolved) {
+        RefinerMode::CloudSession => {
+            // Keep the non-constructible witness at the actual factory seam.
+            let provider = authorize_cloud_egress(&resolved.consent)
+                .map_err(|_| "consent_required")
+                .and_then(|authorization| cloud_factory(snapshot, authorization));
+            match provider {
+                Ok(provider) => {
+                    receipt.refiner = "cloud_session";
+                    receipt.reason = "cloud_ready";
+                    (Layer1Decision::Armed(provider), receipt)
+                }
+                Err(reason) => {
+                    receipt.reason = reason;
+                    // A failed cloud selection never silently loads local weights.
+                    (Layer1Decision::Disarmed, receipt)
+                }
+            }
+        }
+        RefinerMode::LocalHelper => {
+            // LocalHelperLauncher has no production implementation. The tail
+            // sidecar speaks a different protocol and is not an L1 helper.
+            receipt.refiner = "local_tail_patch";
+            receipt.reason = "local_helper_unavailable";
+            (fallback, receipt)
+        }
+        RefinerMode::Off => {
+            receipt.refiner = "local_tail_patch";
+            receipt.reason = match resolved.derivation {
+                ModeDerivation::ConsentMissingFallback => "consent_missing",
+                ModeDerivation::ConsentDeniedFallback => "consent_denied",
+                ModeDerivation::UnknownModeFallback => "asr_mode_invalid",
+                _ => "apple_only_phase1",
+            };
+            (fallback, receipt)
+        }
+    }
+}
