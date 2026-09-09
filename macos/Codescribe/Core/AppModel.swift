@@ -75,6 +75,11 @@ final class OverlayController: ObservableObject {
   private let panelFactory: @MainActor (OverlayState, TextScaleController) -> NSPanel
   private let orderPanelFront: @MainActor (NSPanel) -> Void
   private let orderPanelOut: @MainActor (NSPanel) -> Void
+  /// Runs the agent-handoff fade and calls back when it finishes. Injected so a
+  /// test can fire the completion at an exact moment in the lifecycle instead of
+  /// racing a wall-clock animation; the default keeps the real 0.18 s fade.
+  private let runHandoffFade:
+    @MainActor (NSPanel, @MainActor @Sendable () -> Void) -> Void
   /// A direct edge resize is the user's size decision for the current session.
   /// The next recording may breathe again from that persisted starting point.
   private var automaticContentSizingEnabled = true
@@ -97,7 +102,10 @@ final class OverlayController: ObservableObject {
     },
     panelFactory: (@MainActor (OverlayState, TextScaleController) -> NSPanel)? = nil,
     orderPanelFront: (@MainActor (NSPanel) -> Void)? = nil,
-    orderPanelOut: (@MainActor (NSPanel) -> Void)? = nil
+    orderPanelOut: (@MainActor (NSPanel) -> Void)? = nil,
+    runHandoffFade: (
+      @MainActor (NSPanel, @MainActor @Sendable () -> Void) -> Void
+    )? = nil
   ) {
     let state = state ?? OverlayState()
     self.state = state
@@ -109,6 +117,15 @@ final class OverlayController: ObservableObject {
       }
     self.orderPanelFront = orderPanelFront ?? { $0.orderFrontRegardless() }
     self.orderPanelOut = orderPanelOut ?? { $0.orderOut(nil) }
+    self.runHandoffFade =
+      runHandoffFade ?? { panel, completed in
+        NSAnimationContext.runAnimationGroup { context in
+          context.duration = 0.18
+          panel.animator().alphaValue = 0
+        } completionHandler: {
+          MainActor.assumeIsolated { completed() }
+        }
+      }
     state.engine = engine
     // Drive the tray status off the SAME authoritative recording lifecycle the
     // overlay already receives. The tray view-model otherwise only polls on
@@ -355,15 +372,27 @@ final class OverlayController: ObservableObject {
     if state.freeMotion {
       OverlayPlacement.persistOrigin(panel.frame.origin)
     }
-    NSAnimationContext.runAnimationGroup { context in
-      context.duration = 0.18
-      panel.animator().alphaValue = 0
-    } completionHandler: { [weak self] in
-      Task { @MainActor in
-        guard let self, let panel = self.panel else { return }
-        self.orderPanelOut(panel)
-        panel.alphaValue = 1
+    // Bind the completion to the exact panel AND the capture it is fading out.
+    // The panel object is cached and reused, so the old completion re-read
+    // `self.panel` and ordered out whichever window was current — a take that
+    // started inside the 0.18 s fade lost its overlay to its predecessor's
+    // handoff. Alpha is always restored: refusing the order-out while leaving a
+    // reused window at alpha 0 would trade a hidden panel for an invisible one.
+    let fadedPanel = panel
+    let generation = state.captureGeneration
+    runHandoffFade(
+      fadedPanel,
+      { [weak self] in
+        defer { fadedPanel.alphaValue = 1 }
+        guard let self else { return }
+        // Still the live window, but a successor capture owns it now: this fade
+        // has no authority over the take that replaced its own. A panel that is
+        // no longer current is an orphan and is ordered out either way.
+        if self.panel === fadedPanel, self.state.captureGeneration != generation {
+          return
+        }
+        self.orderPanelOut(fadedPanel)
       }
-    }
+    )
   }
 }

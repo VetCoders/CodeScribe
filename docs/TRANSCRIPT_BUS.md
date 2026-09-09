@@ -275,6 +275,65 @@ into every later complete `rendered_text` revision, preserving capture order at
 equal positions. Swift receives that finished projection verbatim; it does not
 insert, pad, retain, or replay marker text.
 
+### Receiver lifecycle and presentation guarantees
+
+The overlay receiver keeps three things apart: the capture that is pending, the
+previous take's authoritative document, and an unsent local draft. A new capture
+is admitted on the controller's own `on_recording_preparing` /
+`on_recording_started` callback while nothing is recording — never on a Bus
+`session_started` row, because the consumer contract below forbids reading that
+row as permission to mutate product state.
+
+At that admission the receiver holds a monotonic, presentation-local capture
+generation. It fences asynchronous UI work only: the terminal auto-hide wake, the
+orphaned-"starting" watchdog, and the agent-handoff fade completion each capture
+the generation they were armed under and refuse to act once it moved. The
+generation cannot mint a session, an occurrence, a seal, a delivery
+acknowledgement or acoustic evidence; those remain Rust-owned, and a UI counter
+that named any of them would be exactly the forged authority this boundary
+forbids.
+
+A pending capture paints no previous speech and inherits no action capabilities:
+phase, terminal flag, reducer revision and the five action bits are reset, and
+the previous projection leaves the paint path. It is retired, not destroyed. The
+superseded document and the last superseded uncommitted draft each stay readable
+in one bounded slot; delivery recovery still belongs to the composer store and
+the existing retained-delivery documents, and no second transcript history store
+exists. A scheduled draft commit for the superseded take is cancelled rather than
+sent, so no revision request crosses FFI for a closed session while a new capture
+is live.
+
+Retiring a session also fences its late events. A retired projection may still
+complete its own addressed delivery and capture release, but it cannot repaint
+the successor's canvas, change its chrome, finalize it, arm its countdown or
+close it. Duplicate `preparing` / `started` beats for an open capture are
+idempotent: they do not re-fence the take, erase already admitted text, or
+restart the session clock.
+
+Visibility follows the current capture route plus the explicit overlay
+preference. An enabled Dictation take stays visible through measured silence; an
+explicit overlay-off runs headless; a genuine Agent/Assistive route stays hidden;
+and showing the panel never takes key or main focus. There is no always-show
+shortcut and no disabled animation.
+
+One seam is not closable inside the receiver. `CsTrayStatusPayload`
+(`bridge/src/tray_status.rs`) carries `kind`, `tone`, `indicator_mode`,
+`assistive`, `tooltip`, `menu_label` and a monotonic tray `generation`, but no
+session or capture identity. `TrayStatusStore` already refuses non-monotonic
+ticks, so ordering is sound; what the payload cannot express is whether a current
+`assistive` reading belongs to the live capture or to a different route. The
+documented mid-hold `Fn` → `Fn+Shift` upgrade is delivered on exactly that tick,
+so the receiver honours it and does not guess. Binding a tray tick to a capture
+requires capture identity on the producer side; until then this is a stated
+boundary, not an inferred hide cause. The lifecycle callbacks are identity-less
+for the same reason: `on_recording_preparing` / `on_recording_started` carry no
+session id, so a projection for a session the receiver has never observed cannot
+be classified as predecessor or successor by presentation alone.
+
+These guarantees are source contracts authored under W2. The Swift tests that
+state them are UNRUN, and no binding generation, install or runtime reproduction
+is claimed here.
+
 ## Authority boundary
 
 ```text

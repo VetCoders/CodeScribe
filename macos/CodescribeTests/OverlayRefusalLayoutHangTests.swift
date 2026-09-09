@@ -228,4 +228,112 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       calibrationVersion: nil
     )
   }
+
+  // MARK: New-take presentation on the real panel
+
+  /// Founder witness, Dragon `3bae96614`: the next take opened on the previous
+  /// take's words. The state contract is asserted in OverlayStateTests; this is
+  /// the real hosting-hierarchy witness that clearing a long canvas repaints and
+  /// that the layout pass still returns — the failure mode this file exists for.
+  @MainActor
+  func testNewTakeAfterARefusedTakeRepaintsFromEmptyAndLayoutReturns() throws {
+    let harness = try mountListeningPanel(revisions: 14, label: "new-take")
+    defer { harness.tearDown() }
+    harness.state.handleError(message: refusal)
+    XCTAssertEqual(harness.state.mode, .listening)
+    XCTAssertEqual(harness.state.activeText.count, harness.chars)
+
+    harness.state.handleRecordingPreparing()
+    harness.root.layoutSubtreeIfNeeded()
+    XCTAssertEqual(harness.state.canvasText, "", "the new take opens on its own screen")
+    XCTAssertEqual(harness.state.activeText, "")
+
+    let elapsed = measureLayout(harness.root)
+    print(
+      "W2_OVERLAY_NEW_TAKE_LAYOUT chars=\(harness.chars) elapsed_s=\(elapsed)"
+    )
+    XCTAssertLessThan(
+      elapsed, 2.0,
+      "clearing a \(harness.chars)-char canvas took \(elapsed)s — the repaint is not bounded"
+    )
+    XCTAssertEqual(
+      harness.state.supersededTranscriptProjection?.renderedText.count, harness.chars,
+      "the refused take's words are retired, not destroyed")
+  }
+
+  /// `hideForAgentHandoff` used to re-read `self.panel` in its fade completion.
+  /// The panel object is cached and reused, so a take that started inside the
+  /// 0.18 s fade had its own overlay ordered out by its predecessor's handoff.
+  /// The fade is injected here so the completion fires at an exact point in the
+  /// lifecycle instead of racing the animation.
+  @MainActor
+  func testHandoffFadeCompletionCannotCloseTheSuccessorsOverlay() throws {
+    let state = OverlayState()
+    let panel = try XCTUnwrap(
+      DictationOverlayWindow.make(
+        state: state,
+        textScale: TextScaleController(key: "OverlayRefusalLayoutHangTests.handoff.textScale")
+      ) as? FloatingOverlayPanel
+    )
+    defer {
+      panel.orderOut(nil)
+      panel.invalidatePresence()
+    }
+
+    var pendingFade: (@MainActor @Sendable () -> Void)?
+    var outs = 0
+    let controller = OverlayController(
+      state: state,
+      engine: nil,
+      overlayEnabledProvider: { true },
+      assistiveStatusProvider: { false },
+      panelFactory: { _, _ in panel },
+      orderPanelFront: { $0.orderFrontRegardless() },
+      orderPanelOut: { shown in
+        shown.orderOut(nil)
+        outs += 1
+      },
+      // Mimic the real fade's visible effect so the alpha assertions below
+      // describe a window that was actually dimmed, not one that never moved.
+      runHandoffFade: { faded, completed in
+        faded.alphaValue = 0
+        pendingFade = completed
+      }
+    )
+    // The controller's production hooks reach `AppModel.shared`; these are the
+    // panel calls they make, without building the real chat/license stack.
+    state.onRecordingPreparing = { [unowned controller] in controller.showForRecording() }
+    state.onRecordingStarted = { [unowned controller] in controller.showForRecording() }
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertTrue(panel.isVisible)
+    let handedOffGeneration = state.captureGeneration
+
+    controller.hideForAgentHandoff()
+    let staleFade = try XCTUnwrap(pendingFade, "the handoff must run a fade")
+    XCTAssertEqual(outs, 0, "nothing is ordered out until the fade completes")
+    XCTAssertEqual(panel.alphaValue, 0, "the window is mid-fade")
+
+    // Take 2 opens while the predecessor's fade is still in flight.
+    state.finishControllerRecording()
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertGreaterThan(state.captureGeneration, handedOffGeneration)
+    XCTAssertTrue(panel.isVisible)
+    XCTAssertEqual(panel.alphaValue, 1, "showing the successor undims the reused window")
+
+    staleFade()
+    XCTAssertEqual(outs, 0, "the predecessor's handoff cannot close the successor")
+    XCTAssertTrue(panel.isVisible, "the successor keeps its window")
+    XCTAssertEqual(panel.alphaValue, 1, "and that window is not left invisible")
+
+    // The successor's own handoff still completes normally.
+    controller.hideForAgentHandoff()
+    let ownFade = try XCTUnwrap(pendingFade)
+    ownFade()
+    XCTAssertEqual(outs, 1, "a handoff still hides the take it actually fed")
+    XCTAssertEqual(panel.alphaValue, 1)
+    withExtendedLifetime(controller) {}
+  }
 }

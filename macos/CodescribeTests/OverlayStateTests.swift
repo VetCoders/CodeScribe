@@ -2152,7 +2152,17 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertFalse(state.terminal)
   }
 
-  func testRecordingLifecycleDoesNotClearTheLastProjection() {
+  /// Founder witness, Dragon build `3bae96614` (2026-09-09): a new take opened
+  /// showing the PREVIOUS take's transcript. The lifecycle used to keep the old
+  /// projection in the paint path — this test previously asserted that as the
+  /// contract (`…DoesNotClearTheLastProjection`, `mode == .formatted` and the
+  /// old words on a fresh capture). The witness falsified it.
+  ///
+  /// The real concern that test defended survives and is asserted here: the
+  /// lifecycle must not DESTROY the last projection. It is retired out of the
+  /// paint path and stays readable, which is a different thing from painting it
+  /// as new speech.
+  func testRecordingLifecycleRetiresThePriorProjectionInsteadOfPaintingIt() {
     let state = OverlayState()
 
     state.handleRecordingStarted()
@@ -2165,12 +2175,27 @@ final class OverlayStateTests: XCTestCase {
     )
     state.finishControllerRecording()
     XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
+    let firstGeneration = state.captureGeneration
 
     state.handleRecordingStarted()
 
-    XCTAssertEqual(state.mode, .formatted)
-    XCTAssertEqual(state.activeText, "tekst poprzedniego nagrania")
-    XCTAssertEqual(state.formattedText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.mode, .listening, "a pending capture is not a formatted take")
+    XCTAssertEqual(state.activeText, "", "no old speech on a new take's canvas")
+    XCTAssertEqual(state.formattedText, "")
+    XCTAssertEqual(state.canvasText, "")
+    XCTAssertFalse(state.terminal)
+    XCTAssertFalse(state.canPaste)
+    XCTAssertFalse(state.canInsert)
+    XCTAssertFalse(state.canCopy)
+    XCTAssertFalse(state.canRetranscribe)
+    XCTAssertFalse(state.canFormat)
+    XCTAssertGreaterThan(state.captureGeneration, firstGeneration)
+
+    // Not destroyed — the prior document is still readable, and its session is
+    // retired so its own late events cannot repaint this capture.
+    XCTAssertEqual(
+      state.supersededTranscriptProjection?.renderedText, "tekst poprzedniego nagrania")
+    XCTAssertEqual(state.supersededTranscriptProjection?.sessionId, "previous-take")
 
     projectSessionText(
       "tekst nowego nagrania",
@@ -2180,5 +2205,285 @@ final class OverlayStateTests: XCTestCase {
     )
     XCTAssertEqual(state.mode, .listening)
     XCTAssertEqual(state.formattedText, "tekst nowego nagrania")
+  }
+
+  // MARK: Acceptance 1 — old formatted take + dirty draft cannot reach a new one
+
+  func testFormattedTakeWithDirtyDraftLeavesNoOldSpeechOnTheNextCapture() {
+    let engine = OverlayStateTestEngine()
+    let state = OverlayState()
+    state.engine = engine
+
+    projectText(
+      "Tekst poprzedniej sesji.",
+      to: state,
+      canPaste: true,
+      canInsert: true,
+      canRetranscribe: true,
+      terminal: true,
+      sessionId: "take-1"
+    )
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Tekst poprzedniej sesji z moją poprawką.")
+    XCTAssertTrue(state.isRevisionDraftDirty)
+    XCTAssertEqual(state.canvasText, "Tekst poprzedniej sesji z moją poprawką.")
+    // A genuine focus exit schedules the commit; the next capture arrives first.
+    state.endTranscriptEdit()
+
+    state.handleRecordingPreparing()
+    XCTAssertEqual(state.canvasText, "", "preparing alone must clear the canvas")
+    XCTAssertEqual(state.formattedText, "")
+    XCTAssertFalse(state.isRevisionDraftDirty)
+    XCTAssertFalse(state.isEditingTranscript)
+    XCTAssertFalse(state.isTranscriptEditable)
+
+    state.handleRecordingStarted()
+    XCTAssertEqual(state.canvasText, "")
+    XCTAssertEqual(state.mode, .listening)
+
+    // Both the sealed document and the uncommitted draft stayed recoverable,
+    // and nothing was committed across the capture boundary.
+    XCTAssertEqual(
+      state.supersededTranscriptProjection?.renderedText, "Tekst poprzedniej sesji.")
+    XCTAssertEqual(
+      state.supersededRevisionDraft, "Tekst poprzedniej sesji z moją poprawką.")
+    XCTAssertTrue(
+      engine.revisionRequests.isEmpty,
+      "a superseded draft is preserved for recovery, never committed mid-capture")
+    XCTAssertFalse(state.revisionCommitPending)
+    XCTAssertNil(state.revisionCommitError)
+  }
+
+  func testCleanDraftLeavesNoRecoverySlotBehind() {
+    let state = OverlayState()
+    projectText("Dokładnie ta sama treść.", to: state, terminal: true, sessionId: "clean-take")
+    XCTAssertFalse(state.isRevisionDraftDirty)
+
+    state.handleRecordingPreparing()
+    XCTAssertNil(
+      state.supersededRevisionDraft,
+      "an unedited draft is not unsaved work and must not be offered as recovery")
+    XCTAssertEqual(
+      state.supersededTranscriptProjection?.renderedText, "Dokładnie ta sama treść.")
+  }
+
+  // MARK: Acceptance 5 — duplicate preparing/started is idempotent
+
+  func testDuplicatePreparingAndStartedKeepAdmittedTextAndClock() {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+
+    state.handleRecordingPreparing()
+    let generation = state.captureGeneration
+    state.handleRecordingStarted()
+    clock.now += 7
+    projectSessionText("już przyjęte słowa", sessionId: "open-take", sequence: 1, to: state)
+    XCTAssertEqual(state.formattedText, "już przyjęte słowa")
+    XCTAssertEqual(state.elapsedCaptureSeconds(), 7)
+
+    // The controller can repeat either beat for an OPEN capture.
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    state.handleRecordingPreparing()
+
+    XCTAssertEqual(state.captureGeneration, generation, "one open capture, one generation")
+    XCTAssertEqual(
+      state.formattedText, "już przyjęte słowa", "a duplicate beat cannot erase admitted text")
+    XCTAssertEqual(state.canvasText, "już przyjęte słowa")
+    XCTAssertEqual(state.elapsedCaptureSeconds(), 7, "the session clock is not restarted")
+    XCTAssertNil(state.supersededTranscriptProjection)
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "open-take")
+  }
+
+  // MARK: Acceptance 3 — stale async work cannot close or repaint a successor
+
+  func testAutoHideWakeArmedByAnEarlierTakeCannotCloseTheSuccessor() {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectSessionText("pierwszy take", sessionId: "take-1", sequence: 1, to: state, terminal: true)
+    let staleGeneration = state.captureGeneration
+
+    // Take 2 opens before the first take's five-second wake resumes.
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectSessionText("drugi take", sessionId: "take-2", sequence: 1, to: state)
+    clock.now += OverlayState.autoHideDelaySeconds + 1
+
+    state.fireAutoHideForTests(generation: staleGeneration)
+    XCTAssertEqual(closes, 0, "take 1's countdown has no authority over take 2")
+    XCTAssertEqual(state.formattedText, "drugi take")
+
+    // The successor's own terminal countdown still closes its own overlay.
+    projectSessionText(
+      "drugi take zamknięty", sessionId: "take-2", sequence: 2, to: state, terminal: true)
+    clock.now += OverlayState.autoHideDelaySeconds + 1
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 1)
+  }
+
+  func testWarmupWatchdogArmedByAnEarlierTakeCannotDismissTheSuccessor() {
+    let state = OverlayState()
+    var closes = 0
+    state.onClose = { closes += 1 }
+
+    state.handleRecordingPreparing()
+    let staleGeneration = state.captureGeneration
+    state.finishControllerRecording()
+    state.handleRecordingPreparing()
+
+    XCTAssertTrue(state.warmingUp, "the successor is still in its own warmup window")
+    state.fireWarmupWatchdogForTests(generation: staleGeneration)
+    XCTAssertEqual(closes, 0, "a stale orphan-dismiss cannot abort a live capture")
+    XCTAssertTrue(state.warmingUp)
+
+    state.fireWarmupWatchdogForTests(generation: state.captureGeneration)
+    XCTAssertEqual(closes, 1, "the successor's own watchdog still recovers a stuck start")
+  }
+
+  func testLateTerminalOfASupersededTakeCannotRepaintOrFinalizeTheSuccessor() {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+    var endedSessions: [String] = []
+    state.onCaptureEnded = { endedSessions.append($0) }
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectSessionText("stary take", sessionId: "old", sequence: 1, to: state)
+
+    state.finishControllerRecording()
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectSessionText("nowy take", sessionId: "new", sequence: 1, to: state)
+
+    // The predecessor's terminal seal finally arrives.
+    projectSessionText("stary take domknięty", sessionId: "old", sequence: 2, to: state,
+      terminal: true)
+
+    XCTAssertEqual(state.formattedText, "nowy take", "a retired seal cannot repaint")
+    XCTAssertEqual(state.mode, .listening, "nor change the successor's chrome")
+    XCTAssertFalse(state.terminal, "nor finalize it")
+    XCTAssertEqual(
+      endedSessions, ["old"],
+      "the retired take still completes its own addressed capture release")
+
+    clock.now += OverlayState.autoHideDelaySeconds + 1
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 0, "a retired terminal never armed a countdown for this capture")
+  }
+
+  // MARK: Acceptance 2 and 4 — visibility follows the capture route
+
+  /// The lifecycle hooks are replaced with the panel calls they perform in
+  /// production. `OverlayController`'s own hooks reach `AppModel.shared`, which
+  /// would build the real chat/license stack inside a unit test.
+  private func makeRoutedController(
+    state: OverlayState,
+    overlayEnabled: Bool,
+    assistive: Bool,
+    panel: NSPanel,
+    frontCount: @escaping () -> Void,
+    outCount: @escaping () -> Void
+  ) -> OverlayController {
+    let controller = OverlayController(
+      state: state,
+      engine: nil,
+      overlayEnabledProvider: { overlayEnabled },
+      assistiveStatusProvider: { assistive },
+      panelFactory: { _, _ in panel },
+      orderPanelFront: { panel in
+        panel.orderFrontRegardless()
+        frontCount()
+      },
+      orderPanelOut: { panel in
+        panel.orderOut(nil)
+        outCount()
+      }
+    )
+    state.onRecordingPreparing = { [unowned controller] in controller.showForRecording() }
+    state.onRecordingStarted = { [unowned controller] in controller.showForRecording() }
+    state.onRecordingStopped = { [unowned controller] in controller.markStopped() }
+    return controller
+  }
+
+  func testEnabledDictationStaysVisibleThroughCaptureAndSilence() {
+    var fronts = 0
+    var outs = 0
+    let state = OverlayState()
+    let panel = NSPanel()
+    let controller = makeRoutedController(
+      state: state, overlayEnabled: true, assistive: false, panel: panel,
+      frontCount: { fronts += 1 }, outCount: { outs += 1 })
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertGreaterThan(fronts, 0)
+    XCTAssertEqual(outs, 0)
+
+    // Silence: no VAD, no measured level, no projection — and a non-assistive
+    // tray tick arriving mid-capture. None of these is a hide decision.
+    state.applyVad(false)
+    // `AudioLevelMeter.push` takes LINEAR rms and rejects negatives, so a quiet
+    // room is a tiny positive block, not a dBFS number. It measures silence.
+    state.applyAudioLevel(0.0002)
+    controller.handleIndicatorModeChange(.hold)
+    controller.handleIndicatorModeChange(.toggle)
+    controller.handleIndicatorModeChange(.processing)
+    controller.showForRecording()
+
+    XCTAssertEqual(outs, 0, "an enabled Dictation overlay survives measured silence")
+    XCTAssertFalse(state.vadActive)
+    XCTAssertTrue(state.hasMeasuredAudioLevel, "the mic is alive and reporting")
+    XCTAssertEqual(state.levelMeter.gain, 0, "what it reports is silence")
+    XCTAssertTrue(state.autoPasteControlAvailable)
+    withExtendedLifetime(controller) {}
+  }
+
+  func testExplicitOffAndGenuineAssistiveHideWithoutStealingFocus() {
+    var offFronts = 0
+    let offState = OverlayState()
+    let offPanel = NSPanel()
+    let offController = makeRoutedController(
+      state: offState, overlayEnabled: false, assistive: false, panel: offPanel,
+      frontCount: { offFronts += 1 }, outCount: {})
+    offState.handleRecordingPreparing()
+    offState.handleRecordingStarted()
+    XCTAssertEqual(offFronts, 0, "explicit overlay-off runs headless")
+    XCTAssertFalse(offPanel.isVisible)
+
+    var agentFronts = 0
+    let agentState = OverlayState()
+    let agentPanel = NSPanel()
+    let agentController = makeRoutedController(
+      state: agentState, overlayEnabled: true, assistive: true, panel: agentPanel,
+      frontCount: { agentFronts += 1 }, outCount: {})
+    agentState.handleRecordingPreparing()
+    agentState.handleRecordingStarted()
+    XCTAssertEqual(agentFronts, 0, "a genuine Agent/Assistive route is owned by the composer")
+    XCTAssertFalse(agentState.autoPasteControlAvailable)
+
+    // The visible Dictation route never takes key or main away from the user.
+    var visibleFronts = 0
+    let visibleState = OverlayState()
+    let realPanel = DictationOverlayWindow.make(
+      state: visibleState,
+      textScale: TextScaleController(key: "OverlayStateTests.route.textScale")
+    )
+    let visibleController = makeRoutedController(
+      state: visibleState, overlayEnabled: true, assistive: false, panel: realPanel,
+      frontCount: { visibleFronts += 1 }, outCount: {})
+    visibleState.handleRecordingPreparing()
+    XCTAssertGreaterThan(visibleFronts, 0)
+    XCTAssertTrue(realPanel.isVisible)
+    XCTAssertFalse(realPanel.isKeyWindow, "showing the overlay is not a focus grab")
+    XCTAssertFalse(realPanel.isMainWindow)
+    realPanel.orderOut(nil)
+    withExtendedLifetime([offController, agentController, visibleController]) {}
   }
 }

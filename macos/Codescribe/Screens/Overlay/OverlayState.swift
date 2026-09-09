@@ -384,6 +384,25 @@ final class OverlayState {
   /// Latest immutable projection event only; Rust `TranscriptRevision` remains
   /// the document owner and Rust `AcousticSerial` remains evidence authority.
   private(set) var latestTranscriptProjection: CsTranscriptProjectionEvent?
+  /// Monotonic, presentation-local capture generation. Every asynchronous UI
+  /// job (auto-hide wake, warmup watchdog, panel handoff completion) captures
+  /// the generation it was armed under and refuses to act once it moved.
+  ///
+  /// This is a fence, never an authority: it cannot mint a session, an
+  /// occurrence, a seal, a delivery acknowledgement or acoustic evidence. Rust
+  /// owns all five, and a UI counter that started naming them would be exactly
+  /// the forged transcript authority this overlay is forbidden to invent.
+  @ObservationIgnored private(set) var captureGeneration: UInt64 = 0
+  /// The previous take's authoritative document, moved OUT of the paint path
+  /// when a new capture is admitted, so a pending capture cannot show it as new
+  /// speech. Delivery recovery still belongs to the composer store and
+  /// `retainedComposerDocuments`; this single slot only keeps the last
+  /// superseded document readable instead of dropping it on the floor.
+  @ObservationIgnored private(set) var supersededTranscriptProjection:
+    CsTranscriptProjectionEvent?
+  /// The last superseded uncommitted draft. One bounded slot, replaced per
+  /// capture — deliberately not a second transcript history store.
+  @ObservationIgnored private(set) var supersededRevisionDraft: String?
   private var agentSessionArmed = false
   private var agentFinalTranscriptAppeared = false
   private var agentAutoSendCancelled = false
@@ -1150,6 +1169,9 @@ final class OverlayState {
     hasMeasuredAudioLevel = false
     levelMeter.reset()
     if !recording {
+      // Duplicate preparing/started for an OPEN capture must never reach this
+      // branch: it would re-fence a take whose text was already admitted.
+      admitNewCapture()
       resetTranscript()
       errorMessage = nil
       beginCaptureClock()
@@ -1170,6 +1192,7 @@ final class OverlayState {
     if !recording {
       hasMeasuredAudioLevel = false
       levelMeter.reset()
+      admitNewCapture()
       resetTranscript()
       errorMessage = nil
       beginCaptureClock()
@@ -1223,10 +1246,11 @@ final class OverlayState {
   /// rapid repeated preparing events collapse to a single 4s window.
   private func armWarmupWatchdog() {
     warmupWatchdogTask?.cancel()
+    let generation = captureGeneration
     warmupWatchdogTask = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: OverlayState.warmupWatchdogNanos)
       guard !Task.isCancelled else { return }
-      self?.fireWarmupWatchdog()
+      self?.fireWarmupWatchdog(generation: generation)
     }
   }
 
@@ -1241,7 +1265,11 @@ final class OverlayState {
   /// Fallback dismiss for a stuck optimistic overlay. Only fires if we are STILL
   /// in the "starting" state (`warmingUp`, not finalized) — if any real event
   /// already progressed us, `warmingUp` is false and this is a no-op.
-  private func fireWarmupWatchdog() {
+  /// `generation` is the capture this watchdog was armed for. A successor take
+  /// that re-armed (or a capture that already ended and was replaced) leaves a
+  /// resumed older task here; dismissing on it would close the wrong overlay.
+  private func fireWarmupWatchdog(generation: UInt64) {
+    guard generation == captureGeneration else { return }
     warmupWatchdogTask = nil
     guard warmingUp, !finalized else { return }
     abortRecordingSession(resetTranscript: true)
@@ -1262,24 +1290,31 @@ final class OverlayState {
     }
     cancelAutoHide()
     autoHideDeadline = nowProvider() + OverlayState.autoHideDelaySeconds
-    scheduleAutoHideWake(after: OverlayState.autoHideDelaySeconds)
+    scheduleAutoHideWake(after: OverlayState.autoHideDelaySeconds, generation: captureGeneration)
   }
 
-  private func scheduleAutoHideWake(after delay: TimeInterval) {
+  private func scheduleAutoHideWake(after delay: TimeInterval, generation: UInt64) {
     let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
     autoHideTask = Task { @MainActor [weak self] in
       try? await Task.sleep(nanoseconds: nanoseconds)
       guard !Task.isCancelled else { return }
-      self?.evaluateAutoHideDeadline(rescheduleIfEarly: true)
+      self?.evaluateAutoHideDeadline(rescheduleIfEarly: true, generation: generation)
     }
   }
 
-  private func evaluateAutoHideDeadline(rescheduleIfEarly: Bool) {
+  /// The terminal outcome of the take named by `generation` may close its own
+  /// overlay. A wake that survives into a successor capture is refused here
+  /// rather than at the flags: `terminal`/`autoHideDeadline` describe whatever
+  /// take is current, so they cannot answer "was this deadline mine?".
+  private func evaluateAutoHideDeadline(rescheduleIfEarly: Bool, generation: UInt64) {
+    guard generation == captureGeneration else { return }
     autoHideTask = nil
     guard isTerminalMode, !isPointerHovering, let deadline = autoHideDeadline else { return }
     let remaining = deadline - nowProvider()
     if remaining > 0 {
-      if rescheduleIfEarly { scheduleAutoHideWake(after: remaining) }
+      if rescheduleIfEarly {
+        scheduleAutoHideWake(after: remaining, generation: generation)
+      }
       return
     }
     autoHideDeadline = nil
@@ -1295,9 +1330,22 @@ final class OverlayState {
   /// Deterministic XCTest seam: tests inject a monotonic clock, advance it,
   /// and evaluate the same deadline logic without wall-clock sleeps.
   func fireAutoHideNowForTests() {
+    fireAutoHideForTests(generation: captureGeneration)
+  }
+
+  /// Deterministic negative seam: replay a wake that was armed by an EARLIER
+  /// capture (pass its generation) and prove it cannot close the successor.
+  func fireAutoHideForTests(generation: UInt64) {
     autoHideTask?.cancel()
     autoHideTask = nil
-    evaluateAutoHideDeadline(rescheduleIfEarly: false)
+    evaluateAutoHideDeadline(rescheduleIfEarly: false, generation: generation)
+  }
+
+  /// Deterministic negative seam for the orphaned-"starting" watchdog. It does
+  /// NOT cancel the live task: cancelling the successor's own watchdog would
+  /// hide the very refusal the negative test exists to observe.
+  func fireWarmupWatchdogForTests(generation: UInt64) {
+    fireWarmupWatchdog(generation: generation)
   }
 
   private func cancelAutoHide() {
@@ -1738,6 +1786,63 @@ final class OverlayState {
     }
     pendingNoSpeechMessage = message
     noSpeechNotice = message
+  }
+
+  /// One capture boundary.
+  ///
+  /// Called only from the lifecycle admission the controller already owns
+  /// (`preparing` / `started` while nothing is recording). It is deliberately
+  /// NOT driven by a Bus row: `docs/TRANSCRIPT_BUS.md` forbids treating
+  /// `session_started` as permission to mutate product state, so the overlay
+  /// fences on the controller's own callback instead.
+  ///
+  /// The pending capture gets an empty canvas and no inherited action
+  /// capabilities. The superseded take keeps its document and its draft
+  /// readable, and its session is retired: a late projection for it can still
+  /// finish its addressed delivery, but it can no longer repaint, finalize or
+  /// auto-hide the successor.
+  private func admitNewCapture() {
+    // Read the draft's dirtiness against the OUTGOING document, before any
+    // field below moves. Computed after the reset it would compare against an
+    // empty projection and misclassify a clean draft as unsaved work.
+    let draftWasDirty = isRevisionDraftDirty
+    captureGeneration &+= 1
+    if let prior = latestTranscriptProjection {
+      retiredProjectionSessions.insert(prior.sessionId)
+      supersededTranscriptProjection = prior
+    }
+    latestTranscriptProjection = nil
+    // A scheduled focus-exit commit belongs to the take being superseded.
+    // Letting it fire across the boundary would send an FFI revision for a
+    // closed session while a new capture is live, so the bytes are preserved
+    // for recovery rather than committed behind the user's back.
+    revisionFocusCommitTask?.cancel()
+    revisionFocusCommitTask = nil
+    supersededRevisionDraft = draftWasDirty ? revisionDraft : nil
+    revisionDraft = ""
+    // Retained chrome is evidence about the previous take, not this one.
+    transcriptMode = "dictation"
+    mode = .listening
+    terminal = false
+    revision = 0
+    canPaste = false
+    canInsert = false
+    canCopy = false
+    canRetranscribe = false
+    canFormat = false
+    // The canvas is no longer editable, so AppKit will resign it; recording the
+    // presentation truth here keeps the caret and the auto-hide hold honest.
+    // `endTranscriptEdit` is idempotent, so the later resign cannot double-fire
+    // a commit for a draft this boundary already moved to recovery.
+    isEditingTranscript = false
+    revisionCommitPending = false
+    formatterCommitPending = false
+    revisionCommitError = nil
+    formatterError = nil
+    pendingRevisionSessionId = nil
+    pendingRevisionSource = nil
+    userRevisionProvenance = nil
+    onTranscriptPresentationChanged?()
   }
 
   private func resetTranscript() {
