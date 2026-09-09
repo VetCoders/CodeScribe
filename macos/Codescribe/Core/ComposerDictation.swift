@@ -49,83 +49,42 @@ final class RealComposerDictation: ComposerDictating {
 
   func toggle() {
     guard let store, !transitioning else { return }
-    // A start still in flight is never replaced. A request that already spent
-    // its stop permission is different: its terminal may never arrive, and this
-    // press is the user asking us to reconcile — see the idle branch below.
+    // Pending settlement is still ownership. Neither another press nor a false
+    // recording query can acknowledge delivery or replace its destination.
     guard !store.hasComposerCaptureRequest || store.ownsLiveDictation
-      || store.composerCaptureAwaitingTerminal
     else { return }
-    let wasOwned = store.ownsLiveDictation
+    let ownedHandle = store.ownsLiveDictation ? store.composerCaptureHandle : nil
+    let request = store.currentComposerCaptureRequestID
     let destination = store.selectedThreadID
     transitioning = true
     store.prepareDictationGesture()
     transitionTask = Task { @MainActor in
       defer { transitioning = false }
-      let live = await hotkeys.isRecording()
-      // Read after suspension: a terminal notification may have revoked the
-      // local request while the controller query was in flight.
-      let owned = store.ownsLiveDictation
-      store.dictationBlocked = live && !owned
-      if live && !owned {
-        dictationLog.info("Agent voice capture press ignored — another surface owns the take")
-        store.releaseUnownedDictationGesture()
-        return
-      }
-      // A stop gesture invalidated during the query must not turn into a start.
-      guard !wasOwned || owned else { return }
-      if owned {
-        // Idle does not prove pending text has been delivered. In either case
-        // retire stop permission without releasing the original destination.
+      if let request {
+        guard store.isCurrentComposerCaptureRequest(request), let handle = ownedHandle else { return }
         store.awaitComposerCaptureTerminal()
-        guard let handle = store.composerCaptureHandle else {
-          // Ownership without an admitted identity is not stop permission: we
-          // would have to stop "whatever is live", which is exactly the thing
-          // this seam exists to refuse.
-          dictationLog.error("Agent voice capture stop refused — no admitted capture identity")
-          store.reconcileComposerCaptureLost()
-          return
-        }
         do {
           let outcome = try await hotkeys.stopComposerTurnRecording(handle: handle)
-          switch outcome {
-          case .stopped:
-            dictationLog.info("Agent composer take stop accepted for its own capture")
-          case .alreadyStopping:
-            dictationLog.info("Agent composer take is already stopping; terminal still owed")
-          case .foreignCapture:
-            // Someone replaced our take between the press and this call. Theirs
-            // keeps running; ours is over, so release without touching it.
-            dictationLog.info("Agent composer stop refused — a foreign take owns the microphone")
-            store.reconcileComposerCaptureLost()
-          case .noLiveCapture:
-            // Nothing is capturing: this take can produce no further terminal.
-            dictationLog.info("Agent composer stop found no live capture; reconciling request")
-            store.reconcileComposerCaptureLost()
-          }
+          store.applyComposerStopOutcome(outcome, requestID: request, handle: handle)
         } catch {
-          // Transport failure says nothing about the take. Keep the pending
-          // destination; the next press reconciles against the controller.
-          store.reportDictationFailure(
-            "Couldn't change recording: \(error.userFacingMessage)", preservingDelivery: true)
+          store.reportComposerStopFailure(
+            "Couldn't change recording: \(error.userFacingMessage)", requestID: request, handle: handle)
         }
         // The terminal projection consumer must deliver before releasing the
         // latch. No post-stop isRecording poll can establish that ordering.
         return
       }
-      if store.hasComposerCaptureRequest {
-        // The controller just answered that nothing is capturing, so no take of
-        // ours can still produce a terminal. Release the stuck request against
-        // that fact — not against a timeout — so the gesture works again.
-        dictationLog.info("Agent composer request reconciled against an idle controller")
-        store.reconcileComposerCaptureLost()
+      let live = await hotkeys.isRecording()
+      guard !store.hasComposerCaptureRequest else { return }
+      if live {
+        store.releaseUnownedDictationGesture()
+        return
       }
       let requestID = store.beginComposerCaptureRequest(threadID: destination)
       do {
         let admitted = try await hotkeys.startComposerTurnRecording()
         guard store.isCurrentComposerCaptureRequest(requestID) else { return }
-        store.completeComposerCaptureStart(requestID, live: false, handle: admitted)
-        let stillLive = await hotkeys.isRecording()
-        store.completeComposerCaptureStart(requestID, live: stillLive, handle: admitted)
+        store.completeComposerCaptureStart(requestID, live: true, handle: admitted)
         dictationLog.info("Agent composer take start requested on shared controller")
       } catch {
         guard store.isCurrentComposerCaptureRequest(requestID) else { return }

@@ -40,8 +40,9 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     var admittedCaptureId = "capture-1"
     /// Typed answer the conditional stop returns when it does not throw.
     var stopOutcome: CsConditionalStop = .stopped
-    var onStart: (@MainActor @Sendable () -> Void)?
-    var onQuery: (@MainActor @Sendable () -> Void)?
+    var onStart: (@MainActor @Sendable () async -> Void)?
+    var onQuery: (@MainActor @Sendable () async -> Void)?
+    var onStop: (@MainActor @Sendable () async -> Void)?
     private(set) var calls: [CaptureCall] = []
 
     init(recording: [Bool]) {
@@ -65,6 +66,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
 
     func stopComposerTurnRecording(handle: CsCaptureHandle) async throws -> CsConditionalStop {
       calls.append(.stop(handle.captureId))
+      await onStop?()
       if stopFails { throw CaptureFailure.refused }
       return stopOutcome
     }
@@ -126,7 +128,10 @@ final class ComposerTurnOwnershipTests: XCTestCase {
   }
 
   private func makeFixture(recording: [Bool]) -> Fixture {
-    let store = AgentChatStore(threadsProvider: StubThreadsProvider())
+    let name = "Codescribe.ComposerTurnOwnershipTests." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: name)!
+    addTeardownBlock { UserDefaults(suiteName: name)?.removePersistentDomain(forName: name) }
+    let store = AgentChatStore(threadsProvider: StubThreadsProvider(), persistenceDefaults: defaults)
     let surface = FakeCaptureSurface(recording: recording)
     let dictation = RealComposerDictation(store: store, hotkeys: surface)
     store.dictation = dictation
@@ -309,12 +314,12 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     XCTAssertNil(f.store.dictationThreadID)
   }
 
-  func testTerminalDuringStopQueryRevokesPreviouslyCompletedStart() async {
+  func testTerminalBeforeStopReplyRevokesPreviouslyCompletedStart() async {
     let f = makeFixture(recording: [false, true, true])
     f.dictation.toggle()
     await settle(f)
     XCTAssertTrue(f.store.ownsLiveDictation)
-    f.surface.onQuery = { [store = f.store] in
+    f.surface.onStop = { [store = f.store] in
       store.endDictationSession()
       store.setDictationPhase(.recording)
     }
@@ -322,7 +327,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.dictation.toggle()
     await settle(f)
 
-    XCTAssertFalse(stopRequested(f.surface.calls))
+    XCTAssertTrue(stopRequested(f.surface.calls))
     XCTAssertFalse(f.store.ownsLiveDictation)
   }
 
@@ -362,19 +367,121 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     XCTAssertFalse(f.store.hasComposerCaptureRequest)
   }
 
-  func testTerminalDuringStopQueryCannotTurnThatGestureIntoANewStart() async {
+  func testTerminalDuringStopCannotTurnThatGestureIntoANewStart() async {
     let f = makeFixture(recording: [false, true, false])
     f.dictation.toggle()
     await settle(f)
-    f.surface.onQuery = { [store = f.store] in store.endDictationSession() }
+    f.surface.onStop = { [store = f.store] in store.endDictationSession() }
 
     f.dictation.toggle()
     await settle(f)
 
     XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
-    XCTAssertFalse(stopRequested(f.surface.calls))
+    XCTAssertTrue(stopRequested(f.surface.calls))
     XCTAssertFalse(f.store.ownsLiveDictation)
     XCTAssertNil(f.store.dictationThreadID)
+  }
+
+  /// Acknowledgment is emitted only after the continuation is registered.
+  @MainActor
+  private final class Gate {
+    let entered: XCTestExpectation
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    init(_ entered: XCTestExpectation) { self.entered = entered }
+    func wait() async {
+      guard !released else { return }
+      await withCheckedContinuation { continuation in
+        continuations.append(continuation)
+        if continuations.count == 1 { entered.fulfill() }
+      }
+    }
+    func release() {
+      released = true
+      let pending = continuations
+      continuations.removeAll()
+      for continuation in pending { continuation.resume() }
+    }
+  }
+
+  func testOwnedStopReachesHandleWhileAnAcknowledgedRecordingQueryNeverAnswers() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertTrue(f.store.ownsLiveDictation, "handle admission needs no telemetry round trip")
+    let query = Gate(expectation(description: "recording query held"))
+    f.surface.onQuery = { await query.wait() }
+    let blockedQuery = Task { await f.surface.isRecording() }
+    await fulfillment(of: [query.entered], timeout: 1)
+    let reached = expectation(description: "named Stop reached while query held")
+    f.surface.onStop = { reached.fulfill() }
+    f.surface.stopOutcome = .pending
+    f.dictation.toggle()
+    await fulfillment(of: [reached], timeout: 1)
+    // Release even if the assertion timed out, so a regression cannot strand
+    // the suite's continuation. The endpoint assertion happened before release.
+    query.release()
+    _ = await blockedQuery.value
+    await settle(f)
+    XCTAssertEqual(stopCount(f.surface.calls), 1)
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    XCTAssertEqual(f.store.dictationPhase, .preparing)
+  }
+
+  func testPendingAndFalseRecordingCannotReplaceThreadOrStartAgain() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.stopOutcome = .pending
+    f.dictation.toggle()
+    await settle(f)
+    f.store.select(f.threadB)
+    let calls = f.surface.calls
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, calls)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertEqual(f.store.dictationPhase, .preparing)
+    XCTAssertEqual(f.store.receiveDictationTranscript("A's exact words", captureID: "capture-1"), .parked(threadID: f.threadA))
+    XCTAssertTrue(f.store.finishDictationCapture(sessionID: "capture-1"))
+    XCTAssertEqual(f.store.draft, "")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "A's exact words")
+  }
+
+  func testAdmissionUnavailableKeepsSameHandleForExplicitRetry() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.stopOutcome = .admissionUnavailable
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    f.surface.stopOutcome = .pending
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls.filter { if case .stop("capture-1") = $0 { return true }; return false }.count, 2)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+  }
+
+  func testCancelledAdapterStopCannotErasePendingOwner() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    let stop = Gate(expectation(description: "Stop registered"))
+    f.surface.onStop = { await stop.wait() }
+    f.surface.stopOutcome = .pending
+    f.dictation.toggle()
+    await fulfillment(of: [stop.entered], timeout: 1)
+    f.dictation.transitionTask?.cancel()
+    stop.release()
+    await settle(f)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(stopCount(f.surface.calls), 1)
   }
 
 }

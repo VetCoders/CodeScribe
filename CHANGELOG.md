@@ -51,6 +51,8 @@ Release exists.
 
 ### Fixed
 
+- **Latched paste target never yields to a foreign frontmost app.** `execute_clipboard_paste` follows the throne law `clipboard_paste_may_post`: a latched target must confirm focus or be observed frontmost; the external-frontmost fallback (2fb2bd8ec) now applies only to an Insert with no latch. Canary finding P1-01 (2026-08-24) closed.
+
 - **Repeated speech is no longer deleted by string equality.** Light+ stopped
   collapsing every immediately repeated word, and decoder-loop cleanup now
   consults the number of acoustic spans before removing a run. Saying a name
@@ -125,6 +127,7 @@ Release exists.
 
 ### Changed
 
+- **One owner per delivery fact.** `os::selection::is_codescribe_app` is the single self-app check (the controller's `target_is_self_app` twin is gone); the frontmost app is read only through `NSWorkspace` (the `System Events` osascript fallback is gone, so the paste latch and the post-activation observation compare the same name and never spawn a process or ride Automation TCC); dead `clipboard::paste_text` / `is_restore_enabled` removed (no caller since 2026-08-21); hold and toggle starts share one paste-target capture and one latch writer.
 - **Span idempotence is enabled by default.**
   `CODESCRIBE_SPAN_IDEMPOTENCE` changed from `0` to `1`. The gate deduplicates
   structural replays of the same observation identity; it must never dedupe

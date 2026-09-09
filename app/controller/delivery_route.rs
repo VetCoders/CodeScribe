@@ -179,13 +179,6 @@ pub(crate) struct TranscriptProjectionAvailability {
     pub can_format: bool,
 }
 
-/// Localized name of **this process**. Used to skip `NSRunningApplication`
-/// activate (we are already running). Not a paste veto — the Agent window
-/// is a legal Cmd+V sink. Overlay-canvas veto is the Swift caret probe.
-pub fn target_is_self_app(name: &str) -> bool {
-    name.trim().eq_ignore_ascii_case("codescribe")
-}
-
 /// Facts an overlay Insert / defer click may feed the throne.
 ///
 /// Focus-at-click is not an input. `latched_target_is_self` is true only when
@@ -318,6 +311,33 @@ fn overlay_insert_route(facts: DeliveryFacts) -> DeliveryDecision {
     }
 }
 
+/// Transport law for an already decided `ClipboardPaste`: may the synthetic
+/// Cmd+V be posted right now?
+///
+/// - A **latched** target must have confirmed focus (bounded wait) or be
+///   observed frontmost afterwards. It never yields to whoever happens to be
+///   frontmost — that fallback re-admitted "focus at stop" through the back
+///   door (`2fb2bd8ec`, 2026-09-08) and was the canary finding P1-01
+///   "auto-paste accepts unconfirmed activation" (2026-08-24).
+/// - With **no** latch (an overlay Insert started from Codescribe itself, so
+///   the latch never stored a target) the external frontmost app is the only
+///   caret the user can mean; Codescribe's own windows are still refused.
+///
+/// Event-tap permission is checked by the caller; this is destination law only.
+#[must_use]
+pub const fn clipboard_paste_may_post(
+    target_latched: bool,
+    focus_confirmed: bool,
+    target_observed_frontmost: bool,
+    frontmost_is_external: bool,
+) -> bool {
+    if target_latched {
+        focus_confirmed || target_observed_frontmost
+    } else {
+        frontmost_is_external
+    }
+}
+
 /// One INFO line: route, reason, intent, latched target. The stop-path budget
 /// already has a `delivery_secs` phase; this names *where* those seconds went.
 pub fn format_delivery_route_line(
@@ -337,6 +357,7 @@ pub fn format_delivery_route_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::os::selection::is_codescribe_app;
 
     fn facts(overrides: impl FnOnce(&mut DeliveryFacts)) -> DeliveryFacts {
         let mut f = DeliveryFacts {
@@ -588,10 +609,29 @@ mod tests {
 
     #[test]
     fn codescribe_is_self_case_insensitive() {
-        assert!(target_is_self_app("Codescribe"));
-        assert!(target_is_self_app(" codescribe "));
-        assert!(!target_is_self_app("Ghostty"));
-        assert!(!target_is_self_app(""));
+        assert!(is_codescribe_app("Codescribe"));
+        assert!(is_codescribe_app(" codescribe "));
+        assert!(!is_codescribe_app("Ghostty"));
+        assert!(!is_codescribe_app(""));
+    }
+
+    #[test]
+    fn latched_target_unconfirmed_never_follows_foreign_frontmost() {
+        // Today's take: target latched, activation unconfirmed, a foreign app frontmost.
+        assert!(!clipboard_paste_may_post(true, false, false, true));
+        assert!(!clipboard_paste_may_post(true, false, false, false));
+    }
+
+    #[test]
+    fn latched_target_posts_when_confirmed_or_observed() {
+        assert!(clipboard_paste_may_post(true, true, false, false));
+        assert!(clipboard_paste_may_post(true, false, true, false));
+    }
+
+    #[test]
+    fn unlatched_insert_follows_external_frontmost_only() {
+        assert!(clipboard_paste_may_post(false, false, false, true));
+        assert!(!clipboard_paste_may_post(false, false, false, false));
     }
 
     #[test]
