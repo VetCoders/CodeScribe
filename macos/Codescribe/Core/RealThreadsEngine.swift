@@ -7,13 +7,13 @@ import Foundation
 final class RealThreadsEngine: BackgroundThreadListing {
   private let threads = CodescribeThreads()
 
-  func listThreads() -> [ChatThread] {
-    guard let list = try? threads.listThreads(filter: nil) else { return [] }
+  func listThreads() throws -> [ChatThread] {
+    let list = try threads.listThreads(filter: nil)
     return list.map(Self.thread)
   }
 
-  func searchThreads(query: String) -> [ChatThread] {
-    guard let list = try? threads.searchThreads(query: query) else { return [] }
+  func searchThreads(query: String) throws -> [ChatThread] {
+    let list = try threads.searchThreads(query: query)
     return list.map(Self.thread)
   }
 

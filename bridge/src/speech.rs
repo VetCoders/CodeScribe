@@ -30,15 +30,15 @@ pub fn stop_speaking() {
 pub async fn speak_text(text: String) -> Result<CsSpeechResult, CsError> {
     let ticket = speech::playback::begin();
     application_runtime::run(async move {
-        let cancelled = async {
-            while speech::playback::current(ticket) {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        };
-        let audio = tokio::select! {
-            biased;
-            _ = cancelled => return Ok(CsSpeechResult { outcome: "stopped".into(), duration_ms: 0, cached: false }),
-            result = speech::synthesize(&text) => result.map_err(anyhow::Error::from)?,
+        let Some(audio) = synthesize_until_stopped(ticket, speech::synthesize(&text))
+            .await
+            .map_err(anyhow::Error::from)?
+        else {
+            return Ok(CsSpeechResult {
+                outcome: "stopped".into(),
+                duration_ms: 0,
+                cached: false,
+            });
         };
         let duration_ms = audio.duration_ms();
         let cached = audio.cached;
@@ -53,4 +53,46 @@ pub async fn speak_text(text: String) -> Result<CsSpeechResult, CsError> {
         })
     })
     .await?
+}
+
+async fn synthesize_until_stopped(
+    ticket: u64,
+    synthesis: impl std::future::Future<Output = Result<speech::SpeechAudio, speech::SpeechError>>,
+) -> Result<Option<speech::SpeechAudio>, speech::SpeechError> {
+    let cancelled = async {
+        while speech::playback::current(ticket) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => Ok(None),
+        result = synthesis => result.map(Some),
+    }
+}
+
+#[cfg(test)]
+mod rc_w1_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_drops_pending_synthesis_and_wins_over_late_refusal() {
+        let ticket = speech::playback::begin();
+        let pending = async {
+            speech::playback::stop();
+            std::future::pending::<Result<speech::SpeechAudio, speech::SpeechError>>().await
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            synthesize_until_stopped(ticket, pending),
+        )
+        .await
+        .expect("stop must settle pending synthesis")
+        .expect("stop is not a provider failure");
+        assert!(result.is_none());
+        let result = synthesize_until_stopped(ticket, async { Err(speech::SpeechError::Http(403)) })
+            .await
+            .expect("a stopped request must not publish its late refusal");
+        assert!(result.is_none());
+    }
 }

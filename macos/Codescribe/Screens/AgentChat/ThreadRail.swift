@@ -27,6 +27,11 @@ struct ThreadRail: View {
     .onChange(of: search) { _, newValue in
       store.searchThreads(newValue)
     }
+    .onChange(of: store.threadSearchQuery) { _, newValue in
+      if search.trimmingCharacters(in: .whitespacesAndNewlines) != newValue {
+        search = newValue
+      }
+    }
     .confirmationDialog(
       "Delete this thread?",
       isPresented: Binding(
@@ -162,6 +167,15 @@ struct ThreadRail: View {
       .clipShape(RoundedRectangle(cornerRadius: CSRadius.input, style: .continuous))
       .padding(.horizontal, 12)
       .padding(.bottom, 8)
+
+      if let error = store.threadSearchError {
+        Text(error)
+          .font(CSFont.mono(10, .medium))
+          .foregroundStyle(CSColor.textBody)
+          .padding(.horizontal, 12)
+          .padding(.bottom, 8)
+          .accessibilityLabel(error)
+      }
 
       // Section eyebrow
       HStack {

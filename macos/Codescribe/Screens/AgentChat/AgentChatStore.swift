@@ -497,8 +497,8 @@ enum ThreadTitlePolicy {
 /// codescribe ThreadStore (via `CodescribeThreads`). Kept separate from
 /// `AgentChatEngine` so the #Preview mock stays standalone.
 protocol ChatThreadsProviding: AnyObject {
-  func listThreads() -> [ChatThread]
-  func searchThreads(query: String) -> [ChatThread]
+  func listThreads() throws -> [ChatThread]
+  func searchThreads(query: String) throws -> [ChatThread]
   func loadMessages(backendId: String) -> [ChatMessage]
   func deleteThread(backendId: String) -> Bool
   func setThreadFavorite(backendId: String, isFavorite: Bool) -> Bool
@@ -656,6 +656,7 @@ final class AgentChatStore: ObservableObject {
 
   @Published var speechError: String?
   @Published private(set) var speakingMessageID: UUID?
+  private var speechRequestID: UUID?
 
   var speechUnavailableReason: String? {
     guard let engine else { return "Speech engine is unavailable." }
@@ -675,19 +676,35 @@ final class AgentChatStore: ObservableObject {
       return
     }
     speechError = nil
+    let requestID = UUID()
+    speechRequestID = requestID
     speakingMessageID = message.id
-    defer { speakingMessageID = nil }
+    defer {
+      if speechRequestID == requestID {
+        speechRequestID = nil
+        speakingMessageID = nil
+      }
+    }
     do {
       try await engine.speak(text: message.text)
     } catch {
-      speechError = error.userFacingMessage
+      if speechRequestID == requestID { speechError = error.userFacingMessage }
     }
   }
 
-  func stopSpeaking() { engine?.stopSpeaking() }
+  func stopSpeaking() {
+    speechRequestID = nil
+    speakingMessageID = nil
+    engine?.stopSpeaking()
+  }
 
   /// Injected provider for persisted threads. `nil` → falls back to mock seed.
   var threadsProvider: ChatThreadsProviding?
+  @Published private(set) var threadSearchError: String?
+  @Published private(set) var threadSearchQuery = ""
+  private var threadsBeforeSearch: [ChatThread]?
+  private var threadListRevision: UInt64 = 0
+  private(set) var initialThreadIndexTask: Task<Void, Never>?
 
   /// Backs the composer slash-command palette. `nil` (previews, unit tests
   /// without a runtime) ⇒ every command lists nothing rather than lying about
@@ -711,6 +728,7 @@ final class AgentChatStore: ObservableObject {
       try paletteSource.apply(entry, for: command)
     } catch {
       guard let threadID = currentThread?.id else { return }
+      if threadsBeforeSearch != nil { searchThreads("") }
       append(
         ChatMessage(
           role: .tool,
@@ -799,19 +817,25 @@ final class AgentChatStore: ObservableObject {
 
     let seeded: [ChatThread]
     var deferredIndexLoad = false
+    var initialThreadError: String?
     if let threads {
       seeded = threads  // explicit (preview/mock)
     } else if threadsProvider != nil, !loadsThreadIndexEagerly {
       seeded = [ChatThread(title: "New thread", meta: "now")]  // shell; index merges async
       deferredIndexLoad = true
-    } else if let real = threadsProvider?.listThreads(), !real.isEmpty {
-      seeded = real  // real persisted threads
-    } else if threadsProvider != nil {
-      seeded = [ChatThread(title: "New thread", meta: "now")]  // real provider, empty history
+    } else if let threadsProvider {
+      do {
+        let real = try threadsProvider.listThreads()
+        seeded = real.isEmpty ? [ChatThread(title: "New thread", meta: "now")] : real
+      } catch {
+        seeded = [ChatThread(title: "New thread", meta: "now")]
+        initialThreadError = "Could not load threads. Try refreshing the list."
+      }
     } else {
       seeded = Self.seedThreads()  // no provider → mock seed
     }
     self.threads = seeded
+    self.threadSearchError = initialThreadError
     self.selectedThreadID = seeded.first?.id
     // didSet does not fire inside init — publish the seed selection once so
     // the assistive lane routes to what the rail shows from the first frame.
@@ -839,24 +863,37 @@ final class AgentChatStore: ObservableObject {
   /// minted thread is not on disk until its first stream completes and would
   /// be dropped by a mid-turn replace), so the merge waits for idle.
   private func scheduleInitialThreadIndexLoad() {
-    Task { @MainActor [weak self] in
+    let revision = threadListRevision
+    initialThreadIndexTask = Task { @MainActor [weak self] in
       guard let self, let provider = self.threadsProvider else { return }
       let start = Date()
       let loaded: [ChatThread]
-      if let backgroundProvider = provider as? any BackgroundThreadListing {
-        loaded = await Task.detached(priority: .userInitiated) {
-          backgroundProvider.listThreads()
-        }.value
-      } else {
-        loaded = provider.listThreads()
+      do {
+        if let backgroundProvider = provider as? any BackgroundThreadListing {
+          loaded = try await Task.detached(priority: .userInitiated) {
+            try backgroundProvider.listThreads()
+          }.value
+        } else {
+          loaded = try provider.listThreads()
+        }
+      } catch {
+        if self.threadListRevision == revision {
+          self.threadSearchError = "Could not load threads. Try refreshing the list."
+        }
+        return
       }
       AgentPerf.log("thread index load", since: start, detail: "\(loaded.count) threads")
       var idleWaits = 0
-      while self.activeComposerTurn != nil || self.voiceTurnPhase != nil, idleWaits < 240 {
+      while self.activeComposerTurn != nil || self.voiceTurnPhase != nil, idleWaits < 240,
+        !Task.isCancelled
+      {
         idleWaits += 1
         try? await Task.sleep(for: .milliseconds(500))
       }
-      if !loaded.isEmpty {
+      guard !Task.isCancelled else { return }
+      if !loaded.isEmpty, self.threadListRevision == revision,
+        self.activeComposerTurn == nil, self.voiceTurnPhase == nil, self.dictationThreadID == nil
+      {
         let mergeStart = Date()
         self.replaceThreads(
           with: loaded,
@@ -872,6 +909,7 @@ final class AgentChatStore: ObservableObject {
   }
 
   func invalidate() {
+    initialThreadIndexTask?.cancel()
     for observer in externalThreadsObservers {
       NotificationCenter.default.removeObserver(observer)
     }
@@ -880,6 +918,7 @@ final class AgentChatStore: ObservableObject {
 
   var currentThread: ChatThread? {
     threads.first { $0.id == selectedThreadID }
+      ?? threadsBeforeSearch?.first { $0.id == selectedThreadID }
   }
 
   /// Push the rail's current selection down as the voice-assistive routing
@@ -945,16 +984,31 @@ final class AgentChatStore: ObservableObject {
     let t = ChatThread(title: "New thread", meta: "now", messages: [])
     threads.insert(t, at: 0)
     selectedThreadID = t.id
+    threadListRevision &+= 1
     draft = ""
   }
 
   func refreshThreads() {
+    refreshThreads(selectingBackendId: currentThread?.backendId)
+  }
+
+  private func refreshThreads(selectingBackendId backendId: String?) {
     guard let threadsProvider else { return }
-    replaceThreads(
-      with: threadsProvider.listThreads(),
-      selectingBackendId: currentThread?.backendId,
-      keepLocalDrafts: true
-    )
+    threadListRevision &+= 1
+    do {
+      let rows = try threadSearchQuery.isEmpty
+        ? threadsProvider.listThreads()
+        : threadsProvider.searchThreads(query: threadSearchQuery)
+      if threadsBeforeSearch != nil { threadsBeforeSearch = restoredSearchRows() }
+      replaceThreads(
+        with: rows, selectingBackendId: backendId,
+        keepLocalDrafts: threadSearchQuery.isEmpty, allowEmpty: !threadSearchQuery.isEmpty,
+        preserveSelection: !threadSearchQuery.isEmpty
+      )
+      threadSearchError = nil
+    } catch {
+      threadSearchError = "Could not refresh threads. The previous list is still shown."
+    }
   }
 
   // MARK: External refresh (rail live refresh — wave S, cut C)
@@ -1017,23 +1071,63 @@ final class AgentChatStore: ObservableObject {
   /// until its first stream completes.
   func refreshThreadsFromExternalChange() {
     guard threadsProvider != nil else { return }
-    guard activeComposerTurn == nil, voiceTurnPhase == nil else { return }
+    guard activeComposerTurn == nil, voiceTurnPhase == nil, dictationThreadID == nil else { return }
     refreshThreads()
   }
 
   func searchThreads(_ query: String) {
     guard let threadsProvider else { return }
     let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.isEmpty {
-      refreshThreads()
-    } else {
-      replaceThreads(
-        with: threadsProvider.searchThreads(query: trimmed),
-        selectingBackendId: currentThread?.backendId,
-        keepLocalDrafts: false,
-        allowEmpty: true
-      )
+    if trimmed == threadSearchQuery, threadSearchError == nil { return }
+    threadListRevision &+= 1
+    let hasActiveTurn = activeComposerTurn != nil || voiceTurnPhase != nil || dictationThreadID != nil
+    guard trimmed.isEmpty || !hasActiveTurn else {
+      threadSearchError = "Finish the current turn before changing the thread search."
+      return
     }
+    if trimmed.isEmpty {
+      threadSearchQuery = ""
+      let fallback = restoredSearchRows()
+      do {
+        let rows = try threadsProvider.listThreads()
+        replaceThreads(
+          with: rows, selectingBackendId: currentThread?.backendId,
+          keepLocalDrafts: true
+        )
+        threadSearchError = nil
+      } catch {
+        replaceThreads(
+          with: fallback, selectingBackendId: currentThread?.backendId,
+          keepLocalDrafts: true
+        )
+        threadSearchError = "Could not reload threads. The previous list was restored."
+      }
+      threadsBeforeSearch = nil
+    } else {
+      do {
+        let rows = try threadsProvider.searchThreads(query: trimmed)
+        if threadsBeforeSearch == nil {
+          threadsBeforeSearch = threads
+        } else {
+          threadsBeforeSearch = restoredSearchRows()
+        }
+        threadSearchQuery = trimmed
+        replaceThreads(
+          with: rows, selectingBackendId: currentThread?.backendId,
+          keepLocalDrafts: false, allowEmpty: true, preserveSelection: true
+        )
+        threadSearchError = nil
+      } catch {
+        threadSearchError = "Could not search threads. The previous list is still shown."
+      }
+    }
+  }
+
+  private func restoredSearchRows() -> [ChatThread] {
+    guard let saved = threadsBeforeSearch else { return threads }
+    let current = Dictionary(uniqueKeysWithValues: threads.map { ($0.id, $0) })
+    let savedIDs = Set(saved.map(\.id))
+    return saved.map { current[$0.id] ?? $0 } + threads.filter { !savedIDs.contains($0.id) }
   }
 
   func select(_ id: UUID) {
@@ -1042,6 +1136,9 @@ final class AgentChatStore: ObservableObject {
   }
 
   func toggleFavorite(_ thread: ChatThread) {
+    if !threads.contains(where: { $0.id == thread.id }), threadsBeforeSearch != nil {
+      searchThreads("")
+    }
     let next = !thread.isFavorite
     guard let ti = threads.firstIndex(where: { $0.id == thread.id }) else { return }
     if let backendId = thread.backendId {
@@ -1056,6 +1153,9 @@ final class AgentChatStore: ObservableObject {
   /// in memory only. No-ops on an empty or unchanged title. The chat header
   /// reads `currentThread.title`, so it updates reactively too.
   func rename(_ thread: ChatThread, to newTitle: String) {
+    if !threads.contains(where: { $0.id == thread.id }), threadsBeforeSearch != nil {
+      searchThreads("")
+    }
     guard let trimmed = ThreadTitlePolicy.normalized(newTitle), trimmed != thread.title,
       let ti = threads.firstIndex(where: { $0.id == thread.id })
     else { return }
@@ -1076,6 +1176,9 @@ final class AgentChatStore: ObservableObject {
   /// Per-message, in-memory only; deliberately does NOT touch the fields the
   /// scroll signature reads, so a toggle never auto-scrolls the list.
   func toggleRenderMode(messageID: UUID, in threadID: UUID) {
+    if !threads.contains(where: { $0.id == threadID }), threadsBeforeSearch != nil {
+      searchThreads("")
+    }
     update(messageID, in: threadID) {
       $0.renderMode = MessageRenderMode.nextRenderMode(after: $0.renderMode)
     }
@@ -1124,6 +1227,8 @@ final class AgentChatStore: ObservableObject {
       activeComposerTurn = nil
     }
     threads.removeAll { $0.id == thread.id }
+    threadsBeforeSearch?.removeAll { $0.id == thread.id }
+    threadListRevision &+= 1
     if selectedThreadID == thread.id {
       selectedThreadID = threads.first?.id
       if let selectedThreadID { loadMessagesIfNeeded(selectedThreadID) }
@@ -1224,7 +1329,7 @@ final class AgentChatStore: ObservableObject {
   /// exact message the operator just queued without cancelling it first.
   func composerHistory(in threadID: UUID) -> [String] {
     let sent =
-      threads.first(where: { $0.id == threadID })?.messages
+      restoredSearchRows().first(where: { $0.id == threadID })?.messages
       .filter { $0.role == .you }
       .map(\.text) ?? []
     let queued = queuedTurns(in: threadID).map(\.text)
@@ -1273,6 +1378,10 @@ final class AgentChatStore: ObservableObject {
   /// Accept a message: persist it durably, enqueue it FIFO on its thread, and
   /// let the single dispatch owner start it if the composer slot is idle.
   private func accept(text: String, staged: [PendingAttachment], threadID: UUID) {
+    threadListRevision &+= 1
+    // Search only hides rows. Restore them before the existing turn owner
+    // mutates messages, including a selected row hidden by a no-match query.
+    if threadsBeforeSearch != nil { searchThreads("") }
     let backendId = ensureBackendId(threadID)
     let turn = QueuedTurn(
       id: UUID(),
@@ -1711,6 +1820,8 @@ final class AgentChatStore: ObservableObject {
   /// while a turn for another thread updates in the background. Only explicit
   /// user actions (`select`, `newThread`, delete fallback) move selection.
   func ingestVoiceTurn(threadId backendId: String, userText: String) {
+    threadListRevision &+= 1
+    if threadsBeforeSearch != nil { searchThreads("") }
     // Defensive: a new voice turn can open before the previous one closed
     // (rapid double-press / a fresh session). Finalize the stale assistant
     // bubble in the UI before we overwrite the turn references below —
@@ -2146,6 +2257,7 @@ final class AgentChatStore: ObservableObject {
     // two messages accepted in the same millisecond can never swap.
     let persisted = readDurableAcceptedTurns()
     guard !persisted.isEmpty else { return }
+    if threadsBeforeSearch != nil { searchThreads("") }
     for item in persisted {
       guard !queuedTurns.contains(where: { $0.id == item.id }) else { continue }
       let threadID: UUID
@@ -2405,15 +2517,6 @@ final class AgentChatStore: ObservableObject {
     return f
   }()
 
-  private func refreshThreads(selectingBackendId backendId: String) {
-    guard let threadsProvider else { return }
-    replaceThreads(
-      with: threadsProvider.listThreads(),
-      selectingBackendId: backendId,
-      keepLocalDrafts: true
-    )
-  }
-
   /// Row-level equality on everything the rail renders. Matched incoming
   /// rows reuse the existing `ChatThread` instances (same `id`s), so equal
   /// rows ⇒ identical identity set ⇒ selection resolution is a no-op too.
@@ -2430,11 +2533,13 @@ final class AgentChatStore: ObservableObject {
     with incoming: [ChatThread],
     selectingBackendId backendId: String?,
     keepLocalDrafts: Bool,
-    allowEmpty: Bool = false
+    allowEmpty: Bool = false,
+    preserveSelection: Bool = false
   ) {
     let previousSelectedID = selectedThreadID
+    let existingRows = restoredSearchRows()
     let existingByBackend = Dictionary(
-      uniqueKeysWithValues: threads.compactMap { thread -> (String, ChatThread)? in
+      uniqueKeysWithValues: existingRows.compactMap { thread -> (String, ChatThread)? in
         guard let backendId = thread.backendId else { return nil }
         return (backendId, thread)
       }
@@ -2452,7 +2557,7 @@ final class AgentChatStore: ObservableObject {
     }
 
     if keepLocalDrafts {
-      let retained = threads.filter { thread in
+      let retained = existingRows.filter { thread in
         let isSelected = thread.id == previousSelectedID
         let isPopulatedDraft = thread.backendId == nil && !thread.messages.isEmpty
         guard isSelected || isPopulatedDraft else { return false }
@@ -2481,6 +2586,9 @@ final class AgentChatStore: ObservableObject {
       return
     }
     threads = resolved
+    // Filtering the rail is not a selection gesture or a routing command.
+    // The selected conversation remains available through currentThread.
+    if preserveSelection { return }
     // Selection is user-owned. A completion refresh may reorder or replace
     // rail rows, but it must preserve the thread the user is reading. The
     // selected logical row is retained above across transient index gaps; the

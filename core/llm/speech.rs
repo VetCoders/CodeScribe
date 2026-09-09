@@ -29,6 +29,8 @@ pub enum SpeechError {
     MissingCredentials(&'static str),
     /// A signed-in account failed; API key fallback is forbidden.
     Account(&'static str),
+    /// The selected credential has no supported public speech capability here.
+    Capability(&'static str),
     /// Invalid input, settings, response, or storage operation.
     Invalid(&'static str),
     /// HTTP refusal, safe for probes and UI.
@@ -47,6 +49,7 @@ impl fmt::Display for SpeechError {
                 f,
                 "unavailable: {v} account authentication failed; sign in again"
             ),
+            Self::Capability(reason) => f.write_str(reason),
             Self::Invalid(s) => f.write_str(s),
             Self::Http(s) => write!(f, "Speech endpoint returned HTTP {s}"),
             Self::Transport => f.write_str("Speech endpoint transport failed"),
@@ -151,16 +154,27 @@ pub async fn resolve_vendor_auth(
     vendor: ProviderKind,
     fallback_key: Option<&str>,
 ) -> Result<SpeechAuth, SpeechError> {
+    resolve_vendor_auth_using(vendor, || api_key(vendor, fallback_key)).await
+}
+
+async fn resolve_vendor_auth_using(
+    vendor: ProviderKind,
+    key: impl FnOnce() -> Option<String>,
+) -> Result<SpeechAuth, SpeechError> {
     let (name, _, _) = pins(vendor)?;
+    let signed_in = vendor_signed_in(vendor);
+    if signed_in {
+        speech_capability(vendor, AuthSource::OAuth)?;
+    }
     resolve_with(
         vendor,
-        vendor_signed_in(vendor),
+        signed_in,
         || async move {
             account_auth::access_token(vendor)
                 .await
                 .map_err(|_| SpeechError::Account(name))
         },
-        || api_key(vendor, fallback_key),
+        key,
     )
     .await
 }
@@ -220,6 +234,9 @@ impl SpeechOptions {
         if self.voice.trim().is_empty() {
             return Err(SpeechError::Invalid("Speech voice is empty"));
         }
+        if self.vendor == ProviderKind::OpenAiResponses && self.model.trim().is_empty() {
+            return Err(SpeechError::Invalid("Speech model is empty"));
+        }
         Ok(())
     }
     /// Vendor cap in Unicode characters, never UTF-8 bytes.
@@ -250,6 +267,17 @@ fn lane_vendor(lane: &RuntimeLlmLane) -> Result<ProviderKind, SpeechError> {
     pins(vendor).map_err(|_| SpeechError::Unsupported(lane.provider_display_name().into()))?;
     Ok(vendor)
 }
+/// ChatGPT/Codex login is not evidence of public OpenAI audio permissions.
+/// Keep the selected account authoritative instead of silently using a key.
+fn speech_capability(vendor: ProviderKind, source: AuthSource) -> Result<(), SpeechError> {
+    pins(vendor)?;
+    if vendor == ProviderKind::OpenAiResponses && source == AuthSource::OAuth {
+        return Err(SpeechError::Capability(
+            "OpenAI account speech is not supported by this integration; Codex chat login does not establish public audio permissions. No API-key fallback was attempted.",
+        ));
+    }
+    Ok(())
+}
 /// None means credentials and configuration are present; it is not an API liveness claim.
 pub fn speech_availability() -> Option<String> {
     let check = || -> Result<(), SpeechError> {
@@ -258,9 +286,9 @@ pub fn speech_availability() -> Option<String> {
         let lane = settings.llm_lanes().assistive();
         let vendor = lane_vendor(lane)?;
         SpeechOptions::for_vendor(vendor)?;
-        if !vendor_signed_in(vendor)
-            && api_key(vendor, lane.credential().request_api_key().as_deref()).is_none()
-        {
+        if vendor_signed_in(vendor) {
+            speech_capability(vendor, AuthSource::OAuth)?;
+        } else if api_key(vendor, lane.credential().request_api_key().as_deref()).is_none() {
             return Err(SpeechError::MissingCredentials(pins(vendor)?.0));
         }
         Ok(())
@@ -329,7 +357,10 @@ pub async fn synthesize(text: &str) -> Result<SpeechAudio, SpeechError> {
     let lane = settings.llm_lanes().assistive();
     let vendor = lane_vendor(lane)?;
     let options = SpeechOptions::for_vendor(vendor)?;
-    let auth = resolve_vendor_auth(vendor, None).await?;
+    let auth = resolve_vendor_auth_using(vendor, || {
+        api_key(vendor, lane.credential().request_api_key().as_deref())
+    })
+    .await?;
     synthesize_with(text, &options, &auth).await
 }
 /// Probe entry point; uses the same network and cache path as the Agent.
@@ -338,6 +369,7 @@ pub async fn synthesize_with(
     options: &SpeechOptions,
     auth: &SpeechAuth,
 ) -> Result<SpeechAudio, SpeechError> {
+    speech_capability(options.vendor, auth.source)?;
     let (_, _, endpoint) = pins(options.vendor)?;
     synthesize_at(text, options, auth, endpoint, &cache_dir()?).await
 }
@@ -349,13 +381,21 @@ async fn synthesize_at(
     cache: &Path,
 ) -> Result<SpeechAudio, SpeechError> {
     options.validate()?;
+    if auth.bearer.trim().is_empty() {
+        return Err(SpeechError::MissingCredentials(pins(options.vendor)?.0));
+    }
     if text.trim().is_empty() {
         return Err(SpeechError::Invalid("No text to speak"));
     }
     tokio::fs::create_dir_all(cache)
         .await
         .map_err(|_| SpeechError::Invalid("Cannot create speech cache"))?;
-    let path = cache.join(format!("{}.pcm", options.cache_key(text)));
+    // A cache hit is never evidence that a different account has permission.
+    // Hash the credential into the namespace; never store the bearer itself.
+    let path = cache.join(format!(
+        "{}.pcm",
+        authenticated_cache_key(options, text, auth, endpoint)
+    ));
     if let Ok(bytes) = tokio::fs::read(&path).await
         && let Ok(samples) = decode_pcm(&bytes)
     {
@@ -415,18 +455,23 @@ async fn synthesize_at(
     let tmp = cache.join(format!("{}.tmp", uuid::Uuid::new_v4()));
     let write = async {
         use tokio::io::AsyncWriteExt;
-        let mut open = tokio::fs::OpenOptions::new();
+        let mut open = std::fs::OpenOptions::new();
         open.write(true).create_new(true);
         #[cfg(unix)]
-        open.mode(0o600);
-        let mut file = open.open(&tmp).await?;
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.mode(0o600);
+        }
+        // Establish the owned file before yielding. Cancellation cannot race
+        // a background open into recreating it after the cleanup guard drops.
+        let mut file = tokio::fs::File::from_std(open.open(&tmp)?);
+        let _cleanup = SpeechCacheTemporary(tmp.clone());
         file.write_all(&pcm).await?;
         file.sync_all().await?;
         tokio::fs::rename(&tmp, &path).await
     }
     .await;
     if write.is_err() {
-        let _ = tokio::fs::remove_file(&tmp).await;
         return Err(SpeechError::Invalid("Cannot write speech cache"));
     }
     Ok(SpeechAudio {
@@ -438,5 +483,183 @@ async fn synthesize_at(
     })
 }
 
+struct SpeechCacheTemporary(PathBuf);
+
+impl Drop for SpeechCacheTemporary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn authenticated_cache_key(
+    options: &SpeechOptions,
+    text: &str,
+    auth: &SpeechAuth,
+    endpoint: &str,
+) -> String {
+    let identity = json!({
+        "version": 2,
+        "audio": options.cache_key(text),
+        "endpoint": endpoint,
+        "auth_source": auth.source.as_str(),
+        "credential": format!("{:x}", Sha256::digest(auth.bearer.as_bytes())),
+    });
+    format!("{:x}", Sha256::digest(identity.to_string().as_bytes()))
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rc_w1_tests {
+    use super::*;
+    const ENDPOINT: &str = "https://api.openai.com/v1/audio/speech";
+
+    fn options() -> SpeechOptions {
+        SpeechOptions {
+            vendor: ProviderKind::OpenAiResponses,
+            model: "test-model".into(),
+            voice: "cedar".into(),
+            speed: 1.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn public_speech_refuses_codex_oauth_before_cache_or_network() {
+        let result = synthesize_with(
+            "Hello",
+            &options(),
+            &SpeechAuth {
+                bearer: "test-account".into(),
+                source: AuthSource::OAuth,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(SpeechError::Capability(_))));
+        assert!(speech_capability(ProviderKind::XaiResponses, AuthSource::OAuth).is_ok());
+        assert!(speech_capability(ProviderKind::OpenAiResponses, AuthSource::ApiKey).is_ok());
+        assert!(matches!(
+            speech_capability(ProviderKind::AnthropicMessages, AuthSource::ApiKey),
+            Err(SpeechError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_or_failed_account_never_reads_a_fallback_key() {
+        for failure in [false, true] {
+            let result = resolve_with(
+                ProviderKind::XaiResponses,
+                true,
+                || async move {
+                    if failure {
+                        Err(SpeechError::Account("xai"))
+                    } else {
+                        Ok("  ".into())
+                    }
+                },
+                || panic!("selected account forbids key fallback"),
+            )
+            .await;
+            assert!(matches!(result, Err(SpeechError::Account("xai"))));
+        }
+    }
+
+    #[test]
+    fn cache_identity_covers_audio_endpoint_and_credential() {
+        let auth = SpeechAuth {
+            bearer: "test-key".into(),
+            source: AuthSource::ApiKey,
+        };
+        let original = options();
+        let key = authenticated_cache_key(&original, "Hello", &auth, ENDPOINT);
+        let mut variants = Vec::new();
+        let mut voice = options();
+        voice.voice = "marin".into();
+        variants.push(voice);
+        let mut model = options();
+        model.model = "other-model".into();
+        variants.push(model);
+        let mut speed = options();
+        speed.speed = 1.25;
+        variants.push(speed);
+        for variant in variants {
+            assert_ne!(key, authenticated_cache_key(&variant, "Hello", &auth, ENDPOINT));
+        }
+        for (text, endpoint, bearer, source) in [
+            ("Other", ENDPOINT, "test-key", AuthSource::ApiKey),
+            (
+                "Hello",
+                "https://other.invalid/speech",
+                "test-key",
+                AuthSource::ApiKey,
+            ),
+            ("Hello", ENDPOINT, "other-key", AuthSource::ApiKey),
+            ("Hello", ENDPOINT, "test-key", AuthSource::OAuth),
+        ] {
+            let changed = SpeechAuth {
+                bearer: bearer.into(),
+                source,
+            };
+            assert_ne!(
+                key,
+                authenticated_cache_key(&original, text, &changed, endpoint)
+            );
+        }
+        assert!(!key.contains("test-key"));
+    }
+
+    #[tokio::test]
+    async fn changed_credential_cannot_hide_refusal_behind_cached_audio() {
+        let mut server = mockito::Server::new_async().await;
+        let allowed = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer allowed-key")
+            .with_status(200)
+            .with_body(vec![0, 0, 1, 0])
+            .expect(1)
+            .create_async()
+            .await;
+        let refused = server
+            .mock("POST", "/")
+            .match_header("authorization", "Bearer refused-key")
+            .with_status(403)
+            .with_body("private provider detail")
+            .expect(1)
+            .create_async()
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = SpeechAuth {
+            bearer: "allowed-key".into(),
+            source: AuthSource::ApiKey,
+        };
+        let first = synthesize_at("Hello", &options(), &auth, &server.url(), dir.path())
+            .await
+            .unwrap();
+        let repeat = synthesize_at("Hello", &options(), &auth, &server.url(), dir.path())
+            .await
+            .unwrap();
+        assert!(!first.cached);
+        assert!(repeat.cached);
+        let auth = SpeechAuth {
+            bearer: "refused-key".into(),
+            source: AuthSource::ApiKey,
+        };
+        let result = synthesize_at("Hello", &options(), &auth, &server.url(), dir.path()).await;
+        assert!(matches!(result, Err(SpeechError::Http(403))));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        allowed.assert_async().await;
+        refused.assert_async().await;
+    }
+
+    #[test]
+    fn cancelled_cache_write_removes_only_its_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("owned.tmp");
+        let complete = dir.path().join("complete.pcm");
+        std::fs::write(&partial, [0]).unwrap();
+        std::fs::write(&complete, [0, 0]).unwrap();
+        drop(SpeechCacheTemporary(partial.clone()));
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(complete).unwrap(), vec![0, 0]);
+    }
+}
