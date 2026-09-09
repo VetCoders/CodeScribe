@@ -7,6 +7,8 @@
 //! only: every member occurrence keeps its own PCM identity, and the
 //! returned candidate is admitted per occurrence by the acoustic ledger.
 
+use std::time::{Duration, Instant};
+
 use crate::pipeline::acoustic_ledger::OccurrenceIdentity;
 
 /// One sealed Apple fragment waiting to share a Whisper window.
@@ -44,6 +46,7 @@ pub struct Layer1Coalesce {
     pieces: Vec<CoalescedPiece>,
     neighbour_before: String,
     segments: usize,
+    deadline: Option<Instant>,
 }
 
 impl Layer1Coalesce {
@@ -67,8 +70,18 @@ impl Layer1Coalesce {
 
     /// Push a sealed fragment. Returns a flush when the window is full, or
     /// when `piece` starts after a sentence pause (the previous window first).
+    #[cfg(test)]
     pub fn push(&mut self, piece: CoalescedPiece, sample_rate: u32) -> Vec<CoalesceFlush> {
-        let mut out = Vec::new();
+        self.push_at(piece, sample_rate, Instant::now())
+    }
+
+    pub fn push_at(
+        &mut self,
+        piece: CoalescedPiece,
+        sample_rate: u32,
+        now: Instant,
+    ) -> Vec<CoalesceFlush> {
+        let mut out = self.flush_due(now);
         if let Some(last) = self.pieces.last() {
             let gap = piece.start_ts - last.covered_through_secs;
             if gap >= Self::PAUSE_SECS {
@@ -77,6 +90,9 @@ impl Layer1Coalesce {
         }
         if self.pieces.is_empty() && self.neighbour_before.is_empty() {
             // Neighbour is set by the caller before the first push of a window.
+        }
+        if self.pieces.is_empty() {
+            self.deadline = Some(now + Duration::from_millis(1_200));
         }
         self.segments = self.segments.saturating_add(piece.segment_count.max(1));
         self.pieces.push(piece);
@@ -93,6 +109,15 @@ impl Layer1Coalesce {
     /// its range.
     pub fn force_flush(&mut self) -> Vec<CoalesceFlush> {
         self.take_flushes()
+    }
+
+    /// Oldest closed member owns the deadline. More pieces cannot postpone it.
+    pub fn flush_due(&mut self, now: Instant) -> Vec<CoalesceFlush> {
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.take_flushes()
+        } else {
+            Vec::new()
+        }
     }
 
     fn should_flush(&self, sample_rate: u32) -> bool {
@@ -117,6 +142,7 @@ impl Layer1Coalesce {
         }
         let pieces = std::mem::take(&mut self.pieces);
         self.segments = 0;
+        self.deadline = None;
         let neighbour_context = std::mem::take(&mut self.neighbour_before);
         build_flushes(pieces, neighbour_context)
     }
@@ -144,7 +170,8 @@ fn build_flushes(pieces: Vec<CoalescedPiece>, neighbour_context: String) -> Vec<
             Some(run)
                 if run
                     .last()
-                    .is_some_and(|previous| previous.sample_end == piece.sample_start) =>
+                    .is_some_and(|previous| previous.sample_end == piece.sample_start
+                        && previous.occurrence.same_capture(&piece.occurrence)) =>
             {
                 run.push(piece);
             }
@@ -174,12 +201,13 @@ fn build_flush(pieces: Vec<CoalescedPiece>, neighbour_context: String) -> Coales
     let sample_start = pieces.first().map_or(0, |p| p.sample_start);
     let sample_end = pieces.last().map_or(0, |p| p.sample_end);
     let primary_utterance_id = pieces.last().map_or(0, |p| p.utterance_id);
-    let mut cursor = sample_start;
-    for (i, piece) in pieces.into_iter().enumerate() {
-        if i > 0 {
-            committed_text.push(' ');
+    for piece in pieces {
+        if !piece.committed_text.is_empty() {
+            if !committed_text.is_empty() {
+                committed_text.push(' ');
+            }
+            committed_text.push_str(&piece.committed_text);
         }
-        committed_text.push_str(&piece.committed_text);
         member_ids.push((piece.utterance_id, piece.covered_through_secs));
         member_occurrences.push((piece.utterance_id, piece.occurrence.clone()));
         debug_assert_eq!(
@@ -187,22 +215,9 @@ fn build_flush(pieces: Vec<CoalescedPiece>, neighbour_context: String) -> Coales
             piece.sample_end.saturating_sub(piece.sample_start),
             "a piece must carry the PCM range it declares before it can be coalesced"
         );
-        let piece_start = piece.sample_start.max(sample_start);
-        if piece_start > cursor {
-            audio.resize(audio.len() + (piece_start - cursor) as usize, 0.0);
-            cursor = piece_start;
-        }
-        let skip = cursor.saturating_sub(piece_start) as usize;
-        if skip < piece.audio.len() {
-            audio.extend_from_slice(&piece.audio[skip..]);
-            cursor = piece_start + piece.audio.len() as u64;
-        }
-    }
-    let declared = sample_end.saturating_sub(sample_start) as usize;
-    if audio.len() < declared {
-        audio.resize(declared, 0.0);
-    } else if audio.len() > declared {
-        audio.truncate(declared);
+        // Runs are split at every gap and capture boundary. Never repair an
+        // invalid payload by padding or truncating: provider validation refuses it.
+        audio.extend_from_slice(&piece.audio);
     }
     CoalesceFlush {
         committed_text,
@@ -244,6 +259,41 @@ mod tests {
             start_ts,
             covered_through_secs: end_ts,
             segment_count: segs,
+        }
+    }
+
+    #[test]
+    fn oldest_deadline_preserves_context_without_waiting_for_the_next_piece() {
+        let now = Instant::now();
+        let mut buffer = Layer1Coalesce::default();
+        buffer.set_neighbour("previous");
+        assert!(buffer.push_at(piece(1, "one", 0.0, 0.4, 1), 16_000, now).is_empty());
+        assert!(buffer.push_at(piece(2, "two", 0.4, 0.8, 1), 16_000,
+            now + Duration::from_millis(1_000)).is_empty());
+        let flushes = buffer.flush_due(now + Duration::from_millis(1_200));
+        assert_eq!(flushes.len(), 1);
+        assert_eq!(flushes[0].member_occurrences.len(), 2);
+        assert_eq!(flushes[0].committed_text, "one two");
+        assert_eq!(flushes[0].neighbour_context, "previous");
+        assert!(buffer.flush_due(now + Duration::from_secs(20)).is_empty());
+    }
+
+    #[test]
+    fn adjacent_samples_from_different_epochs_never_share_a_request() {
+        let now = Instant::now();
+        let mut buffer = Layer1Coalesce::default();
+        let first = piece(1, "", 0.0, 0.4, 1);
+        let mut second = piece(2, "", 0.4, 0.8, 1);
+        second.occurrence.capture_epoch = 2;
+        assert!(buffer.push_at(first, 16_000, now).is_empty());
+        assert!(buffer.push_at(second, 16_000, now).is_empty());
+        let flushes = buffer.force_flush();
+        assert_eq!(flushes.len(), 2);
+        assert!(flushes.iter().all(|flush| flush.committed_text.is_empty()));
+        assert_eq!(flushes[0].member_occurrences[0].1.capture_epoch, 1);
+        assert_eq!(flushes[1].member_occurrences[0].1.capture_epoch, 2);
+        for flush in flushes {
+            assert_eq!(flush.audio.len() as u64, flush.sample_end - flush.sample_start);
         }
     }
 
