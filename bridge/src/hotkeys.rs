@@ -885,21 +885,7 @@ impl CodescribeHotkeys {
         handle: CsCaptureHandle,
     ) -> Result<CsConditionalStop, CsError> {
         application_runtime::run(async move {
-            let Some(controller) = current_controller(&shared_controller()) else {
-                return Ok(CsConditionalStop::NoLiveCapture);
-            };
-            controller
-                .stop_capture_if_owned(&handle.capture_id)
-                .await
-                .map(|outcome| match outcome {
-                    CaptureStopOutcome::Stopped => CsConditionalStop::Stopped,
-                    CaptureStopOutcome::ForeignCapture => CsConditionalStop::ForeignCapture,
-                    CaptureStopOutcome::NoLiveCapture => CsConditionalStop::NoLiveCapture,
-                    CaptureStopOutcome::AlreadyStopping => CsConditionalStop::AlreadyStopping,
-                })
-                .map_err(|error| CsError::Recording {
-                    msg: error.to_string(),
-                })
+            stop_composer_capture(&shared_controller(), handle).await
         })
         .await?
     }
@@ -1877,6 +1863,83 @@ impl CodescribeHotkeys {
             })
         })
         .await?
+    }
+}
+
+/// No controller construction or blocking global-lock preflight on named Stop.
+/// The runtime owns the bridge root; the controller owns terminal settlement.
+async fn stop_composer_capture(
+    controller_store: &SharedController,
+    handle: CsCaptureHandle,
+) -> Result<CsConditionalStop, CsError> {
+    let controller = {
+        let Ok(slot) = controller_store.try_lock() else {
+            return Ok(CsConditionalStop::AdmissionUnavailable);
+        };
+        slot.as_ref().map(Arc::clone)
+    };
+    let Some(controller) = controller else {
+        return Ok(CsConditionalStop::NoLiveCapture);
+    };
+    controller.stop_capture_if_owned(&handle.capture_id).await
+        .map(CsConditionalStop::from)
+        .map_err(|error| CsError::Recording { msg: error.to_string() })
+}
+
+impl From<CaptureStopOutcome> for CsConditionalStop {
+    fn from(outcome: CaptureStopOutcome) -> Self {
+        match outcome {
+            CaptureStopOutcome::Stopped => Self::Stopped,
+            CaptureStopOutcome::ForeignCapture => Self::ForeignCapture,
+            CaptureStopOutcome::NoLiveCapture => Self::NoLiveCapture,
+            CaptureStopOutcome::AlreadyStopping => Self::AlreadyStopping,
+            CaptureStopOutcome::Pending => Self::Pending,
+            CaptureStopOutcome::AdmissionUnavailable => Self::AdmissionUnavailable,
+        }
+    }
+}
+
+#[cfg(test)]
+mod composer_stop_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn pending_and_unavailable_are_preserved_by_the_production_mapping() {
+        for (source, target) in [
+            (CaptureStopOutcome::Stopped, CsConditionalStop::Stopped),
+            (CaptureStopOutcome::ForeignCapture, CsConditionalStop::ForeignCapture),
+            (CaptureStopOutcome::NoLiveCapture, CsConditionalStop::NoLiveCapture),
+            (CaptureStopOutcome::AlreadyStopping, CsConditionalStop::AlreadyStopping),
+            (CaptureStopOutcome::Pending, CsConditionalStop::Pending),
+            (CaptureStopOutcome::AdmissionUnavailable, CsConditionalStop::AdmissionUnavailable),
+        ] {
+            assert_eq!(CsConditionalStop::from(source), target);
+        }
+    }
+
+    #[test]
+    fn held_controller_store_refuses_without_waiting_or_creating_a_controller() {
+        let store: SharedController = Arc::new(Mutex::new(None));
+        let held = store.lock().unwrap();
+        let mut call = Box::pin(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) = call.as_mut().poll(&mut context) else {
+            panic!("named bridge Stop must refuse before suspension on a held store");
+        };
+        assert_eq!(result.unwrap(), CsConditionalStop::AdmissionUnavailable);
+        assert!(held.is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_controller_and_idle_real_controller_report_no_live_capture() {
+        let store: SharedController = Arc::new(Mutex::new(None));
+        assert_eq!(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }).await.unwrap(), CsConditionalStop::NoLiveCapture);
+        let controller = Arc::new(RecordingController::new_without_keychain());
+        *store.lock().unwrap() = Some(Arc::clone(&controller));
+        for _ in 0..2 {
+            assert_eq!(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }).await.unwrap(), CsConditionalStop::NoLiveCapture);
+            assert_eq!(controller.current_state().await, State::Idle);
+        }
     }
 }
 

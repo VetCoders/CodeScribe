@@ -80,6 +80,55 @@ clear it. This ordering matters: Insert happens after the terminal transition,
 so clearing the target as ordinary recording state makes every finished take
 degrade to DeferredInsert even when the foreign caret was known.
 
+## Composer Stop settlement (W2 source checkpoint, unverified)
+
+The admitted capture handle, produced inside the controller start lock, is the
+composer's Stop authority. Owned Stop goes directly to its named endpoint;
+`isRecording` is telemetry and neither authorizes Stop nor acknowledges delivery.
+The store keeps the initiating thread while settlement is owed. It reuses the
+existing preparing presentation for pending settlement, including after a failure
+banner expires. Delayed replies address both request ID and capture ID.
+
+`RecordingController` retains one capture-addressed task/result slot. A caller
+waits at most the existing `STOP_TIMEOUT` (currently 120 seconds, an existing
+engineering budget, not a Founder-selected latency target). Expiry returns
+`Pending`; it does not cancel recorder drain, formatting, delivery or terminal
+reset. The task holds the existing serialization lock from identity admission
+through its terminal side effects. Duplicate Stop observes that same result;
+completed retention is one slot, replaced only after its task exits. This is a
+bounded caller outcome, not a finite settlement guarantee for an indefinitely
+stalled dependency. A pending take still owes a terminal receipt or recoverable
+failure and prevents another composer capture.
+
+`CsConditionalStop` distinguishes `Stopped`, `AlreadyStopping`, `Pending`,
+`ForeignCapture`, `NoLiveCapture` and `AdmissionUnavailable`. The first three
+leave terminal/delivery ownership in place until the identity-aware consumer
+finishes. Foreign/absent capture releases only that request; its capture-to-thread
+delivery receipt survives for queued text. Admission unavailable means no task
+was accepted; keep the same handle available for an explicit Stop retry. A
+transport error preserves the pending destination. An expired banner is never a
+terminal event. Early terminal text is retained until the start reply supplies
+its authenticated handle, then joined to the initiating thread exactly once.
+
+Named toggle captures use the existing toggle terminal processor even in
+Assistive mode, so it reads the recorder's `CaptureTurnIntent` and preserves the
+one-turn formatter/delivery route. No hands-free configuration is changed.
+
+**Open boundary:** `core/audio/streaming_recorder.rs::stop` keeps a successful
+WAV path only in a local variable before awaiting the transcription task. A join
+failure propagates without that path, although the file exists. The controller
+cannot associate/archive that file from the returned error. This checkpoint
+therefore does not claim recovery of audio on every failure. Core is outside the
+Stop worker's writable fence. No raw text seal or replacement reducer repairs
+this gap.
+
+Generated bindings remain unchanged under W2. W3 must regenerate from
+`bridge/src/recording.rs` and `bridge/src/hotkeys.rs` with `make app-bindings`,
+then run the actual controller/bridge suites, Swift ownership/delivery suites,
+and full `make check`, `make verify`, `make test-swift`. All newly authored tests
+are UNRUN. Installed Stop latency, retained audio and exact real delivery remain
+W4 obligations.
+
 ## Telemetry
 
 One INFO line per stop / To Agent / overlay Insert / defer:

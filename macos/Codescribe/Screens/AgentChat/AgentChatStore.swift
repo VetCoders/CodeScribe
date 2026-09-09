@@ -679,14 +679,13 @@ final class AgentChatStore: ObservableObject {
   private var endedCaptureIDs: Set<String> = []
   private let persistenceDefaults: UserDefaults
 
-  /// True once this request's single stop permission has been spent and the
-  /// surface is waiting for terminal delivery. It is the difference between "a
-  /// start is in flight" (never interruptible) and "a stop already happened and
-  /// its terminal may never arrive" (recoverable).
+  /// Stop was submitted and terminal delivery is still owed. This remains a
+  /// request even when recording telemetry is false or its error banner expires.
   private(set) var composerCaptureAwaitingTerminal = false
 
   var ownsLiveDictation: Bool { composerCaptureStartCompleted }
   var hasComposerCaptureRequest: Bool { composerCaptureRequestID != nil }
+  var currentComposerCaptureRequestID: UUID? { composerCaptureRequestID }
 
   /// Click-latency paint must not latch a destination or authorize a stop.
   func prepareDictationGesture() {
@@ -696,6 +695,10 @@ final class AgentChatStore: ObservableObject {
   /// Called only after the adapter observed idle, before submitting its start.
   /// Capture the gesture's thread, even if selection changed during that query.
   func beginComposerCaptureRequest(threadID: UUID?) -> UUID {
+    // Admission is store-owned too: callers cannot replace a pending request.
+    if let current = composerCaptureRequestID { return current }
+    dictationFailureTask?.cancel()
+    dictationFailureToken = UUID()
     let requestID = UUID()
     composerCaptureRequestID = requestID
     composerCaptureStartCompleted = false
@@ -716,34 +719,67 @@ final class AgentChatStore: ObservableObject {
   func completeComposerCaptureStart(
     _ requestID: UUID, live: Bool, handle: CsCaptureHandle?
   ) {
-    guard isCurrentComposerCaptureRequest(requestID) else { return }
+    guard isCurrentComposerCaptureRequest(requestID), !composerCaptureAwaitingTerminal else { return }
     if let handle, let owner = dictationThreadID {
       captureOwners[handle.captureId] = owner
+      // The terminal may beat the FFI start reply. Until the admitted identity
+      // arrives those bytes are recovery, not permission to use the selection.
+      // Join only a still-retained document; an explicit recovery action that
+      // already consumed it must never be replayed.
+      if let document = composerRecoveryDocuments.first(where: { $0.id == "capture:" + handle.captureId }) {
+        composerRecoveryDocuments.removeAll { $0.id == document.id }
+        captureDeliveryReceipts.removeValue(forKey: handle.captureId)
+        receiveDictationTranscript(document.text, captureID: handle.captureId)
+      }
     }
     if let handle, endedCaptureIDs.contains(handle.captureId) {
       endDictationSession()
       return
     }
-    composerCaptureStartCompleted = live
+    // `live` is telemetry, never evidence that the admitted take was released.
+    // The argument remains for existing callers; only the handle grants Stop.
+    _ = live
+    composerCaptureStartCompleted = handle != nil
     composerCaptureHandle = handle
-    dictationPhase = live ? .recording : .idle
-    // Even an idle reply may race queued terminal text. Keep its destination.
+    dictationPhase = handle != nil ? .recording : .preparing
   }
 
   /// Consume local stop permission once; terminal delivery still owns the latch.
   func awaitComposerCaptureTerminal() {
     composerCaptureStartCompleted = false
     composerCaptureAwaitingTerminal = true
-    dictationPhase = .idle
+    dictationPhase = .preparing
+  }
+
+  /// Delayed replies address both the local request and the admitted take.
+  /// A terminal consumer may already have delivered A and admitted B meanwhile.
+  func applyComposerStopOutcome(_ outcome: CsConditionalStop, requestID: UUID, handle: CsCaptureHandle) {
+    guard isCurrentComposerCaptureRequest(requestID),
+      composerCaptureHandle?.captureId == handle.captureId else { return }
+    switch outcome {
+    case .stopped, .alreadyStopping, .pending:
+      awaitComposerCaptureTerminal()
+    case .admissionUnavailable:
+      composerCaptureStartCompleted = true
+      composerCaptureAwaitingTerminal = false
+      dictationPhase = .recording
+    case .foreignCapture, .noLiveCapture:
+      reconcileComposerCaptureLost()
+    }
+  }
+
+  func reportComposerStopFailure(_ message: String, requestID: UUID, handle: CsCaptureHandle) {
+    guard isCurrentComposerCaptureRequest(requestID),
+      composerCaptureHandle?.captureId == handle.captureId else { return }
+    reportDictationFailure(message, preservingDelivery: true)
   }
 
   /// Release a request whose take the controller says no longer exists.
   ///
   /// Identity-aware recovery, driven by the controller's answer and an explicit
   /// user gesture — never by a timer that erases the latch on a schedule and
-  /// takes a still-live delivery destination with it. Any text still owed to
-  /// the released thread arrives later with no owner and is retained, which is
-  /// a visible outcome rather than a silent drop.
+  /// takes a still-live delivery destination with it. Capture-to-thread receipts
+  /// survive request release, so queued text still reaches its original owner.
   func reconcileComposerCaptureLost() {
     composerCaptureRequestID = nil
     composerCaptureStartCompleted = false
@@ -760,7 +796,7 @@ final class AgentChatStore: ObservableObject {
   func releaseUnownedDictationGesture() {
     // A stopped/failed local request may still have terminal text in flight.
     if hasComposerCaptureRequest {
-      dictationPhase = .idle
+      dictationPhase = .preparing
     } else {
       setDictationPhase(.idle)
     }
@@ -773,6 +809,11 @@ final class AgentChatStore: ObservableObject {
   /// Guards the auto-clear of a `.failed` phase against a stale timer overwriting
   /// a newer state.
   private var dictationFailureToken = UUID()
+  private(set) var dictationFailureTask: Task<Void, Never>?
+  /// Injectable display clock; it never settles a capture or acknowledges text.
+  var waitForDictationFailureExpiry: @MainActor () async throws -> Void = {
+    try await Task.sleep(nanoseconds: 4_000_000_000)
+  }
 
   /// Toggle Agent capture (start ↔ stop-and-send).
   func toggleDictation() { dictation?.toggle() }
@@ -977,17 +1018,23 @@ final class AgentChatStore: ObservableObject {
   func reportDictationFailure(_ message: String, preservingDelivery: Bool = false) {
     if preservingDelivery {
       composerCaptureStartCompleted = false
+      composerCaptureAwaitingTerminal = true
       dictationPhase = .failed(message)
     } else {
       setDictationPhase(.failed(message))
     }
     let token = UUID()
+    let requestID = composerCaptureRequestID
     dictationFailureToken = token
-    Task { @MainActor in
-      try? await Task.sleep(nanoseconds: 4_000_000_000)
-      guard dictationFailureToken == token, case .failed = dictationPhase else { return }
+    dictationFailureTask?.cancel()
+    let waitForExpiry = waitForDictationFailureExpiry
+    dictationFailureTask = Task { @MainActor [weak self] in
+      do { try await waitForExpiry() } catch { return }
+      guard let self, !Task.isCancelled, dictationFailureToken == token,
+        (composerCaptureRequestID == requestID || composerCaptureRequestID == nil),
+        case .failed = dictationPhase else { return }
       // Banner expiry is display cleanup, not a terminal delivery receipt.
-      dictationPhase = .idle
+      dictationPhase = hasComposerCaptureRequest ? .preparing : .idle
     }
   }
 
