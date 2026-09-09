@@ -15,26 +15,13 @@ fn options(vendor: ProviderKind) -> SpeechOptions {
     }
 }
 #[tokio::test]
-async fn stored_key_wins_over_signed_in_account() {
-    // Live 2026-09-09: the account token on api.openai.com is a 401.
-    let auth = resolve_with(
-        OPENAI,
-        true,
-        || async { panic!("OAuth must not run when a key is stored") },
-        || Some("key-test-token".into()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(auth.bearer, "key-test-token");
-    assert_eq!(auth.source, AuthSource::ApiKey);
-}
-#[tokio::test]
-async fn signed_in_account_serves_a_vendor_without_a_key() {
+async fn signed_in_account_wins_and_never_reads_key() {
+    // Founder 2026-09-09 16:41: OAuth before the stored key.
     let auth = resolve_with(
         OPENAI,
         true,
         || async { Ok("oauth-test-token".into()) },
-        || None,
+        || panic!("key must be ignored"),
     )
     .await
     .unwrap();
@@ -44,7 +31,7 @@ async fn signed_in_account_serves_a_vendor_without_a_key() {
         OPENAI,
         true,
         || async { Err(SpeechError::Account("openai")) },
-        || None,
+        || panic!("refresh failure cannot fall back"),
     )
     .await;
     assert!(matches!(failure, Err(SpeechError::Account("openai"))));

@@ -466,22 +466,72 @@ fn non_empty_trimmed(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Unverified JWT payload claims. Display and routing metadata only —
+/// authorization always rides the access token itself.
+fn jwt_claims(token: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
 /// Best-effort display identity from the id_token JWT payload (email, else
 /// sub). Display-only — the claims are NOT verified here; authorization always
 /// rides the access token, never this label.
 fn id_token_identity(tokens: &AccountTokens) -> Option<String> {
-    use base64::Engine;
-    let payload = tokens.id_token.as_deref()?.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.as_bytes())
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let claims = jwt_claims(tokens.id_token.as_deref()?)?;
     ["email", "sub"].iter().find_map(|key| {
         claims
             .get(key)
             .and_then(serde_json::Value::as_str)
             .and_then(|value| non_empty_trimmed(value.to_string()))
     })
+}
+
+/// ChatGPT workspace id a request on the vendor's own backend must carry as
+/// `ChatGPT-Account-ID`. Claim path per codex-rs `token_data.rs`
+/// (`https://api.openai.com/auth`.`chatgpt_account_id` on the id_token), with
+/// opencode's fallbacks (top-level `chatgpt_account_id`, `organizations[0].id`),
+/// then the same walk over the access token.
+pub fn account_id_from_tokens(tokens: &AccountTokens) -> Option<String> {
+    tokens
+        .id_token
+        .as_deref()
+        .and_then(account_id_from_jwt)
+        .or_else(|| account_id_from_jwt(&tokens.access_token))
+}
+
+fn account_id_from_jwt(token: &str) -> Option<String> {
+    let claims = jwt_claims(token)?;
+    let as_id = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| non_empty_trimmed(id.to_string()))
+    };
+    as_id(
+        claims
+            .get("https://api.openai.com/auth")
+            .and_then(|auth| auth.get("chatgpt_account_id")),
+    )
+    .or_else(|| as_id(claims.get("chatgpt_account_id")))
+    .or_else(|| {
+        as_id(
+            claims
+                .get("organizations")
+                .and_then(|orgs| orgs.get(0))
+                .and_then(|org| org.get("id")),
+        )
+    })
+}
+
+/// [`account_id_from_tokens`] over the stored account for `provider`; `None`
+/// when not signed in or when the tokens carry no workspace claim.
+pub fn account_id(provider: ProviderKind) -> Option<String> {
+    load_account_tokens(provider)
+        .ok()
+        .and_then(|tokens| account_id_from_tokens(&tokens))
 }
 
 /// Issuer base URL for `provider`: env override, else the provider default.
@@ -1281,5 +1331,57 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    /// The Codex backend needs the workspace id from the token claims; the
+    /// codex-rs path wins, the opencode fallbacks follow, and a token with no
+    /// claim yields `None` rather than an empty header.
+    #[test]
+    fn account_id_walks_the_codex_and_opencode_claim_paths() {
+        use base64::Engine;
+        let jwt = |payload: &str| {
+            format!(
+                "h.{}.s",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+            )
+        };
+        let tokens = |access: &str, id: Option<&str>| {
+            AccountTokens::new(
+                ProviderKind::OpenAiResponses,
+                access.to_string(),
+                None,
+                id.map(str::to_string),
+                None,
+                None,
+            )
+        };
+        let codex = jwt(
+            r#"{"email":"u@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_codex"}}"#,
+        );
+        assert_eq!(
+            account_id_from_tokens(&tokens("opaque", Some(&codex))).as_deref(),
+            Some("acct_codex")
+        );
+        let flat = jwt(r#"{"chatgpt_account_id":"acct_flat"}"#);
+        assert_eq!(
+            account_id_from_tokens(&tokens("opaque", Some(&flat))).as_deref(),
+            Some("acct_flat")
+        );
+        let orgs = jwt(r#"{"organizations":[{"id":"org_first"},{"id":"org_second"}]}"#);
+        assert_eq!(
+            account_id_from_tokens(&tokens("opaque", Some(&orgs))).as_deref(),
+            Some("org_first")
+        );
+        // No id_token: the access token's claims are walked the same way.
+        let access = jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_access"}}"#);
+        assert_eq!(
+            account_id_from_tokens(&tokens(&access, None)).as_deref(),
+            Some("acct_access")
+        );
+        assert_eq!(
+            account_id_from_tokens(&tokens("opaque", Some(&jwt(r#"{"email":"x"}"#)))),
+            None
+        );
+        assert_eq!(account_id_from_tokens(&tokens("not-a-jwt", None)), None);
     }
 }

@@ -79,6 +79,9 @@ pub struct ResponsesStreamingManager<'a> {
     endpoint: &'a str,
     api_key: &'a str,
     auth_header_mode: AuthHeaderMode,
+    /// Lane-specific request headers beyond auth (e.g. the Codex backend's
+    /// `ChatGPT-Account-ID` and `originator`). Applied to every request.
+    extra_headers: Vec<(String, String)>,
     callbacks: StreamCallbacks,
     initial_response_timeout: Duration,
     inter_chunk_timeout: Duration,
@@ -103,6 +106,7 @@ impl<'a> ResponsesStreamingManager<'a> {
             endpoint,
             api_key,
             auth_header_mode: AuthHeaderMode::BearerAndApiKey,
+            extra_headers: Vec::new(),
             callbacks,
             initial_response_timeout,
             inter_chunk_timeout,
@@ -112,6 +116,12 @@ impl<'a> ResponsesStreamingManager<'a> {
     /// Override the auth header shape (builder style).
     pub fn with_auth_header_mode(mut self, auth_header_mode: AuthHeaderMode) -> Self {
         self.auth_header_mode = auth_header_mode;
+        self
+    }
+
+    /// Attach lane-specific headers to every request (builder style).
+    pub fn with_extra_headers(mut self, extra_headers: Vec<(String, String)>) -> Self {
+        self.extra_headers = extra_headers;
         self
     }
 
@@ -128,11 +138,14 @@ impl<'a> ResponsesStreamingManager<'a> {
     pub async fn stream<T: Serialize>(&self, request: &T) -> Result<ResponsesStreamOutput> {
         let endpoint_url =
             validated_endpoint_url(self.endpoint).context("Invalid Responses API endpoint URL")?;
-        let request_builder = apply_auth_headers(
-            // nosemgrep: rust.actix.ssrf.reqwest-taint.reqwest-taint -- URL is validated by `validated_endpoint_url`.
-            self.client.post(endpoint_url.clone()),
-            self.api_key,
-            self.auth_header_mode,
+        let request_builder = apply_extra_headers(
+            apply_auth_headers(
+                // nosemgrep: rust.actix.ssrf.reqwest-taint.reqwest-taint -- URL is validated by `validated_endpoint_url`.
+                self.client.post(endpoint_url.clone()),
+                self.api_key,
+                self.auth_header_mode,
+            ),
+            &self.extra_headers,
         )
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
@@ -457,6 +470,7 @@ impl<'a> ResponsesStreamingManager<'a> {
             endpoint: self.endpoint.to_string(),
             api_key: self.api_key.to_string(),
             auth_header_mode: self.auth_header_mode,
+            extra_headers: self.extra_headers.clone(),
             initial_response_timeout: self.initial_response_timeout,
             inter_chunk_timeout: self.inter_chunk_timeout,
         };
@@ -642,6 +656,7 @@ struct AgentStreamTransport {
     endpoint: String,
     api_key: String,
     auth_header_mode: AuthHeaderMode,
+    extra_headers: Vec<(String, String)>,
     initial_response_timeout: Duration,
     inter_chunk_timeout: Duration,
 }
@@ -664,16 +679,20 @@ async fn run_agent_stream(
         endpoint,
         api_key,
         auth_header_mode,
+        extra_headers,
         initial_response_timeout,
         inter_chunk_timeout,
     } = transport;
     let endpoint_url =
         validated_endpoint_url(&endpoint).context("Invalid agent streaming endpoint URL")?;
-    let request_builder = apply_auth_headers(
-        // nosemgrep: rust.actix.ssrf.reqwest-taint.reqwest-taint -- URL is validated by `validated_endpoint_url`.
-        client.post(endpoint_url),
-        &api_key,
-        auth_header_mode,
+    let request_builder = apply_extra_headers(
+        apply_auth_headers(
+            // nosemgrep: rust.actix.ssrf.reqwest-taint.reqwest-taint -- URL is validated by `validated_endpoint_url`.
+            client.post(endpoint_url),
+            &api_key,
+            auth_header_mode,
+        ),
+        &extra_headers,
     )
     .header("Content-Type", "application/json")
     .header("Accept", "text/event-stream")
@@ -885,6 +904,18 @@ fn apply_auth_headers(
         AuthHeaderMode::BearerAndApiKey => builder.header("x-api-key", api_key),
         AuthHeaderMode::BearerOnly => builder,
     }
+}
+
+/// Lane-specific headers on top of auth; an empty list is a no-op.
+fn apply_extra_headers(
+    builder: reqwest::RequestBuilder,
+    extra_headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    extra_headers
+        .iter()
+        .fold(builder, |builder, (name, value)| {
+            builder.header(name, value)
+        })
 }
 
 /// SSRF gate for every outgoing request in this module.
