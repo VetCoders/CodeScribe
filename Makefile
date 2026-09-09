@@ -349,9 +349,9 @@ bump-major:
 # gate: smoke-canaries class=operator ci=no -- verify-canaries + host rows: dist inputs, appcast feed, live-store purity, Sparkle key parity, keychain domain cleanliness (scripts/canaries.sh --host)
 # gate: test-keychain-session class=hermetic ci=no -- ephemeral signing-keychain contract (scripts/tests/keychain-session-test.sh) against a FAKE security binary and a temp HOME; touches no real keychain
 # gate: verify-dmg class=operator ci=no -- fail-closed payload check against an already-built DMG; release.yml runs the same check via scripts/verify-dmg-payload.sh, not via this target
-# gate: test class=operator ci=no -- workspace tests + #[ignore] real-API tests + STT pipeline; sources ~/.codescribe/.env and opens Console
+# gate: test class=operator ci=no -- workspace tests with heavy cases ignored; no dotenv or forced opt-ins; opens Console
 # gate: test-quick class=operator ci=no -- workspace tests only, but still sources ~/.codescribe/.env and opens Console
-# gate: test-all class=operator ci=no -- test + ignored + STT pipeline + SSE streaming; needs LLM keys
+# gate: test-all class=operator ci=no -- same workspace selection as test; heavy/API lanes require explicit targets
 # gate: test-e2e class=operator ci=no -- e2e tests in release profile; sources the operator dotenv
 # gate: test-e2e-real class=operator ci=no -- e2e against real LLM APIs; needs LLM_API_KEY and LLM_ASSISTIVE_API_KEY
 # gate: test-e2e-roundtrip class=operator ci=no -- #[ignore] lanes of e2e_vad_flow (private data_assets corpus) + e2e_round_trip (TTS/CSM, Whisper, MiniLM models; sets CODESCRIBE_E2E_ROUNDTRIP=1); no LLM keys; fails, never skips, when a model or clip is missing
@@ -471,21 +471,17 @@ echo "╚═══════════════════════�
 open -a Console "$$LOG"
 endef
 
+# Ordinary selection never sweeps --ignored or enables STT/API/model work.
+# Even an inherited round-trip opt-in leaves those cases ignored here; select
+# test-e2e-roundtrip explicitly for heavy evidence. `verify` remains the CI gate.
 test:
 	@$(TEST_SETUP); \
 	set -o pipefail; \
-	echo "=== Tests (workspace) ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); $(APPLY_TEST_LLM); \
+	echo "=== Tests (workspace; heavy cases remain ignored) ===" | tee -a "$$LOG"; \
 	cargo test --workspace --all-targets -- --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
 	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
-	echo "=== Tests (ignored / real API) ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); $(APPLY_TEST_LLM); \
-	cargo test --workspace --all-targets -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
-	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
-	echo "=== Full Pipeline (STT) ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); CODESCRIBE_E2E_STT=1 \
-	cargo test --test e2e_full_pipeline -- --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
-	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
+	echo "Heavy round-trip NOT RUN: requires explicit test-e2e-roundtrip (sets CODESCRIBE_E2E_ROUNDTRIP=1)." | tee -a "$$LOG"; \
+	echo "Real API/STT/SSE evidence requires the dedicated bench targets." | tee -a "$$LOG"; \
 	echo "Done. Log: $$LOG" | tee -a "$$LOG"
 
 test-quick:
@@ -523,7 +519,7 @@ test-e2e-roundtrip:
 	@$(TEST_SETUP); \
 	set -o pipefail; \
 	echo "=== VAD flow (private corpus, --ignored) ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); \
+	$(ENV_LOAD); CODESCRIBE_E2E_ROUNDTRIP=1 \
 	cargo test --test e2e_vad_flow -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
 	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
 	echo "=== Round-trip TTS→STT→embed (--ignored) ===" | tee -a "$$LOG"; \
@@ -1051,25 +1047,15 @@ test-teacher:
 	@cargo run --bin codescribe-teacher -- proof --html /tmp/codescribe-teacher.html
 	@echo "HTML: /tmp/codescribe-teacher.html  (open /tmp/codescribe-teacher.html)"
 
+# "all" means all workspace targets, not permission to activate ignored lanes.
 test-all:
 	@$(TEST_SETUP); \
 	set -o pipefail; \
-	echo "=== Full Test Suite ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); $(APPLY_TEST_LLM); \
+	echo "=== Tests (workspace; heavy cases remain ignored) ===" | tee -a "$$LOG"; \
 	cargo test --workspace --all-targets -- --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
 	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
-	echo "=== Ignored / Real API ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); $(APPLY_TEST_LLM); \
-	cargo test --workspace --all-targets -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
-	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
-	echo "=== Full Pipeline (STT) ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); CODESCRIBE_E2E_STT=1 \
-	cargo test --test e2e_full_pipeline -- --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
-	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
-	echo "=== SSE Streaming ===" | tee -a "$$LOG"; \
-	$(ENV_LOAD); $(APPLY_TEST_LLM); \
-	cargo test e2e_sse --release -- --ignored --nocapture 2>&1 | tee -a "$$LOG"; test_rc=$${PIPESTATUS[0]}; \
-	if [[ $$test_rc -ne 0 ]]; then exit $$test_rc; fi; \
+	echo "Heavy round-trip NOT RUN: requires explicit test-e2e-roundtrip (sets CODESCRIBE_E2E_ROUNDTRIP=1)." | tee -a "$$LOG"; \
+	echo "Real API/STT/SSE evidence requires the dedicated bench targets." | tee -a "$$LOG"; \
 	echo "Done. Log: $$LOG" | tee -a "$$LOG"
 
 demo:
@@ -1291,7 +1277,7 @@ help:
 	@printf '\n'
 	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'QUALITY — BENCH INSTRUMENTS (this host only, never a merge gate)'
 	@printf '%s\n' '  Full classification: make -s gate-ledger'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' 'Full suite incl. ignored real-API tests (sources ~/.codescribe/.env)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' 'Workspace tests; heavy cases ignored, no forced opt-ins'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-quick' 'Workspace tests, no real API (sources ~/.codescribe/.env)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-swift' 'SwiftUI suite + phrase-restart lockstep (needs Xcode + ffi dylib)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'smoke-macos27' 'Host smoke after an OS/Xcode bump (SMOKE_ARGS=--with-inference)'
@@ -1307,7 +1293,7 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'corpus-census' 'Inventory both private corpus roots; hashes/counts only'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-corpus-parity' 'Isolated production replay (profiles/runs/recordings are explicit vars)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-teacher' 'Teacher CLI proof HTML (live×whisper×human)'
-	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-all' 'Run full test suite'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test-all' 'All workspace targets; heavy/API evidence requires explicit bench targets'
 
 # ============================================================================
 # Release & Distribution

@@ -23,6 +23,7 @@ pub use history::{
     SessionTranscriptArchive,
     TranscriptKind,
     archive_session_take,
+    archive_session_take_from_file,
     // Voice Drafts API (Mission Control)
     delete_draft,
     drafts_dir,

@@ -9,8 +9,8 @@
 //!
 //! Heavy tests are `#[ignore]` AND require an explicit opt-in — both locks
 //! on purpose: `--ignored` alone must never turn a workspace-wide run into a
-//! model download, and the opt-in without `--ignored` must never report green
-//! for work that did not run.
+//! model download. Opt-in without `--ignored` leaves the heavy cases visibly
+//! ignored; it does not constitute round-trip evidence.
 //!
 //! Run with: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored
 //! (or `make test-e2e-roundtrip`). Without the models the tests FAIL with the
@@ -23,24 +23,21 @@ use anyhow::Result;
 #[path = "support/e2e_stt_matrix.rs"]
 mod e2e_stt_matrix;
 
-use e2e_stt_matrix::{ROUNDTRIP_OPT_IN_ENV, env_opt_in, parse_opt_in};
+use e2e_stt_matrix::{ROUNDTRIP_OPT_IN_ENV, parse_opt_in};
 
-/// Second lock behind `#[ignore]`. Panics (never returns Ok) when the operator
-/// ran `--ignored` without opting in, so a green result always means the
-/// round-trip actually executed.
-/// Opt-in gate for the `--ignored` sweep. Without the env var the test prints
-/// a loud SKIP and returns — `make test-all` runs `--ignored` across the whole
-/// workspace and must not go red on hosts without TTS/corpus models. With the
-/// env var set (`make test-e2e-roundtrip`) a missing model is a real failure.
-fn opted_in() -> bool {
-    if env_opt_in(ROUNDTRIP_OPT_IN_ENV) {
-        return true;
-    }
-    eprintln!(
-        "SKIP: round-trip e2e needs {ROUNDTRIP_OPT_IN_ENV}=1 (or `make test-e2e-roundtrip`); \
-         this run proves nothing"
+/// Pure second lock behind `#[ignore]`, using the shared opt-in syntax.
+/// Refusal is an error before any model initialization, never a passing skip.
+fn roundtrip_gate(value: Option<&str>) -> Result<()> {
+    anyhow::ensure!(
+        parse_opt_in(value),
+        "round-trip gate refused before model initialization: set {ROUNDTRIP_OPT_IN_ENV}=1 \
+         or true and select --ignored (or use `make test-e2e-roundtrip`)"
     );
-    false
+    Ok(())
+}
+
+fn require_roundtrip_opt_in() -> Result<()> {
+    roundtrip_gate(std::env::var(ROUNDTRIP_OPT_IN_ENV).ok().as_deref())
 }
 
 /// Calculate simple word overlap similarity (0.0 - 1.0)
@@ -71,23 +68,42 @@ fn word_similarity(a: &str, b: &str) -> f32 {
 
 #[test]
 fn test_roundtrip_gate_requires_explicit_opt_in() {
-    assert!(parse_opt_in(Some("1")), "1 should enable opt-in gates");
+    for value in ["1", "true", "TRUE", " True ", "\t1\n"] {
+        assert!(roundtrip_gate(Some(value)).is_ok(), "rejected {value:?}");
+    }
+    for value in [None, Some(""), Some("0"), Some("yes"), Some("false")] {
+        let error = roundtrip_gate(value).expect_err("missing or invalid opt-in must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("refused before model initialization")
+        );
+    }
+}
+
+/// Exercise the actual ignored test entrypoints, not only the parser. Only the
+/// child environment is changed, so parallel tests retain their own opt-in.
+#[test]
+fn test_roundtrip_ignored_without_opt_in_fails() -> Result<()> {
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args(["--ignored", "--nocapture", "--test-threads=1"])
+        .env_remove(ROUNDTRIP_OPT_IN_ENV)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "false green: {stdout}\n{stderr}");
     assert!(
-        parse_opt_in(Some("true")),
-        "true should enable opt-in gates"
+        stdout.contains("0 passed; 10 failed; 0 ignored"),
+        "all ten heavy entries must fail: {stdout}\n{stderr}"
     );
-    assert!(
-        !parse_opt_in(Some("yes")),
-        "yes should not enable round-trip opt-in gates"
+    assert_eq!(
+        stderr
+            .matches("round-trip gate refused before model initialization")
+            .count(),
+        10,
+        "each heavy entry must refuse at its gate: {stdout}\n{stderr}"
     );
-    assert!(
-        !parse_opt_in(Some("0")),
-        "0 should not enable round-trip opt-in gates"
-    );
-    assert!(
-        !parse_opt_in(None),
-        "missing env var should keep heavy round-trip tests disabled"
-    );
+    Ok(())
 }
 
 #[test]
@@ -132,9 +148,7 @@ fn test_whisper_embedded_readiness_contract() {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_tts_stt_round_trip_english() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     // Initialize components
     codescribe_core::tts::init()?;
@@ -173,9 +187,7 @@ fn test_tts_stt_round_trip_english() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_tts_stt_round_trip_polish() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::tts::init()?;
     codescribe_core::stt::whisper::init()?;
@@ -208,9 +220,7 @@ fn test_tts_stt_round_trip_polish() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_embedding_round_trip_similarity() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::tts::init()?;
     codescribe_core::stt::whisper::init()?;
@@ -244,9 +254,7 @@ fn test_embedding_round_trip_similarity() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_embedding_preserves_meaning() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::embedder::init()?;
 
@@ -283,9 +291,7 @@ fn test_embedding_preserves_meaning() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_full_pipeline_double_round_trip() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::tts::init()?;
     codescribe_core::stt::whisper::init()?;
@@ -327,9 +333,7 @@ fn test_full_pipeline_double_round_trip() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_whisper_embedded_model_works() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     // Verify embedded model is being used
     let embedded = codescribe_core::stt::whisper::embedded::is_embedded_available();
@@ -364,9 +368,7 @@ fn test_whisper_embedded_model_works() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_tts_embedded_model_works() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     let embedded = codescribe_core::tts::embedded::is_embedded_available();
     eprintln!("TTS embedded model available: {}", embedded);
@@ -396,9 +398,7 @@ fn test_tts_embedded_model_works() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_embedded_model_works() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     let embedded = codescribe_core::embedder::embedded::is_embedded_available();
     eprintln!("Embedded model available: {}", embedded);
@@ -434,9 +434,7 @@ fn test_embedded_model_works() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_numbers_survive_round_trip() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::tts::init()?;
     codescribe_core::stt::whisper::init()?;
@@ -463,9 +461,7 @@ fn test_numbers_survive_round_trip() -> Result<()> {
 #[test]
 #[ignore = "opt-in e2e: CODESCRIBE_E2E_ROUNDTRIP=1 cargo test --test e2e_round_trip -- --ignored"]
 fn test_punctuation_handling() -> Result<()> {
-    if !opted_in() {
-        return Ok(());
-    }
+    require_roundtrip_opt_in()?;
 
     codescribe_core::tts::init()?;
     codescribe_core::stt::whisper::init()?;
