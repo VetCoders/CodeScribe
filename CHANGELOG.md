@@ -125,6 +125,7 @@ Release exists.
 
 ### Changed
 
+- **One owner per delivery fact.** `os::selection::is_codescribe_app` is the single self-app check (the controller's `target_is_self_app` twin is gone); the frontmost app is read only through `NSWorkspace` (the `System Events` osascript fallback is gone, so the paste latch and the post-activation observation compare the same name and never spawn a process or ride Automation TCC); dead `clipboard::paste_text` / `is_restore_enabled` removed (no caller since 2026-08-21); hold and toggle starts share one paste-target capture and one latch writer.
 - **Span idempotence is enabled by default.**
   `CODESCRIBE_SPAN_IDEMPOTENCE` changed from `0` to `1`. The gate deduplicates
   structural replays of the same observation identity; it must never dedupe

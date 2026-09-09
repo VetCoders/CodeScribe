@@ -158,7 +158,7 @@ pub fn capture_assistive_context_with_image_with_prior_frontmost(
     let copy_delay_ms = env_u64("ASSISTIVE_CONTEXT_COPY_DELAY_MS", 150);
 
     let current_frontmost_app = if include_app {
-        frontmost_app_name()
+        current_frontmost_app_name()
     } else {
         None
     };
@@ -226,7 +226,7 @@ pub fn capture_frontmost_app_only_with_prior_frontmost(
 
     let include_app = env_flag("ASSISTIVE_CONTEXT_INCLUDE_APP", true);
     let current_frontmost_app = if include_app {
-        current_frontmost_app_name().or_else(frontmost_app_name)
+        current_frontmost_app_name()
     } else {
         None
     };
@@ -366,10 +366,12 @@ pub fn activate_app_by_name(_app_name: &str) -> bool {
 /// Localized name of the app currently owning focus, via
 /// `NSWorkspace.frontmostApplication.localizedName`.
 ///
-/// This is the runtime-truth signal for "is the right window focused yet?",
-/// unlike the `System Events` osascript query which is slower and rides the
-/// Automation TCC path. Returns `None` when AppKit is unavailable or there is
-/// no frontmost app.
+/// This is the runtime-truth signal for "is the right window focused yet?"
+/// and the only frontmost-app reader in the crate (the `System Events`
+/// osascript query is gone: it spawned a process per call, rode the
+/// Automation TCC path and returned the process name, which could differ from
+/// this localized name and defeat the latch-vs-observation comparison).
+/// Returns `None` when AppKit is unavailable or there is no frontmost app.
 #[cfg(target_os = "macos")]
 fn nsworkspace_frontmost_app_name() -> Option<String> {
     use objc::runtime::{Class, Object};
@@ -467,9 +469,13 @@ fn normalized_app_name(app_name: Option<String>) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
-/// Whether this app name is Codescribe itself — the guard against capturing
-/// our own overlay as if it were the user's document.
-fn is_codescribe_app(app_name: &str) -> bool {
+/// Whether this app name is Codescribe itself (the localized name of **this
+/// process**). One owner for the whole crate: the capture latch skips its own
+/// overlay here, and the delivery transport uses it to skip
+/// `NSRunningApplication` activate (we are already running). Not a paste
+/// veto — the Agent window is a legal Cmd+V sink; the overlay-canvas veto is
+/// the Swift caret probe.
+pub fn is_codescribe_app(app_name: &str) -> bool {
     app_name.trim().eq_ignore_ascii_case("codescribe")
 }
 
@@ -649,49 +655,6 @@ pub fn build_assistive_input(
 /// path, no Automation TCC). `None` when the signal is unavailable.
 pub(crate) fn current_frontmost_app_name() -> Option<String> {
     nsworkspace_frontmost_app_name()
-}
-
-/// Frontmost app name via the `System Events` osascript query.
-///
-/// Slower than [`nsworkspace_frontmost_app_name`] and it rides the Automation
-/// TCC path, so a denial shows up here as a failed query rather than an error.
-/// Returns `None` on any failure — best-effort by design.
-#[cfg(target_os = "macos")]
-fn frontmost_app_name() -> Option<String> {
-    use std::process::Command;
-
-    // This is best-effort. It may fail if System Events is restricted.
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            r#"tell application "System Events" to name of first application process whose frontmost is true"#,
-        ])
-        .output()
-        .map_err(|e| {
-            warn!("frontmost_app_name: failed to run osascript: {}", e);
-            e
-        })
-        .ok()?;
-
-    if !output.status.success() {
-        // System Events query failing here typically means a silent Automation
-        // TCC denial (errAEEventNotPermitted, -1743). Log at warn so the cause
-        // of a missing frontmost app is observable.
-        warn!(
-            "frontmost_app_name: System Events query failed: exit={:?} (possible Automation TCC denial)",
-            output.status.code()
-        );
-        return None;
-    }
-
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-/// Non-macOS stub: no frontmost-app concept to query.
-#[cfg(not(target_os = "macos"))]
-fn frontmost_app_name() -> Option<String> {
-    None
 }
 
 /// Read the current selection, preferring Accessibility and falling back to a

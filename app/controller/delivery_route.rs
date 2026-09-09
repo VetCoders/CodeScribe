@@ -179,13 +179,6 @@ pub(crate) struct TranscriptProjectionAvailability {
     pub can_format: bool,
 }
 
-/// Localized name of **this process**. Used to skip `NSRunningApplication`
-/// activate (we are already running). Not a paste veto — the Agent window
-/// is a legal Cmd+V sink. Overlay-canvas veto is the Swift caret probe.
-pub fn target_is_self_app(name: &str) -> bool {
-    name.trim().eq_ignore_ascii_case("codescribe")
-}
-
 /// Facts an overlay Insert / defer click may feed the throne.
 ///
 /// Focus-at-click is not an input. `latched_target_is_self` is true only when
@@ -337,6 +330,7 @@ pub fn format_delivery_route_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::os::selection::is_codescribe_app;
 
     fn facts(overrides: impl FnOnce(&mut DeliveryFacts)) -> DeliveryFacts {
         let mut f = DeliveryFacts {
@@ -588,10 +582,10 @@ mod tests {
 
     #[test]
     fn codescribe_is_self_case_insensitive() {
-        assert!(target_is_self_app("Codescribe"));
-        assert!(target_is_self_app(" codescribe "));
-        assert!(!target_is_self_app("Ghostty"));
-        assert!(!target_is_self_app(""));
+        assert!(is_codescribe_app("Codescribe"));
+        assert!(is_codescribe_app(" codescribe "));
+        assert!(!is_codescribe_app("Ghostty"));
+        assert!(!is_codescribe_app(""));
     }
 
     #[test]

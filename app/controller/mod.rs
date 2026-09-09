@@ -80,7 +80,7 @@ use crate::os::hotkeys::{self, HoldMode};
 use crate::os::selection::{
     AssistiveContext, capture_assistive_context,
     capture_assistive_context_with_image_with_prior_frontmost,
-    capture_frontmost_app_only_with_prior_frontmost,
+    capture_frontmost_app_only_with_prior_frontmost, is_codescribe_app,
 };
 use crate::os::shortcut_registry;
 use context_bucket::ContextBucket;
@@ -90,7 +90,7 @@ use codescribe_core::conversation::{ConversationEngine, MoshiConfig};
 use codescribe_core::ipc::{EngineEventWire, IpcEvent, IpcEventPayload};
 use codescribe_core::tts::AudioPlayer;
 
-use delivery_route::{DeliveryFacts, target_is_self_app};
+use delivery_route::DeliveryFacts;
 use helpers::send_assistive_with_agent_runtime_lane;
 use hotkey_policy::{
     STOP_TIMEOUT, effective_hold_start_delay_ms, should_apply_incoming_mode_flags,
@@ -1431,7 +1431,7 @@ impl RecordingController {
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .is_some_and(|name| {
-                target_is_self_app(name)
+                is_codescribe_app(name)
                     || (crate::os::selection::activate_app_by_name(name)
                         && crate::os::selection::wait_for_frontmost_app(
                             name,
@@ -1447,7 +1447,7 @@ impl RecordingController {
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .is_some_and(|name| !target_is_self_app(name));
+            .is_some_and(|name| !is_codescribe_app(name));
         debug!(
             target = ?target_app,
             frontmost = ?frontmost,
@@ -1676,6 +1676,27 @@ impl RecordingController {
             deferred_insert_shortcut,
             deferred_insert_failure,
         })
+    }
+
+    /// The one paste-target capture for a take that carries no assistive
+    /// context: the app frontmost at take START, with the previous latch as
+    /// the fallback when Codescribe itself is frontmost. Hold and toggle
+    /// starts both come through here so the latch has a single producer.
+    async fn capture_paste_target_context(&self) -> AssistiveContext {
+        let prior = self.pre_overlay_frontmost_app.read().await.clone();
+        tokio::task::spawn_blocking(move || capture_frontmost_app_only_with_prior_frontmost(prior))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// The one latch writer at take start: store the captured frontmost app
+    /// as the paste target and the whole context for the assistive prompt.
+    /// Returns whether a target was latched.
+    async fn latch_trigger_context(&self, trigger_context: AssistiveContext) -> bool {
+        let has_latched_target = trigger_context.frontmost_app.is_some();
+        *self.pre_overlay_frontmost_app.write().await = trigger_context.frontmost_app.clone();
+        *self.assistive_context.write().await = Some(trigger_context);
+        has_latched_target
     }
 
     /// Arm the edited overlay transcript without attempting target activation.
@@ -2871,16 +2892,9 @@ impl RecordingController {
                 .clone()
                 .unwrap_or_default()
         } else {
-            let prior = self.pre_overlay_frontmost_app.read().await.clone();
-            tokio::task::spawn_blocking(move || {
-                capture_frontmost_app_only_with_prior_frontmost(prior)
-            })
-            .await
-            .unwrap_or_default()
+            self.capture_paste_target_context().await
         };
-        let has_latched_target = trigger_context.frontmost_app.is_some();
-        *self.pre_overlay_frontmost_app.write().await = trigger_context.frontmost_app.clone();
-        *self.assistive_context.write().await = Some(trigger_context);
+        let has_latched_target = self.latch_trigger_context(trigger_context).await;
 
         // Reset VAD flag for new session
         self.vad_triggered.store(false, Ordering::SeqCst);
@@ -3230,16 +3244,9 @@ impl RecordingController {
                 .await
                 .unwrap_or_default()
         } else {
-            let prior = self.pre_overlay_frontmost_app.read().await.clone();
-            tokio::task::spawn_blocking(move || {
-                capture_frontmost_app_only_with_prior_frontmost(prior)
-            })
-            .await
-            .unwrap_or_default()
+            self.capture_paste_target_context().await
         };
-        let has_latched_target = trigger_context.frontmost_app.is_some();
-        *self.pre_overlay_frontmost_app.write().await = trigger_context.frontmost_app.clone();
-        *self.assistive_context.write().await = Some(trigger_context);
+        let has_latched_target = self.latch_trigger_context(trigger_context).await;
 
         // Generate session ID
         let new_session_id = Uuid::new_v4().to_string();
@@ -3533,7 +3540,10 @@ impl RecordingController {
         match self.capture_gate(expected).await {
             CaptureStopOutcome::Stopped => {}
             refused => {
-                info!(?refused, "conditional stop refused: capture identity mismatch");
+                info!(
+                    ?refused,
+                    "conditional stop refused: capture identity mismatch"
+                );
                 return Ok(refused);
             }
         }
@@ -3921,7 +3931,10 @@ impl RecordingController {
         match self.capture_gate(expected).await {
             CaptureStopOutcome::Stopped => {}
             refused => {
-                info!(?refused, "conditional finish refused: capture identity mismatch");
+                info!(
+                    ?refused,
+                    "conditional finish refused: capture identity mismatch"
+                );
                 return Ok(refused);
             }
         }
