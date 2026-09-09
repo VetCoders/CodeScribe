@@ -22,7 +22,9 @@ final class ComposerTurnOwnershipTests: XCTestCase {
   private enum CaptureCall: Equatable {
     case isRecording
     case startComposerTurn
-    case stop
+    /// Carries the identity the gesture asked to stop, so a test can assert the
+    /// adapter named *its own* capture rather than "whatever is live".
+    case stop(String)
   }
 
   private enum CaptureFailure: Error { case refused }
@@ -34,6 +36,10 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     private var answerCursor = 0
     var startFails = false
     var stopFails = false
+    /// Identity the controller admits for the next start.
+    var admittedCaptureId = "capture-1"
+    /// Typed answer the conditional stop returns when it does not throw.
+    var stopOutcome: CsConditionalStop = .stopped
     var onStart: (@MainActor @Sendable () -> Void)?
     var onQuery: (@MainActor @Sendable () -> Void)?
     private(set) var calls: [CaptureCall] = []
@@ -50,15 +56,17 @@ final class ComposerTurnOwnershipTests: XCTestCase {
       return answer
     }
 
-    func startComposerTurnRecording() async throws {
+    func startComposerTurnRecording() async throws -> CsCaptureHandle {
       calls.append(.startComposerTurn)
       await onStart?()
       if startFails { throw CaptureFailure.refused }
+      return CsCaptureHandle(captureId: admittedCaptureId)
     }
 
-    func stopRecording() async throws {
-      calls.append(.stop)
+    func stopComposerTurnRecording(handle: CsCaptureHandle) async throws -> CsConditionalStop {
+      calls.append(.stop(handle.captureId))
       if stopFails { throw CaptureFailure.refused }
+      return stopOutcome
     }
   }
 
@@ -96,6 +104,17 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     func setGeneratedTitle(backendId: String, title: String) -> Bool { true }
     func exportThreadMarkdown(backendId: String, assistantOnly: Bool) -> String? { nil }
     func generateThreadId() -> String { "t_generated" }
+  }
+
+  /// "A stop was requested", independent of which capture it named. Existing
+  /// cases assert the gesture's stop policy; the identity assertions are their
+  /// own tests below.
+  private func stopRequested(_ calls: [CaptureCall]) -> Bool {
+    calls.contains { if case .stop = $0 { return true } else { return false } }
+  }
+
+  private func stopCount(_ calls: [CaptureCall]) -> Int {
+    calls.filter { if case .stop = $0 { return true } else { return false } }.count
   }
 
   private struct Fixture: Sendable {
@@ -148,7 +167,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     await settle(f)
 
     XCTAssertFalse(
-      f.surface.calls.contains(.stop),
+      stopRequested(f.surface.calls),
       "a composer press must never end a capture another surface owns"
     )
     XCTAssertFalse(
@@ -172,7 +191,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.dictation.toggle()
     await settle(f)
 
-    XCTAssertTrue(f.surface.calls.contains(.stop), "the owning surface ends its own take")
+    XCTAssertTrue(stopRequested(f.surface.calls), "the owning surface ends its own take")
     XCTAssertFalse(f.store.ownsLiveDictation)
     XCTAssertEqual(f.store.dictationThreadID, f.threadA, "terminal text still has a destination")
   }
@@ -196,7 +215,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     )
     f.dictation.toggle()
     await settle(f)
-    XCTAssertTrue(f.surface.calls.contains(.stop))
+    XCTAssertTrue(stopRequested(f.surface.calls))
     XCTAssertEqual(f.store.dictationThreadID, f.threadA)
   }
 
@@ -230,7 +249,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.store.setDictationPhase(.recording) // A foreign lifecycle cannot revive the failed request.
     f.dictation.toggle()
     await settle(f)
-    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(stopRequested(f.surface.calls))
   }
 
   func testStopFailureRevokesStopPermissionButPreservesTerminalDestination() async {
@@ -250,7 +269,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.store.setDictationPhase(.recording) // A later foreign phase cannot grant another stop.
     f.dictation.toggle()
     await settle(f)
-    XCTAssertEqual(f.surface.calls.filter { $0 == .stop }.count, 1)
+    XCTAssertEqual(stopCount(f.surface.calls), 1)
     f.store.endDictationSession()
     XCTAssertNil(f.store.dictationThreadID)
     XCTAssertFalse(f.store.hasComposerCaptureRequest)
@@ -286,7 +305,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     await settle(f)
 
     XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
-    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(stopRequested(f.surface.calls))
     XCTAssertNil(f.store.dictationThreadID)
   }
 
@@ -303,7 +322,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.dictation.toggle()
     await settle(f)
 
-    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(stopRequested(f.surface.calls))
     XCTAssertFalse(f.store.ownsLiveDictation)
   }
 
@@ -353,7 +372,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     await settle(f)
 
     XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
-    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(stopRequested(f.surface.calls))
     XCTAssertFalse(f.store.ownsLiveDictation)
     XCTAssertNil(f.store.dictationThreadID)
   }

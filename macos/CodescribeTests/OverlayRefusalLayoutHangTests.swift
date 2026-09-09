@@ -205,6 +205,8 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       canRetranscribe: false,
       canFormat: false,
       terminal: false,
+      lifecycleTerminal: false,
+      delivery: .unattempted,
       acousticReceipts: [receipt]
     )
   }

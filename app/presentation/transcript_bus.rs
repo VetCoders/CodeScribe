@@ -247,11 +247,52 @@ pub struct TranscriptBusEvidenceEvent {
     pub can_format: bool,
     #[serde(default)]
     pub terminal: bool,
+    /// True only for the session's lifecycle terminal — the line that says the
+    /// controller left this session.
+    ///
+    /// `terminal` alone does not mean that. A committed user/formatter revision
+    /// is also terminal: it revises the final document. Conflating the two let a
+    /// Light+ or formatter revision release the capture and consume the delivery
+    /// slot *before* the lifecycle line carrying the real delivery arrived.
+    #[serde(default)]
+    pub lifecycle_terminal: bool,
+    /// Controller-owned delivery disposition for this take. Only the terminal
+    /// lifecycle projection carries anything but [`TranscriptDelivery::Unattempted`];
+    /// an evidence revision describes the document, never its destination.
+    #[serde(default)]
+    pub delivery: TranscriptDelivery,
     pub acoustic_receipts: Vec<ProjectedAcousticReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seal_coverage: Option<ProjectedSealCoverageReceipt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comparison: Option<ProjectedTranscriptComparisonReceipt>,
+}
+
+/// Where the stop path sent this take's committed document, as a state an
+/// observer branches on. Deliberately typed: the human-facing `label` is
+/// presentation and must never carry control meaning, and a route that was
+/// *selected* is not a destination that *accepted*.
+///
+/// The Bus records the controller's disposition only. `ComposerPending` in
+/// particular is a standing obligation, not a success: the Agent composer is
+/// the intended destination and the receiver has not acknowledged admission.
+/// Rust never upgrades it — only the receiver's own typed receipt can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptDelivery {
+    /// No stop-path delivery ran for this take (start failure, superseded
+    /// hold, an abandoned session). Absence of an attempt, not a failure.
+    #[default]
+    Unattempted,
+    /// The document belongs to the Agent composer draft of the thread that
+    /// owned the capture. Pending until the receiver admits it.
+    ComposerPending,
+    /// A system sink (synthetic paste or armed deferred insert) accepted the
+    /// text at the OS boundary.
+    SinkAccepted,
+    /// The stop path finished without any sink taking the text. It stays
+    /// recoverable in the overlay and the session archive.
+    Retained,
 }
 
 /// Why the controller left a Bus session. Typed on purpose: the terminal
@@ -483,6 +524,11 @@ impl TranscriptBus {
                 can_retranscribe: availability.can_retranscribe,
                 can_format: availability.can_format,
                 terminal: is_user_revision,
+                // A revision revises the document; it never ends the session.
+                lifecycle_terminal: false,
+                // An evidence revision states what the document is, never where
+                // it went. Only `publish_ended` stamps a delivery disposition.
+                delivery: TranscriptDelivery::Unattempted,
                 acoustic_receipts: vec![Self::project_serial(
                     serial,
                     entry.word_evidence_receipts.clone(),
@@ -593,10 +639,14 @@ impl TranscriptBus {
     /// zero occurrences sealed. `reason` is the typed cause; a session that was
     /// superseded or failed before recording says so instead of masquerading
     /// as a completed take.
+    ///
+    /// `delivery` is the controller's own disposition for the take. The Bus
+    /// copies it; it never infers a destination from phase, label or text.
     pub fn publish_ended(
         &self,
         reason: TranscriptSessionEndReason,
         session_wav_exists: bool,
+        delivery: TranscriptDelivery,
     ) -> Option<TranscriptBusEvidenceEvent> {
         let mut writer = self
             .writer
@@ -679,6 +729,8 @@ impl TranscriptBus {
                             can_retranscribe: availability.can_retranscribe,
                             can_format: availability.can_format,
                             terminal: true,
+                            lifecycle_terminal: true,
+                            delivery,
                             acoustic_receipts: Vec::new(),
                             seal_coverage: None,
                             comparison: None,
@@ -693,6 +745,12 @@ impl TranscriptBus {
                 terminal.can_retranscribe = availability.can_retranscribe;
                 terminal.can_format = availability.can_format;
                 terminal.terminal = true;
+                // This projection is cloned from the last committed evidence
+                // event, which was not a lifecycle line. Say what it now is.
+                terminal.lifecycle_terminal = true;
+                // The last committed evidence event carried `Unattempted`; the
+                // lifecycle line is the one place a disposition is stated.
+                terminal.delivery = delivery;
                 writer.last_projection = Some(terminal.clone());
                 Some(terminal)
             }
@@ -924,17 +982,28 @@ mod tests {
         };
 
         let never_started = TranscriptBus::open_at(session.clone(), path.clone(), None).unwrap();
-        let never_started_terminal =
-            never_started.publish_ended(TranscriptSessionEndReason::StartSuperseded, false);
+        let never_started_terminal = never_started.publish_ended(
+            TranscriptSessionEndReason::StartSuperseded,
+            false,
+            TranscriptDelivery::Unattempted,
+        );
         assert!(never_started_terminal.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 0);
 
         let bus = TranscriptBus::open_at(session, path.clone(), None).unwrap();
         bus.publish_started();
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, false)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                false,
+                TranscriptDelivery::SinkAccepted,
+            )
             .expect("started session must produce one terminal projection");
-        let duplicate_terminal = bus.publish_ended(TranscriptSessionEndReason::StartFailed, false);
+        let duplicate_terminal = bus.publish_ended(
+            TranscriptSessionEndReason::StartFailed,
+            false,
+            TranscriptDelivery::Unattempted,
+        );
         assert!(duplicate_terminal.is_none());
         assert_eq!(terminal.reducer_action, "session_ended");
         assert_eq!(terminal.phase, TranscriptProjectionPhase::NoSpeech);
@@ -958,5 +1027,99 @@ mod tests {
             lines[1].end_reason,
             Some(TranscriptSessionEndReason::Completed)
         );
+    }
+
+    /// Acceptance: only the lifecycle line states a destination, and it states
+    /// the controller's disposition verbatim.
+    ///
+    /// The failure this pins is the one that made a delivery contract necessary
+    /// at all: an observer that has to infer "where did this go" from a phase or
+    /// a display label will eventually infer it wrong.
+    #[test]
+    fn only_the_lifecycle_line_carries_a_delivery_disposition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "session-delivery".to_string(),
+                mode: TranscriptMode::Agent,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            path,
+            None,
+        )
+        .unwrap();
+        bus.publish_started();
+
+        let terminal = bus
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                false,
+                TranscriptDelivery::ComposerPending,
+            )
+            .expect("a started session ends with one terminal projection");
+
+        assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
+        assert!(
+            terminal.lifecycle_terminal,
+            "the line that ends the session must say so"
+        );
+    }
+
+    /// A take that never delivered says `Unattempted`, which is not the same
+    /// claim as "delivered nowhere on purpose" and not the same as a failure.
+    #[test]
+    fn a_take_with_no_delivery_attempt_claims_no_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "session-unattempted".to_string(),
+                mode: TranscriptMode::Dictation,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            path,
+            None,
+        )
+        .unwrap();
+        bus.publish_started();
+
+        let terminal = bus
+            .publish_ended(
+                TranscriptSessionEndReason::StartFailed,
+                false,
+                TranscriptDelivery::Unattempted,
+            )
+            .expect("a started session ends with one terminal projection");
+
+        assert_eq!(terminal.delivery, TranscriptDelivery::Unattempted);
+    }
+
+    /// A legacy row without the additive fields decodes to the honest defaults:
+    /// no destination claimed, and not a lifecycle line.
+    #[test]
+    fn legacy_rows_default_to_no_destination_and_no_lifecycle_claim() {
+        let legacy = serde_json::json!({
+            "schema": "codescribe.transcript-evidence.v1",
+            "sequence": 1,
+            "emitted_at": "2026-09-09T20:00:00Z",
+            "session_id": "legacy",
+            "mode": "dictation",
+            "reducer_revision": 1,
+            "reducer_action": "apply_ledger_decision",
+            "occurrence_session_id": "legacy",
+            "capture_epoch": 1,
+            "sample_start": 0,
+            "sample_end": 16000,
+            "document_index": 0,
+            "label": "Kurde",
+            "rendered_text": "Kurde",
+            "acoustic_receipts": []
+        });
+        let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.delivery, TranscriptDelivery::Unattempted);
+        assert!(!decoded.lifecycle_terminal);
     }
 }

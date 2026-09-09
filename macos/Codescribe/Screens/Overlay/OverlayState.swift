@@ -233,7 +233,7 @@ final class OverlayState {
   var errorMessage: String?
   private(set) var presentationStatus: OverlayPresentationStatus?
   private(set) var errorLifecycleDetail =
-    "Recording stopped before a transcript was available."
+"No transcript was delivered."
   /// Prompt-free policy snapshot from C02's persisted settings owner. These
   /// values are replaced only by a fresh engine read, never by optimistic UI.
   private(set) var autoPasteEnabled = true
@@ -322,6 +322,15 @@ final class OverlayState {
   /// already-admitted projection to grow its canvas; no transcript bytes leave
   /// this passive overlay boundary.
   @ObservationIgnored var onTranscriptPresentationChanged: (() -> Void)?
+  /// Hand the terminal document to the Agent composer and read back what the
+  /// receiver did with it.
+  ///
+  /// The return value is the whole point: the overlay is the postman, and a
+  /// postman does not sign for the parcel. Only an `.admitted` or `.parked`
+  /// receipt lets this state release the capture destination or record the
+  /// delivery as done. A `.retained` receipt keeps the text on screen and
+  /// recoverable instead of painting a success the composer never saw.
+  @ObservationIgnored var onComposerTranscript: ((String) -> ComposerDeliveryReceipt)?
   /// Content-free success seam. No transcript crosses this callback.
   var onSuccessfulDictation: (() -> Void)?
 
@@ -338,6 +347,14 @@ final class OverlayState {
   /// The exact rendered text at the terminal projection.
   private var deliveredText: String = ""
   private var deliveredTextSessionId: String?
+  /// Sessions whose composer delivery a receiver has already taken responsibility
+  /// for. Deliberately separate from `deliveredTextSessionId`: that key records
+  /// "the overlay snapshotted the terminal bytes", which a Light+/formatter
+  /// revision also does. Conflating the two let a presentation revision consume
+  /// the delivery slot before the delivery event arrived.
+  private var composerDeliverySessionId: String?
+  /// The exact bytes a receiver refused, kept accessible instead of dropped.
+  private(set) var retainedComposerDelivery: String?
   private var qualityCapturedProvenance: String?
   private var pendingRevisionSessionId: String?
   private var pendingRevisionSource: UInt64?
@@ -1383,7 +1400,7 @@ final class OverlayState {
     errorMessage = message
     errorLifecycleDetail =
       captureHadStarted
-      ? "Recording stopped before a transcript was available."
+      ? "No transcript was delivered."
       : "Recording did not start."
     finalized = true
     showToast(toast)
@@ -1455,7 +1472,26 @@ final class OverlayState {
       && formatterReceipt != nil
     let signalsFirstSuccessfulTerminal =
       !terminal && projection.terminal && projection.phase == OverlayMode.formatted.rawValue
-    if projection.terminal {
+    // The reducer emits two different terminals. `apply_manual_edit` is a
+    // presentation revision — a Light+ mint or a formatter receipt — and it can
+    // legitimately arrive BEFORE the controller publishes `session_ended`.
+    // Treating it as the lifecycle terminal released the capture and consumed
+    // the delivery slot early, so the real delivery event then failed its own
+    // dedup check and the take was never handed to the composer. Only the
+    // lifecycle line ends the capture.
+    // Typed, not parsed: the producer states whether this is the line that ends
+    // the session or a revision of its final document.
+    let isLifecycleTerminal = projection.terminal && projection.lifecycleTerminal
+    if isLifecycleTerminal {
+      // Deliver BEFORE releasing capture. `abortRecordingSession` fires the
+      // app-level stopped callback, which clears the composer's thread latch —
+      // the receiver needs that latch to know which conversation owns the take.
+      // Typed destination from the producer; the human-facing `label` is never
+      // consulted, because a delivery protocol that reads a display string is
+      // one copy-edit away from silently routing a take nowhere.
+      if projection.delivery == .composerPending {
+        admitComposerDelivery(projection)
+      }
       // Release capture before flipping `finalized`; abort uses the previous
       // value to decide whether the app-level stopped callback is still owed.
       abortRecordingSession()
@@ -1478,6 +1514,8 @@ final class OverlayState {
     if isNewSession {
       deliveredText = ""
       deliveredTextSessionId = nil
+      composerDeliverySessionId = nil
+      retainedComposerDelivery = nil
       qualityCapturedProvenance = nil
       userRevisionProvenance = nil
       revisionCommitPending = false
@@ -1525,6 +1563,52 @@ final class OverlayState {
         captureQualityIfEdited(action: "revision")
       }
     }
+  }
+
+  /// Offer one terminal document to the composer and record only what the
+  /// receiver actually accepted.
+  ///
+  /// Every early return is a case where no delivery may be claimed:
+  ///
+  /// - an empty document is nothing to deliver, so it claims neither success
+  ///   nor failure;
+  /// - a duplicate lifecycle terminal for a session already handed over must
+  ///   not insert a second copy;
+  /// - a missing callback means no receiver is wired at all — the text stays
+  ///   retained and visible rather than being reported as delivered.
+  private func admitComposerDelivery(_ projection: CsTranscriptProjectionEvent) {
+    guard composerDeliverySessionId != projection.sessionId else { return }
+    // This take was routed to the composer, so the overlay's own deadline must
+    // never submit it — not on the happy path, and least of all on the path
+    // where the handover failed. Auto-sending words the composer never received
+    // would be the loudest possible version of the bug this cut closes.
+    agentAutoSendCancelled = true
+    let text = projection.renderedText
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    guard let onComposerTranscript else {
+      retainComposerDelivery(text, notice: "no composer receiver")
+      return
+    }
+    switch onComposerTranscript(text) {
+    case .admitted, .parked:
+      // The receiver holds the bytes. Only now is this session's delivery slot
+      // consumed: the text is in a draft the user can edit and send explicitly.
+      composerDeliverySessionId = projection.sessionId
+      retainedComposerDelivery = nil
+    case .retained(let refused):
+      retainComposerDelivery(refused, notice: "kept for recovery")
+    case .empty:
+      break
+    }
+  }
+
+  /// Keep a refused delivery accessible. This is not an error state for the
+  /// transcript — the words are real and sealed exactly as they were; what
+  /// failed is the handover, and saying so is the honest chrome.
+  private func retainComposerDelivery(_ text: String, notice: String) {
+    retainedComposerDelivery = text
+    errorMessage = nil
+    showFooterNotice(notice)
   }
 
   private func relayFormatIntent() {
@@ -1603,10 +1687,12 @@ final class OverlayState {
 
   private func resetTranscript() {
     deliveredText = ""
+    composerDeliverySessionId = nil
+    retainedComposerDelivery = nil
     pendingNoSpeechMessage = nil
     noSpeechNotice = OverlayState.defaultNoSpeechNotice
     presentationStatus = nil
-    errorLifecycleDetail = "Recording stopped before a transcript was available."
+    errorLifecycleDetail = "No transcript was delivered."
     finalized = false
     agentFinalTranscriptAppeared = false
     agentAutoSendCancelled = false
@@ -1738,7 +1824,7 @@ final class OverlayState {
       renderedText: renderedText, phase: phase.rawValue, canPaste: isFormatted, canInsert: isFormatted,
       canCopy: !renderedText.isEmpty, canRetranscribe: phase == .noSpeech || isFormatted,
       canFormat: isFormatted,
-      terminal: terminal, acousticReceipts: [])
+      terminal: terminal, lifecycleTerminal: terminal, delivery: .unattempted, acousticReceipts: [])
   }
 }
 

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use codescribe::controller::{
-    HotkeyAction, HotkeyInput, HotkeyType, RecordingController, State, admission,
+    CaptureStopOutcome, HotkeyAction, HotkeyInput, HotkeyType, RecordingController, State,
+    admission,
 };
 use codescribe::os::hold_badge::BadgeMode;
 use codescribe::os::hotkeys::{self, HoldAction, HoldMode, HotkeyEvent};
@@ -29,7 +30,8 @@ use crate::agent_delivery::{
 };
 use crate::recording::{
     CsAdmissionReadiness, CsEnergyCalibrationReport, CsLayerSummary, CsPresentationStatusEvent,
-    CsTranscriptProjectionEvent, CsTranscription, CsTranscriptionListener,
+    CsCaptureHandle, CsConditionalStop, CsTranscriptProjectionEvent, CsTranscription,
+    CsTranscriptionListener,
 };
 use crate::{CsError, application_runtime};
 
@@ -855,12 +857,46 @@ impl CodescribeHotkeys {
     /// the same capture-ownership gate and the same optimistic overlay as the
     /// assistive toggle, and differs only in the per-take capture intent it
     /// carries — the take stays open through silence until an explicit stop.
-    pub async fn start_composer_turn_recording(&self) -> Result<(), CsError> {
+    /// Returns the controller-admitted identity of the take this press opened.
+    /// Swift keeps it and hands it back to stop exactly that capture.
+    pub async fn start_composer_turn_recording(&self) -> Result<CsCaptureHandle, CsError> {
         application_runtime::run(async move {
             let controller =
                 ensure_controller(&shared_controller(), tokio::runtime::Handle::current());
             start_composer_turn_with_capture_gate(controller)
                 .await
+                .map(|capture_id| CsCaptureHandle { capture_id })
+                .map_err(|error| CsError::Recording {
+                    msg: error.to_string(),
+                })
+        })
+        .await?
+    }
+
+    /// Stop one named capture, and refuse if a different take now owns the mic.
+    ///
+    /// This is the composer's only stop entry. `stop_recording` above stays the
+    /// unconditional surface for the hotkey and tray, which legitimately stop
+    /// whatever is live; a UI gesture may not, because between the moment the
+    /// user pressed and the moment this call lands the microphone can have
+    /// changed hands.
+    pub async fn stop_composer_turn_recording(
+        &self,
+        handle: CsCaptureHandle,
+    ) -> Result<CsConditionalStop, CsError> {
+        application_runtime::run(async move {
+            let Some(controller) = current_controller(&shared_controller()) else {
+                return Ok(CsConditionalStop::NoLiveCapture);
+            };
+            controller
+                .stop_capture_if_owned(&handle.capture_id)
+                .await
+                .map(|outcome| match outcome {
+                    CaptureStopOutcome::Stopped => CsConditionalStop::Stopped,
+                    CaptureStopOutcome::ForeignCapture => CsConditionalStop::ForeignCapture,
+                    CaptureStopOutcome::NoLiveCapture => CsConditionalStop::NoLiveCapture,
+                    CaptureStopOutcome::AlreadyStopping => CsConditionalStop::AlreadyStopping,
+                })
                 .map_err(|error| CsError::Recording {
                     msg: error.to_string(),
                 })
@@ -1249,11 +1285,14 @@ async fn dispatch_recording_with_capture_gate(
 /// optimistic overlay, dispatch, compensate an orphaned "preparing", and release
 /// ownership once the controller is back at `Idle`.
 ///
-/// A composer press only ever *starts* a take. Stopping goes through
-/// `stop_recording`, which is why there is no stop branch here to get wrong.
+/// A composer press only ever *starts* a take; stopping goes through
+/// `stop_composer_turn_recording`, which names the capture it intends to end.
+/// That split is why there is no stop branch here to get wrong.
+///
+/// Returns the controller-admitted capture identity of the take it opened.
 async fn start_composer_turn_with_capture_gate(
     controller: Arc<RecordingController>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     if controller.current_state().await != State::Idle {
         return Err(anyhow::anyhow!(
             "Another transcription capture already owns the microphone"

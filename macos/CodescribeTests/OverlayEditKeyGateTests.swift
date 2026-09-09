@@ -139,6 +139,8 @@ final class OverlayEditKeyGateTests: XCTestCase {
         canRetranscribe: isFormatted,
         canFormat: isFormatted,
         terminal: terminal,
+        lifecycleTerminal: terminal,
+        delivery: .unattempted,
         acousticReceipts: []
       )
     )

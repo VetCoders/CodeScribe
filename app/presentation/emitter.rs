@@ -134,9 +134,6 @@ pub struct UserRevisionIntent {
     pub provenance: DocumentRevisionProvenance,
 }
 
-/// Rust-authored acknowledgement for one committed user revision. Swift uses
-/// this only as request status; visible text still arrives through projection.
-#[derive(Debug, Clone, PartialEq, Eq)]
 /// One terminal document offered for exactly one paid formatter pass.
 ///
 /// Produced only by [`TranscriptReducer::terminal_formatter_request`]. An empty
@@ -151,6 +148,9 @@ pub struct TerminalFormatterRequest {
     pub source_text: String,
 }
 
+/// Rust-authored acknowledgement for one committed user revision. Swift uses
+/// this only as request status; visible text still arrives through projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRevisionCommit {
     pub session_id: String,
     pub source_revision: u64,
@@ -1246,10 +1246,13 @@ impl EventSink for PresentationEmitter {
 /// does not compile or execute them under the W2 embargo.
 #[cfg(test)]
 mod tests {
-    use super::{PresentationEmitter, TranscriptReducer, UserRevisionIntent, UserRevisionRefusal};
+    use super::{
+        PresentationEmitter, TerminalFormatterRequest, TranscriptReducer, UserRevisionCommit,
+        UserRevisionIntent, UserRevisionRefusal,
+    };
     use crate::presentation::transcript_bus::{
-        TranscriptBus, TranscriptBusEvidenceEvent, TranscriptMode, TranscriptProjectionPhase,
-        TranscriptSession, TranscriptSessionEndReason,
+        TranscriptBus, TranscriptBusEvidenceEvent, TranscriptDelivery, TranscriptMode,
+        TranscriptProjectionPhase, TranscriptSession, TranscriptSessionEndReason,
     };
     use crate::presentation::transcript_projection::TranscriptProjectionReader;
     use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
@@ -1405,7 +1408,7 @@ mod tests {
         emitter.on_event(&mutation);
         emitter.finish().await;
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("committed book must produce a terminal projection");
 
         assert_eq!(delivery.lock().await.as_str(), "Iwo");
@@ -1577,7 +1580,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
 
         let commit = emitter
@@ -1723,7 +1726,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
 
         let source = emitter
@@ -1880,7 +1883,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -1998,7 +2001,7 @@ mod tests {
             receipt: terminal_seal,
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -2332,5 +2335,34 @@ mod tests {
         assert_eq!(ledger.text_of(&occurrence), Some("Iwo!"));
         assert_eq!(ledger.qualified_occurrences().count(), qualified_before);
         assert_eq!(reducer.document_by_occurrence.len(), 1);
+    }
+
+    /// Acceptance: both emitter request/acknowledgement types keep the derives
+    /// their doc comments promise.
+    ///
+    /// An attribute inserted between a doc comment and its struct stranded
+    /// `UserRevisionCommit`'s derives onto the type that followed it, which also
+    /// gave that type two identical `derive` attributes. Neither defect is
+    /// visible by reading either declaration alone. This exercises `Debug`,
+    /// `Clone` and `PartialEq` on both, so the compiler answers the question.
+    #[test]
+    fn the_emitter_request_and_commit_types_keep_their_declared_derives() {
+        let request = TerminalFormatterRequest {
+            session_id: "derive-session".to_string(),
+            source_revision: 3,
+            source_text: "one turn".to_string(),
+        };
+        assert_eq!(request.clone(), request);
+        assert!(format!("{request:?}").contains("derive-session"));
+
+        let commit = UserRevisionCommit {
+            session_id: "derive-session".to_string(),
+            source_revision: 3,
+            revision: 4,
+            rendered_text: "one turn.".to_string(),
+            provenance_receipt: "formatter-derive".to_string(),
+        };
+        assert_eq!(commit.clone(), commit);
+        assert!(format!("{commit:?}").contains("formatter-derive"));
     }
 }

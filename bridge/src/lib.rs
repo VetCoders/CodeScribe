@@ -59,6 +59,7 @@ pub use quality::{
     overlay_highlights_enabled, quality_finalize_correction, quality_recent_records,
     quality_teach_span,
 };
+pub use recording::{CsCaptureHandle, CsConditionalStop, CsTranscriptDelivery};
 pub use speech::{CsSpeechResult, speak_text, speech_availability, stop_speaking};
 pub use tray_status::{
     CodescribeTrayStatus, CsTrayStatusKind, CsTrayStatusListener, CsTrayStatusPayload,

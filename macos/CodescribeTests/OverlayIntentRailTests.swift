@@ -360,6 +360,8 @@ final class OverlayIntentRailTests: XCTestCase {
         canRetranscribe: canRetranscribe,
         canFormat: canFormat,
         terminal: terminal,
+        lifecycleTerminal: terminal,
+        delivery: .unattempted,
         acousticReceipts: []
       )
     )

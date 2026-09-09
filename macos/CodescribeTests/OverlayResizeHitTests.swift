@@ -474,6 +474,8 @@ final class OverlayResizeHitTests: XCTestCase {
         canRetranscribe: false,
         canFormat: false,
         terminal: false,
+        lifecycleTerminal: false,
+        delivery: .unattempted,
         acousticReceipts: []
       )
     )

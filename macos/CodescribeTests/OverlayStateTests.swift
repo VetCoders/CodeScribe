@@ -273,6 +273,8 @@ final class OverlayStateTests: XCTestCase {
         canRetranscribe: canRetranscribe,
         canFormat: canFormat,
         terminal: terminal,
+        lifecycleTerminal: lifecycleTerminal ?? terminal,
+        delivery: delivery,
         acousticReceipts: [receipt]
       )
     )
@@ -1830,6 +1832,8 @@ final class OverlayStateTests: XCTestCase {
         canRetranscribe: terminal,
         canFormat: !terminal,
         terminal: terminal,
+        lifecycleTerminal: terminal,
+        delivery: .unattempted,
         acousticReceipts: [receipt]
       )
     )

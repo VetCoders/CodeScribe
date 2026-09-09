@@ -145,6 +145,13 @@ final class OverlayController: ObservableObject {
       AppModel.shared.tray.isStartingDictation = false
       AppModel.shared.chat.dictationBlocked = true
     }
+    // Delivery runs BEFORE the stopped callback releases the thread latch: the
+    // receiver needs `dictationThreadID` to know which conversation this take
+    // belongs to. The receipt travels back so the overlay can tell an admitted
+    // draft from one nobody could take.
+    state.onComposerTranscript = { text in
+      AppModel.shared.chat.receiveDictationTranscript(text)
+    }
     state.onRecordingStopped = { [weak self] in
       guard let self else { return }
       self.refreshAssistiveLatch()

@@ -531,6 +531,24 @@ enum ComposerDictationPhase: Equatable {
   case failed(String)
 }
 
+/// What the composer actually did with one terminal document.
+///
+/// The delivering side reads this instead of assuming: a route that was chosen,
+/// an event that was queued, or a callback that was invoked are all statements
+/// about the postman, not about the recipient. Only this receipt is admission.
+enum ComposerDeliveryReceipt: Equatable {
+  /// Appended to the live composer draft of the thread that owns the capture.
+  case admitted(threadID: UUID)
+  /// The owning thread is not the selected one. The store holds the text for
+  /// that thread and will surface it there — the current draft is untouched.
+  case parked(threadID: UUID)
+  /// No thread could take it. The exact bytes come back so the caller keeps
+  /// them visible and recoverable instead of dropping them.
+  case retained(String)
+  /// Nothing to deliver. This claims neither success nor failure.
+  case empty
+}
+
 /// UI-only gesture seam over the shared recording controller.
 @MainActor
 protocol ComposerDictating: AnyObject {
@@ -589,6 +607,25 @@ final class AgentChatStore: ObservableObject {
   /// Lifecycle paint may select a delivery thread but cannot create this receipt.
   private var composerCaptureRequestID: UUID?
   private var composerCaptureStartCompleted = false
+  /// The controller's own identity for the take this gesture opened. Unlike the
+  /// booleans above, this is not a local belief: the controller minted it, and
+  /// handing it back is what lets a stop be refused when the microphone changed
+  /// hands after the press.
+  private(set) var composerCaptureHandle: CsCaptureHandle?
+
+  /// Terminal documents whose owning thread was not selected when they arrived.
+  /// Held per thread so a delivery for A can never overwrite, relocate, or
+  /// silently inherit the draft the user is typing in B.
+  private var parkedComposerDeliveries: [UUID: String] = [:]
+  /// A delivery no thread could take (its owner is gone). Surfaced for explicit
+  /// recovery rather than discarded.
+  @Published private(set) var retainedComposerDelivery: String?
+
+  /// True once this request's single stop permission has been spent and the
+  /// surface is waiting for terminal delivery. It is the difference between "a
+  /// start is in flight" (never interruptible) and "a stop already happened and
+  /// its terminal may never arrive" (recoverable).
+  private(set) var composerCaptureAwaitingTerminal = false
 
   var ownsLiveDictation: Bool { composerCaptureStartCompleted }
   var hasComposerCaptureRequest: Bool { composerCaptureRequestID != nil }
@@ -604,6 +641,7 @@ final class AgentChatStore: ObservableObject {
     let requestID = UUID()
     composerCaptureRequestID = requestID
     composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
     dictationThreadID = threadID
     let destination = threads.first { $0.id == threadID }
       ?? threadsBeforeSearch?.first { $0.id == threadID }
@@ -617,9 +655,12 @@ final class AgentChatStore: ObservableObject {
 
   /// A terminal lifecycle beat invalidates the request before an async reply
   /// can promote it. Success is local request evidence, not controller identity.
-  func completeComposerCaptureStart(_ requestID: UUID, live: Bool) {
+  func completeComposerCaptureStart(
+    _ requestID: UUID, live: Bool, handle: CsCaptureHandle?
+  ) {
     guard isCurrentComposerCaptureRequest(requestID) else { return }
     composerCaptureStartCompleted = live
+    composerCaptureHandle = handle
     dictationPhase = live ? .recording : .idle
     // Even an idle reply may race queued terminal text. Keep its destination.
   }
@@ -627,6 +668,27 @@ final class AgentChatStore: ObservableObject {
   /// Consume local stop permission once; terminal delivery still owns the latch.
   func awaitComposerCaptureTerminal() {
     composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = true
+    dictationPhase = .idle
+  }
+
+  /// Release a request whose take the controller says no longer exists.
+  ///
+  /// Identity-aware recovery, driven by the controller's answer and an explicit
+  /// user gesture — never by a timer that erases the latch on a schedule and
+  /// takes a still-live delivery destination with it. Any text still owed to
+  /// the released thread arrives later with no owner and is retained, which is
+  /// a visible outcome rather than a silent drop.
+  func reconcileComposerCaptureLost() {
+    composerCaptureRequestID = nil
+    composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
+    composerCaptureHandle = nil
+    dictationBlocked = false
+    let hadSession = dictationThreadID != nil
+    dictationThreadID = nil
+    if hadSession { publishAssistiveTarget(force: true) }
+    if case .failed = dictationPhase { return }
     dictationPhase = .idle
   }
 
@@ -666,6 +728,8 @@ final class AgentChatStore: ObservableObject {
     case .idle, .failed:
       composerCaptureRequestID = nil
       composerCaptureStartCompleted = false
+      composerCaptureAwaitingTerminal = false
+      composerCaptureHandle = nil
       let hadSession = dictationThreadID != nil
       dictationThreadID = nil
       // Selection changes were suppressed while the capture was latched — resync
@@ -673,6 +737,69 @@ final class AgentChatStore: ObservableObject {
       if hadSession { publishAssistiveTarget(force: true) }
     }
     dictationPhase = phase
+  }
+
+  /// Take one terminal document for the thread that owned the capture.
+  ///
+  /// Delivery returns to the *capturing* thread, never to whatever the rail
+  /// happens to show now. When those differ the text is parked for its owner
+  /// and the current draft is left exactly as the user left it: stealing the
+  /// selection to make an append land is how a voice note ends up in the wrong
+  /// conversation, and relocating a draft is how one gets lost.
+  ///
+  /// The returned receipt is the only admission evidence. A missing owner or a
+  /// deleted thread yields `.retained` with the exact bytes, so the caller can
+  /// keep them on screen instead of reporting a delivery that never happened.
+  @discardableResult
+  func receiveDictationTranscript(_ text: String) -> ComposerDeliveryReceipt {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return .empty }
+    guard let owner = dictationThreadID else {
+      retainComposerDelivery(text)
+      return .retained(text)
+    }
+    let ownerExists =
+      threads.contains { $0.id == owner }
+      || threadsBeforeSearch?.contains { $0.id == owner } == true
+    guard ownerExists else {
+      // The capture's thread was deleted while the take was in flight. There is
+      // no destination left; say so with the words intact.
+      parkedComposerDeliveries[owner] = nil
+      retainComposerDelivery(text)
+      return .retained(text)
+    }
+    if selectedThreadID == owner {
+      draft = appendComposerDelivery(text, to: draft)
+      requestComposerFocus()
+      return .admitted(threadID: owner)
+    }
+    parkedComposerDeliveries[owner] = appendComposerDelivery(
+      text, to: parkedComposerDeliveries[owner] ?? "")
+    return .parked(threadID: owner)
+  }
+
+  /// Join a delivered document onto an existing draft without gluing words.
+  private func appendComposerDelivery(_ text: String, to existing: String) -> String {
+    guard !existing.isEmpty else { return text }
+    return existing.hasSuffix("\n") ? existing + text : existing + "\n" + text
+  }
+
+  private func retainComposerDelivery(_ text: String) {
+    retainedComposerDelivery = text
+  }
+
+  /// Consume a retained delivery once the user has acted on it.
+  func clearRetainedComposerDelivery() {
+    retainedComposerDelivery = nil
+  }
+
+  /// Move a parked delivery into the draft of the thread it belongs to, at the
+  /// moment that thread becomes visible. Called from `select`; separate so a
+  /// test can drive it without a full selection cycle.
+  func drainParkedComposerDelivery(for id: UUID) {
+    guard let parked = parkedComposerDeliveries.removeValue(forKey: id) else { return }
+    draft = appendComposerDelivery(parked, to: draft)
+    requestComposerFocus()
   }
 
   /// Terminal lifecycle beat for the shared recorder: the microphone is free.
@@ -686,6 +813,8 @@ final class AgentChatStore: ObservableObject {
   func endDictationSession() {
     composerCaptureRequestID = nil
     composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
+    composerCaptureHandle = nil
     dictationBlocked = false
     if case .failed = dictationPhase {
       dictationThreadID = nil
@@ -1197,6 +1326,9 @@ final class AgentChatStore: ObservableObject {
   func select(_ id: UUID) {
     selectedThreadID = id
     loadMessagesIfNeeded(id)
+    // A take that finished while the user was reading another thread waits
+    // here, not in whatever draft happened to be on screen at the time.
+    drainParkedComposerDelivery(for: id)
   }
 
   func toggleFavorite(_ thread: ChatThread) {
@@ -1289,6 +1421,11 @@ final class AgentChatStore: ObservableObject {
     }
     if activeComposerTurn?.threadID == thread.id {
       activeComposerTurn = nil
+    }
+    // A parked delivery for a thread being deleted has nowhere left to land.
+    // Surface it for explicit recovery instead of losing it with the thread.
+    if let stranded = parkedComposerDeliveries.removeValue(forKey: thread.id) {
+      retainComposerDelivery(stranded)
     }
     threads.removeAll { $0.id == thread.id }
     threadsBeforeSearch?.removeAll { $0.id == thread.id }
