@@ -254,7 +254,7 @@ final class OnboardingViewModel: ObservableObject {
       agentBridgeStatus = try agentBridge.install(selectedClients: selectedAgentClients)
       agentBridgeError = nil
     } catch {
-      agentBridgeError = error.localizedDescription
+      agentBridgeError = error.userFacingMessage
       agentBridgeStatus = agentBridge.status()
     }
   }
@@ -415,7 +415,7 @@ final class OnboardingViewModel: ObservableObject {
     do {
       try engine.setOnboardingMode(onboardingMode.value)
     } catch {
-      lastError = error.localizedDescription
+      lastError = error.userFacingMessage
     }
   }
 
@@ -432,7 +432,7 @@ final class OnboardingViewModel: ObservableObject {
     do {
       try engine.updateConfig(key: "WHISPER_LANGUAGE", value: selectedLanguage.shortCode)
     } catch {
-      lastError = error.localizedDescription
+      lastError = error.userFacingMessage
     }
   }
 
@@ -453,7 +453,7 @@ final class OnboardingViewModel: ObservableObject {
       try hotkeys.setModeBinding(mode: .formatting, binding: formatting)
       try hotkeys.setModeBinding(mode: .assistive, binding: assistive)
     } catch {
-      lastError = error.localizedDescription
+      lastError = error.userFacingMessage
     }
   }
 
@@ -464,7 +464,7 @@ final class OnboardingViewModel: ObservableObject {
     do {
       try engine.updateConfig(key: "LLM_ASSISTIVE_PROVIDER", value: id)
     } catch {
-      lastError = error.localizedDescription
+      lastError = error.userFacingMessage
     }
   }
 
@@ -482,7 +482,7 @@ final class OnboardingViewModel: ObservableObject {
       apiKeyDraft = ""
       keyStatus = engine.keyStatus()
     } catch {
-      lastError = error.localizedDescription
+      lastError = error.userFacingMessage
     }
   }
 }

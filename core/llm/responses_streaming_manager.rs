@@ -693,7 +693,7 @@ async fn run_agent_stream(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Agent SSE HTTP {} - {}", status, body);
+        anyhow::bail!("Agent SSE HTTP {}: {}", status, summarize_error_body(&body));
     }
 
     let mut tool_tracker = ToolCallTracker::default();
@@ -1688,6 +1688,40 @@ fn extract_output_channels(output: &[StreamOutputItem]) -> (String, Option<Strin
 }
 
 /// Unit and mockito SSE tests for auth, channel extraction, and agent events.
+/// The human line out of a provider's error body.
+///
+/// Vendors answer a refused request with `{"error":{"message":…,"type":…}}`;
+/// the operator reads the message and the type, never the escaped JSON with
+/// its `\n` and `null` fields (Founder 2026-09-09 16:15, a 401 rendered as
+/// a raw blob in the chat bubble). A body that is not that shape is passed
+/// through trimmed, and an empty body reads as the status alone.
+fn summarize_error_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(message) = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+    {
+        let kind = value
+            .pointer("/error/type")
+            .or_else(|| value.pointer("/error/code"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty());
+        return match kind {
+            Some(kind) => format!("{message} ({kind})"),
+            None => message.to_string(),
+        };
+    }
+    if trimmed.is_empty() {
+        "no response body".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2436,6 +2470,37 @@ mod tests {
             private_https
                 .to_string()
                 .contains("Private/internal endpoint URLs are not allowed")
+        );
+    }
+
+    #[test]
+    fn summarize_error_body_reads_the_vendor_message_not_the_blob() {
+        let openai_401 = r#"{
+  "error": {
+    "message": "You have insufficient permissions for this operation. Missing scopes: api.responses.write.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}"#;
+        assert_eq!(
+            super::summarize_error_body(openai_401),
+            "You have insufficient permissions for this operation. Missing scopes: api.responses.write. (invalid_request_error)"
+        );
+        assert_eq!(
+            super::summarize_error_body(
+                r#"{"error":{"message":"rate limited","code":"rate_limit"}}"#
+            ),
+            "rate limited (rate_limit)"
+        );
+        assert_eq!(
+            super::summarize_error_body("  upstream down  "),
+            "upstream down"
+        );
+        assert_eq!(super::summarize_error_body(""), "no response body");
+        assert_eq!(
+            super::summarize_error_body(r#"{"error":{"message":""}}"#),
+            r#"{"error":{"message":""}}"#
         );
     }
 }

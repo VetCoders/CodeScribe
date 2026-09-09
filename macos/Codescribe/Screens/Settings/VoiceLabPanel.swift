@@ -521,7 +521,7 @@ struct VoiceLabPanel: View {
         } catch {
           helperText = nil
           helperCompare =
-            "Helper \(pass.visibleName) failed: \(error.localizedDescription)"
+            "Helper \(pass.visibleName) failed: \(error.userFacingMessage)"
         }
       }
     }

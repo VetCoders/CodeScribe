@@ -680,7 +680,7 @@ final class AgentChatStore: ObservableObject {
     do {
       try await engine.speak(text: message.text)
     } catch {
-      speechError = error.localizedDescription
+      speechError = error.userFacingMessage
     }
   }
 
@@ -716,7 +716,7 @@ final class AgentChatStore: ObservableObject {
           role: .tool,
           timestamp: "now",
           text: "Nie udało się zastosować „\(entry.title)”: "
-            + error.localizedDescription
+            + error.userFacingMessage
         ),
         to: threadID
       )
@@ -1462,7 +1462,7 @@ final class AgentChatStore: ObservableObject {
         if Task.isCancelled { return }
         finish(
           assistantID, in: threadID,
-          text: "Something went wrong: \(error.localizedDescription)")
+          text: "Something went wrong: \(error.userFacingMessage)")
       }
     }
     inFlightSends[threadID] = InFlightSend(id: turnID, task: sendTask)

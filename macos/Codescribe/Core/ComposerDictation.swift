@@ -45,7 +45,7 @@ final class RealComposerDictation: ComposerDictating {
       } catch {
         dictationLog.error(
           "Agent voice capture gesture failed: \(error.localizedDescription, privacy: .public)")
-        store.reportDictationFailure("Couldn't change recording: \(error.localizedDescription)")
+        store.reportDictationFailure("Couldn't change recording: \(error.userFacingMessage)")
         return
       }
       // Terminal reconcile against the controller. The lifecycle hooks own the
