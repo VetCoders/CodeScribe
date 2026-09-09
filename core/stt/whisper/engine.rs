@@ -573,6 +573,34 @@ impl LocalWhisperEngine {
             sparkline: stats.sparkline.clone(),
         };
 
+        // Silero is the judge of whether there is anything to decode. Whisper on
+        // audio with no speech (a 0.2 s click, a noise-floor take) hallucinates
+        // a language-model prior ("Thank you.") instead of staying silent
+        // (measured 2026-09-09 on session 05d37129), so an audible-speech
+        // verdict of "none" ends the file pass here with an empty transcript.
+        // Silero never cuts or glues the PCM the decoder sees; it only decides
+        // whether the decoder runs at all.
+        if no_speech {
+            tracing::info!(
+                reason = vad
+                    .no_speech_reason
+                    .as_deref()
+                    .unwrap_or("no_speech_windows"),
+                total_secs = duration_secs,
+                total_windows = stats.total_windows,
+                "file_pass_skipped_no_speech: Silero found no speech; decoder not run"
+            );
+            let final_pass = skipped_final_pass(options, "no_speech");
+            return Ok(TranscriptionVerdict::from_parts(
+                String::new(),
+                RawTranscript::default(),
+                Some(vad),
+                TranscriptionSource::LocalFinalPass,
+                self.engine_provenance,
+                final_pass,
+            ));
+        }
+
         tracing::debug!(
             "transcribe_file: VAD evidence recorded; decoding full audio with silence-aligned windows"
         );
