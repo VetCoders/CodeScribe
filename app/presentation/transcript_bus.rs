@@ -452,6 +452,10 @@ impl TranscriptBus {
             ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. } => {
                 "apply_manual_edit"
             }
+            // A live presentation shape of one closed occurrence. It is not a
+            // manual edit and not a terminal revision: the words are unchanged,
+            // the lifecycle is open, and the take is still being spoken.
+            ReducerAction::ApplyIncrementalShaping { .. } => "apply_incremental_shaping",
             ReducerAction::RecordContextMarker { .. } => "record_context_marker",
         };
         let is_user_revision = matches!(&revision.action, ReducerAction::ApplyUserRevision { .. });
@@ -1497,5 +1501,107 @@ mod tests {
         let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.delivery, TranscriptDelivery::Unattempted);
         assert!(!decoded.lifecycle_terminal);
+    }
+
+    // Recovery falsifiers: these contracts are intentionally UNRUN under W2.
+    // The inherited publisher currently has no shaping authentication guard.
+    #[test]
+    fn incremental_bus_refuses_rendered_bytes_not_bound_to_the_shaping_receipt() {
+        let (mut ledger, mut reducer, _) = committed_fixture("shaping-bytes");
+        let occurrence = OccurrenceIdentity::new("shaping-bytes", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        revision.rendered_text = "Unrelated replacement without source authority.".to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(
+            session("shaping-bytes"), temp.path().join("bus.jsonl"), None,
+        ).unwrap();
+        assert!(bus.publish_revision(&revision, &ledger).is_empty());
+        assert!(bus.writer.lock().unwrap().last_projection.is_none());
+    }
+
+    #[test]
+    fn incremental_bus_refuses_a_shaping_receipt_absent_from_the_ledger() {
+        let (mut ledger, mut reducer, _) = committed_fixture("shaping-forgery");
+        let occurrence = OccurrenceIdentity::new("shaping-forgery", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let crate::presentation::emitter::ReducerAction::ApplyIncrementalShaping { receipt } =
+            &mut revision.action
+        else {
+            panic!("the real reducer must return a shaping action");
+        };
+        receipt.receipt_id = "light-plus-incremental-not-minted".to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(
+            session("shaping-forgery"), temp.path().join("bus.jsonl"), None,
+        ).unwrap();
+        assert!(bus.publish_revision(&revision, &ledger).is_empty());
+        assert!(bus.writer.lock().unwrap().last_projection.is_none());
+    }
+
+    /// A live per-occurrence shape is observed exactly like any other committed
+    /// revision — same evidence rows, same rendered document, same receipts —
+    /// but it must not borrow the vocabulary of an edit or of a terminal. The
+    /// take is still being spoken, so the book stays open and the projection
+    /// stays `listening`.
+    #[test]
+    fn an_incremental_shaping_publishes_a_listening_revision_without_closing_the_book() {
+        let (mut ledger, mut reducer, committed) = committed_fixture("shaping-bus");
+        let occurrence = OccurrenceIdentity::new("shaping-bus", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger
+            .seal(&occurrence)
+            .expect("a closed qualified occurrence seals")
+            .clone();
+        assert!(seal.is_occurrence_seal());
+        let sealed = reducer
+            .apply_ledger_seal(&seal)
+            .expect("the occurrence seal projects");
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("incremental-shaping.jsonl");
+        let bus = TranscriptBus::open_at(session("shaping-bus"), path, None).unwrap();
+        bus.publish_started();
+        assert_eq!(bus.publish_revision(&sealed, &ledger).len(), 2);
+
+        let shaping = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .expect("a sealed committed occurrence shapes");
+        let events = bus.publish_revision(&shaping, &ledger);
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the whole document is projected, not only the shaped span"
+        );
+        for event in &events {
+            assert_eq!(event.reducer_action, "apply_incremental_shaping");
+            assert_eq!(event.phase, TranscriptProjectionPhase::Listening);
+            assert!(!event.terminal, "a shape is not a terminal revision");
+            assert!(!event.lifecycle_terminal, "a shape never ends the session");
+            assert_eq!(event.delivery, TranscriptDelivery::Unattempted);
+            assert_eq!(event.rendered_text, shaping.rendered_text);
+            assert!(
+                event.acoustic_receipts[0].manual_edit_receipt.is_none(),
+                "a shape must not project as a human correction"
+            );
+        }
+        // Only the shaped occurrence changed; the open one is byte-exact.
+        assert_eq!(committed.rendered_text, "Zażółć gęślą\n jaźń.");
+        assert_eq!(shaping.rendered_text, "Zażółć. gęślą\n jaźń.");
+        assert_eq!(events[0].label, "Zażółć", "the spoken label is unchanged");
+
+        assert!(
+            !bus.writer.lock().unwrap().sealed,
+            "an occurrence-level revision must never close the committed book"
+        );
     }
 }

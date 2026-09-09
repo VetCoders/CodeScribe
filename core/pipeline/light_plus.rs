@@ -320,4 +320,62 @@ mod tests {
         assert_eq!(apply(""), "");
         assert_eq!(apply("   \n  "), "");
     }
+
+    /// A span that shapes to nothing returns an empty string rather than a
+    /// lone period. The live per-occurrence caller reads that emptiness as
+    /// "refuse", so a hesitation-only utterance keeps its spoken label instead
+    /// of being deleted from the document by a formatting pass.
+    #[test]
+    fn a_span_that_shapes_to_nothing_returns_nothing() {
+        for hesitation in ["yyy", "  eee ", "hmm", "\n"] {
+            assert_eq!(
+                apply_with_left_context("Zdanie przed.", hesitation),
+                "",
+                "a shape that consumed every word must be empty, not punctuation"
+            );
+        }
+    }
+
+    /// Left context that closes on a comma is an unfinished clause: the span
+    /// continues it and must not rise to a capital.
+    #[test]
+    fn a_span_after_an_unclosed_clause_stays_lowercase() {
+        let shaped = apply_with_left_context("Zaczynamy od tego,", "że to jest ciag dalszy");
+        assert!(
+            shaped.starts_with("że"),
+            "a continuation after a comma stays lowercase: {shaped}"
+        );
+        assert!(shaped.ends_with('.'), "the span still closes: {shaped}");
+    }
+
+    /// The incremental path is idempotent too: re-shaping an already shaped
+    /// span against the same left context yields the same bytes, so a repeated
+    /// seal observation cannot make the document drift.
+    #[test]
+    fn reshaping_a_shaped_span_with_the_same_left_context_is_stable() {
+        let left = "Pierwsze zdanie.";
+        let once = apply_with_left_context(left, "drugie zdanie bez kropki");
+        assert_eq!(once, "Drugie zdanie bez kropki.");
+        assert_eq!(apply_with_left_context(left, &once), once);
+    }
+
+    /// Spans shaped one at a time, as their occurrences close, join into the
+    /// same readable document a single whole-transcript pass would produce.
+    /// This is the property the live Light+ floor is built on.
+    #[test]
+    fn spans_shaped_one_by_one_join_into_a_readable_document() {
+        let spoken = ["to jest pierwsze zdanie", "a to jest drugie"];
+        let mut document = String::new();
+        for span in spoken {
+            let shaped = apply_with_left_context(&document, span);
+            if !document.is_empty() {
+                document.push(' ');
+            }
+            document.push_str(&shaped);
+        }
+        assert_eq!(document, "To jest pierwsze zdanie. A to jest drugie.");
+        // And the whole-document pass leaves that result alone, so the terminal
+        // Light+ gate mints nothing on top of it.
+        assert_eq!(apply(&document), document);
+    }
 }

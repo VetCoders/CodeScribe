@@ -276,8 +276,11 @@ frozen in the recording snapshot; explicit file actions remain separate.
 **Stop** settles live observers, admits qualified source-mapped gap occurrences
 from the owned archive, drains formatter slots they created, then recomputes
 occurrence-union coverage. A gap over 250 ms blocks terminal truth. Only after a
-terminal ledger seal may the existing Light+, projection and delivery owners
-publish the final transcript. The WAV is never uploaded for this decision.
+terminal ledger seal may the projection and delivery owners publish the **final**
+transcript, and only there may a paid formatter or a user edit rewrite the whole
+document. The deterministic Light+ presentation floor is not gated that way — it
+runs per occurrence seal during capture (§3.y). The WAV is never uploaded for
+this decision.
 
 ### 3.2 Settings UI → config
 
@@ -427,6 +430,54 @@ exact cpal device display name, native sample rate, and native channel count,
 so the same display name at a changed rate/channel layout is not the same
 calibration generation. Older schemas receive no permissive defaults; the one
 remediation for every validity refusal is to re-calibrate.
+
+### 3.y Live Light+ (deterministic presentation during capture)
+
+**W2 recovery status (2026-09-09): partial, not admitted.** The following is
+the intended contract. The recovered source does not yet carry incremental
+shaping receipts through the Bus/bridge projection, validate their rendered
+bytes at publication, or distinguish a one-occurrence terminal seal from an
+occurrence seal. Recovery falsifiers are authored but unrun under the compile
+embargo. This checkpoint does not certify the behavior described below.
+
+A closed utterance must become readable text while the take is still running,
+not at Stop. The Light+ floor therefore has two gates, and they state different
+things:
+
+| Gate                                                | Scope                   | Receipt                              | Lifecycle |
+| --------------------------------------------------- | ----------------------- | ------------------------------------ | --------- |
+| Occurrence seal (`LedgerSeal`, `is_occurrence_seal`) | exactly those words     | `IncrementalShapingReceipt`          | stays open |
+| Terminal seal / `SessionFinalised`                   | the whole document      | `ManualDocumentRevisionReceipt`      | terminal   |
+
+The live gate is `TranscriptReducer::apply_incremental_shaping`, driven by
+`PresentationEmitter::mint_incremental_light_plus`:
+
+- It shapes **one** sealed occurrence with
+  `light_plus::apply_with_left_context`, using the committed text to its left as
+  casing context. The unsealed suffix is never shaped and never enters a sealed
+  source receipt; it keeps rendering the spoken words until its own seal lands.
+- The acoustic label stays immutable. The shape lives beside it, keyed by the
+  same occurrence, so later speech appends instead of replacing the document —
+  a single whole-document override discarded on the next insert is not
+  incremental delivery.
+- The receipt names the occurrence, its seal, the exact source label and a
+  digest of the left neighbourhood, so a shape can be reproduced and a stale one
+  detected. A relabelled occurrence drops its shape and renders the new words.
+- A shape that consumed every word (a hesitation-only utterance) is refused: an
+  empty presentation may never delete captured speech.
+- Duplicates are no-ops. A replayed seal, or a shape that changes nothing, mints
+  no second revision and no second receipt.
+- The literal contract (Ctrl-hold `force_raw`) skips the live gate exactly as it
+  skips the terminal one.
+- A live revision publishes through the ordinary committed corridor — Bus
+  (`reducer_action: apply_incremental_shaping`, phase `listening`), projection
+  callback, delivery buffer — and never through the lifecycle one. It sets no
+  terminal flag, no `lifecycle_terminal`, and no delivery disposition.
+
+Because Light+ is idempotent, a document the live gate already settled yields no
+terminal intent: Stop delivers those exact bytes once, and the terminal CAS
+source the paid formatter and a user edit compare against is the same document
+Swift already holds.
 
 ## 4. Labels vs truth
 

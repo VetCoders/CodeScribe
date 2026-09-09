@@ -420,6 +420,7 @@ pub struct AcousticLedger {
     trail: Vec<LayerDecisionReceipt>,
     manual_edits: Vec<ManualEditReceipt>,
     manual_document_revisions: Vec<ManualDocumentRevisionReceipt>,
+    incremental_shapings: Vec<IncrementalShapingReceipt>,
     derivations: Vec<OccurrenceDerivation>,
     latest_seal_coverage: Option<SealCoverageReceipt>,
 }
@@ -1172,6 +1173,94 @@ impl AcousticLedger {
     /// Every authenticated whole-document user revision, in arrival order.
     pub fn manual_document_revisions(&self) -> &[ManualDocumentRevisionReceipt] {
         &self.manual_document_revisions
+    }
+
+    /// Authenticate one presentation shaping of a single sealed occurrence.
+    ///
+    /// This is deliberately *not* a whole-document revision. A live Light+ pass
+    /// during capture states something much smaller and much more checkable:
+    /// "the closed occurrence X, whose committed label is exactly
+    /// `source_label`, is presented as `shaped_text`". The ledger keeps the
+    /// label itself immutable — `text_of` still returns the spoken words — so
+    /// the shaping can never be mistaken for a human correction of the
+    /// transcript, and a stale shape is detectable by comparing `source_label`
+    /// against the label the ledger currently holds.
+    ///
+    /// `left_context_sha256` pins the neighbouring committed text the casing
+    /// decision was taken against, so a later audit can reproduce the shape
+    /// instead of trusting it.
+    ///
+    /// Refuses an unqualified, unsealed, uncommitted, foreign-session or
+    /// relabelled occurrence, and refuses to restate a shaping it already
+    /// holds — a repeated seal observation mints no second receipt.
+    pub fn record_incremental_shaping(
+        &mut self,
+        session_id: &str,
+        source_revision: u64,
+        revision: u64,
+        occurrence: &OccurrenceIdentity,
+        source_label: &str,
+        left_context: &str,
+        shaped_text: &str,
+    ) -> Result<IncrementalShapingReceipt, &'static str> {
+        if session_id.is_empty() {
+            return Err("incremental_shaping_session_missing");
+        }
+        if shaped_text.trim().is_empty() {
+            return Err("incremental_shaping_text_empty");
+        }
+        if source_revision.checked_add(1) != Some(revision) {
+            return Err("incremental_shaping_revision_nonconsecutive");
+        }
+        if occurrence.session != session_id {
+            return Err("incremental_shaping_session_mismatch");
+        }
+        if !self.is_qualified(occurrence)
+            || !self.is_sealed(occurrence)
+            || !self.committed.contains_key(occurrence)
+        {
+            return Err("incremental_shaping_occurrence_not_sealed");
+        }
+        if self.text_of(occurrence) != Some(source_label) {
+            return Err("incremental_shaping_source_label_stale");
+        }
+        let source_seal_receipt = self
+            .seal_of(occurrence)
+            .map(|seal| seal.receipt_id.clone())
+            .ok_or("incremental_shaping_seal_missing")?;
+        if self.incremental_shapings.iter().any(|held| {
+            &held.occurrence == occurrence
+                && held.source_label == source_label
+                && held.shaped_text == shaped_text
+        }) {
+            return Err("incremental_shaping_unchanged");
+        }
+
+        let ordinal = self.incremental_shapings.len();
+        let receipt = IncrementalShapingReceipt {
+            receipt_id: format!(
+                "{}-incremental-{session_id}-{}-{}-{source_revision}-{revision}-{ordinal}",
+                DocumentRevisionProvenance::LightPlus.as_str(),
+                occurrence.sample_start,
+                occurrence.sample_end,
+            ),
+            provenance: DocumentRevisionProvenance::LightPlus.as_str().to_string(),
+            session_id: session_id.to_string(),
+            source_revision,
+            revision,
+            occurrence: occurrence.clone(),
+            source_seal_receipt,
+            source_label: source_label.to_string(),
+            left_context_sha256: format!("{:x}", Sha256::digest(left_context.as_bytes())),
+            shaped_text: shaped_text.to_string(),
+        };
+        self.incremental_shapings.push(receipt.clone());
+        Ok(receipt)
+    }
+
+    /// Every authenticated per-occurrence shaping, in arrival order.
+    pub fn incremental_shapings(&self) -> &[IncrementalShapingReceipt] {
+        &self.incremental_shapings
     }
 
     /// Record the decision the ledger just took. Called for every observation
@@ -1981,6 +2070,44 @@ pub struct ManualDocumentRevisionReceipt {
     pub source_seal_receipts: Vec<String>,
     /// Complete user-authored replacement bytes.
     pub rendered_text: String,
+}
+
+/// Provenance for one deterministic presentation shaping of a single sealed
+/// occurrence, minted while the session lifecycle is still open.
+///
+/// * inputs: one closed occurrence, the exact committed label it holds, and the
+///   committed left neighbourhood the casing decision saw.
+/// * outputs: the presentation bytes the reducer renders for that occurrence.
+/// * invariants: the acoustic label, its evidence, its geometry and its seal
+///   stay untouched — this receipt sits *beside* them. It names exactly one
+///   occurrence, so an open suffix can never be smuggled into a sealed source
+///   set, and it is not a [`ManualDocumentRevisionReceipt`]: a partial shape
+///   must never be projected as a complete human document edit.
+/// * intended consumers: the transcript reducer's rendered document and the
+///   Transcript Bus projection of that revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncrementalShapingReceipt {
+    /// Stable identifier copied into the reducer entry and Bus projection.
+    pub receipt_id: String,
+    /// Stable origin label. Always `light-plus` today.
+    pub provenance: String,
+    /// Recording session whose occurrence was shaped.
+    pub session_id: String,
+    /// Reducer revision the shaping was computed against.
+    pub source_revision: u64,
+    /// New reducer revision minted by Rust.
+    pub revision: u64,
+    /// The one physical occurrence this shaping presents.
+    pub occurrence: OccurrenceIdentity,
+    /// Seal proving that occurrence was closed before it was shaped.
+    pub source_seal_receipt: String,
+    /// Exact committed label the shape was derived from. A later relabel makes
+    /// the shape stale and detectable rather than silently wrong.
+    pub source_label: String,
+    /// Digest of the committed left neighbourhood the casing decision saw.
+    pub left_context_sha256: String,
+    /// Presentation bytes for this occurrence.
+    pub shaped_text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -3106,5 +3233,174 @@ mod tests {
         ledger
             .seal_terminal(SESSION, EPOCH)
             .expect("complete recorded coverage may become terminal truth");
+    }
+
+    /// A sealed occurrence, its exact committed label, and the left context the
+    /// casing saw. That is the whole claim an incremental shaping makes — and
+    /// the receipt states each part explicitly instead of implying it.
+    fn sealed_for_shaping() -> (AcousticLedger, OccurrenceIdentity) {
+        let occurrence = occ(0, 16_000);
+        let mut ledger = AcousticLedger::new();
+        let calibration = EnergyCalibration::new("incremental-shaping", 1.0, 1);
+        let evidence = AcousticEvidence {
+            occurrence: occurrence.clone(),
+            duration_ms: 1_000.0,
+            energy_integral: 100.0,
+            mean_rms_dbfs: -20.0,
+            peak_dbfs: -10.0,
+            vad_open_sample: Some(0),
+            vad_close_sample: Some(16_000),
+            evidence_calibration_version: calibration.version.clone(),
+        };
+        assert!(ledger.qualify(&evidence, &calibration).is_qualified());
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        let observation = obs(ObservationProducer::Apple, 0, occurrence.clone());
+        assert!(ledger.admit(&observation, "jakieś słowa").grants_mutation());
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        ledger.seal(&occurrence).expect("closed occurrence seals");
+        (ledger, occurrence)
+    }
+
+    #[test]
+    fn an_incremental_shaping_binds_one_sealed_occurrence_and_its_seal() {
+        let (mut ledger, occurrence) = sealed_for_shaping();
+        let seal_receipt = ledger
+            .seal_of(&occurrence)
+            .expect("sealed")
+            .receipt_id
+            .clone();
+
+        let receipt = ledger
+            .record_incremental_shaping(
+                "s1",
+                4,
+                5,
+                &occurrence,
+                "jakieś słowa",
+                "Poprzednie zdanie.",
+                "Jakieś słowa.",
+            )
+            .expect("a sealed, committed, unchanged label shapes");
+
+        assert_eq!(receipt.provenance, "light-plus");
+        assert!(receipt.receipt_id.starts_with("light-plus-incremental-"));
+        assert_eq!(receipt.occurrence, occurrence);
+        assert_eq!(receipt.source_seal_receipt, seal_receipt);
+        assert_eq!(receipt.source_label, "jakieś słowa");
+        assert_eq!(receipt.shaped_text, "Jakieś słowa.");
+        assert_eq!(receipt.source_revision, 4);
+        assert_eq!(receipt.revision, 5);
+        assert_eq!(
+            receipt.left_context_sha256,
+            format!("{:x}", Sha256::digest("Poprzednie zdanie.".as_bytes())),
+            "the left neighbourhood is pinned so the shape can be reproduced"
+        );
+        assert_eq!(ledger.incremental_shapings().len(), 1);
+        assert_eq!(ledger.incremental_shapings()[0], receipt);
+
+        // The acoustic label itself is untouched — presentation, not words.
+        assert_eq!(ledger.text_of(&occurrence), Some("jakieś słowa"));
+        assert!(ledger.manual_document_revisions().is_empty());
+        assert!(ledger.manual_edits().is_empty());
+    }
+
+    #[test]
+    fn an_identical_incremental_shaping_is_refused_instead_of_restated() {
+        let (mut ledger, occurrence) = sealed_for_shaping();
+        assert!(
+            ledger
+                .record_incremental_shaping(
+                    "s1",
+                    4,
+                    5,
+                    &occurrence,
+                    "jakieś słowa",
+                    "",
+                    "Jakieś słowa.",
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                5,
+                6,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "Jakieś słowa.",
+            ),
+            Err("incremental_shaping_unchanged"),
+            "a replayed seal mints no second receipt"
+        );
+        assert_eq!(ledger.incremental_shapings().len(), 1);
+    }
+
+    #[test]
+    fn incremental_shaping_refuses_unsealed_foreign_stale_and_empty_sources() {
+        let (mut ledger, occurrence) = sealed_for_shaping();
+
+        assert_eq!(
+            ledger.record_incremental_shaping("", 4, 5, &occurrence, "jakieś słowa", "", "X."),
+            Err("incremental_shaping_session_missing")
+        );
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                4,
+                5,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "   \n ",
+            ),
+            Err("incremental_shaping_text_empty"),
+            "an empty shape must never be allowed to erase words"
+        );
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                4,
+                9,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "Jakieś słowa.",
+            ),
+            Err("incremental_shaping_revision_nonconsecutive")
+        );
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "obca-sesja",
+                4,
+                5,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "Jakieś słowa.",
+            ),
+            Err("incremental_shaping_session_mismatch")
+        );
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                4,
+                5,
+                &occurrence,
+                "zupełnie inne słowa",
+                "",
+                "Zupełnie inne słowa.",
+            ),
+            Err("incremental_shaping_source_label_stale"),
+            "a shape must be derived from the label the ledger actually holds"
+        );
+
+        let unsealed = occ(16_000, 32_000);
+        assert_eq!(
+            ledger.record_incremental_shaping("s1", 4, 5, &unsealed, "cokolwiek", "", "Cokolwiek."),
+            Err("incremental_shaping_occurrence_not_sealed"),
+            "an open occurrence is never a sealed source"
+        );
+        assert!(ledger.incremental_shapings().is_empty());
     }
 }
