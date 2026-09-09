@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use chrono::{SecondsFormat, Utc};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, SealCoverageReceipt, TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, IncrementalShapingReceipt, SealCoverageReceipt, TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::TranscriptSegment;
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,49 @@ pub struct ProjectedAcousticReceipt {
     pub layer_decision_receipts: Vec<String>,
     pub seal_receipt: Option<String>,
     pub manual_edit_receipt: Option<String>,
+    /// Absent on plain/legacy entries; absence grants no shaping authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_receipt: Option<ProjectedPresentationReceipt>,
+}
+
+/// A complete per-occurrence Light+ proof. Required fields have no defaults.
+/// This observer record cannot be submitted to the reducer as mutation authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectedPresentationReceipt {
+    pub receipt_id: String,
+    pub provenance: String,
+    pub session_id: String,
+    pub source_revision: u64,
+    pub revision: u64,
+    pub capture_epoch: u64,
+    pub sample_start: u64,
+    pub sample_end: u64,
+    pub source_seal_receipt: String,
+    pub source_label: String,
+    pub left_context: String,
+    pub left_context_sha256: String,
+    pub shaped_text: String,
+}
+
+impl From<&IncrementalShapingReceipt> for ProjectedPresentationReceipt {
+    fn from(receipt: &IncrementalShapingReceipt) -> Self {
+        Self {
+            receipt_id: receipt.receipt_id.clone(),
+            provenance: receipt.provenance.clone(),
+            session_id: receipt.session_id.clone(),
+            source_revision: receipt.source_revision,
+            revision: receipt.revision,
+            capture_epoch: receipt.occurrence.capture_epoch,
+            sample_start: receipt.occurrence.sample_start,
+            sample_end: receipt.occurrence.sample_end,
+            source_seal_receipt: receipt.source_seal_receipt.clone(),
+            source_label: receipt.source_label.clone(),
+            left_context: receipt.left_context.clone(),
+            left_context_sha256: receipt.left_context_sha256.clone(),
+            shaped_text: receipt.shaped_text.clone(),
+        }
+    }
 }
 
 /// One uncovered speech span on the canonical capture PCM clock.
@@ -402,12 +445,17 @@ impl TranscriptBus {
         )
     }
 
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session.session_id
+    }
+
     fn project_serial(
         serial: &AcousticSerial,
         word_evidence_receipts: Vec<String>,
         layer_decision_receipts: Vec<String>,
         seal_receipt: Option<String>,
         manual_edit_receipt: Option<String>,
+        presentation_receipt: Option<&IncrementalShapingReceipt>,
     ) -> ProjectedAcousticReceipt {
         ProjectedAcousticReceipt {
             acoustic_serial_version: serial.version,
@@ -431,6 +479,7 @@ impl TranscriptBus {
             layer_decision_receipts,
             seal_receipt,
             manual_edit_receipt,
+            presentation_receipt: presentation_receipt.map(ProjectedPresentationReceipt::from),
         }
     }
 
@@ -442,6 +491,11 @@ impl TranscriptBus {
         revision: &TranscriptRevision,
         ledger: &AcousticLedger,
     ) -> Vec<TranscriptBusEvidenceEvent> {
+        // Atomic refusal: no partial rows, sequence changes or last-render update.
+        // The validator is owned by the reducer, not a second Bus text reducer.
+        if !revision.authenticates_publication(ledger, &self.session.session_id) {
+            return Vec::new();
+        }
         let reducer_action = match &revision.action {
             ReducerAction::ApplyLedgerDecision { .. } => "apply_ledger_decision",
             ReducerAction::RecordLedgerSeal { terminal: true, .. } => "record_ledger_terminal_seal",
@@ -452,6 +506,10 @@ impl TranscriptBus {
             ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. } => {
                 "apply_manual_edit"
             }
+            // A live presentation shape of one closed occurrence. It is not a
+            // manual edit and not a terminal revision: the words are unchanged,
+            // the lifecycle is open, and the take is still being spoken.
+            ReducerAction::ApplyIncrementalShaping { .. } => "apply_incremental_shaping",
             ReducerAction::RecordContextMarker { .. } => "record_context_marker",
         };
         let is_user_revision = matches!(&revision.action, ReducerAction::ApplyUserRevision { .. });
@@ -466,6 +524,11 @@ impl TranscriptBus {
             .writer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        if writer.last_projection.as_ref().is_some_and(|last| {
+            revision.revision <= last.reducer_revision
+        }) {
+            return Vec::new();
+        }
         let is_manual_edit = matches!(
             &revision.action,
             ReducerAction::ApplyManualEdit { .. } | ReducerAction::ApplyUserRevision { .. }
@@ -535,6 +598,7 @@ impl TranscriptBus {
                     entry.layer_decision_receipts.clone(),
                     entry.seal_receipt.clone(),
                     entry.manual_edit_receipt.clone(),
+                    entry.presentation_receipt.as_ref(),
                 )],
                 seal_coverage: revision
                     .seal_coverage
@@ -1238,6 +1302,10 @@ mod tests {
             bus.publish_started();
             let (mut ledger, mut reducer, revision) = committed_fixture("edit");
             assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "edit");
+            for occurrence in ledger.occurrences().cloned().collect::<Vec<_>>() {
+                ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+                assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+            }
             let seal = ledger.seal_terminal("edit", 7).unwrap();
             let sealed = reducer.apply_ledger_seal(&seal).unwrap();
             bus.publish_revision(&sealed, &ledger);
@@ -1498,4 +1566,213 @@ mod tests {
         assert_eq!(decoded.delivery, TranscriptDelivery::Unattempted);
         assert!(!decoded.lifecycle_terminal);
     }
+
+    // Recovery falsifiers: these contracts are intentionally UNRUN under W2.
+    // Preserve predecessor negative controls across the publication recovery.
+    #[test]
+    fn incremental_bus_refuses_rendered_bytes_not_bound_to_the_shaping_receipt() {
+        let (mut ledger, mut reducer, _) = committed_fixture("shaping-bytes");
+        let occurrence = OccurrenceIdentity::new("shaping-bytes", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        revision.rendered_text = "Unrelated replacement without source authority.".to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(
+            session("shaping-bytes"), temp.path().join("bus.jsonl"), None,
+        ).unwrap();
+        assert!(bus.publish_revision(&revision, &ledger).is_empty());
+        assert!(bus.writer.lock().unwrap().last_projection.is_none());
+    }
+
+    #[test]
+    fn incremental_bus_refuses_a_shaping_receipt_absent_from_the_ledger() {
+        let (mut ledger, mut reducer, _) = committed_fixture("shaping-forgery");
+        let occurrence = OccurrenceIdentity::new("shaping-forgery", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let crate::presentation::emitter::ReducerAction::ApplyIncrementalShaping { receipt } =
+            &mut revision.action
+        else {
+            panic!("the real reducer must return a shaping action");
+        };
+        receipt.receipt_id = "light-plus-incremental-not-minted".to_string();
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(
+            session("shaping-forgery"), temp.path().join("bus.jsonl"), None,
+        ).unwrap();
+        assert!(bus.publish_revision(&revision, &ledger).is_empty());
+        assert!(bus.writer.lock().unwrap().last_projection.is_none());
+    }
+
+    /// A live per-occurrence shape is observed exactly like any other committed
+    /// revision — same evidence rows, same rendered document, same receipts —
+    /// but it must not borrow the vocabulary of an edit or of a terminal. The
+    /// take is still being spoken, so the book stays open and the projection
+    /// stays `listening`.
+    #[test]
+    fn an_incremental_shaping_publishes_a_listening_revision_without_closing_the_book() {
+        let (mut ledger, mut reducer, committed) = committed_fixture("shaping-bus");
+        let occurrence = OccurrenceIdentity::new("shaping-bus", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger
+            .seal(&occurrence)
+            .expect("a closed qualified occurrence seals")
+            .clone();
+        assert!(seal.is_occurrence_seal());
+        let sealed = reducer
+            .apply_ledger_seal(&seal)
+            .expect("the occurrence seal projects");
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("incremental-shaping.jsonl");
+        let bus = TranscriptBus::open_at(session("shaping-bus"), path, None).unwrap();
+        bus.publish_started();
+        assert_eq!(bus.publish_revision(&sealed, &ledger).len(), 2);
+
+        let shaping = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .expect("a sealed committed occurrence shapes");
+        let events = bus.publish_revision(&shaping, &ledger);
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the whole document is projected, not only the shaped span"
+        );
+        for event in &events {
+            assert_eq!(event.reducer_action, "apply_incremental_shaping");
+            assert_eq!(event.phase, TranscriptProjectionPhase::Listening);
+            assert!(!event.terminal, "a shape is not a terminal revision");
+            assert!(!event.lifecycle_terminal, "a shape never ends the session");
+            assert_eq!(event.delivery, TranscriptDelivery::Unattempted);
+            assert_eq!(event.rendered_text, shaping.rendered_text);
+            assert!(
+                event.acoustic_receipts[0].manual_edit_receipt.is_none(),
+                "a shape must not project as a human correction"
+            );
+        }
+        // Only the shaped occurrence changed; the open one is byte-exact.
+        assert_eq!(committed.rendered_text, "Zażółć gęślą\n jaźń.");
+        assert_eq!(shaping.rendered_text, "Zażółć. gęślą\n jaźń.");
+        assert_eq!(events[0].label, "Zażółć", "the spoken label is unchanged");
+
+        assert!(
+            !bus.writer.lock().unwrap().sealed,
+            "an occurrence-level revision must never close the committed book"
+        );
+    }
+    #[test]
+    fn retained_shaping_authenticates_the_complete_ordered_snapshot_or_emits_nothing() {
+        let (mut ledger, mut reducer, _) = committed_fixture("retained-proof");
+        let first = OccurrenceIdentity::new("retained-proof", 7, 0, 16_000);
+        let second = OccurrenceIdentity::new("retained-proof", 7, 16_000, 32_000);
+        for occurrence in [&first, &second] {
+            ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(ledger.note_frontier_return(occurrence, ObservationProducer::Apple));
+            let seal = ledger.seal(occurrence).unwrap().clone();
+            reducer.apply_ledger_seal(&seal).unwrap();
+        }
+        let shaped = reducer.apply_incremental_shaping(&mut ledger, &first).unwrap();
+        let revision = reducer.record_context_marker(0, "context").unwrap();
+        assert!(revision.revision > shaped.revision);
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(session("retained-proof"), temp.path().join("bus"), None).unwrap();
+        let mut candidates = Vec::new();
+        let mut altered = revision.clone();
+        altered.rendered_text.push_str(" injected");
+        candidates.push(altered);
+        let mut missing = revision.clone();
+        missing.entries[0].presentation_receipt = None;
+        candidates.push(missing);
+        let mut fabricated = revision.clone();
+        fabricated.entries[0].presentation_receipt.as_mut().unwrap().receipt_id.push_str("-forged");
+        candidates.push(fabricated);
+        let mut stale_source = revision.clone();
+        stale_source.entries[0].presentation_receipt.as_mut().unwrap().source_revision += 1;
+        candidates.push(stale_source);
+        let mut reordered = revision.clone();
+        reordered.entries.swap(0, 1);
+        candidates.push(reordered);
+        let mut omitted = revision.clone();
+        omitted.entries.pop();
+        candidates.push(omitted);
+        let mut foreign = revision.clone();
+        foreign.entries[1].occurrence.session = "foreign".to_string();
+        candidates.push(foreign);
+        for candidate in candidates {
+            assert!(bus.publish_revision(&candidate, &ledger).is_empty());
+            let writer = bus.writer.lock().unwrap();
+            assert_eq!(writer.sequence, 0);
+            assert!(writer.last_projection.is_none());
+        }
+        // Same acoustic labels/geometry/seal IDs, but no minted shaping:
+        // a valid private snapshot still needs the exact live ledger receipt.
+        let (mut without_shaping, _, _) = committed_fixture("retained-proof");
+        for occurrence in [&first, &second] {
+            without_shaping.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+            assert!(without_shaping.note_frontier_return(occurrence, ObservationProducer::Apple));
+            without_shaping.seal(occurrence).unwrap();
+        }
+        assert!(bus.publish_revision(&revision, &without_shaping).is_empty());
+        let rows = bus.publish_revision(&revision, &ledger);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].acoustic_receipts[0].presentation_receipt.as_ref().unwrap().revision,
+            shaped.revision, "retained provenance names its original revision");
+        assert!(rows[1].acoustic_receipts[0].presentation_receipt.is_none());
+        let bytes = std::fs::read(temp.path().join("bus")).unwrap();
+        assert!(bus.publish_revision(&revision, &ledger).is_empty());
+        assert_eq!(std::fs::read(temp.path().join("bus")).unwrap(), bytes);
+
+        let manual = ObservationIdentity::new(ObservationProducer::ManualHuman, 99, 0, first);
+        assert!(ledger.admit(&manual, "replacement").grants_mutation());
+        let fresh_bus = TranscriptBus::open_at(session("retained-proof"), temp.path().join("stale"), None).unwrap();
+        assert!(fresh_bus.publish_revision(&revision, &ledger).is_empty(),
+            "an intact old snapshot is still refused after its acoustic source changes");
+    }
+
+    #[test]
+    fn serialized_projection_absence_and_malformed_proof_never_mint_authority() {
+        let (mut ledger, mut reducer, plain) = committed_fixture("serialized-shape");
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(session("serialized-shape"), temp.path().join("bus"), None).unwrap();
+        let plain_rows = bus.publish_revision(&plain, &ledger);
+        let old = serde_json::to_value(&plain_rows[0]).unwrap();
+        assert!(old["acoustic_receipts"][0].get("presentation_receipt").is_none());
+        let old: TranscriptBusEvidenceEvent = serde_json::from_value(old).unwrap();
+        assert!(old.acoustic_receipts[0].presentation_receipt.is_none());
+        let occurrence = OccurrenceIdentity::new("serialized-shape", 7, 0, 16_000);
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        let revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let rows = bus.publish_revision(&revision, &ledger);
+        let encoded = serde_json::to_value(&rows[0]).unwrap();
+        let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.acoustic_receipts[0].presentation_receipt,
+            rows[0].acoustic_receipts[0].presentation_receipt);
+        for field in ["source_revision", "source_seal_receipt", "left_context", "left_context_sha256", "shaped_text"] {
+            let mut incomplete = encoded.clone();
+            incomplete["acoustic_receipts"][0]["presentation_receipt"].as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<TranscriptBusEvidenceEvent>(incomplete).is_err());
+        }
+        // A decoded observer record is not a TranscriptRevision capability.
+        // Rewriting it never enters publish_revision or creates a ledger receipt.
+        let count = ledger.incremental_shapings().len();
+        let mut fabricated = encoded;
+        fabricated["acoustic_receipts"][0]["presentation_receipt"]["receipt_id"] = "not-minted".into();
+        let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(fabricated).unwrap();
+        assert!(!ledger.incremental_shapings().iter().any(|receipt| {
+            receipt.receipt_id == decoded.acoustic_receipts[0].presentation_receipt.as_ref().unwrap().receipt_id
+        }));
+        assert_eq!(ledger.incremental_shapings().len(), count);
+    }
+
 }

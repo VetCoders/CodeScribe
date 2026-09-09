@@ -247,7 +247,8 @@ final class OverlayStateTests: XCTestCase {
       wordEvidenceReceipts: includesWordEvidence ? ["test-word-evidence-\(sequence)"] : [],
       layerDecisionReceipts: ["test-layer-decision-\(sequence)"],
       sealReceipt: terminal ? "test-seal-\(sequence)" : nil,
-      manualEditReceipt: manualEditReceipt
+      manualEditReceipt: manualEditReceipt,
+      presentationReceipt: nil
     )
     state.applyTranscriptProjection(
       CsTranscriptProjectionEvent(
@@ -2043,7 +2044,8 @@ final class OverlayStateTests: XCTestCase {
       wordEvidenceReceipts: ["\(sessionId)-word-\(sequence)"],
       layerDecisionReceipts: ["\(sessionId)-layer-\(sequence)"],
       sealReceipt: terminal ? "\(sessionId)-seal-\(sequence)" : nil,
-      manualEditReceipt: nil
+      manualEditReceipt: nil,
+      presentationReceipt: nil
     )
     state.applyTranscriptProjection(
       CsTranscriptProjectionEvent(

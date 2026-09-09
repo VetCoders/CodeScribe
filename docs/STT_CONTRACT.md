@@ -276,8 +276,11 @@ frozen in the recording snapshot; explicit file actions remain separate.
 **Stop** settles live observers, admits qualified source-mapped gap occurrences
 from the owned archive, drains formatter slots they created, then recomputes
 occurrence-union coverage. A gap over 250 ms blocks terminal truth. Only after a
-terminal ledger seal may the existing Light+, projection and delivery owners
-publish the final transcript. The WAV is never uploaded for this decision.
+terminal ledger seal may the projection and delivery owners publish the **final**
+transcript, and only there may a paid formatter or a user edit rewrite the whole
+document. The deterministic Light+ presentation floor is not gated that way — it
+runs per occurrence seal during capture (§3.y). The WAV is never uploaded for
+this decision.
 
 ### 3.2 Settings UI → config
 
@@ -427,6 +430,67 @@ exact cpal device display name, native sample rate, and native channel count,
 so the same display name at a changed rate/channel layout is not the same
 calibration generation. Older schemas receive no permissive defaults; the one
 remediation for every validity refusal is to re-calibrate.
+
+### 3.y Live Light+ (deterministic presentation during capture)
+
+**W2 publication recovery (2026-09-10): source checkpoint, still isolated.**
+Reducer snapshots now bind every public field to a private, in-process publication
+digest and validate every current/retained presentation receipt against the live
+ledger before Bus or delivery publication. The digest is a reducer capability,
+not an acoustic witness, serialized signature or second document authority.
+Ledger seals have explicit `Occurrence` / `Terminal` scope with different IDs,
+even for one occurrence. Tests remain UNRUN under the compile embargo; generated
+bindings, executable validation and installed runtime proof belong to W3/W4.
+This source description is not a structural-close or runtime attestation.
+
+A closed utterance must become readable text while the take is still running,
+not at Stop. The Light+ floor therefore has two gates, and they state different
+things:
+
+| Gate                                                | Scope                   | Receipt                              | Lifecycle |
+| --------------------------------------------------- | ----------------------- | ------------------------------------ | --------- |
+| Occurrence seal (`LedgerSeal`, `is_occurrence_seal`) | exactly those words     | `IncrementalShapingReceipt`          | stays open |
+| Terminal ledger seal                               | the sealed document     | explicit terminal seal; optional document Light+ receipt | finalizing |
+| Controller `session_ended`                          | capture lifecycle       | no new shaping or acoustic authority | ended |
+
+The live gate is `TranscriptReducer::apply_incremental_shaping`, driven by
+`PresentationEmitter::mint_incremental_light_plus`:
+
+- It shapes **one** sealed occurrence with
+  `light_plus::apply_with_left_context`, using the committed text to its left as
+  casing context. A known open predecessor defers the later shape; each closure
+  revisits the sealed prefix in occurrence order. The unsealed suffix never
+  enters a shaping receipt and preserves its exact edge/interior whitespace.
+  Joining adds a space only when neither adjoining edge already has whitespace.
+- The acoustic label stays immutable. The shape lives beside it, keyed by the
+  same occurrence, so later speech appends instead of replacing the document —
+  a single whole-document override discarded on the next insert is not
+  incremental delivery.
+- The receipt names the occurrence, its seal, the exact source label and a
+  exact left-context bytes and their SHA-256, so a shape can be reproduced and a
+  stale one detected. A relabel or earlier insertion invalidates affected shapes,
+  including dependent suffix shapes. Earlier receipts remain immutable history;
+  a later valid shape receives its own source revision and context provenance.
+- A shape that consumed every word (a hesitation-only utterance) is refused: an
+  empty presentation may never delete captured speech.
+- Duplicates are no-ops. A replayed seal, or a shape that changes nothing, mints
+  no second revision and no second receipt.
+- The literal contract (Ctrl-hold `force_raw`) skips the live gate exactly as it
+  skips the terminal one.
+- A live revision publishes through the ordinary committed corridor — Bus
+  (`reducer_action: apply_incremental_shaping`, phase `listening`), projection
+  callback, delivery buffer — and never through the lifecycle one. It sets no
+  terminal flag, no `lifecycle_terminal`, and no delivery disposition.
+
+Because Light+ is idempotent, a document the live gate already settled yields no
+terminal intent: Stop delivers those exact bytes once, and the terminal CAS
+source the paid formatter and a user edit compare against is the same document
+Swift already holds. Per-entry Bus and bridge `presentation_receipt` fields carry
+both new and retained Light+ provenance; they never use `manual_edit_receipt` or
+invent word-to-PCM mapping. A terminal user/formatter document receipt retains
+its separate whole-document authority. Duplicate seal delivery produces no
+reducer revision, callback or Bus row, and Bus rejects replayed revision IDs.
+Tests distinguish one document revision from its N per-entry projection rows.
 
 ## 4. Labels vs truth
 
