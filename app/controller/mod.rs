@@ -1418,8 +1418,11 @@ impl RecordingController {
     /// transport only. Focus counts as confirmed when the bounded wait saw the
     /// target frontmost **or** the target is observed frontmost afterwards
     /// (an accepted-but-unconfirmed activation of an app that already owned
-    /// focus). An unconfirmed ambulance or a denied event tap parks Paste
-    /// Here and leaves the user's pasteboard alone.
+    /// focus). A latched target that confirmed neither never yields to whoever
+    /// is frontmost; only an Insert with no latch may follow the external
+    /// frontmost app (`delivery_route::clipboard_paste_may_post`). An
+    /// unconfirmed ambulance or a denied event tap parks Paste Here and leaves
+    /// the user's pasteboard alone.
     async fn execute_clipboard_paste(
         &self,
         paste_text: String,
@@ -1451,10 +1454,20 @@ impl RecordingController {
         debug!(
             target = ?target_app,
             frontmost = ?frontmost,
-            focus_confirmed,
+            focus_confirmed_by_wait = focus_confirmed,
             target_observed_frontmost,
             frontmost_is_external,
             "{context}: paste target activation"
+        );
+        // Throne law, shadowed on purpose so the corridor below reads exactly
+        // as the contract states it: a latched target must have confirmed
+        // focus or be observed frontmost; only an Insert with no latch may
+        // follow the external frontmost app.
+        let focus_confirmed = delivery_route::clipboard_paste_may_post(
+            target_app.is_some(),
+            focus_confirmed,
+            target_observed_frontmost,
+            frontmost_is_external,
         );
 
         let config = self.get_config().await;
@@ -1462,9 +1475,7 @@ impl RecordingController {
 
         let mut deferred_insert_shortcut = None;
         let mut deferred_insert_failure = None;
-        let delivery = if (focus_confirmed || target_observed_frontmost || frontmost_is_external)
-            && preflight.can_post_events()
-        {
+        let delivery = if focus_confirmed && preflight.can_post_events() {
             clipboard::paste_and_restore(&paste_text)
                 .with_context(|| format!("{context}: failed to paste"))?;
             OverlayPasteDelivery::Pasted

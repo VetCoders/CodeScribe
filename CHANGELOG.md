@@ -51,6 +51,8 @@ Release exists.
 
 ### Fixed
 
+- **Latched paste target never yields to a foreign frontmost app.** `execute_clipboard_paste` follows the throne law `clipboard_paste_may_post`: a latched target must confirm focus or be observed frontmost; the external-frontmost fallback (2fb2bd8ec) now applies only to an Insert with no latch. Canary finding P1-01 (2026-08-24) closed.
+
 - **Repeated speech is no longer deleted by string equality.** Light+ stopped
   collapsing every immediately repeated word, and decoder-loop cleanup now
   consults the number of acoustic spans before removing a run. Saying a name

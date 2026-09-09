@@ -54,7 +54,10 @@ Finish and hold release):
 - Transport is `execute_clipboard_paste`, shared with overlay Insert:
   activate the latched target, confirm focus (bounded wait **or** the target
   observed frontmost afterwards), preflight the event tap, borrow the
-  clipboard for one Cmd+V. Anything else parks Paste Here.
+  clipboard for one Cmd+V. Anything else parks Paste Here. A latched target
+  that confirmed neither never yields to whoever happens to be frontmost
+  (`clipboard_paste_may_post`); only an Insert with no latch may follow the
+  external frontmost app.
 - Exactly once per take (`claim_take_delivery`): a second stop of the same
   take id archives only.
 - **Seal refused (degraded delivery).** When the ledger refuses the terminal
