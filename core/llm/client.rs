@@ -71,12 +71,16 @@ impl CloudTranscriptionVerdict {
     }
 }
 
-/// NDJSON chunk response
+/// NDJSON response line: `stt-jsonl-v1` (`type` = hello/ack/transcript.final/
+/// stream.closed/error) or the legacy `is_final` shape.
 #[derive(Deserialize, Debug)]
 struct NdjsonChunk {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     text: Option<String>,
     is_final: Option<bool>,
     error: Option<String>,
+    message: Option<String>,
 }
 
 /// Audio validation error type for pre-flight checks
@@ -271,25 +275,7 @@ async fn transcribe_external(
 ) -> Result<CloudTranscriptionVerdict> {
     info!("Using external STT endpoint: {}", endpoint_url);
 
-    // Read file into memory (shared by all protocols)
     let canonical_path = canonicalize_path(path)?;
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path (path canonicalized above)
-    let mut file = File::open(&canonical_path)
-        .await
-        .context("Failed to open audio file")?;
-
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
-        .await
-        .context("Failed to read audio file")?;
-
-    // Pre-flight validation
-    if let Err(validation_error) = validate_audio(&buffer) {
-        error!("Audio validation failed: {}", validation_error);
-        crate::status::notify_status(crate::status::StatusSignal::Error);
-        anyhow::bail!("Audio validation failed: {}", validation_error);
-    }
-
     let lang = language.unwrap_or("pl");
 
     // File lane only: `:stream` is the NDJSON variant, anything else is multipart.
@@ -306,10 +292,24 @@ async fn transcribe_external(
     };
     let api_key = auth.as_ref().map_or(api_key, |auth| auth.bearer.as_str());
     if endpoint_url.ends_with(":stream") {
-        // NDJSON streaming HTTP
-        transcribe_ndjson(endpoint_url, api_key, buffer, lang).await
+        // NDJSON streaming HTTP: the file is decoded and sent in segments, so
+        // the whole-file upload cap of the multipart lane does not apply.
+        transcribe_ndjson(endpoint_url, api_key, &canonical_path, lang).await
     } else {
-        // OpenAI-compatible multipart upload
+        // OpenAI-compatible multipart upload: one body, one backend cap.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path (path canonicalized above)
+        let mut file = File::open(&canonical_path)
+            .await
+            .context("Failed to open audio file")?;
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer)
+            .await
+            .context("Failed to read audio file")?;
+        if let Err(validation_error) = validate_audio(&buffer) {
+            error!("Audio validation failed: {}", validation_error);
+            crate::status::notify_status(crate::status::StatusSignal::Error);
+            anyhow::bail!("Audio validation failed: {}", validation_error);
+        }
         let filename = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -322,98 +322,174 @@ async fn transcribe_external(
 // NDJSON Streaming HTTP STT
 // ============================================================================
 
-/// Transcribe audio via NDJSON streaming HTTP
+/// Wire rate of the `:stream` lane (`stt-jsonl-v1`): PCM16 mono at 16 kHz.
+const NDJSON_SAMPLE_RATE: u32 = 16_000;
+/// Segment length for the `:stream` file lane. Measured 2026-09-09 on
+/// api.libraxis.cloud: 10-minute PCM16@16k segments (19 MB, 25 MB NDJSON)
+/// transcribe; one 20-minute body (51 MB) dies with nginx 500.
+const NDJSON_SEGMENT_SECONDS: usize = 600;
+/// A cut is moved back into the quietest 20 ms frame of this window so a
+/// segment boundary lands between words, not inside one.
+const NDJSON_SEGMENT_SEARCH_SECONDS: usize = 5;
+const NDJSON_QUIET_FRAME_SAMPLES: usize = 320;
+/// PCM bytes per `chunk` line, the size the operator's proven shell client uses.
+const NDJSON_CHUNK_BYTES: usize = 128 * 1024;
+
+/// Transcribe an audio file via the NDJSON streaming HTTP lane (`stt-jsonl-v1`).
 ///
-/// Protocol:
-/// 1. POST raw audio with Content-Type and x-api-key header
-/// 2. Stream response, parse newline-delimited JSON chunks
-/// 3. Return text from final chunk (is_final: true)
+/// The file is decoded and resampled to 16 kHz mono, cut into segments of at
+/// most [`NDJSON_SEGMENT_SECONDS`] at quiet points, and every segment is one
+/// request: `set` → `chunk`× → `end`, answered by `transcript.final`. The
+/// segment texts are joined in order. Long takes never travel as one body.
 async fn transcribe_ndjson(
     url: &str,
     api_key: &str,
-    audio_data: Vec<u8>,
+    path: &Path,
     language: &str,
 ) -> Result<CloudTranscriptionVerdict> {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-
     let start = Instant::now();
-
-    // Parse WAV header to extract sample rate and PCM data
-    // WAV format: RIFF header (12 bytes) + fmt chunk (24+ bytes) + data chunk
-    if audio_data.len() < 44 {
-        anyhow::bail!("Audio data too short for WAV header");
+    let decode_path = path.to_path_buf();
+    let (samples, sample_rate) =
+        tokio::task::spawn_blocking(move || crate::audio::load_audio_file(&decode_path))
+            .await
+            .context("audio decode task join error")??;
+    if samples.is_empty() {
+        anyhow::bail!("Audio validation failed: {}", AudioValidationError::Empty);
     }
-
-    // Verify RIFF header
-    if &audio_data[0..4] != b"RIFF" || &audio_data[8..12] != b"WAVE" {
-        anyhow::bail!("Invalid WAV file format");
-    }
-
-    // Extract sample rate from fmt chunk (bytes 24-27, little-endian)
-    let sample_rate = u32::from_le_bytes([
-        audio_data[24],
-        audio_data[25],
-        audio_data[26],
-        audio_data[27],
-    ]);
-
-    // Find data chunk start (skip header, typically 44 bytes but can vary)
-    let mut data_start = 12; // After "WAVE"
-    while data_start + 8 < audio_data.len() {
-        let chunk_id = &audio_data[data_start..data_start + 4];
-        let chunk_size = u32::from_le_bytes([
-            audio_data[data_start + 4],
-            audio_data[data_start + 5],
-            audio_data[data_start + 6],
-            audio_data[data_start + 7],
-        ]) as usize;
-
-        if chunk_id == b"data" {
-            data_start += 8; // Skip "data" + size
-            break;
-        }
-        data_start += 8 + chunk_size;
-    }
-
-    let pcm_data = &audio_data[data_start..];
-
+    let samples = crate::audio::resample_to_16k(&samples, sample_rate);
+    let pcm: Vec<i16> = samples
+        .iter()
+        .map(|s| (s.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16)
+        .collect();
+    let segments = split_pcm_at_quiet_points(
+        &pcm,
+        NDJSON_SEGMENT_SECONDS * NDJSON_SAMPLE_RATE as usize,
+        NDJSON_SEGMENT_SEARCH_SECONDS * NDJSON_SAMPLE_RATE as usize,
+    );
     info!(
-        "[NDJSON STT] POST {} ({} bytes PCM @ {}Hz, lang={})",
+        "[NDJSON STT] POST {} ({:.1}s @ {}Hz → {} segment(s), lang={})",
         url,
-        pcm_data.len(),
-        sample_rate,
+        pcm.len() as f64 / f64::from(NDJSON_SAMPLE_RATE),
+        NDJSON_SAMPLE_RATE,
+        segments.len(),
         language
     );
 
-    // Build NDJSON payload with base64 audio
-    // Single chunk with all audio (could be chunked for streaming in future)
-    let audio_base64 = BASE64.encode(pcm_data);
+    let mut texts: Vec<String> = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let text = transcribe_ndjson_segment(url, api_key, segment, language)
+            .await
+            .with_context(|| format!("segment {}/{}", index + 1, segments.len()))?;
+        info!(
+            "[NDJSON STT] segment {}/{}: {:.1}s → {} chars",
+            index + 1,
+            segments.len(),
+            segment.len() as f64 / f64::from(NDJSON_SAMPLE_RATE),
+            text.chars().count()
+        );
+        let text = text.trim();
+        if !text.is_empty() {
+            texts.push(text.to_string());
+        }
+    }
+    let final_text = texts.join(" ");
 
-    let chunk_json = serde_json::json!({
-        "type": "chunk",
-        "audio_base64": audio_base64,
-        "sample_rate": sample_rate,
-        "encoding": "pcm16",
-        "language": language,
-        "request_vocabulary": crate::stt::request_vocabulary::CODESCRIBE_STT_VOCABULARY,
-        "last": true
-    });
-
-    let end_json = serde_json::json!({"type": "end"});
-
-    let ndjson_body = format!("{}\n{}\n", chunk_json, end_json);
-
-    debug!(
-        "[NDJSON STT] Sending {} bytes NDJSON ({} bytes base64)",
-        ndjson_body.len(),
-        audio_base64.len()
+    let duration_ms = start.elapsed().as_millis();
+    info!(
+        "[NDJSON STT] Complete in {}ms: {} chars over {} segment(s)",
+        duration_ms,
+        final_text.len(),
+        segments.len()
     );
 
-    let response = get_client()
+    if final_text.is_empty() {
+        anyhow::bail!("No transcription received from NDJSON STT");
+    }
+
+    Ok(CloudTranscriptionVerdict::new(
+        final_text,
+        Some(duration_ms.min(u128::from(u64::MAX)) as u64),
+        None,
+    ))
+}
+
+/// Cut PCM into slices of at most `segment_len` samples. Each cut is moved
+/// back, within `search_len` samples of the boundary, to the start of the
+/// quietest [`NDJSON_QUIET_FRAME_SAMPLES`] frame. Slices concatenate back to
+/// the input exactly.
+fn split_pcm_at_quiet_points(pcm: &[i16], segment_len: usize, search_len: usize) -> Vec<&[i16]> {
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pcm.len() - pos > segment_len {
+        let boundary = pos + segment_len;
+        let window_start = boundary.saturating_sub(search_len).max(pos + 1);
+        let mut cut = boundary;
+        let mut quietest = u64::MAX;
+        let mut frame_start = window_start;
+        while frame_start + NDJSON_QUIET_FRAME_SAMPLES <= boundary {
+            let energy: u64 = pcm[frame_start..frame_start + NDJSON_QUIET_FRAME_SAMPLES]
+                .iter()
+                .map(|s| u64::from(s.unsigned_abs()))
+                .sum();
+            if energy < quietest {
+                quietest = energy;
+                cut = frame_start;
+            }
+            frame_start += NDJSON_QUIET_FRAME_SAMPLES;
+        }
+        segments.push(&pcm[pos..cut]);
+        pos = cut;
+    }
+    segments.push(&pcm[pos..]);
+    segments
+}
+
+/// One `stt-jsonl-v1` request for one PCM16@16k segment.
+async fn transcribe_ndjson_segment(
+    url: &str,
+    api_key: &str,
+    pcm: &[i16],
+    language: &str,
+) -> Result<String> {
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+    let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let mut body = String::with_capacity(bytes.len() * 4 / 3 + 1024);
+    body.push_str(
+        &serde_json::json!({
+            "type": "set",
+            "language": language,
+            "sample_rate": NDJSON_SAMPLE_RATE,
+            "encoding": "pcm16",
+            "vad": false
+        })
+        .to_string(),
+    );
+    body.push('\n');
+    for chunk in bytes.chunks(NDJSON_CHUNK_BYTES) {
+        body.push_str(
+            &serde_json::json!({"type": "chunk", "audio_base64": BASE64.encode(chunk)}).to_string(),
+        );
+        body.push('\n');
+    }
+    body.push_str(&serde_json::json!({"type": "end"}).to_string());
+    body.push('\n');
+    debug!(
+        "[NDJSON STT] Sending {} bytes NDJSON ({} bytes PCM)",
+        body.len(),
+        bytes.len()
+    );
+
+    let request = get_client()
         .post(url)
-        .header("x-api-key", api_key)
-        .header("Content-Type", "application/x-ndjson")
-        .body(ndjson_body)
+        .header("Content-Type", "application/x-ndjson");
+    let request = match crate::stt::tail_provider::stt_auth_mode(url) {
+        crate::stt::tail_provider::SttAuthMode::Unauthenticated => request,
+        crate::stt::tail_provider::SttAuthMode::Bearer => request.bearer_auth(api_key),
+        crate::stt::tail_provider::SttAuthMode::ApiKey => request.header("x-api-key", api_key),
+    };
+    let response = request
+        .body(body)
         .send()
         .await
         .context("Failed to send NDJSON STT request")?;
@@ -428,10 +504,10 @@ async fn transcribe_ndjson(
     // Stream and parse NDJSON
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
-    let mut final_text = String::new();
+    let mut final_text: Option<String> = None;
     let mut partial_count = 0u32;
 
-    while let Some(chunk) = stream.next().await {
+    'lines: while let Some(chunk) = stream.next().await {
         let bytes = chunk.context("Failed to read NDJSON chunk")?;
         buffer.extend_from_slice(&bytes);
 
@@ -450,7 +526,7 @@ async fn transcribe_ndjson(
                 let data = line_str.strip_prefix("data:").unwrap().trim();
                 if data == "[DONE]" {
                     debug!("[NDJSON STT] Received [DONE] marker");
-                    break;
+                    break 'lines;
                 }
                 data
             } else if line_str.starts_with("event:") {
@@ -462,19 +538,27 @@ async fn transcribe_ndjson(
             };
 
             if let Ok(chunk) = serde_json::from_str::<NdjsonChunk>(json_str) {
-                if let Some(err) = chunk.error {
+                if chunk.kind.as_deref() == Some("error") || chunk.error.is_some() {
+                    let err = chunk
+                        .error
+                        .or(chunk.message)
+                        .unwrap_or_else(|| "unspecified".to_string());
                     error!("[NDJSON STT] Error in stream: {}", err);
                     anyhow::bail!("NDJSON STT error: {}", err);
                 }
-
+                if chunk.kind.as_deref() == Some("stream.closed") {
+                    break 'lines;
+                }
                 if let Some(text) = chunk.text {
-                    if chunk.is_final.unwrap_or(false) {
-                        final_text = text;
+                    if chunk.kind.as_deref() == Some("transcript.final")
+                        || chunk.is_final.unwrap_or(false)
+                    {
                         info!(
                             "[NDJSON STT] Final: {} chars after {} partials",
-                            final_text.len(),
+                            text.len(),
                             partial_count
                         );
+                        final_text = Some(text);
                     } else {
                         partial_count += 1;
                         debug!(
@@ -488,22 +572,7 @@ async fn transcribe_ndjson(
         }
     }
 
-    let duration_ms = start.elapsed().as_millis();
-    info!(
-        "[NDJSON STT] Complete in {}ms: {} chars",
-        duration_ms,
-        final_text.len()
-    );
-
-    if final_text.is_empty() {
-        anyhow::bail!("No transcription received from NDJSON STT");
-    }
-
-    Ok(CloudTranscriptionVerdict::new(
-        final_text,
-        Some(duration_ms.min(u128::from(u64::MAX)) as u64),
-        None,
-    ))
+    final_text.ok_or_else(|| anyhow::anyhow!("No transcript.final received from NDJSON STT"))
 }
 
 // ============================================================================
@@ -683,6 +752,62 @@ async fn transcribe_multipart_request(url: &str, api_key: &str, form: Form) -> R
 /// Unit tests for audio preflight, retry classification, serde.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_pcm_is_one_segment() {
+        let pcm = vec![1000i16; 16_000 * 30];
+        let segments = split_pcm_at_quiet_points(&pcm, 600 * 16_000, 5 * 16_000);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].len(), pcm.len());
+    }
+
+    #[test]
+    fn long_pcm_cuts_inside_the_quiet_gap_before_the_boundary() {
+        // 25 minutes of "speech" with a 400 ms hole at 9:58 and one at 19:57.
+        let rate = 16_000usize;
+        let mut pcm = vec![8000i16; 25 * 60 * rate];
+        let holes = [
+            (598 * rate, 598 * rate + 6_400),
+            (1_197 * rate, 1_197 * rate + 6_400),
+        ];
+        for (from, to) in holes {
+            pcm[from..to].fill(0);
+        }
+        let segments = split_pcm_at_quiet_points(&pcm, 600 * rate, 5 * rate);
+        assert_eq!(segments.len(), 3, "25 min at 10-min segments");
+        let first_cut = segments[0].len();
+        let second_cut = first_cut + segments[1].len();
+        assert!(
+            (holes[0].0..holes[0].1).contains(&first_cut),
+            "first cut {first_cut} not inside the 9:58 hole"
+        );
+        assert!(
+            (holes[1].0..holes[1].1).contains(&second_cut),
+            "second cut {second_cut} not inside the 19:57 hole"
+        );
+        for segment in &segments {
+            assert!(segment.len() <= 600 * rate);
+            assert!(!segment.is_empty());
+        }
+        let rebuilt: Vec<i16> = segments.concat();
+        assert_eq!(rebuilt, pcm, "segments must concatenate back to the input");
+    }
+
+    #[test]
+    fn ndjson_lines_parse_both_wire_shapes() {
+        let modern: NdjsonChunk =
+            serde_json::from_str(r#"{"type": "transcript.final", "text": "Dziękuję.", "duration_ms": null, "response_id": "r1"}"#)
+                .unwrap();
+        assert_eq!(modern.kind.as_deref(), Some("transcript.final"));
+        assert_eq!(modern.text.as_deref(), Some("Dziękuję."));
+        let legacy: NdjsonChunk =
+            serde_json::from_str(r#"{"text": "x", "is_final": true}"#).unwrap();
+        assert_eq!(legacy.is_final, Some(true));
+        let err: NdjsonChunk =
+            serde_json::from_str(r#"{"type": "error", "message": "boom"}"#).unwrap();
+        assert_eq!(err.kind.as_deref(), Some("error"));
+        assert_eq!(err.message.as_deref(), Some("boom"));
+    }
+
     use super::*;
 
     #[test]
