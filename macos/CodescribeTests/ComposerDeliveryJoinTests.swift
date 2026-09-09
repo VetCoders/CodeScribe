@@ -1,6 +1,5 @@
 import Foundation
 import XCTest
-import os
 
 @testable import Codescribe
 
@@ -84,39 +83,47 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     func generateThreadId() -> String { "t_generated" }
   }
 
-  /// Reply state a turn can be suspended on, so a test can hold one thread's
-  /// turn "in flight" while asserting what happens to a *different* thread's
-  /// unsent composer. The lock is what makes it safe off the main actor:
-  /// `streamReply` is a nonisolated protocol requirement.
-  private final class HeldReplyState: Sendable {
-    private struct Storage {
-      var continuations: [CheckedContinuation<String, Error>] = []
-      var startedTexts: [String] = []
-    }
+  /// Readiness is published only after the continuation is registered. Tests
+  /// await that handshake; cancellation resumes every outstanding continuation.
+  @MainActor
+  private final class HeldReplyState {
+    var startedTexts: [String] = []
+    var onStart: ((String) -> Void)?
+    private var pending: [(UUID, CheckedContinuation<String, Error>)] = []
+    private var cancelled: Set<UUID> = []
+    private var isClosed = false
 
-    private let storage = OSAllocatedUnfairLock(initialState: Storage())
-
-    var startedTexts: [String] { storage.withLock { $0.startedTexts } }
-
-    func recordStart(_ text: String) {
-      storage.withLock { $0.startedTexts.append(text) }
-    }
-
-    func suspend(_ continuation: CheckedContinuation<String, Error>) {
-      storage.withLock { $0.continuations.append(continuation) }
+    func register(_ id: UUID, text: String, continuation: CheckedContinuation<String, Error>) {
+      guard !isClosed, !cancelled.contains(id), !Task.isCancelled else {
+        continuation.resume(throwing: CancellationError())
+        return
+      }
+      pending.append((id, continuation))
+      startedTexts.append(text)
+      onStart?(text)
     }
 
     func finishNext(_ reply: String) {
-      let continuation = storage.withLock {
-        $0.continuations.isEmpty ? nil : $0.continuations.removeFirst()
-      }
-      continuation?.resume(returning: reply)
+      guard !pending.isEmpty else { return }
+      pending.removeFirst().1.resume(returning: reply)
+    }
+
+    func cancel(_ id: UUID) {
+      cancelled.insert(id)
+      guard let index = pending.firstIndex(where: { $0.0 == id }) else { return }
+      pending.remove(at: index).1.resume(throwing: CancellationError())
+    }
+
+    func cancelAll() {
+      isClosed = true
+      let held = pending
+      pending.removeAll()
+      for (_, continuation) in held { continuation.resume(throwing: CancellationError()) }
     }
   }
 
   private final class HeldReplyEngine: AgentChatEngine {
     let state = HeldReplyState()
-
     func isAvailable() -> Bool { true }
     func availabilityDetail() -> String? { nil }
     func generateThreadTitle(_ text: String) async throws -> String? { nil }
@@ -130,43 +137,36 @@ final class ComposerDeliveryJoinTests: XCTestCase {
       onToolExecuting: @escaping @MainActor (String, String) -> Void,
       onToolResult: @escaping @MainActor (String, String, Bool, String) -> Void
     ) async throws -> String {
-      state.recordStart(text)
-      return try await withCheckedThrowingContinuation { state.suspend($0) }
+      let id = UUID()
+      let reply = try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          state.register(id, text: text, continuation: continuation)
+        }
+      } onCancel: { [state] in
+        Task { @MainActor in state.cancel(id) }
+      }
+      onDelta(reply)
+      return reply
     }
 
-    func cancelReply(threadId: String) -> Bool { true }
+    func cancelReply(threadId: String) -> Bool {
+      state.cancelAll()
+      return true
+    }
   }
 
   // MARK: Isolation
 
-  /// The accepted-turn queue and the attachment sidecar both live in shared
-  /// defaults, so a suite that sends must leave them exactly as it found them or
-  /// the next store's restart replay inherits this suite's queue and chips.
-  private static let sharedDefaultsKeys = [
-    AgentChatStore.acceptedTurnsDefaultsKey,
-    AgentChatStore.attachmentMetadataDefaultsKey,
-  ]
-
-  override func setUp() {
-    super.setUp()
-    Self.sharedDefaultsKeys.forEach(UserDefaults.standard.removeObject(forKey:))
+  private func isolatedDefaults() -> UserDefaults {
+    let name = "Codescribe.ComposerDeliveryJoinTests." + UUID().uuidString
+    let defaults = UserDefaults(suiteName: name)!
+    addTeardownBlock { UserDefaults(suiteName: name)?.removePersistentDomain(forName: name) }
+    return defaults
   }
 
-  override func tearDown() {
-    Self.sharedDefaultsKeys.forEach(UserDefaults.standard.removeObject(forKey:))
-    super.tearDown()
-  }
-
-  private func waitUntil(
-    timeout: TimeInterval = 2,
-    _ message: String = "condition not met in time",
-    _ condition: () -> Bool
-  ) async {
-    let deadline = Date().addingTimeInterval(timeout)
-    while !condition(), Date() < deadline {
-      try? await Task.sleep(nanoseconds: 10_000_000)
-    }
-    XCTAssertTrue(condition(), message)
+  private func admitCapture(_ store: AgentChatStore, threadID: UUID, id: String = "join-session") {
+    let request = store.beginComposerCaptureRequest(threadID: threadID)
+    store.completeComposerCaptureStart(request, live: true, handle: CsCaptureHandle(captureId: id))
   }
 
   private struct Fixture: Sendable {
@@ -178,7 +178,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   }
 
   private func makeFixture(recording: [Bool]) -> Fixture {
-    let store = AgentChatStore(threadsProvider: StubThreadsProvider())
+    let store = AgentChatStore(threadsProvider: StubThreadsProvider(), persistenceDefaults: isolatedDefaults())
     let surface = FakeCaptureSurface(recording: recording)
     let dictation = RealComposerDictation(store: store, hotkeys: surface)
     store.dictation = dictation
@@ -359,21 +359,168 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// the capture the user has since started. Sessions are keyed by id, so the
   /// late event lands on its own (retired) session and nothing else.
   func testDelayedPriorSessionTerminalDoesNotReleaseTheCurrentCapture() {
+    let f = makeFixture(recording: [false, true])
     let state = OverlayState()
+    state.connectComposer(to: f.store)
     var stopped = 0
     state.onRecordingStopped = { stopped += 1 }
-
+    admitCapture(f.store, threadID: f.threadA, id: "session-1")
     listening("first take", to: state, sessionId: "session-1")
-    sessionEnded("first take", to: state, sessionId: "session-1", delivery: .retained)
+    sessionEnded("first take", to: state, sessionId: "session-1")
     let afterFirst = stopped
 
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    admitCapture(f.store, threadID: f.threadB, id: "session-2")
+    f.store.dictationBlocked = true
     listening("second take", to: state, sessionId: "session-2")
-    // The late duplicate for the retired session arrives after the new one began.
-    sessionEnded("first take", to: state, sessionId: "session-1", delivery: .retained)
+    sessionEnded("first take", to: state, sessionId: "session-1")
 
-    XCTAssertEqual(
-      stopped, afterFirst + 1,
-      "the late prior-session terminal ends its own session, not the live one")
+    XCTAssertEqual(stopped, afterFirst, "retired A cannot stop B")
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "session-2")
+    XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+    XCTAssertEqual(f.store.dictationPhase, .recording)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertTrue(f.store.dictationBlocked)
+    XCTAssertEqual(f.store.draft, "B typed")
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "session-2")
+    XCTAssertFalse(state.terminal)
+    XCTAssertEqual(state.activeText, "second take")
+  }
+
+  func testUnseenOldTerminalCannotUseNewCapturePermissionBeforeItsFirstProjection() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadB, id: "B")
+    f.store.select(f.threadB)
+    f.store.draft = "B draft"
+    var stopped = 0
+    state.onRecordingStopped = { stopped += 1 }
+    sessionEnded("unseen A", to: state, sessionId: "A")
+    sessionEnded("unseen A", to: state, sessionId: "A")
+    XCTAssertEqual(stopped, 0)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "B")
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.draft, "B draft")
+    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["unseen A"])
+  }
+
+  func testTerminalBeforeStartReplyRetainsTextAndCannotResurrectStopPermission() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    let request = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    sessionEnded("early text", to: state, sessionId: "early")
+    f.store.completeComposerCaptureStart(request, live: true,
+      handle: CsCaptureHandle(captureId: "early"))
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["early text"])
+  }
+
+  func testRecoveryRetriesAndIdenticalDistinctTakesKeepExactDocumentsUntilExplicitAction() throws {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    let text = "  Zażółć\nrepeat repeat\t🙂  "
+    sessionEnded(text, to: state, sessionId: "A")
+    sessionEnded(text, to: state, sessionId: "A")
+    sessionEnded(text, to: state, sessionId: "B")
+    sessionEnded(text, to: state, sessionId: "A")
+    XCTAssertEqual(f.store.composerRecoveryDocuments.count, 2)
+    for document in f.store.composerRecoveryDocuments {
+      XCTAssertEqual(Array(document.text.utf8), Array(text.utf8))
+    }
+    let first = try XCTUnwrap(f.store.composerRecoveryDocuments.first)
+    let second = try XCTUnwrap(f.store.composerRecoveryDocuments.last)
+    f.store.select(f.threadB)
+    f.store.draft = "typed B"
+    XCTAssertFalse(f.store.insertComposerRecovery(first.id, into: f.threadA))
+    XCTAssertFalse(f.store.copyComposerRecovery(first.id) { _ in false })
+    XCTAssertEqual(f.store.composerRecoveryDocuments.count, 2)
+    XCTAssertTrue(f.store.insertComposerRecovery(first.id, into: f.threadB))
+    XCTAssertEqual(f.store.draft, "typed B\n" + text)
+    XCTAssertFalse(f.store.insertComposerRecovery(first.id, into: f.threadB))
+    var copied = ""
+    XCTAssertTrue(f.store.copyComposerRecovery(second.id) { copied = $0; return true })
+    XCTAssertEqual(Array(copied.utf8), Array(text.utf8))
+    sessionEnded(text, to: state, sessionId: "A")
+    sessionEnded(text, to: state, sessionId: "B")
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty, "consumed documents do not resurrect")
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
+    XCTAssertTrue(f.store.threads.allSatisfy { $0.messages.isEmpty })
+  }
+
+  func testDeletedOwnerRecoveryCanBeDismissedWithoutSendingOrChangingSelection() throws {
+    let f = makeFixture(recording: [false, true])
+    admitCapture(f.store, threadID: f.threadA, id: "deleted")
+    f.store.select(f.threadB)
+    f.store.delete(try XCTUnwrap(f.store.threads.first { $0.id == f.threadA }))
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    sessionEnded("deleted owner words", to: state, sessionId: "deleted")
+    let document = try XCTUnwrap(f.store.composerRecoveryDocuments.first)
+    XCTAssertFalse(f.store.insertComposerRecovery(document.id, into: f.threadA))
+    XCTAssertEqual(f.store.composerRecoveryDocuments.first?.text, "deleted owner words")
+    f.store.dismissComposerRecovery(document.id)
+    sessionEnded("deleted owner words", to: state, sessionId: "deleted")
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
+    XCTAssertEqual(f.store.draft, "")
+    XCTAssertTrue(f.store.threads.allSatisfy { $0.messages.isEmpty })
+  }
+
+  func testFreshMatchingTerminalThroughRealWiringDeliversOnceAndReleasesHandle() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "fresh")
+    sessionEnded("  fresh bytes  ", to: state, sessionId: "fresh")
+    sessionEnded("  fresh bytes  ", to: state, sessionId: "fresh")
+    XCTAssertEqual(f.store.draft, "  fresh bytes  ")
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
+  }
+
+  func testRealAdapterRegistersHandleBeforePostStartQueryCanDeliverTerminal() async {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    f.surface.onQuery = { [self] in
+      if f.store.composerCaptureHandle?.captureId == "capture-A" {
+        sessionEnded("during query", to: state, sessionId: "capture-A")
+      }
+    }
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.onQuery = nil
+    XCTAssertEqual(f.store.draft, "during query")
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
+  }
+
+  func testWiredRevisionDeliversBeforeMatchingCaptureReleaseAndOnlyOnce() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA)
+    listening("raw", to: state)
+    terminalRevision("revised", to: state)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.draft, "")
+    var draftAtStop: String?
+    state.onRecordingStopped = { draftAtStop = f.store.draft }
+    sessionEnded("revised", to: state)
+    sessionEnded("revised", to: state)
+    XCTAssertEqual(draftAtStop, "revised")
+    XCTAssertEqual(f.store.draft, "revised")
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertFalse(f.store.dictationBlocked)
   }
 
   // MARK: Acceptance 3 — recovery without a blind timer
@@ -430,7 +577,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testTerminalRevisionBeforeSessionEndedStillDeliversExactlyOnce() {
     let state = OverlayState()
     var admitted: [String] = []
-    state.onComposerTranscript = { text in
+    state.onComposerTranscript = { text, _ in
       admitted.append(text)
       return .admitted(threadID: UUID())
     }
@@ -448,7 +595,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testNoOpFormatterRevisionStillLeavesTheDeliveryToTheLifecycleLine() {
     let state = OverlayState()
     var admitted: [String] = []
-    state.onComposerTranscript = { text in
+    state.onComposerTranscript = { text, _ in
       admitted.append(text)
       return .admitted(threadID: UUID())
     }
@@ -465,7 +612,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testRefusedSealStillDeliversItsCommittedWords() {
     let state = OverlayState()
     var admitted: [String] = []
-    state.onComposerTranscript = { text in
+    state.onComposerTranscript = { text, _ in
       admitted.append(text)
       return .admitted(threadID: UUID())
     }
@@ -481,7 +628,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testEmptyCaptureMakesNoDeliveryClaimAtAll() {
     let state = OverlayState()
     var calls = 0
-    state.onComposerTranscript = { _ in
+    state.onComposerTranscript = { _, _ in
       calls += 1
       return .empty
     }
@@ -511,7 +658,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testReceiverRejectionKeepsTheDeliveryRecoverableAndRetryable() {
     let state = OverlayState()
     var offers = 0
-    state.onComposerTranscript = { text in
+    state.onComposerTranscript = { text, _ in
       offers += 1
       return .retained(text)
     }
@@ -530,7 +677,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     let state = OverlayState()
     var sentToAgent: [String] = []
     state.onSendToAgent = { sentToAgent.append($0) }
-    state.onComposerTranscript = { text in .retained(text) }
+    state.onComposerTranscript = { text, _ in .retained(text) }
 
     listening("refused words", to: state)
     sessionEnded("refused words", to: state)
@@ -545,7 +692,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testATakeWithoutAComposerDispositionIsNeverOfferedToTheComposer() {
     let state = OverlayState()
     var offers = 0
-    state.onComposerTranscript = { _ in
+    state.onComposerTranscript = { _, _ in
       offers += 1
       return .admitted(threadID: UUID())
     }
@@ -563,13 +710,13 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// A rather than being appended to whatever is on screen.
   func testResultTargetsTheCapturingThreadWithoutStealingTheCurrentSelection() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.select(f.threadB)
     f.store.draft = "typed in B"
     f.store.pendingAttachments = [PendingAttachment(url: URL(fileURLWithPath: "/tmp/b.png"))]
     let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
 
-    let receipt = f.store.receiveDictationTranscript("words from A")
+    let receipt = f.store.receiveDictationTranscript("words from A", captureID: "join-session")
 
     XCTAssertEqual(receipt, .parked(threadID: f.threadA))
     XCTAssertEqual(f.store.selectedThreadID, f.threadB, "delivery never moves the rail")
@@ -591,10 +738,10 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// draft and join an existing one instead of gluing onto its last word.
   func testDeliveryToTheSelectedOwnerAppendsToTheLiveDraft() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.draft = "already here"
 
-    let receipt = f.store.receiveDictationTranscript("spoken words")
+    let receipt = f.store.receiveDictationTranscript("spoken words", captureID: "join-session")
 
     XCTAssertEqual(receipt, .admitted(threadID: f.threadA))
     XCTAssertEqual(f.store.draft, "already here\nspoken words")
@@ -606,11 +753,11 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testDeletedCapturingThreadYieldsExplicitRetainedRecovery() {
     let f = makeFixture(recording: [false, true])
     let threadA = f.store.threads.first { $0.id == f.threadA }!
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.select(f.threadB)
     f.store.delete(threadA)
 
-    let receipt = f.store.receiveDictationTranscript("words with nowhere to go")
+    let receipt = f.store.receiveDictationTranscript("words with nowhere to go", captureID: "join-session")
 
     XCTAssertEqual(receipt, .retained("words with nowhere to go"))
     XCTAssertEqual(f.store.retainedComposerDelivery, "words with nowhere to go")
@@ -621,9 +768,9 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// recovery rather than removed with the thread.
   func testDeletingAThreadSurfacesItsParkedDeliveryForRecovery() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.select(f.threadB)
-    XCTAssertEqual(f.store.receiveDictationTranscript("parked words"), .parked(threadID: f.threadA))
+    XCTAssertEqual(f.store.receiveDictationTranscript("parked words", captureID: "join-session"), .parked(threadID: f.threadA))
 
     f.store.delete(f.store.threads.first { $0.id == f.threadA }!)
 
@@ -636,7 +783,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     f.store.select(f.threadB)
     f.store.draft = "typed in B"
 
-    let receipt = f.store.receiveDictationTranscript("ownerless words")
+    let receipt = f.store.receiveDictationTranscript("ownerless words", captureID: "join-session")
 
     XCTAssertEqual(receipt, .retained("ownerless words"))
     XCTAssertEqual(f.store.draft, "typed in B")
@@ -648,11 +795,9 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// submits them, and the overlay's own deadline is told to stop trying.
   func testAdmittedDeliveryCancelsTheOverlayAutoSendInsteadOfSubmitting() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     let state = OverlayState()
-    state.onComposerTranscript = { [store = f.store] text in
-      store.receiveDictationTranscript(text)
-    }
+    state.connectComposer(to: f.store)
 
     listening("draft words", to: state)
     sessionEnded("draft words", to: state)
@@ -670,14 +815,14 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   func testEveryThreadKeepsItsOwnComposerAcrossAFullRoundTrip() {
     let f = makeFixture(recording: [false, true])
     f.store.draft = "half a thought in A"
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
 
     f.store.select(f.threadB)
     f.store.draft = "half a thought in B"
     f.store.addAttachments([URL(fileURLWithPath: "/tmp/round-trip-b.png")])
     let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
 
-    XCTAssertEqual(f.store.receiveDictationTranscript("spoken for A"), .parked(threadID: f.threadA))
+    XCTAssertEqual(f.store.receiveDictationTranscript("spoken for A", captureID: "join-session"), .parked(threadID: f.threadA))
 
     f.store.select(f.threadA)
     XCTAssertEqual(
@@ -699,11 +844,12 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// document exactly once, and selecting A again does not repeat them.
   func testRepeatedSelectionSurfacesEachDeliveredDocumentExactlyOnce() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.select(f.threadB)
 
-    XCTAssertEqual(f.store.receiveDictationTranscript("first take"), .parked(threadID: f.threadA))
-    XCTAssertEqual(f.store.receiveDictationTranscript("second take"), .parked(threadID: f.threadA))
+    XCTAssertEqual(f.store.receiveDictationTranscript("first take", captureID: "join-session"), .parked(threadID: f.threadA))
+    admitCapture(f.store, threadID: f.threadA, id: "second-session")
+    XCTAssertEqual(f.store.receiveDictationTranscript("second take", captureID: "second-session"), .parked(threadID: f.threadA))
 
     f.store.select(f.threadA)
     XCTAssertEqual(f.store.draft, "first take\nsecond take")
@@ -721,14 +867,14 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// see: not the selection, not the composer, not the caret.
   func testADeliveryForAnUnselectedThreadChangesNothingOnScreen() {
     let f = makeFixture(recording: [false, true])
-    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    admitCapture(f.store, threadID: f.threadA)
     f.store.select(f.threadB)
     f.store.draft = "mid-sentence in B"
     f.store.addAttachments([URL(fileURLWithPath: "/tmp/untouched-b.png")])
     let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
     let focusBefore = f.store.composerFocusRequest
 
-    XCTAssertEqual(f.store.receiveDictationTranscript("for A only"), .parked(threadID: f.threadA))
+    XCTAssertEqual(f.store.receiveDictationTranscript("for A only", captureID: "join-session"), .parked(threadID: f.threadA))
 
     XCTAssertEqual(f.store.selectedThreadID, f.threadB)
     XCTAssertEqual(f.store.draft, "mid-sentence in B")
@@ -846,7 +992,15 @@ final class ComposerDeliveryJoinTests: XCTestCase {
   /// touches no part of B's unsent composition at any point in that lifecycle.
   func testAQueuedAndStreamingTurnNeverEmptiesAnotherThreadsComposer() async {
     let engine = HeldReplyEngine()
-    let store = AgentChatStore(engine: engine, threadsProvider: StubThreadsProvider())
+    defer { engine.state.cancelAll() }
+    let firstStarted = expectation(description: "first continuation registered")
+    let secondStarted = expectation(description: "second continuation registered")
+    engine.state.onStart = { text in
+      if text == "first ask" { firstStarted.fulfill() }
+      if text == "second ask" { secondStarted.fulfill() }
+    }
+    let store = AgentChatStore(engine: engine, threadsProvider: StubThreadsProvider(),
+      persistenceDefaults: isolatedDefaults())
     let threadA = store.threads.first { $0.backendId == "t_a" }!.id
     let threadB = store.threads.first { $0.backendId == "t_b" }!.id
 
@@ -858,22 +1012,74 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     store.select(threadA)
     store.draft = "first ask"
     store.send()
-    await waitUntil("A's first turn should start") { engine.state.startedTexts.count == 1 }
+    await fulfillment(of: [firstStarted], timeout: 2)
+    guard engine.state.startedTexts.count == 1 else { return }
 
     store.draft = "second ask"
     store.send()
     XCTAssertEqual(store.queuedTurns.map(\.text), ["second ask"], "the second ask is queued")
 
     engine.state.finishNext("first reply")
-    await waitUntil("the queued turn should start") { engine.state.startedTexts.count == 2 }
+    await fulfillment(of: [secondStarted], timeout: 2)
+    guard engine.state.startedTexts.count == 2 else { return }
     engine.state.finishNext("second reply")
-    await waitUntil("the queue should drain") {
-      store.queuedTurns.isEmpty && store.activeComposerTurn == nil
-    }
+    await store.waitForComposerTurns(in: threadA)
+    XCTAssertTrue(store.queuedTurns.isEmpty)
+    XCTAssertNil(store.activeComposerTurn)
+    XCTAssertEqual(engine.state.startedTexts, ["first ask", "second ask"])
+    let replies = store.threads.first { $0.id == threadA }?.messages.filter { $0.role == .assistant }
+    XCTAssertEqual(replies?.map(\.text), ["first reply", "second reply"])
 
     store.select(threadB)
     XCTAssertEqual(store.draft, "waiting in B", "B's sentence outlived A's whole turn lifecycle")
     XCTAssertEqual(store.pendingAttachments.map(\.id), bAttachmentIDs)
+  }
+
+  func testIndependentStorePersistenceCannotCorruptSentinelPendingWork() async throws {
+    let sentinelDefaults = isolatedDefaults()
+    let otherDefaults = isolatedDefaults()
+    let engine = HeldReplyEngine()
+    defer { engine.state.cancelAll() }
+    let started = expectation(description: "sentinel continuation registered")
+    engine.state.onStart = { _ in started.fulfill() }
+    let sentinel = AgentChatStore(engine: engine, threadsProvider: StubThreadsProvider(),
+      persistenceDefaults: sentinelDefaults)
+    let sentinelThread = try XCTUnwrap(sentinel.selectedThreadID)
+    sentinel.draft = "sentinel pending work"
+    sentinel.addAttachments([URL(fileURLWithPath: "/tmp/sentinel.png")])
+    sentinel.send()
+    await fulfillment(of: [started], timeout: 2)
+    guard engine.state.startedTexts.count == 1 else { return }
+    let accepted = try XCTUnwrap(sentinelDefaults.data(forKey: AgentChatStore.acceptedTurnsDefaultsKey))
+    let attachments = try XCTUnwrap(sentinelDefaults.data(forKey: AgentChatStore.attachmentMetadataDefaultsKey))
+
+    let other = AgentChatStore(threadsProvider: StubThreadsProvider(), persistenceDefaults: otherDefaults)
+    let otherThread = try XCTUnwrap(other.selectedThreadID)
+    other.draft = "independent send"
+    other.addAttachments([URL(fileURLWithPath: "/tmp/other.png")])
+    other.send()
+    await other.waitForComposerTurns(in: otherThread)
+    XCTAssertEqual(sentinelDefaults.data(forKey: AgentChatStore.acceptedTurnsDefaultsKey), accepted)
+    XCTAssertEqual(sentinelDefaults.data(forKey: AgentChatStore.attachmentMetadataDefaultsKey), attachments)
+    engine.state.finishNext("sentinel reply")
+    await sentinel.waitForComposerTurns(in: sentinelThread)
+  }
+
+  func testHeldEngineCancellationReleasesRegisteredContinuation() async {
+    let engine = HeldReplyEngine()
+    let started = expectation(description: "continuation ready for cancellation")
+    engine.state.onStart = { _ in started.fulfill() }
+    let store = AgentChatStore(engine: engine, threadsProvider: StubThreadsProvider(),
+      persistenceDefaults: isolatedDefaults())
+    guard let thread = store.selectedThreadID else { return XCTFail("missing thread") }
+    defer { engine.state.cancelAll() }
+    store.draft = "cancel me"
+    store.send()
+    await fulfillment(of: [started], timeout: 2)
+    engine.state.cancelAll()
+    await store.waitForComposerTurns(in: thread)
+    XCTAssertNil(store.activeComposerTurn)
+    XCTAssertTrue(store.queuedTurns.isEmpty)
   }
 
   // MARK: Deletion recovers words instead of migrating them

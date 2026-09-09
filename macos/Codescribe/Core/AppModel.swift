@@ -121,14 +121,16 @@ final class OverlayController: ObservableObject {
     // true is a mic that can die permanently. Non-assistive sessions therefore
     // push the composer back to `.idle` (it renders as `.blocked` off
     // `dictationBlocked`, which is the honest "busy elsewhere" state), and every
-    // terminal beat resets unconditionally.
+    // identity-less lifecycle paint cannot revoke an admitted composer request.
     state.onRecordingPreparing = { [weak self] in
       guard let self else { return }
       self.automaticContentSizingEnabled = true
       self.sessionWasAssistive = false
       self.refreshAssistiveLatch()
       self.showForRecording()
-      AppModel.shared.chat.setDictationPhase(self.sessionWasAssistive ? .preparing : .idle)
+      if !AppModel.shared.chat.hasComposerCaptureRequest {
+        AppModel.shared.chat.setDictationPhase(self.sessionWasAssistive ? .preparing : .idle)
+      }
       AppModel.shared.tray.isStartingDictation = true
       // Block the composer mic while the shared recorder owns the microphone.
       AppModel.shared.chat.dictationBlocked = true
@@ -140,27 +142,25 @@ final class OverlayController: ObservableObject {
       guard let self else { return }
       self.refreshAssistiveLatch()
       self.showForRecording()
-      AppModel.shared.chat.setDictationPhase(self.sessionWasAssistive ? .recording : .idle)
+      if !AppModel.shared.chat.hasComposerCaptureRequest {
+        AppModel.shared.chat.setDictationPhase(self.sessionWasAssistive ? .recording : .idle)
+      }
       AppModel.shared.tray.isRecording = true
       AppModel.shared.tray.isStartingDictation = false
       AppModel.shared.chat.dictationBlocked = true
     }
-    // Delivery runs BEFORE the stopped callback releases the thread latch: the
-    // receiver needs `dictationThreadID` to know which conversation this take
-    // belongs to. The receipt travels back so the overlay can tell an admitted
-    // draft from one nobody could take.
-    state.onComposerTranscript = { text in
-      AppModel.shared.chat.receiveDictationTranscript(text)
-    }
+    // Both delivery and ownership release use the producer's session identity.
+    state.connectComposer(to: AppModel.shared.chat)
     state.onRecordingStopped = { [weak self] in
       guard let self else { return }
+      // A pending/newer composer request cannot be released by identity-less
+      // lifecycle paint. Its matching projection releases it via connectComposer.
+      guard !AppModel.shared.chat.hasComposerCaptureRequest else { return }
       self.refreshAssistiveLatch()
       self.markStopped()
       AppModel.shared.tray.isRecording = false
       AppModel.shared.tray.isStartingDictation = false
-      // Unconditional: releases the composer phase, the blocked flag and the
-      // thread-ownership latch in one beat, whatever the lane turned out to be.
-      AppModel.shared.chat.endDictationSession()
+      AppModel.shared.chat.finishDictationCapture(sessionID: nil)
       Task { await VoiceLabRuntime.shared.stopOwnedProcess() }
     }
     // Admission and calibration outcomes are product feedback even when the

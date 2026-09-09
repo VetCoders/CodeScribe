@@ -123,6 +123,7 @@ final class RealComposerDictation: ComposerDictating {
       do {
         let admitted = try await hotkeys.startComposerTurnRecording()
         guard store.isCurrentComposerCaptureRequest(requestID) else { return }
+        store.completeComposerCaptureStart(requestID, live: false, handle: admitted)
         let stillLive = await hotkeys.isRecording()
         store.completeComposerCaptureStart(requestID, live: stillLive, handle: admitted)
         dictationLog.info("Agent composer take start requested on shared controller")

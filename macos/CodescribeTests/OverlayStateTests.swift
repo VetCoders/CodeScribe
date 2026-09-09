@@ -284,6 +284,38 @@ final class OverlayStateTests: XCTestCase {
 
   // W2 contracts: synthetic projections enter the production boundary; unrun
   // until the integrator restores Swift gates and regenerates the bindings.
+  func testComposerCallbackCarriesTheProjectionSessionIdentity() {
+    let state = OverlayState()
+    var identities: [String] = []
+    state.onComposerTranscript = { _, sessionID in
+      identities.append(sessionID)
+      return .admitted(threadID: UUID())
+    }
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "B", reducerAction: "session_ended")
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    XCTAssertEqual(identities, ["A", "B"])
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "B")
+  }
+
+  func testMissingReceiverRecoverySurvivesNewSessionAndDeduplicatesIdentityOnly() {
+    let state = OverlayState()
+    let text = "  identical\t🙂  "
+    for sessionID in ["A", "A", "B", "A"] {
+      projectText(text, to: state, terminal: true, delivery: .composerPending,
+        sessionId: sessionID, reducerAction: "session_ended")
+    }
+    XCTAssertEqual(state.retainedComposerDelivery, text + "\n" + text)
+    state.onComposerTranscript = { _, _ in .admitted(threadID: UUID()) }
+    projectText(text, to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    XCTAssertEqual(state.retainedComposerDelivery, text)
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "B")
+  }
+
   func testFirstObservedComposerTerminalAdmitsExactBytesOnce() throws {
     for receipt in [
       ComposerDeliveryReceipt.admitted(threadID: UUID()),
@@ -292,8 +324,8 @@ final class OverlayStateTests: XCTestCase {
       let state = OverlayState()
       let text = "  Zażółć\nrepeat repeat\t🙂  "
       var received: [String] = []
-      state.onComposerTranscript = {
-        received.append($0)
+      state.onComposerTranscript = { text, _ in
+        received.append(text)
         return receipt
       }
 
@@ -312,8 +344,8 @@ final class OverlayStateTests: XCTestCase {
   func testNewSessionFirstTerminalReplacesPriorReceiptWithoutDuplicateAdmission() throws {
     let state = OverlayState()
     var received: [String] = []
-    state.onComposerTranscript = {
-      received.append($0)
+    state.onComposerTranscript = { text, _ in
+      received.append(text)
       return .admitted(threadID: UUID())
     }
     projectText("prior R", to: state, terminal: true, delivery: .composerPending,
@@ -335,16 +367,16 @@ final class OverlayStateTests: XCTestCase {
       for hasReceiver in [false, true] {
         let state = OverlayState()
         if hasPriorSession {
-          state.onComposerTranscript = { _ in .admitted(threadID: UUID()) }
+          state.onComposerTranscript = { _, _ in .admitted(threadID: UUID()) }
           projectText("prior R", to: state, terminal: true, delivery: .composerPending,
             sessionId: "R", reducerAction: "session_ended")
         }
         var refused: [String] = []
         state.onComposerTranscript = nil
         if hasReceiver {
-          state.onComposerTranscript = {
-            refused.append($0)
-            return .retained($0)
+          state.onComposerTranscript = { text, _ in
+            refused.append(text)
+            return .retained(text)
           }
         }
         let text = "  refused S\nrepeat repeat\t🙂  "
@@ -357,8 +389,8 @@ final class OverlayStateTests: XCTestCase {
         XCTAssertEqual(refused, hasReceiver ? [text, text] : [])
 
         var admitted: [String] = []
-        state.onComposerTranscript = {
-          admitted.append($0)
+        state.onComposerTranscript = { text, _ in
+          admitted.append(text)
           return .admitted(threadID: UUID())
         }
         state.applyTranscriptProjection(terminal)
@@ -377,7 +409,7 @@ final class OverlayStateTests: XCTestCase {
       let owner = UUID()
       var captureOwner: UUID? = owner
       var order: [String] = []
-      state.onComposerTranscript = { text in
+      state.onComposerTranscript = { text, _ in
         XCTAssertEqual(captureOwner, owner)
         order.append("delivery")
         return accepts ? .admitted(threadID: owner) : .retained(text)
@@ -405,7 +437,7 @@ final class OverlayStateTests: XCTestCase {
       let owner = UUID()
       var captureOwner: UUID? = owner
       var order: [String] = []
-      state.onComposerTranscript = { text in
+      state.onComposerTranscript = { text, _ in
         XCTAssertEqual(captureOwner, owner)
         XCTAssertEqual(text, "revised S")
         order.append("delivery")
@@ -440,7 +472,7 @@ final class OverlayStateTests: XCTestCase {
       state.applyIndicatorMode(.assistive)
       state.handleRecordingStarted()
       if receiverKind != "missing" {
-        state.onComposerTranscript = { text in
+        state.onComposerTranscript = { text, _ in
           switch receiverKind {
           case "admitted": return .admitted(threadID: UUID())
           case "parked": return .parked(threadID: UUID())
@@ -468,8 +500,8 @@ final class OverlayStateTests: XCTestCase {
     for delivery in [CsTranscriptDelivery.unattempted, .sinkAccepted, .retained, .composerPending] {
       let state = OverlayState()
       var received: [String] = []
-      state.onComposerTranscript = {
-        received.append($0)
+      state.onComposerTranscript = { text, _ in
+        received.append(text)
         return .admitted(threadID: UUID())
       }
       let initialText = delivery == .composerPending ? " \n\t " : "sink words"
