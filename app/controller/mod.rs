@@ -71,7 +71,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::audio::streaming_recorder::{CaptureTurnIntent, StreamingRecorder, TerminalSealRefused};
+use crate::audio::streaming_recorder::{
+    CaptureStopFailure, CaptureTurnIntent, StreamingRecorder, TerminalSealRefused,
+};
 use crate::config::models::ModelManager;
 use crate::config::{Config, RuntimeSettingsSnapshot, UserSettings};
 use crate::os::clipboard;
@@ -255,10 +257,9 @@ fn retainable_session_id(session_id: Option<&str>) -> Option<&str> {
 /// Canonical wav for one Bus take: `~/.codescribe/sessions/<session_id>.wav`.
 /// Bus-demux assigns this path to attached followers. `last_session.wav` is
 /// only a latest-take alias for overlay / `codescribe transcribe last`.
-fn session_audio_path(session_id: &str) -> Option<std::path::PathBuf> {
+fn session_audio_path(root: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
     valid_session_audio_id(session_id).map(|id| {
-        crate::config::Config::config_dir()
-            .join("sessions")
+        root.join("sessions")
             .join(format!("{id}.wav"))
     })
 }
@@ -270,31 +271,94 @@ fn retain_session_audio(
     path: &std::path::Path,
     transcript: codescribe_core::state::SessionTranscriptArchive<'_>,
 ) {
-    // Daily bag: wav/m4a + txt. Hold and double-tap/toggle share this folder.
-    if codescribe_core::state::archive_session_take(path, transcript).is_none() {
-        warn!(
-            "session transcription bag missed audio for {:?}",
-            session_id
-        );
+    if let Err(error) = retain_session_audio_at(
+        session_id,
+        path,
+        transcript,
+        &Config::config_dir(),
+        codescribe_core::state::archive_session_take,
+    ) {
+        warn!("{error:#}");
     }
-    if let Some(dest) = retainable_session_id(session_id).and_then(session_audio_path) {
-        if let Some(parent) = dest.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            warn!("session wav dir failed: {err:#}");
+}
+
+/// Same archive/copy path for ordinary and failed takes. Attempt every owned
+/// destination even if one fails, report failure, and never remove the source.
+/// Directory and daily-bag operation are injectable without changing HOME or
+/// invoking the history transcoder in controller tests.
+fn retain_session_audio_at(
+    session_id: Option<&str>,
+    path: &std::path::Path,
+    transcript: codescribe_core::state::SessionTranscriptArchive<'_>,
+    root: &std::path::Path,
+    archive: impl FnOnce(
+        &std::path::Path,
+        codescribe_core::state::SessionTranscriptArchive<'_>,
+    ) -> Option<std::path::PathBuf>,
+) -> Result<()> {
+    let id = retainable_session_id(session_id)
+        .ok_or_else(|| anyhow::anyhow!("audio retention refused: missing or unsafe session id"))?;
+    let mut failures = Vec::new();
+    if archive(path, transcript).is_none() {
+        failures.push("daily audio archive failed".to_string());
+    }
+    let session_path = session_audio_path(root, id)
+        .ok_or_else(|| anyhow::anyhow!("audio retention refused: unsafe session id"))?;
+    for dest in [session_path, root.join("last_session.wav")] {
+        let copied: Result<()> = (|| {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // A repeated retention of its canonical path must not truncate it.
+            if dest.exists() && std::fs::canonicalize(path)? == std::fs::canonicalize(&dest)? {
+                return Ok(());
+            }
+            std::fs::copy(path, &dest)?;
+            Ok(())
+        })();
+        match copied {
+            Ok(()) => info!("session audio retained at {}", dest.display()),
+            Err(error) => failures.push(format!("{}: {error:#}", dest.display())),
         }
-        match std::fs::copy(path, &dest) {
-            Ok(_) => info!("session wav retained at {}", dest.display()),
-            Err(err) => warn!("session wav retain failed: {err:#}"),
-        }
+    }
+    if failures.is_empty() {
+        Ok(())
     } else {
-        warn!("session wav skipped: missing or unsafe session_id");
+        Err(anyhow::anyhow!(
+            "audio retention failed (source {} preserved): {}",
+            path.display(), failures.join("; ")
+        ))
     }
-    let alias = crate::config::Config::config_dir().join("last_session.wav");
-    match std::fs::copy(path, &alias) {
-        Ok(_) => info!("last_session.wav alias updated at {}", alias.display()),
-        Err(err) => warn!("last_session.wav alias failed: {err:#}"),
+}
+
+/// Consume the producer error while the terminal caller still owns its take.
+/// Both the controller id and the frozen recorder epoch must agree before any
+/// archive side effect. Context keeps the typed error and its original cause.
+fn recover_capture_stop_failure(
+    error: anyhow::Error,
+    session_id: Option<&str>,
+    capture_identity: (Option<&str>, u64),
+    retain: impl FnOnce(&str, &std::path::Path) -> Result<()>,
+) -> anyhow::Error {
+    let Some(failure) = error.downcast_ref::<CaptureStopFailure>() else {
+        return error;
+    };
+    let id = retainable_session_id(session_id);
+    if id.is_none()
+        || id != failure.session_id.as_deref()
+        || capture_identity.0 != failure.session_id.as_deref()
+        || capture_identity.1 == 0
+        || capture_identity.1 != failure.capture_epoch
+    {
+        return error.context("capture recovery refused: session/epoch identity mismatch");
     }
+    if let Some(path) = failure.audio_path.as_deref()
+        && let Err(archive_error) = retain(id.expect("identity checked"), path)
+    {
+        let message = format!("{archive_error:#}; original processing error: {error:#}");
+        return error.context(message);
+    }
+    error
 }
 
 /// Stop the recorder for a finished take and classify the outcome.
@@ -304,7 +368,7 @@ fn retain_session_audio(
 /// take WAV is already on disk. That audio is retained under the Bus uuid here,
 /// before the refusal is returned, so the take survives for Retranscribe and the
 /// error the user sees names the refused seal rather than the mic. Any other
-/// error is the recorder failing to stop.
+/// processing error carries producer-owned recovery evidence when available.
 ///
 /// Incident 2026-09-02 02:17 UTC (`~/.codescribe/logs/codescribe.log`): a quiet
 /// take (-57.9 dB) ended with `terminal_seal_coverage_incomplete`; the toggle
@@ -315,6 +379,8 @@ async fn stop_recorder_for_terminal(
     recorder: &mut StreamingRecorder,
     session_id: Option<&str>,
 ) -> Result<(String, Option<std::path::PathBuf>)> {
+    let (capture_session, capture_epoch) = recorder.capture_identity();
+    let capture_session = capture_session.map(str::to_owned);
     match recorder.stop().await {
         Ok(stopped) => Ok(stopped),
         Err(err) => match err.downcast::<TerminalSealRefused>() {
@@ -338,7 +404,26 @@ async fn stop_recorder_for_terminal(
                 }
                 Err(anyhow::Error::new(refusal))
             }
-            Err(err) => Err(err.context("Failed to stop recorder")),
+            Err(err) => {
+                if err.downcast_ref::<CaptureStopFailure>().is_some() {
+                    Err(recover_capture_stop_failure(
+                        err,
+                        session_id,
+                        (capture_session.as_deref(), capture_epoch),
+                        |id, path| retain_session_audio_at(
+                            Some(id),
+                            path,
+                            codescribe_core::state::SessionTranscriptArchive::Unavailable(
+                                "capture processing failed; committed text unavailable",
+                            ),
+                            &Config::config_dir(),
+                            codescribe_core::state::archive_session_take,
+                        ),
+                    ))
+                } else {
+                    Err(err.context("Failed to stop recorder"))
+                }
+            }
         },
     }
 }
@@ -454,7 +539,7 @@ mod session_audio_id_tests {
     fn uuid_session_ids_are_assigned_under_sessions_not_last_session() {
         let id = "fa3fd371-db9b-4bd5-8fc2-3a5940fa62a3";
         assert_eq!(valid_session_audio_id(id), Some(id));
-        let path = session_audio_path(id).expect("path");
+        let path = session_audio_path(std::path::Path::new("unused-root"), id).expect("path");
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("fa3fd371-db9b-4bd5-8fc2-3a5940fa62a3.wav")
@@ -472,7 +557,7 @@ mod session_audio_id_tests {
         assert!(valid_session_audio_id("../etc").is_none());
         assert!(valid_session_audio_id("short").is_none());
         assert!(valid_session_audio_id("").is_none());
-        assert!(session_audio_path("../etc").is_none());
+        assert!(session_audio_path(std::path::Path::new("unused-root"), "../etc").is_none());
     }
 
     #[test]
@@ -484,7 +569,7 @@ mod session_audio_id_tests {
             "colon is not a wav alphabet character"
         );
         assert_eq!(retainable_session_id(Some(&stopping)), Some(id));
-        let path = session_audio_path(id).expect("path");
+        let path = session_audio_path(std::path::Path::new("unused-root"), id).expect("path");
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
             Some("c06528af-f156-4f05-a6e0-8f282d8b4a07.wav")
@@ -1872,7 +1957,7 @@ impl RecordingController {
         *self.force_ai_mode.write().await = false;
         let session_id = self.session_id.write().await.take();
         let session_wav_exists = retainable_session_id(session_id.as_deref())
-            .and_then(session_audio_path)
+            .and_then(|id| session_audio_path(&Config::config_dir(), id))
             .is_some_and(|path| path.is_file());
         // Every path back to Idle ends the Bus session exactly once (text-free
         // lifecycle line), so an observer can tell "the take is over" apart
@@ -4710,6 +4795,12 @@ mod owned_capture_settlement_tests {
         assert_eq!(controller.current_state().await, State::Idle);
         assert_eq!(rows(&dir).len(), 2);
         assert_eq!(rows(&dir)[1].end_reason, Some(TranscriptSessionEndReason::TranscriptionFailed));
+        *controller.session_id.write().await = Some("successor".into());
+        controller.set_state(State::RecToggle).await;
+        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap_err().to_string(), failure);
+        assert_eq!(controller.session_id.read().await.as_deref(), Some("successor"));
+        assert_eq!(controller.current_state().await, State::RecToggle);
+        assert_eq!(rows(&dir).len(), 2, "duplicate failure cannot end the successor");
     }
 }
 
@@ -5221,5 +5312,153 @@ mod hold_start_terminal_lifecycle_falsifiers {
                     .find(&recorder_start)
                     .expect("recorder start in hold body")
         );
+    }
+}
+
+/// W2 recovery contracts, UNRUN. Exercise the production consumer and copy
+/// owner with temporary directories; the daily history encoder is injected.
+#[cfg(test)]
+mod capture_failure_recovery_tests {
+    use super::*;
+    use codescribe_core::state::SessionTranscriptArchive;
+
+    fn failure(path: Option<std::path::PathBuf>) -> anyhow::Error {
+        anyhow::Error::new(CaptureStopFailure {
+            session_id: Some("capture-owner".into()),
+            capture_epoch: 7,
+            audio_path: path,
+            cause: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "original processing failure").into(),
+            task_failure: None,
+        })
+    }
+
+    #[test]
+    fn matching_failure_retains_exact_audio_and_stays_a_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.wav");
+        let bytes = b"exact producer archive bytes";
+        std::fs::write(&source, bytes).unwrap();
+        let root = dir.path().join("archive");
+        let error = recover_capture_stop_failure(
+            failure(Some(source.clone())), Some("capture-owner:stopping"),
+            (Some("capture-owner"), 7), |id, path| {
+                retain_session_audio_at(Some(id), path,
+                    SessionTranscriptArchive::Unavailable("processing failed"), &root,
+                    |path, transcript| {
+                        assert!(matches!(transcript, SessionTranscriptArchive::Unavailable(_)));
+                        assert_eq!(path, source);
+                        Some(path.to_path_buf())
+                    })
+            },
+        );
+        let typed = error.downcast_ref::<CaptureStopFailure>().unwrap();
+        assert_eq!(typed.audio_path.as_deref(), Some(source.as_path()));
+        assert_eq!(typed.cause.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(error.downcast_ref::<TerminalSealRefused>().is_none());
+        for path in [source, root.join("sessions/capture-owner.wav"), root.join("last_session.wav")] {
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn mismatched_or_missing_identity_never_reaches_archive() {
+        for (id, session, epoch) in [
+            (Some("other-take"), Some("capture-owner"), 7),
+            (Some("capture-owner"), Some("other-take"), 7),
+            (Some("capture-owner"), Some("capture-owner"), 8),
+            (Some("capture-owner"), Some("capture-owner"), 0),
+            (None, Some("capture-owner"), 7),
+            (Some("../capture-owner"), Some("capture-owner"), 7),
+        ] {
+            let error = recover_capture_stop_failure(
+                failure(Some("unused.wav".into())), id, (session, epoch),
+                |_, _| panic!("foreign evidence must not archive or deliver"),
+            );
+            assert!(error.to_string().contains("identity mismatch"));
+            assert!(error.downcast_ref::<CaptureStopFailure>().is_some());
+        }
+    }
+
+    #[test]
+    fn no_archive_receipt_never_invents_a_saved_file() {
+        let error = recover_capture_stop_failure(
+            failure(None), Some("capture-owner"), (Some("capture-owner"), 7),
+            |_, _| panic!("no path exists to retain"),
+        );
+        assert!(error.downcast_ref::<CaptureStopFailure>().unwrap().audio_path.is_none());
+        assert!(error.to_string().contains("no finalized WAV receipt"));
+        assert!(error.to_string().contains("committed text unavailable"));
+    }
+
+    #[test]
+    fn failed_copy_and_daily_archive_preserve_source_and_original_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.wav");
+        std::fs::write(&source, b"source survives").unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"block copies").unwrap();
+        let error = recover_capture_stop_failure(
+            failure(Some(source.clone())), Some("capture-owner"), (Some("capture-owner"), 7),
+            |id, path| retain_session_audio_at(Some(id), path,
+                SessionTranscriptArchive::Unavailable("processing failed"), &root, |_, _| None),
+        );
+        assert!(error.to_string().contains("daily audio archive failed"));
+        assert!(error.to_string().contains("last_session.wav"));
+        assert!(error.to_string().contains("original processing failure"));
+        assert!(error.downcast_ref::<CaptureStopFailure>().is_some());
+        assert_eq!(std::fs::read(source).unwrap(), b"source survives");
+        assert_eq!(std::fs::read(root).unwrap(), b"block copies");
+    }
+
+    #[test]
+    fn daily_archive_failure_does_not_skip_session_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.wav");
+        std::fs::write(&source, b"retained despite daily bag failure").unwrap();
+        let root = dir.path().join("copies");
+        let result = retain_session_audio_at(Some("capture-owner"), &source,
+            SessionTranscriptArchive::Unavailable("failure"), &root, |_, _| None);
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(root.join("sessions/capture-owner.wav")).unwrap(), std::fs::read(source).unwrap());
+    }
+
+    #[tokio::test]
+    async fn recovery_copy_failure_reaches_visible_warning_and_failed_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let controller = RecordingController::new_without_keychain();
+        let mut events = controller.subscribe_events();
+        let bus_path = dir.path().join("bus.jsonl");
+        let bus = TranscriptBus::open_at(TranscriptSession {
+            session_id: "capture-owner".into(),
+            mode: TranscriptMode::Dictation,
+            has_latched_target: false,
+            latched_target_is_self: false,
+        }, bus_path.clone(), None).unwrap();
+        bus.publish_started();
+        *controller.active_transcript_bus.write().await = Some(Arc::new(bus));
+        let error = recover_capture_stop_failure(
+            failure(Some(dir.path().join("take.wav"))), Some("capture-owner"),
+            (Some("capture-owner"), 7), |_, _| Err(anyhow::anyhow!("copy refused")),
+        );
+        let result = Err(error);
+        controller.reset_finished_recording_state(&result).await;
+        controller.handle_processed_recording_result(false, &result).await;
+        let mut visible = false;
+        while let Ok(event) = events.try_recv() {
+            if let IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) = event.payload
+                && code == "transcription_failed"
+            {
+                assert!(message.contains("copy refused"));
+                assert!(message.contains("original processing failure"));
+                visible = true;
+            }
+        }
+        assert!(visible);
+        let rows: Vec<crate::presentation::transcript_bus::CleanTranscriptEvent> =
+            std::fs::read_to_string(bus_path).unwrap().lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].end_reason, Some(TranscriptSessionEndReason::TranscriptionFailed));
+        assert_eq!(controller.current_state().await, State::Idle);
     }
 }

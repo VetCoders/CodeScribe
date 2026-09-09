@@ -117,13 +117,45 @@ Named toggle captures use the existing toggle terminal processor even in
 Assistive mode, so it reads the recorder's `CaptureTurnIntent` and preserves the
 one-turn formatter/delivery route. No hands-free configuration is changed.
 
-**Open boundary:** `core/audio/streaming_recorder.rs::stop` keeps a successful
-WAV path only in a local variable before awaiting the transcription task. A join
-failure propagates without that path, although the file exists. The controller
-cannot associate/archive that file from the returned error. This checkpoint
-therefore does not claim recovery of audio on every failure. Core is outside the
-Stop worker's writable fence. No raw text seal or replacement reducer repairs
-this gap.
+### Producer failure recovery (W2 source checkpoint, tests UNRUN)
+
+`StreamingRecorder::stop` now passes every archive outcome through the same
+terminal tail: send the actual archive result to the worker, release lifecycle
+notification ownership, join the transcription task, drain presentation, and
+release the sink. A failed archive cannot skip that tail. A pending join retains
+its handle in the recorder; this does not impose a deadline on the dependency.
+
+`CaptureStopFailure` carries the bound session and capture epoch, the exact WAV
+path **only if Recorder returned one**, and the original typed error. If both
+archive and task fail, archive failure stays primary and the task failure is
+retained separately. No successful seal, successful Stop, new path search, or
+`last_session.wav` lookup is used to repair a processing failure.
+
+The common hold/toggle consumer compares the evidence with both the controller
+take id and recorder identity frozen before Stop. Missing or mismatched identity
+refuses retention. For matching evidence it uses the existing daily archive and
+session-WAV copy path; the latest alias is an output convenience, never identity.
+Every destination is attempted, failures remain visible through the existing
+`transcription_failed` warning, and the original WAV is not removed. Copy failure
+adds context without replacing the typed processing error. The owned Stop slot
+retains the error for duplicate callers; the existing terminal epilogue ends the
+failed take once, without resetting a successor or claiming delivery.
+
+For this new processing-failure path, committed text is **unavailable**: the
+producer's shared string has no revision/occurrence authentication attached to
+it. It is neither archived as speech nor delivered. The controller does not
+rebuild a document from ledger internals. Existing authenticated Bus projections
+remain owned by the emitter/Bus; exposing a failure-time authenticated snapshot
+is a separate owner seam if required. Existing `TerminalSealRefused` degraded
+text delivery and clean-stop behavior remain in their established branches.
+
+Remaining acceptance: finite settlement of indefinitely hung dependencies,
+transport loss without an eventual terminal receipt, failure-time authenticated
+text handoff, and installed real Stop/recovery evidence. Producer tests inject
+capture/archive ingress into the production stop tail; they do not exercise a
+microphone or the private Recorder WAV writer. Consumer tests inject the daily
+encoder and use real temporary-file copies. These seams are W3 falsifiers, not
+executed end-to-end proof.
 
 Generated bindings remain unchanged under W2. W3 must regenerate from
 `bridge/src/recording.rs` and `bridge/src/hotkeys.rs` with `make app-bindings`,

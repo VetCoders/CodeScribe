@@ -126,6 +126,41 @@ impl std::fmt::Display for TerminalSealRefused {
 
 impl std::error::Error for TerminalSealRefused {}
 
+/// Producer-owned evidence after capture/archive or transcription-task failure.
+/// A saved WAV is recovery material, never proof of a successful transcript.
+/// There is deliberately no text field: the shared render buffer alone cannot
+/// authenticate a committed revision after a worker fails.
+#[derive(Debug)]
+pub struct CaptureStopFailure {
+    pub session_id: Option<String>,
+    pub capture_epoch: u64,
+    pub audio_path: Option<std::path::PathBuf>,
+    pub cause: anyhow::Error,
+    /// If archive finalization and the task both failed, keep both causes.
+    pub task_failure: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for CaptureStopFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture processing failed: {:#}; committed text unavailable", self.cause)?;
+        if let Some(path) = &self.audio_path {
+            write!(f, "; source WAV retained at {}", path.display())?;
+        } else {
+            write!(f, "; no finalized WAV receipt")?;
+        }
+        if let Some(error) = &self.task_failure {
+            write!(f, "; transcription task also failed: {error:#}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CaptureStopFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
 // Keep enough raw audio queued to survive a cold Whisper load without dropping
 // the user's first words. The STT session drains this backlog once the model is ready.
 /// Channel depth for cold Whisper load: first words queue instead of drop.
@@ -329,6 +364,11 @@ impl StreamingRecorder {
     /// Borrow the ledger handle already bound for the next/active session.
     pub fn acoustic_ledger_handle(&self) -> Option<Arc<StdMutex<AcousticLedger>>> {
         self.acoustic_ledger.as_ref().map(Arc::clone)
+    }
+
+    /// Identity bound at capture open, not a latest-file or UI-slot lookup.
+    pub fn capture_identity(&self) -> (Option<&str>, u64) {
+        (self.authority_session_id.as_deref(), self.capture_epoch)
     }
 
     /// Store a per-utterance text callback.
@@ -549,6 +589,15 @@ impl StreamingRecorder {
 
         // 1. Stop recording (drops callback and sender)
         let stopped = self.recorder.stop().await;
+        self.complete_stop(stopped).await
+    }
+
+    /// The production stop tail. Tests inject only the recorder's archive
+    /// outcome; notification, task join, drain and failure selection stay here.
+    async fn complete_stop(
+        &mut self,
+        stopped: Result<Option<std::path::PathBuf>>,
+    ) -> Result<(String, Option<std::path::PathBuf>)> {
         if let Some(sender) = self.terminal_audio_sender.take() {
             let receipt = match &stopped {
                 Ok(Some(path)) => Ok(
@@ -565,14 +614,18 @@ impl StreamingRecorder {
             };
             let _ = sender.send(receipt);
         }
-        let audio_path = stopped?;
         self.lifecycle_handle = None;
 
         // 2. Wait for worker to finish processing remaining chunks
-        if let Some(handle) = self.transcription_handle.take() {
+        // Borrow until joined: cancellation of a caller must not detach the
+        // handle. Named controller Stop keeps this future alive across expiry.
+        let task_failure = if let Some(handle) = self.transcription_handle.as_mut() {
             debug!("Waiting for transcription session task to finish...");
-            handle.await.context("Transcription session task failed")?;
-        }
+            handle.await.context("Transcription session task failed").err()
+        } else {
+            None
+        };
+        self.transcription_handle = None;
 
         // 3. Drain presentation layer.
         // PresentationEmitter's BufferedEmitter tick loop runs in a separate
@@ -592,6 +645,22 @@ impl StreamingRecorder {
             }
         }
         self.event_sink = None;
+
+        // No early return may bypass the owned shutdown tail. Archive failure
+        // is primary when both operations failed; never invent a saved path.
+        let (audio_path, cause, task_failure) = match stopped {
+            Ok(path) => (path, task_failure, None),
+            Err(error) => (None, Some(error), task_failure),
+        };
+        if let Some(cause) = cause {
+            return Err(anyhow::Error::new(CaptureStopFailure {
+                session_id: self.authority_session_id.clone(),
+                capture_epoch: self.capture_epoch,
+                audio_path,
+                cause,
+                task_failure,
+            }));
+        }
 
         let incomplete_coverage = self.acoustic_ledger.as_ref().and_then(|ledger| {
             ledger
@@ -1332,5 +1401,153 @@ mod terminal_seal_refusal_tests {
         assert!(text.starts_with("terminal transcript refused"), "{text}");
         assert!(text.contains("585216/2696704"), "{text}");
         assert!(!text.to_lowercase().contains("recorder"), "{text}");
+    }
+}
+
+/// W2 source contracts: UNRUN. Only capture/archive ingress is injected;
+/// complete_stop is the same notification/join/drain/error path used by stop.
+#[cfg(test)]
+mod capture_stop_failure_tests {
+    use super::*;
+
+    fn recorder() -> StreamingRecorder {
+        let mut recorder = StreamingRecorder::new().unwrap();
+        recorder.authority_session_id = Some("capture-owner".into());
+        recorder.capture_epoch = 7;
+        recorder.captured_samples.store(4, Ordering::Relaxed);
+        recorder.lifecycle_handle = Some(recorder_lifecycle_channel().0);
+        recorder
+    }
+
+    fn write_wav(path: &std::path::Path) -> Vec<u8> {
+        let mut writer = hound::WavWriter::create(path, hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        }).unwrap();
+        for sample in [123_i16, -456, 789, -321] {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    fn assert_released(recorder: &StreamingRecorder) {
+        assert!(recorder.transcription_handle.is_none());
+        assert!(recorder.terminal_audio_sender.is_none());
+        assert!(recorder.lifecycle_handle.is_none());
+        assert!(recorder.event_sink.is_none());
+        assert!(!recorder.is_recording());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saved_wav_survives_task_panic_with_exact_identity_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("take.wav");
+        let bytes = write_wav(&path);
+        let mut recorder = recorder();
+        recorder.sample_rate = 16_000;
+        let sink = Arc::new(crate::pipeline::sinks::CollectorEventSink::new());
+        let weak_sink = Arc::downgrade(&sink);
+        recorder.set_event_sink(Some(sink));
+        // Neither preview nor a raw buffer can become recovery transcript.
+        *recorder.transcript_buffer.lock().await = "UNAUTHENTICATED PREVIEW".into();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        recorder.terminal_audio_sender = Some(sender);
+        recorder.transcription_handle = Some(tokio::spawn(async {
+            panic!("controlled transcription failure");
+        }));
+        let error = recorder.complete_stop(Ok(Some(path.clone()))).await.unwrap_err();
+        let failure = error.downcast_ref::<CaptureStopFailure>().unwrap();
+        assert_eq!(failure.session_id.as_deref(), Some("capture-owner"));
+        assert_eq!(failure.capture_epoch, 7);
+        assert_eq!(failure.audio_path.as_deref(), Some(path.as_path()));
+        assert!(failure.cause.downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
+        assert!(error.to_string().contains("controlled transcription failure"));
+        assert!(!format!("{error:?}").contains("UNAUTHENTICATED PREVIEW"));
+        assert!(error.downcast_ref::<TerminalSealRefused>().is_none());
+        let archive = receiver.try_recv().unwrap().unwrap();
+        assert_eq!(archive.session_id, "capture-owner");
+        assert_eq!(archive.capture_epoch, 7);
+        assert_eq!(archive.path, path);
+        assert_eq!(archive.sample_count, 4);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_released(&recorder);
+        assert!(weak_sink.upgrade().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_failure_reaps_worker_and_preserves_both_errors_without_a_path() {
+        let mut recorder = recorder();
+        recorder.set_event_sink(Some(Arc::new(crate::pipeline::sinks::CollectorEventSink::new())));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        recorder.terminal_audio_sender = Some(sender);
+        recorder.transcription_handle = Some(tokio::spawn(async {
+            panic!("secondary worker failure");
+        }));
+        let error = recorder.complete_stop(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied, "archive denied",
+        ).into())).await.unwrap_err();
+        let failure = error.downcast_ref::<CaptureStopFailure>().unwrap();
+        assert_eq!(failure.cause.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(failure.task_failure.as_ref().unwrap().downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
+        assert!(failure.audio_path.is_none());
+        assert!(receiver.try_recv().unwrap().unwrap_err().contains("archive denied"));
+        assert_released(&recorder);
+    }
+
+    #[tokio::test]
+    async fn public_stop_routes_worker_failure_through_the_cleanup_tail() {
+        let mut recorder = recorder();
+        recorder.transcription_handle = Some(tokio::spawn(async {
+            panic!("public stop worker failure");
+        }));
+        // A never-opened device returns no archive. This exercises public stop
+        // without a microphone; the saved-WAV case injects archive ingress above.
+        let error = recorder.stop().await.unwrap_err();
+        let failure = error.downcast_ref::<CaptureStopFailure>().unwrap();
+        assert!(failure.audio_path.is_none());
+        assert_eq!(failure.session_id.as_deref(), Some("capture-owner"));
+        assert_eq!(failure.capture_epoch, 7);
+        assert!(failure.cause.downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
+        assert_released(&recorder);
+    }
+
+    #[tokio::test]
+    async fn archive_failure_still_joins_a_successful_worker() {
+        let mut recorder = recorder();
+        let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = Arc::clone(&joined);
+        recorder.transcription_handle = Some(tokio::spawn(async move {
+            completed.store(true, Ordering::SeqCst);
+        }));
+        let error = recorder.complete_stop(Err(anyhow!("archive failed"))).await.unwrap_err();
+        assert!(joined.load(Ordering::SeqCst));
+        assert!(error.downcast_ref::<CaptureStopFailure>().unwrap().task_failure.is_none());
+        assert_released(&recorder);
+    }
+
+    #[tokio::test]
+    async fn clean_stop_and_seal_refusal_keep_their_existing_outcomes() {
+        let mut recorder = recorder();
+        let stopped = recorder.complete_stop(Ok(None)).await.unwrap();
+        assert_eq!(stopped, (String::new(), None));
+        let mut ledger = AcousticLedger::new();
+        assert!(ledger.record_seal_coverage(SealCoverageReceipt {
+            session_id: "capture-owner".into(),
+            capture_epoch: 7,
+            speech_samples: 100,
+            covered_samples: 0,
+            uncovered_speech_ranges: Vec::new(),
+            max_uncovered_samples: 100,
+            incomplete_threshold_samples: 10,
+            status: SealCoverageStatus::Incomplete,
+        }));
+        recorder.acoustic_ledger = Some(Arc::new(StdMutex::new(ledger)));
+        let error = recorder.complete_stop(Ok(None)).await.unwrap_err();
+        assert!(error.downcast_ref::<TerminalSealRefused>().is_some());
+        assert!(error.downcast_ref::<CaptureStopFailure>().is_none());
+        assert_released(&recorder);
     }
 }
