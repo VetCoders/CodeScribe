@@ -43,9 +43,8 @@ struct DictationOverlayView: View {
           footerEngineLabel: state.footerEngineLabel,
           footerNotice: state.toast,
           footerEngineDot: footerEngineDot,
-          formatLevel: state.autoFormatLevel,
           onIntent: state.relayIntent,
-          onFormatLevel: { state.setAutoFormatLevel($0) },
+          onRetranscribe: { state.retranscribe(pass: $0) },
           onFocusChange: { actionsFocused = $0 }
         )
       )

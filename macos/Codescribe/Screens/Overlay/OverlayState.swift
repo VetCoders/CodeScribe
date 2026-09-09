@@ -88,6 +88,31 @@ enum OverlayMode: String, Equatable {
 /// A user command emitted by the overlay rail. The rail decides only which
 /// projected commands to paint; this value crosses the view/state seam without
 /// carrying a second copy of reducer or delivery policy.
+/// Retranscribe pass picked on the dock. Path prefixes are the bridge contract
+/// (`bridge/src/recording.rs` `split_retranscribe_path`).
+enum OverlayRetranscribePass: String, CaseIterable, Identifiable {
+  case fullHq = "hq"
+  case cloud = "cloud"
+
+  var id: String { rawValue }
+
+  var pathPrefix: String { "\(rawValue):" }
+
+  var visibleName: String {
+    switch self {
+    case .fullHq: "Full HQ file pass"
+    case .cloud: "Cloud pass"
+    }
+  }
+
+  var help: String {
+    switch self {
+    case .fullHq: "Full local Whisper file pass over the last session audio"
+    case .cloud: "Cloud STT pass over the last session audio"
+    }
+  }
+}
+
 enum OverlayIntent: String, Equatable, Hashable {
   case finish
   case commitRevision = "commit-revision"
@@ -614,7 +639,8 @@ final class OverlayState {
     case .insertPaste:
       relayInsertPasteIntent()
     case .retranscribe:
-      relayRetranscribeIntent()
+      // Keyboard / AX path without a menu pick: the local paradigm.
+      relayRetranscribeIntent(pass: .fullHq)
     case .format:
       relayFormatIntent()
     case .close:
@@ -677,7 +703,15 @@ final class OverlayState {
     }
   }
 
-  private func relayRetranscribeIntent() {
+  /// Explicit overlay Retranscribe. The pass is the operator's pick from the
+  /// dock menu (grok `0a5e75fa3`, 2026-08-15): Full HQ local Whisper file pass
+  /// or Cloud pass over the retained session audio. Never derived from a
+  /// settings mode behind the operator's back.
+  func retranscribe(pass: OverlayRetranscribePass) {
+    relayRetranscribeIntent(pass: pass)
+  }
+
+  private func relayRetranscribeIntent(pass: OverlayRetranscribePass) {
     guard let engine else {
       presentActionFailure(
         "Retranscription needs the recording engine", notice: "retranscribe unavailable")
@@ -688,10 +722,7 @@ final class OverlayState {
         "The previous recording is no longer available", notice: "no recording")
       return
     }
-    let settings = CodescribeConfig().loadSettings()
-    let asrMode = (settings.asrMode ?? "apple_only").lowercased()
-    let prefix = asrMode == "cloud" ? "cloud:" : "hq:"
-    let prefixedPath = "\(prefix)\(path)"
+    let prefixedPath = "\(pass.pathPrefix)\(path)"
 
     cancelAutoHide()
     showFooterNotice("retranscribing…", persists: true)

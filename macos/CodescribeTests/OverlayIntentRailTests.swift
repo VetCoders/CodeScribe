@@ -187,7 +187,7 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(state.canvasText, "local draft")
   }
 
-  func testFormatLevelPickerWritesThroughEngineAndRepaintsFromTruth() {
+  func testRetranscribeMenuPicksThePassAndTheBareIntentStaysLocal() async {
     let state = projectedState(
       phase: "formatted",
       text: "final",
@@ -200,22 +200,29 @@ final class OverlayIntentRailTests: XCTestCase {
     )
     let engine = OverlayIntentBoundaryEngine()
     state.engine = engine
-    state.handleRecordingPreparing()
-    XCTAssertEqual(state.autoFormatLevel, .correction)
-
+    // Founder 2026-09-09: the formatting level is tray quick-settings chrome,
+    // never a dock control; Retranscribe is opt-in with a Local / Cloud pick.
     let rail = OverlayIntentRail(
       phase: state.statusText,
       intents: OverlayIntentRail.projectedIntents(for: state),
       palette: .dark,
-      formatLevel: state.autoFormatLevel,
       onIntent: state.relayIntent,
-      onFormatLevel: state.setAutoFormatLevel
+      onRetranscribe: { state.retranscribe(pass: $0) }
     )
+    XCTAssertTrue(rail.intents.contains(.retranscribe))
 
-    rail.cycleFormatLevel()
+    let cloud = expectation(description: "cloud pass reached the engine")
+    engine.onTranscribeFile = { cloud.fulfill() }
+    rail.retranscribe(.cloud)
+    await fulfillment(of: [cloud], timeout: 1)
+    XCTAssertEqual(engine.receivedTranscribePath, "cloud:/tmp/overlay-intent-boundary.wav")
 
-    XCTAssertEqual(engine.formatLevelWrites, [.smart], "Correction cycles to Smart, like the tray")
-    XCTAssertEqual(state.autoFormatLevel, .smart, "repainted from the engine read, not the click")
+    let local = expectation(description: "bare intent runs the local HQ pass")
+    engine.onTranscribeFile = { local.fulfill() }
+    rail.dispatch(.retranscribe)
+    await fulfillment(of: [local], timeout: 1)
+    XCTAssertEqual(engine.receivedTranscribePath, "hq:/tmp/overlay-intent-boundary.wav")
+    XCTAssertTrue(engine.formatLevelWrites.isEmpty, "the dock never writes the formatting level")
   }
 
   func testEveryIntentHasVoiceOverCopyAndRailReportsProjectedPhase() {

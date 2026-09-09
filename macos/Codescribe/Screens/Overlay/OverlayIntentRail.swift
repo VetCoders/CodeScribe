@@ -32,9 +32,8 @@ struct OverlayIntentRail: View {
   let footerEngineLabel: String
   let footerNotice: String?
   let footerEngineDot: Color
-  let formatLevel: FormattingPolicyOption
   let onIntent: (OverlayIntent) -> Void
-  let onFormatLevel: (FormattingPolicyOption) -> Void
+  let onRetranscribe: (OverlayRetranscribePass) -> Void
 
   init(
     phase: String,
@@ -43,9 +42,8 @@ struct OverlayIntentRail: View {
     footerEngineLabel: String = "",
     footerNotice: String? = nil,
     footerEngineDot: Color = .clear,
-    formatLevel: FormattingPolicyOption = .correction,
     onIntent: @escaping (OverlayIntent) -> Void,
-    onFormatLevel: @escaping (FormattingPolicyOption) -> Void = { _ in },
+    onRetranscribe: @escaping (OverlayRetranscribePass) -> Void = { _ in },
     onFocusChange: @escaping (Bool) -> Void = { _ in }
   ) {
     self.onFocusChange = onFocusChange
@@ -55,9 +53,8 @@ struct OverlayIntentRail: View {
     self.footerEngineLabel = footerEngineLabel
     self.footerNotice = footerNotice
     self.footerEngineDot = footerEngineDot
-    self.formatLevel = formatLevel
     self.onIntent = onIntent
-    self.onFormatLevel = onFormatLevel
+    self.onRetranscribe = onRetranscribe
   }
 
   var body: some View {
@@ -69,10 +66,11 @@ struct OverlayIntentRail: View {
       .padding(.horizontal, 8)
       .background(.regularMaterial, in: Capsule())
       HStack(spacing: 4) {
-        formatLevelButton
-          .focused($focusedControl, equals: "format-level")
         ForEach(intents, id: \.self) { intent in
-          if intent != .close {
+          if intent == .retranscribe {
+            retranscribeMenu
+              .focused($focusedControl, equals: intent.rawValue)
+          } else if intent != .close {
             OverlayDockButton(
               title: intent.accessibilityLabel,
               systemImage: intent.systemImage,
@@ -130,30 +128,30 @@ struct OverlayIntentRail: View {
     }
   }
 
-  /// Off → Correction → Smart → Max → Off, the same cycle as the tray. The
-  /// label is durable engine truth; a click writes through the engine and the
-  /// state re-reads before this repaints.
-  private var formatLevelButton: some View {
-    Button(action: cycleFormatLevel) {
-      Text(formatLevel.visibleName)
-        .csMono(10, .semibold)
-        .foregroundStyle(
-          formatLevel == .off ? palette.mutedText.color : palette.primaryText.color
-        )
-        .lineLimit(1)
-        .padding(.horizontal, CSSpace.xs)
-        .frame(height: 24)
-        .contentShape(Capsule())
+  /// Retranscribe is opt-in with the pass picked here: Full HQ (local
+  /// Whisper file pass) or Cloud. The formatting level is not overlay chrome;
+  /// the operator sets it in the tray quick settings (Founder 2026-09-09).
+  private var retranscribeMenu: some View {
+    Menu {
+      ForEach(OverlayRetranscribePass.allCases) { pass in
+        Button(pass.visibleName) { retranscribe(pass) }
+          .help(pass.help)
+          .accessibilityIdentifier("overlay-retranscribe-\(pass.rawValue)")
+      }
+    } label: {
+      Label(OverlayIntent.retranscribe.accessibilityLabel, systemImage: OverlayIntent.retranscribe.systemImage)
+        .labelStyle(.iconOnly)
+        .frame(width: 32, height: 28)
+        .contentShape(RoundedRectangle(cornerRadius: CSRadius.chip, style: .continuous))
+        .foregroundStyle(palette.primaryText.color)
     }
+    .menuStyle(.button)
     .buttonStyle(.plain)
-    .background {
-      Capsule().strokeBorder(palette.border.color, lineWidth: 1)
-    }
-    .help("Formatting level: \(formatLevel.visibleName). Click to cycle.")
-    .accessibilityLabel("Formatting level")
-    .accessibilityValue(formatLevel.visibleName)
-    .accessibilityHint("Cycles the automatic formatting level")
-    .accessibilityIdentifier("overlay-format-level")
+    .menuIndicator(.hidden)
+    .help(OverlayIntent.retranscribe.accessibilityHint)
+    .accessibilityLabel(OverlayIntent.retranscribe.accessibilityLabel)
+    .accessibilityHint(OverlayIntent.retranscribe.accessibilityHint)
+    .accessibilityIdentifier("overlay-intent-\(OverlayIntent.retranscribe.rawValue)")
   }
 
   static func projectedIntents(for state: OverlayState) -> [OverlayIntent] {
@@ -209,8 +207,8 @@ struct OverlayIntentRail: View {
     onIntent(intent)
   }
 
-  func cycleFormatLevel() {
-    onFormatLevel(formatLevel.next)
+  func retranscribe(_ pass: OverlayRetranscribePass) {
+    onRetranscribe(pass)
   }
 }
 
