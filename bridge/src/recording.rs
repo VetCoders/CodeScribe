@@ -580,6 +580,52 @@ mod retranscribe_tests {
         ));
     }
 
+    /// Real instrument, not a seam: both overlay Retranscribe passes over a
+    /// real session WAV. HQ = local Whisper file pass; Cloud = the File STT
+    /// lane with the operator's real endpoint and key (`Config::load`, may
+    /// open Keychain). Prints the verdicts so a human can read them.
+    ///
+    ///   PROOF_WAV=~/.codescribe/sessions/<id>.wav \
+    ///   cargo test -p codescribe-ffi -- --ignored --nocapture retranscribe_passes_on_real_session_audio
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "real audio + real STT credentials"]
+    async fn retranscribe_passes_on_real_session_audio() {
+        let wav = std::env::var("PROOF_WAV").unwrap_or_else(|_| {
+            codescribe_core::config::Config::config_dir()
+                .join("last_session.wav")
+                .to_string_lossy()
+                .into_owned()
+        });
+        assert!(
+            std::path::Path::new(&wav).exists(),
+            "PROOF_WAV missing: {wav}"
+        );
+
+        let hq = transcribe_session_file(format!("hq:{wav}"))
+            .await
+            .expect("HQ file pass");
+        eprintln!("HQ pass: {} chars: {:?}", hq.text.chars().count(), hq.text);
+        assert!(
+            !hq.text.trim().is_empty(),
+            "HQ pass returned no text for real speech"
+        );
+
+        match transcribe_session_file(format!("cloud:{wav}")).await {
+            Ok(cloud) => {
+                eprintln!(
+                    "Cloud pass: {} chars: {:?}",
+                    cloud.text.chars().count(),
+                    cloud.text
+                );
+                assert!(
+                    !cloud.text.trim().is_empty(),
+                    "Cloud pass answered with no text for real speech"
+                );
+            }
+            Err(err) => panic!("Cloud pass failed: {err}"),
+        }
+    }
+
     #[test]
     fn cloud_pass_reads_the_file_lane_only() {
         let mut config = codescribe_core::config::Config {

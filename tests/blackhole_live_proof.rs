@@ -121,4 +121,35 @@ async fn blackhole_session_proof() {
         eprintln!("  [{i}] {ev:?}");
     }
     eprintln!("==================================================");
+
+    // A proof that accepts silence proves nothing (Founder 2026-09-09: "to są
+    // testy, a nie byle było"). The loopback must deliver real speech into the
+    // capture, and the capture must come back with words.
+    let digital_silence = captured_events.iter().any(|ev| {
+        matches!(ev, EngineEvent::Warning { code, message }
+            if code == "capture_level_low" && message.contains("all_audio_median_db=-inf"))
+    });
+    assert!(
+        !digital_silence,
+        "BlackHole capture was digital zero: the player never delivered the WAV into the device"
+    );
+    let speech_samples = captured_events.iter().find_map(|ev| match ev {
+        EngineEvent::SealCoverage { receipt, .. } => Some(receipt.speech_samples),
+        _ => None,
+    });
+    assert!(
+        speech_samples.is_some_and(|n| n > 0),
+        "no speech samples reached the ledger: {speech_samples:?}"
+    );
+    let transcript = match &stop_result {
+        Ok((text, _)) => text.clone(),
+        Err(err) => err
+            .downcast_ref::<codescribe_core::audio::streaming_recorder::TerminalSealRefused>()
+            .map(|refusal| refusal.committed_text.clone())
+            .unwrap_or_default(),
+    };
+    assert!(
+        !transcript.trim().is_empty(),
+        "real speech played through BlackHole produced no transcript"
+    );
 }
