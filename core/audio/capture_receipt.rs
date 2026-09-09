@@ -37,6 +37,7 @@ pub const CLIP_ABS: f32 = 0.99;
 
 static LAST_RECEIPT: OnceLock<Mutex<Option<CaptureLevelReceipt>>> = OnceLock::new();
 static LAST_OPEN_PATH: OnceLock<Mutex<Option<CapturePathMeta>>> = OnceLock::new();
+#[cfg(not(test))]
 static SESSION_ENERGY: OnceLock<Mutex<SessionEnergyClock>> = OnceLock::new();
 
 /// One capture hop on the session PCM axis. Intensity lives here, not on tokens.
@@ -60,8 +61,24 @@ fn last_open_path_slot() -> &'static Mutex<Option<CapturePathMeta>> {
     LAST_OPEN_PATH.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(not(test))]
 fn session_energy_slot() -> &'static Mutex<SessionEnergyClock> {
     SESSION_ENERGY.get_or_init(|| Mutex::new(SessionEnergyClock::default()))
+}
+
+// Unit tests execute independent synthetic takes on parallel harness threads.
+// Route EVERY energy reader/writer through the same thread-owned slot, including
+// CaptureLevelAccumulator::push_samples. Production keeps its cross-thread,
+// process-global clock above; no thresholds or measurement rules change.
+#[cfg(test)]
+thread_local! {
+    static TEST_SESSION_ENERGY: std::sync::Arc<Mutex<SessionEnergyClock>> =
+        std::sync::Arc::new(Mutex::new(SessionEnergyClock::default()));
+}
+
+#[cfg(test)]
+fn session_energy_slot() -> std::sync::Arc<Mutex<SessionEnergyClock>> {
+    TEST_SESSION_ENERGY.with(std::sync::Arc::clone)
 }
 
 /// Open a new capture epoch's energy ladder. Call at live-session start only.
@@ -94,9 +111,8 @@ pub fn session_energy_db(sample_start: u64, sample_end: u64) -> Option<f32> {
     if sample_end <= sample_start {
         return None;
     }
-    let hops = session_energy_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slot = session_energy_slot();
+    let hops = slot.lock().unwrap_or_else(|e| e.into_inner());
     let mut weighted = 0.0_f64;
     let mut covered = 0.0_f64;
     for hop in &hops.hops {
@@ -125,9 +141,8 @@ pub fn session_active_speech_ranges(
     sample_rate: u32,
 ) -> Vec<TailSampleRange> {
     let merge_gap = u64::from(sample_rate).saturating_mul(ACTIVE_SPEECH_MERGE_GAP_MS) / 1_000;
-    let hops = session_energy_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let slot = session_energy_slot();
+    let hops = slot.lock().unwrap_or_else(|e| e.into_inner());
     let mut ranges: Vec<(u64, u64)> = Vec::new();
     for hop in hops
         .hops
@@ -650,5 +665,44 @@ mod tests {
         assert!(session_energy_db(480, 640).is_none());
         begin_session_energy_clock();
         assert!(session_energy_db(160, 320).is_none());
+    }
+
+    /// Two test threads interleave reset/feed/read sequences, including the
+    /// implicit writer in push_samples. A shared global ladder fails this test.
+    #[test]
+    fn session_energy_test_threads_isolate_all_readers_and_writers() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = [0.1_f32, 0.01_f32].map(|amplitude| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                begin_session_energy_clock();
+                barrier.wait();
+                let mut accumulator = CaptureLevelAccumulator::new();
+                accumulator.push_samples(&[amplitude; 160]);
+                barrier.wait();
+                let db = session_energy_db(0, 160);
+                let ranges = session_active_speech_ranges("isolated", 1, 16_000);
+                // Every participant finishes reading before either resets. Keep
+                // all assertions after the last barrier so a falsifier cannot
+                // strand its peer waiting forever.
+                barrier.wait();
+                if amplitude == 0.1 {
+                    begin_session_energy_clock();
+                }
+                barrier.wait();
+                let db = db.expect("this thread's measured hop");
+                assert!((db - linear_to_db(amplitude)).abs() < 0.001);
+                assert_eq!(ranges.len(), 1);
+                assert_eq!((ranges[0].sample_start, ranges[0].sample_end), (0, 160));
+                assert_eq!(session_energy_db(0, 160).is_none(), amplitude == 0.1);
+                assert_eq!(
+                    session_active_speech_ranges("isolated", 1, 16_000).is_empty(),
+                    amplitude == 0.1,
+                );
+            })
+        });
+        for handle in handles {
+            handle.join().expect("isolated energy fixture thread");
+        }
     }
 }

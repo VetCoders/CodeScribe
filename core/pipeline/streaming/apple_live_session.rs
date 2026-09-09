@@ -4760,53 +4760,6 @@ mod tests {
         assert!(patched.contains("powkurwiać się razem"));
     }
 
-    /// Partial → Preview; each phrase final → UtteranceFinal with rising ids.
-    #[test]
-    fn emit_maps_partial_and_two_phrase_finals() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 2.0);
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::Partial {
-                    text: "hello".into(),
-                    segments: vec![segment("hello", 0.0, 0.5)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "hello world".into(),
-                    segments: vec![segment("hello world", 0.0, 1.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "second".into(),
-                    segments: vec![segment("second", 1.0, 2.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            1.0,
-        );
-        drop(tx);
-        let mut got = Vec::new();
-        while let Ok(e) = rx.try_recv() {
-            got.push(e);
-        }
-        assert_eq!(state.sealed_count, 2);
-        assert!(matches!(got[0], EngineEvent::Preview { rev: 1, .. }));
-        assert!(matches!(
-            got[1],
-            EngineEvent::UtteranceFinal {
-                utterance_id: 1,
-                ..
-            }
-        ));
-        assert!(matches!(
-            got[2],
-            EngineEvent::UtteranceFinal {
-                utterance_id: 2,
-                ..
-            }
-        ));
-    }
 
     fn count_iwo(text: &str) -> usize {
         text.split_whitespace()
@@ -4837,230 +4790,10 @@ mod tests {
         }
     }
 
-    /// Append doctrine (session a5623d55, 2026-08-12): a phrase final whose
-    /// segments are entirely consumed by the trusted timing boundary but whose
-    /// text carries NOVEL content must still reach the canvas. Demoting it to
-    /// the preview lane is a silent replacement channel — the very next
-    /// partial overwrites `open_partial` wholesale and the only copy dies.
-    #[test]
-    fn boundary_consumed_final_with_novel_text_still_reaches_canvas() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 40.0);
 
-        // Utterance 1 commits normally; trusted boundary moves to 14.0.
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "Zmienili zobacz".into(),
-                segments: vec![segment("Zmienili zobacz", 0.5, 14.0)],
-            }],
-            &tx,
-            &mut state,
-            14.2,
-        );
 
-        // SFSpeech restart re-delivers with stale timings BEHIND the boundary
-        // but novel words; the collapsed restart partial lands right after.
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "Czyli dupa zbita".into(),
-                    segments: vec![segment("Czyli dupa zbita", 10.0, 13.5)],
-                },
-                LiveStreamEvent::Partial {
-                    text: "Tak".into(),
-                    segments: vec![segment("Tak", 17.0, 17.4)],
-                },
-            ],
-            &tx,
-            &mut state,
-            17.5,
-        );
 
-        let mut finals = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let EngineEvent::UtteranceFinal { text, .. } = event {
-                finals.push(text);
-            }
-        }
-        let canvas = finals.join(" ");
-        assert!(
-            canvas.contains("Czyli dupa zbita"),
-            "Apple-asserted novel text died in the preview lane (podmianka): canvas={canvas:?}"
-        );
-    }
 
-    /// Append doctrine, freeze path: the safety-net freeze seals the open
-    /// partial WITHOUT segments. That seal must not die on `disjoint.is_empty()`
-    /// — the frozen text is the only copy of a whole utterance.
-    #[test]
-    fn frozen_partial_without_segments_still_reaches_canvas() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 30.0);
-
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::Partial {
-                    text: "pojebany tekst czyli dupa".into(),
-                    segments: Vec::new(),
-                },
-                // Collapsed restart: freeze must seal the prior hypothesis.
-                LiveStreamEvent::Partial {
-                    text: "Tak".into(),
-                    segments: Vec::new(),
-                },
-            ],
-            &tx,
-            &mut state,
-            12.0,
-        );
-
-        let mut finals = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let EngineEvent::UtteranceFinal { text, .. } = event {
-                finals.push(text);
-            }
-        }
-        let canvas = normalize_for_containment(&finals.join(" "));
-        assert!(
-            canvas.contains("pojebany tekst czyli dupa"),
-            "frozen open partial died sealing without segments: canvas={canvas:?}"
-        );
-    }
-
-    /// F3 wiring contract: a seal must resolve to the audio actually retained
-    /// for this session, and advance the lower bound for the next utterance.
-    /// This is what W2-A's tail-patch will stand on.
-    #[test]
-    fn seals_resolve_their_audio_window_from_retained_pcm() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 6.0);
-
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "pierwsze zdanie".into(),
-                    segments: vec![segment("pierwsze zdanie", 0.5, 2.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "drugie zdanie".into(),
-                    segments: vec![segment("drugie zdanie", 2.5, 4.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            6.0,
-        );
-
-        assert_eq!(state.sealed_count, 2);
-        assert_eq!(
-            state.unresolved_windows, 0,
-            "both boundaries must address retained audio"
-        );
-        assert_eq!(state.last_sealed_end, 4.0);
-        // Audio before the last boundary is committed canvas and released.
-        assert!(state.audio.window(0.0, 1.0).is_none());
-        assert!(state.audio.window(2.5, 4.0).is_some());
-    }
-
-    #[test]
-    fn cumulative_apple_final_commits_only_segments_after_last_boundary() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 4.0);
-
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "alpha beta".into(),
-                    segments: vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "alpha beta gamma".into(),
-                    segments: vec![
-                        segment("alpha", 0.0, 1.0),
-                        segment("beta", 1.0, 2.0),
-                        segment("gamma", 2.0, 3.0),
-                    ],
-                },
-            ],
-            &tx,
-            &mut state,
-            4.0,
-        );
-
-        let mut finals = Vec::new();
-        let mut overlap_warnings = 0;
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                EngineEvent::UtteranceFinal {
-                    raw_text,
-                    start_ts,
-                    end_ts,
-                    ..
-                } => finals.push((raw_text, start_ts, end_ts)),
-                EngineEvent::Warning { code, .. } if code == APPLE_FINAL_OVERLAP_WARNING_CODE => {
-                    overlap_warnings += 1;
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(
-            finals,
-            vec![("alpha beta".into(), 0.0, 2.0), ("gamma".into(), 2.0, 3.0)]
-        );
-        assert_eq!(overlap_warnings, 1);
-    }
-
-    #[test]
-    fn cumulative_final_commits_only_its_novel_suffix() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 3.0);
-
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "alpha beta".into(),
-                    segments: vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "alpha beta revised".into(),
-                    segments: vec![segment("alpha beta revised", 0.0, 2.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            3.0,
-        );
-
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        // Append doctrine: the canvas-known prefix "alpha beta" must not
-        // double-commit, but the novel suffix must never die in preview.
-        let finals: Vec<&String> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { text, .. } => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(finals.len(), 2, "novel suffix must commit: {events:?}");
-        assert!(
-            normalize_for_containment(finals[1]).contains("revised"),
-            "second final must carry only the novel suffix: {finals:?}"
-        );
-        assert!(
-            !normalize_for_containment(finals[1]).contains("alpha"),
-            "canvas-known prefix must not double-commit: {finals:?}"
-        );
-        assert_eq!(state.utterance_id, 2, "novel suffix gets a fresh ID");
-        assert_eq!(
-            state.last_apple_segment_end, 3.0,
-            "synthesized window consumes the boundary to the session clock"
-        );
-    }
 
     /// A trailing cumulative callback can assert novel text after capture has
     /// already reached EOF. The text still belongs on the append-only canvas,
@@ -5146,412 +4879,16 @@ mod tests {
         );
     }
 
-    /// End to end through `seal_utterance_final`: four sealed occurrences of one
-    /// name, then a cumulative final restating five. Exactly one new occurrence
-    /// may reach the canvas.
-    #[test]
-    fn five_spoken_occurrences_survive_a_cumulative_restatement_end_to_end() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 5.0);
 
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "Iwo Iwo Iwo Iwo".into(),
-                    segments: vec![
-                        segment("Iwo", 0.0, 1.0),
-                        segment("Iwo", 1.0, 2.0),
-                        segment("Iwo", 2.0, 3.0),
-                        segment("Iwo", 3.0, 4.0),
-                    ],
-                },
-                // Cumulative restatement: same audio re-stated, plus one more
-                // occurrence. The segment is fully behind the cursor, so this
-                // takes the segment-less path.
-                LiveStreamEvent::PhraseFinal {
-                    text: "Iwo Iwo Iwo Iwo Iwo".into(),
-                    segments: vec![segment("Iwo Iwo Iwo Iwo Iwo", 0.0, 4.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            5.0,
-        );
 
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let finals: Vec<String> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { text, .. } => Some(text.clone()),
-                _ => None,
-            })
-            .collect();
-        let spoken = finals
-            .iter()
-            .map(|text| normalize_for_containment(text))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let occurrences = spoken.split_whitespace().filter(|w| *w == "iwo").count();
-        assert_eq!(
-            occurrences, 5,
-            "five acoustic occurrences, five tokens — got {finals:?}"
-        );
-    }
 
-    /// Regression guard for the prefix probe: the canvas-known prefix must be
-    /// recognised even when the lexicon rewrites words inside it.
-    ///
-    /// `cumulative_final_commits_only_its_novel_suffix` cannot catch this — its
-    /// "alpha beta revised" survives every rewrite table untouched, so it stayed
-    /// green through the whole defect. Here "doker" → "Docker" puts a real
-    /// rewrite inside the shared prefix, which is what broke the match: the
-    /// probe was normalised through `seal_span_text` while the canvas is built
-    /// from post-`process_utterance` text, so the two sides disagreed at the
-    /// first rewritten word and nearly the whole phrase re-committed as novel.
-    /// Measured on session f72fbbb7 (2026-08-12): 603 live words against 318
-    /// spoken, +90%.
-    #[test]
-    fn cumulative_final_prefix_survives_words_the_lexicon_rewrites() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 3.0);
 
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "uruchom doker".into(),
-                    segments: vec![segment("uruchom", 0.0, 1.0), segment("doker", 1.0, 2.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "uruchom doker i restart".into(),
-                    segments: vec![segment("uruchom doker i restart", 0.0, 2.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            3.0,
-        );
 
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let finals: Vec<&String> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { text, .. } => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            finals.len(),
-            2,
-            "the novel suffix must still commit: {events:?}"
-        );
 
-        let novel = normalize_for_containment(finals[1]);
-        assert!(
-            novel.contains("restart"),
-            "novel suffix must reach the canvas: {finals:?}"
-        );
-        assert!(
-            !novel.contains("uruchom"),
-            "a rewritten prefix is still a known prefix — re-committing it is the repetition defect: {finals:?}"
-        );
-        assert!(
-            !novel.contains("doker") && !novel.contains("docker"),
-            "the WHOLE known prefix must be consumed, not just the words the lexicon left alone — \
-             stopping at the first rewritten word is exactly how a phrase re-commits: {finals:?}"
-        );
-    }
 
-    /// A later cumulative final can be entirely covered by already-committed
-    /// spans. It is not an active tail: surfacing the whole callback as Preview
-    /// makes the presentation reducer render `committed + restatement` and the
-    /// delivery buffer duplicates the take at stop.
-    #[test]
-    fn fully_reheard_cumulative_final_clears_preview_instead_of_repeating_canvas() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 8.0);
 
-        let heard_first = "szuty klawiszowe to podwójny lewy przycisk myszy";
-        let restated =
-            "skróty klawiszowe to podwójny lewy przycisk myszy lub klawisz na klawiaturze";
 
-        for (text, end) in [(heard_first, 5.0), (restated, 6.0), (restated, 6.5)] {
-            emit_stream_events(
-                vec![LiveStreamEvent::PhraseFinal {
-                    text: text.into(),
-                    segments: vec![segment(text, 0.0, end)],
-                }],
-                &tx,
-                &mut state,
-                8.0,
-            );
-        }
 
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let last_preview = events.iter().rev().find_map(|event| match event {
-            EngineEvent::Preview { text, .. } => Some(text.as_str()),
-            _ => None,
-        });
-        assert_eq!(
-            last_preview,
-            Some(""),
-            "a fully re-heard final must clear the volatile tail, not repeat the canvas: {events:?}"
-        );
-        assert!(
-            state.open_partial.is_empty(),
-            "a fully re-heard final must not survive as stop-time open partial"
-        );
-    }
-
-    #[test]
-    fn legitimate_repeated_words_survive_disjoint_apple_windows() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 3.0);
-        emit_stream_events(
-            vec![
-                LiveStreamEvent::PhraseFinal {
-                    text: "tak".into(),
-                    segments: vec![segment("tak", 0.0, 1.0)],
-                },
-                LiveStreamEvent::PhraseFinal {
-                    text: "tak".into(),
-                    segments: vec![segment("tak", 1.0, 2.0)],
-                },
-            ],
-            &tx,
-            &mut state,
-            3.0,
-        );
-        let raw_finals = std::iter::from_fn(|| rx.try_recv().ok())
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { raw_text, .. } => Some(raw_text),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(raw_finals, vec!["tak", "tak"]);
-    }
-
-    /// Falsification arm: an `end_ts` that does not describe this session's PCM
-    /// must be counted and surfaced, never silently truncated into a window.
-    #[test]
-    fn seal_window_beyond_captured_audio_is_counted_unresolved() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 2.0);
-
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "zdanie z przyszlosci".into(),
-                segments: vec![segment("zdanie z przyszlosci", 8.0, 9.0)],
-            }],
-            &tx,
-            &mut state,
-            2.0,
-        );
-
-        assert_eq!(state.sealed_count, 1, "the text still seals");
-        assert!(
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .any(|event| matches!(event, EngineEvent::UtteranceFinal { .. })),
-            "unresolved Apple text still emits a final"
-        );
-        assert_eq!(state.unresolved_windows, 1);
-        assert_eq!(
-            state.last_sealed_end, 0.0,
-            "an unresolved boundary must not advance the window floor"
-        );
-    }
-
-    /// Contract sensor: mid-stream Previews must be consumable without waiting
-    /// for audio EOF. The session select loop is the production path; this
-    /// locks the interleave contract — events already queued while PCM is
-    /// still open surface to the sink immediately (not only after stop).
-    #[tokio::test]
-    async fn live_previews_surface_before_audio_eof() {
-        /// Test sink that records Preview text only (order of live surface).
-        struct CollectSink(Mutex<Vec<String>>);
-        impl EventSink for CollectSink {
-            /// Append preview text when present; ignore non-preview events.
-            fn on_event(&self, event: &EngineEvent) {
-                if let EngineEvent::Preview { text, .. } = event {
-                    self.0.lock().expect("lock").push(text.clone());
-                }
-            }
-        }
-
-        let sink = CollectSink(Mutex::new(Vec::new()));
-        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<EngineEvent>();
-        // Worker still "open" (we hold ev_tx) — two partials already produced.
-        ev_tx
-            .send(EngineEvent::Preview {
-                rev: 1,
-                text: "a".into(),
-            })
-            .unwrap();
-        ev_tx
-            .send(EngineEvent::Preview {
-                rev: 2,
-                text: "ab".into(),
-            })
-            .unwrap();
-
-        // Same interleave shape as apple_stream_transcription_session: drain
-        // events without requiring audio EOF first.
-        let mut drained = 0usize;
-        while drained < 2 {
-            tokio::select! {
-                event = ev_rx.recv() => {
-                    let Some(event) = event else { break };
-                    sink.on_event(&event);
-                    drained += 1;
-                }
-            }
-        }
-        // Drop worker side only after assert — proves previews did not wait on it.
-        drop(ev_tx);
-        let got = sink.0.lock().expect("lock").clone();
-        assert_eq!(got, vec!["a".to_string(), "ab".to_string()]);
-    }
-
-    /// W1-A contract: lexicon correction must land at SEAL time on the Apple
-    /// progressive path — before the text becomes committed canvas. The Apple
-    /// path used to emit raw SFSpeech text and rely on the stop-path
-    /// postprocess, which is a post-commit rewrite (forbidden by the
-    /// append-only doctrine).
-    #[test]
-    fn apple_seal_lexicon_corrects_sealed_final() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "uruchom doker teraz".into(),
-                segments: vec![segment("uruchom doker teraz", 0.0, 1.0)],
-            }],
-            &tx,
-            &mut state,
-            1.0,
-        );
-        drop(tx);
-        let event = rx.try_recv().expect("sealed final");
-        let EngineEvent::UtteranceFinal { text, raw_text, .. } = event else {
-            panic!("expected UtteranceFinal, got {event:?}");
-        };
-        // w2-b: seal ordering is lexicon → Light+. "doker"→"Docker", then
-        // sentence capitalisation + terminal period from Light+ left-context.
-        assert_eq!(text, "Uruchom Docker teraz.");
-        assert_eq!(
-            raw_text, "uruchom doker teraz",
-            "raw_text must preserve uncorrected engine output for the quality loop"
-        );
-        assert_eq!(state.sealed_count, 1);
-    }
-
-    /// Previews are in-flight presentation, not canvas — they must stay raw so
-    /// the correction lands exactly once, at seal time.
-    #[test]
-    fn apple_seal_lexicon_leaves_previews_raw() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        emit_stream_events(
-            vec![LiveStreamEvent::Partial {
-                text: "uruchom doker".into(),
-                segments: vec![segment("uruchom doker", 0.0, 1.0)],
-            }],
-            &tx,
-            &mut state,
-            1.0,
-        );
-        drop(tx);
-        let event = rx.try_recv().expect("preview");
-        let EngineEvent::Preview { text, .. } = event else {
-            panic!("expected Preview, got {event:?}");
-        };
-        assert_eq!(text, "uruchom doker");
-    }
-
-    /// Utterances that postprocess reduces to nothing must be dropped with an
-    /// explicit `FilteredEmpty` signal — never emitted as an empty final.
-    #[test]
-    fn apple_seal_lexicon_drops_filtered_empty_instead_of_emitting_blank() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                // Trailing-":D" burst: a known ASR artifact that cleanup strips
-                // to nothing.
-                text: ":D".into(),
-                segments: vec![segment(":D", 0.0, 1.0)],
-            }],
-            &tx,
-            &mut state,
-            1.0,
-        );
-        drop(tx);
-        let event = rx.try_recv().expect("drop event");
-        let EngineEvent::Drop { kind, text, .. } = event else {
-            panic!("expected Drop, got {event:?}");
-        };
-        assert_eq!(kind, DropKind::FilteredEmpty);
-        assert_eq!(text, ":D");
-        assert!(
-            rx.try_recv().is_err(),
-            "no final may follow a filtered drop"
-        );
-        assert_eq!(state.sealed_count, 0);
-        assert_eq!(state.filtered_empty_drops, 1);
-    }
-
-    /// Partials-only engines never emit a phrase final; the summary fallback is
-    /// the seal, so it needs the same correction.
-    #[test]
-    fn apple_seal_lexicon_corrects_summary_fallback_seal() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        emit_stream_events(
-            vec![LiveStreamEvent::Summary {
-                text: "zbuduj obraz doker".into(),
-                segments: vec![segment("zbuduj obraz doker", 0.0, 2.0)],
-                ok: true,
-                error: None,
-            }],
-            &tx,
-            &mut state,
-            2.0,
-        );
-        drop(tx);
-        let event = rx.try_recv().expect("summary seal");
-        let EngineEvent::UtteranceFinal { text, .. } = event else {
-            panic!("expected UtteranceFinal, got {event:?}");
-        };
-        assert_eq!(text, "Zbuduj obraz Docker.");
-        assert!(state.open_partial.is_empty());
-    }
-
-    /// Apple is the first observer. Sealing commits its observation unchanged;
-    /// later repair requires a matching occurrence identity through the ledger.
-    #[test]
-    fn apple_seal_preserves_observed_text_until_ledger_repair() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "uruchom doker teraz".into(),
-                segments: vec![segment("uruchom doker teraz", 0.0, 1.0)],
-            }],
-            &tx,
-            &mut state,
-            1.0,
-        );
-        drop(tx);
-        let event = rx.try_recv().expect("sealed final");
-        let EngineEvent::UtteranceFinal { text, .. } = event else {
-            panic!("expected UtteranceFinal, got {event:?}");
-        };
-        assert_eq!(text, "uruchom doker teraz");
-    }
 
     // ── W2-A · Layer 1 tail-patch on the Apple progressive path ──────────────
 
@@ -5962,90 +5299,7 @@ mod tests {
         assert!(!lane.forward_completion_to_worker(&done_tx, rejected));
     }
 
-    /// Wiring contract: a sealed utterance must hand Layer 1 the exact audio
-    /// behind it plus the exact committed string `ReplaceRange` offsets are
-    /// computed against. Anything else patches canvas from the wrong source.
-    #[test]
-    fn apple_tail_patch_seal_enqueues_audio_window_for_the_sealed_utterance() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (tp_tx, mut tp_rx) = mpsc::channel::<TailPatchRequest>(TAIL_PATCH_QUEUE_CAP);
-        let mut state = AppleSealState::new_with_tail_patch(TEST_SAMPLE_RATE, tp_tx);
-        push_capture(&mut state, 6.0);
 
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "uruchom doker".into(),
-                segments: vec![segment("uruchom doker", 0.5, 2.0)],
-            }],
-            &tx,
-            &mut state,
-            6.0,
-        );
-
-        assert!(
-            state.flush_layer1_coalesce(&tx),
-            "one-seal tests flush the held window so the request is observable"
-        );
-        let req = tp_rx
-            .try_recv()
-            .expect("sealed utterance must enqueue a tail-patch request");
-        assert_eq!(req.utterance_id, 1);
-        assert_eq!(
-            req.committed_text, "Uruchom Docker.",
-            "Layer 1 must diff against the progressive-sealed text (lexicon → Light+), not raw engine output"
-        );
-        assert_eq!(
-            req.audio.len(),
-            2 * TEST_SAMPLE_RATE as usize,
-            "window is [previous seal end, end_ts) at session rate"
-        );
-        assert_eq!(req.provider_request.identity.range.sample_start, 0);
-        assert_eq!(req.provider_request.identity.range.sample_end, 32_000);
-        assert_eq!(req.provider_request.identity.request_id, req.utterance_id);
-        assert_eq!(
-            state.tail_patch_awaiting_completion, 1,
-            "an accepted request is what the end-of-session closure loop owes a wait to"
-        );
-    }
-
-    /// A first final that arrives after the retention horizon must not poison
-    /// the whole session. Measured live 2026-08-14: a 247 s take whose first
-    /// SFSpeech final came at 156 s went 11/11 unresolved — `last_sealed_end`
-    /// stayed 0.0 because it only advances on success, so Layer 1 received
-    /// zero windows for the entire take. The window start clamps to retained
-    /// audio (everything older is committed canvas by definition); a genuinely
-    /// lying `end_ts` stays fail-closed.
-    #[test]
-    fn seal_window_clamps_start_after_retention_eviction() {
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 200.0);
-        let retained_start = state.audio.retained_start_secs();
-        assert!(
-            retained_start > 0.0,
-            "fixture must push past the retention cap to evict the session head"
-        );
-
-        let window = resolve_sealed_audio_window(&mut state, 150.0)
-            .expect("stale `from` must clamp to retained audio, not fail the take");
-        assert_eq!(
-            window.sample_start,
-            (retained_start as f64 * TEST_SAMPLE_RATE as f64) as u64,
-            "clamped window starts at the oldest retained sample"
-        );
-        assert_eq!(window.sample_end, 150 * TEST_SAMPLE_RATE as u64);
-
-        // The poison spiral is broken: the next window chains normally.
-        let next = resolve_sealed_audio_window(&mut state, 180.0)
-            .expect("later windows must resolve once the first seal landed");
-        assert_eq!(next.sample_start, 150 * TEST_SAMPLE_RATE as u64);
-
-        // A boundary that precedes the already-sealed canvas is still a lie.
-        assert!(
-            resolve_sealed_audio_window(&mut state, 100.0).is_none(),
-            "end_ts behind the sealed canvas must stay fail-closed"
-        );
-        assert_eq!(state.unresolved_windows, 1);
-    }
 
     /// SFSpeech may report a word end a few milliseconds past PCM capture.
     /// Ingestion clamps it once onto the integer sample clock; later stages do
@@ -6134,89 +5388,8 @@ mod tests {
         );
     }
 
-    /// F3 carry-over: a boundary that does not address retained audio already
-    /// counts as unresolved. It must also never reach Whisper — patching from
-    /// the wrong span is worse than not patching.
-    #[test]
-    fn apple_tail_patch_unresolved_window_enqueues_nothing() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (tp_tx, mut tp_rx) = mpsc::channel::<TailPatchRequest>(TAIL_PATCH_QUEUE_CAP);
-        let mut state = AppleSealState::new_with_tail_patch(TEST_SAMPLE_RATE, tp_tx);
-        push_capture(&mut state, 2.0);
 
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "zdanie z przyszlosci".into(),
-                segments: vec![segment("zdanie z przyszlosci", 8.0, 9.0)],
-            }],
-            &tx,
-            &mut state,
-            2.0,
-        );
 
-        assert_eq!(state.sealed_count, 1, "the text still seals");
-        assert_eq!(state.unresolved_windows, 1);
-        assert!(
-            tp_rx.try_recv().is_err(),
-            "an unresolved window must not be handed to Layer 1"
-        );
-    }
-
-    /// Layered off (default): the seal path carries no Layer 1 wire at all, so
-    /// zero jobs can be scheduled from it.
-    #[test]
-    fn apple_tail_patch_off_by_default_enqueues_no_jobs() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 4.0);
-
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "uruchom doker".into(),
-                segments: vec![segment("uruchom doker", 0.5, 2.0)],
-            }],
-            &tx,
-            &mut state,
-            4.0,
-        );
-
-        assert!(
-            state.tail_patch.is_none(),
-            "no wire exists when layered is off"
-        );
-        assert_eq!(state.sealed_count, 1);
-        assert_eq!(state.tail_patch_backpressure_drops, 0);
-    }
-
-    /// F1: the seal path runs on the worker thread that also forwards PCM into
-    /// the bridge. It must never block on the patch queue — a full queue drops
-    /// and counts, capture keeps flowing.
-    #[test]
-    fn apple_tail_patch_backpressure_drops_instead_of_stalling_capture() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let (tp_tx, _tp_rx) = mpsc::channel::<TailPatchRequest>(1);
-        let mut state = AppleSealState::new_with_tail_patch(TEST_SAMPLE_RATE, tp_tx);
-        push_capture(&mut state, 10.0);
-
-        let mut events = Vec::new();
-        for i in 0..10 {
-            let start = i as f32 * 0.5;
-            events.push(LiveStreamEvent::PhraseFinal {
-                text: format!("segment {i}"),
-                segments: vec![segment(&format!("segment {i}"), start, start + 0.4)],
-            });
-        }
-        emit_stream_events(events, &tx, &mut state, 10.0);
-
-        assert!(
-            state.tail_patch_backpressure_drops >= 1,
-            "a second 5-segment flush must drop when the queue already holds one job"
-        );
-        assert!(
-            state.sealed_count >= 1,
-            "a dropped flush still seals Apple instead of stalling capture"
-        );
-    }
 
     /// Compatibility parser semantics remain strict. Product-mode defaults are
     /// resolved at recording bootstrap, not by this parser alone.
@@ -6707,122 +5880,7 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn fusion_slices_admit_disjoint_ledger_occurrences_before_raw_finals() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        let disjoint = arm_fusion_slice_admission(&mut state);
-        let fusion_ranges = state
-            .fusion
-            .as_ref()
-            .expect("fusion fixture")
-            .ledger()
-            .utterances()
-            .iter()
-            .map(|utterance| (utterance.id, utterance.range.clone()))
-            .collect::<Vec<_>>();
 
-        assert!(seal_sliced_by_silero(&mut state, &tx, &disjoint));
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-
-        let apple_mutations = events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                EngineEvent::LedgerMutation {
-                    observation, label, ..
-                } if observation.producer == LedgerObservationProducer::Apple => {
-                    Some((index, observation.occurrence.clone(), label.clone()))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(apple_mutations.len(), 2, "one Apple admit per Silero slice");
-        assert_eq!(apple_mutations[0].2, "Iwo");
-        assert_eq!(apple_mutations[1].2, "Iwo");
-        assert_ne!(
-            apple_mutations[0].1, apple_mutations[1].1,
-            "equal labels on disjoint PCM ranges remain distinct occurrences"
-        );
-
-        for (utterance_id, range) in fusion_ranges {
-            let mutation_index = apple_mutations
-                .iter()
-                .find_map(|(index, occurrence, _)| {
-                    (occurrence.sample_start == range.sample_start
-                        && occurrence.sample_end == range.sample_end)
-                        .then_some(*index)
-                })
-                .expect("slice-local ledger mutation");
-            let final_index = events
-                .iter()
-                .position(|event| {
-                    matches!(
-                        event,
-                        EngineEvent::UtteranceFinal {
-                            utterance_id: final_id,
-                            ..
-                        } if *final_id == utterance_id
-                    )
-                })
-                .expect("observation-only final");
-            assert!(
-                mutation_index < final_index,
-                "ledger admission must precede the raw final for slice {utterance_id}"
-            );
-        }
-
-        assert!(
-            events.iter().all(|event| match event {
-                EngineEvent::LedgerMutation { label, .. } => label == "Iwo",
-                EngineEvent::UtteranceFinal { text, raw_text, .. } => {
-                    text == "Iwo" && raw_text == "Iwo"
-                }
-                _ => true,
-            }),
-            "callback-wide text must never be copied into every slice: {events:#?}"
-        );
-    }
-
-    #[test]
-    fn fusion_slice_replay_reaches_ledger_identity_refusal() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        let disjoint = arm_fusion_slice_admission(&mut state);
-        assert!(seal_sliced_by_silero(&mut state, &tx, &disjoint));
-        while rx.try_recv().is_ok() {}
-
-        assert!(seal_sliced_by_silero(&mut state, &tx, &disjoint));
-        let replay_events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        let replay_receipts = replay_events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::LedgerMutation {
-                    observation,
-                    receipt,
-                    ..
-                } if observation.producer == LedgerObservationProducer::Apple => Some(receipt),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(replay_receipts.len(), 2);
-        assert!(
-            replay_receipts
-                .iter()
-                .all(|receipt| !receipt.grants_mutation()),
-            "replayed request/range identity must be refused by AcousticLedger"
-        );
-        assert_eq!(
-            state
-                .acoustic_ledger
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .occurrences()
-                .count(),
-            2,
-            "replay must not mint a third occurrence"
-        );
-    }
 
     /// (a) Utterance identity comes from the spectrum, and the seal carries it.
     ///
@@ -7027,85 +6085,7 @@ mod tests {
         assert_eq!(sealed[0].range.sample_end, at(2.0));
     }
 
-    #[test]
-    fn five_disjoint_iwo_segments_all_reach_the_final() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 6.0);
-        let segments: Vec<_> = (0..5)
-            .map(|i| {
-                let start = i as f32 * 0.4;
-                segment("Iwo", start, start + 0.3)
-            })
-            .collect();
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "Iwo Iwo Iwo Iwo Iwo".into(),
-                segments,
-            }],
-            &tx,
-            &mut state,
-            3.0,
-        );
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let finals: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            finals.len(),
-            1,
-            "one Apple final for five disjoint words: {events:?}"
-        );
-        let iwo_count = count_iwo(finals[0]);
-        assert_eq!(iwo_count, 5, "delivery text: {}", finals[0]);
-    }
 
-    #[test]
-    fn cumulative_fifth_iwo_is_not_absorbed_as_a_revision() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut state = AppleSealState::new(TEST_SAMPLE_RATE);
-        push_capture(&mut state, 8.0);
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "Iwo Iwo Iwo Iwo".into(),
-                segments: (0..4)
-                    .map(|i| {
-                        let start = i as f32 * 0.4;
-                        segment("Iwo", start, start + 0.3)
-                    })
-                    .collect(),
-            }],
-            &tx,
-            &mut state,
-            2.0,
-        );
-        emit_stream_events(
-            vec![LiveStreamEvent::PhraseFinal {
-                text: "Iwo Iwo Iwo Iwo Iwo".into(),
-                segments: vec![segment("Iwo Iwo Iwo Iwo Iwo", 0.0, 1.6)],
-            }],
-            &tx,
-            &mut state,
-            3.0,
-        );
-        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let texts: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                EngineEvent::UtteranceFinal { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        let iwo_count = texts.iter().map(|text| count_iwo(text)).sum::<usize>();
-        assert_eq!(
-            iwo_count, 5,
-            "the fifth acoustic Iwo must survive the cumulative restatement: {texts:?}"
-        );
-    }
 }
 
 /// Conservation falsifiers from the acoustic-identity cut. These encode the
@@ -7593,10 +6573,8 @@ mod rc_w2_acoustic_tests {
     /// `SEAL_COVERAGE_INCOMPLETE_MS` (250 ms) at [`RATE`].
     const THRESHOLD: u64 = 4_000;
 
-    /// The capture energy ladder is one process-global slot. Every test that
-    /// writes or reads it takes this lock first, or two tests measuring
-    /// different takes would answer each other's questions.
-    static ENERGY_CLOCK: Mutex<()> = Mutex::new(());
+    // capture_receipt owns a per-test-thread clock for every energy consumer.
+    // No module-local mutex can protect a process-global reset/feed/read sequence.
 
     fn at(secs: f32) -> u64 {
         (secs * RATE as f32) as u64
@@ -7815,7 +6793,6 @@ mod rc_w2_acoustic_tests {
     /// no longer holds.
     #[test]
     fn repair_reports_unresolvable_gap_pcm_instead_of_inventing_a_witness() {
-        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
         begin_session_energy_clock();
         let mut accumulator = CaptureLevelAccumulator::new();
         accumulator.push_samples(&vec![0.25f32; at(3.0) as usize]);
@@ -7848,7 +6825,6 @@ mod rc_w2_acoustic_tests {
     /// recorded — not a flag, and not the whole take.
     #[test]
     fn capture_energy_fallback_measures_recorded_hops() {
-        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
         begin_session_energy_clock();
         let mut accumulator = CaptureLevelAccumulator::new();
         accumulator.push_samples(&vec![0.25f32; at(1.0) as usize]);
@@ -7878,8 +6854,6 @@ mod rc_w2_acoustic_tests {
     /// is not lowered and no fabricated distinction is introduced here.
     #[test]
     fn measured_silence_and_absent_evidence_are_both_empty_and_not_yet_distinguishable() {
-        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
-
         begin_session_energy_clock();
         let mut accumulator = CaptureLevelAccumulator::new();
         accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
@@ -8501,6 +7475,18 @@ mod rc_w2_acoustic_tests {
     fn utterance_drop_emit_seals_prior_on_shared_opener_partial_restart() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = state_for("rc-w2-utterance-drop", 30.0);
+        // The port needs the real physical qualification owner. Merely setting
+        // calibration leaves the fallback lane unqualified and emits no seals.
+        let mut fusion = SileroIngress::new(RATE, state.session_id.clone(), state.capture_epoch);
+        for (start, end) in [(0, 5), (5, 10), (10, 15)] {
+            fusion.observe(
+                Some((start * u64::from(RATE), end * u64::from(RATE))),
+                true,
+                end * u64::from(RATE),
+            );
+        }
+        state.fusion = Some(fusion);
+        state.fusion_seal_armed = true;
         let s5 = "Zdanie piąte, szybko bez pauz. Teraz mówię bardzo szybko, bez żadnej przerwy, \
                   żeby sprawdzić czy silnik nadąża za tempem, którego normalnie unika w \
                   codziennym dyktowaniu.";
@@ -8564,5 +7550,656 @@ mod rc_w2_acoustic_tests {
             "s5 + frozen s6 + s7 → at least 3 seals, got {}",
             state.sealed_count
         );
+    }
+}
+
+/// rc-w2-test-rehab: current-owner replacements for the 26 parked contracts.
+/// Synthetic PCM/edges below are unit fixtures, never measured take receipts.
+/// Raw finals are telemetry; every document assertion reads AcousticLedger.
+#[cfg(test)]
+mod rc_w2_test_rehab {
+    use super::*;
+    use crate::pipeline::acoustic_ledger::RefuseReason;
+
+    const RATE: u32 = 16_000;
+
+    fn sample(secs: f32) -> u64 {
+        (secs * RATE as f32).round() as u64
+    }
+
+    fn segment(text: &str, start_ts: f32, end_ts: f32) -> TranscriptSegment {
+        TranscriptSegment { text: text.into(), start_ts, end_ts }
+    }
+
+    fn state(session: &str, secs: f32) -> AppleSealState {
+        let mut state = AppleSealState::new_for_session(RATE, session.into(), 7);
+        state.energy_calibration = Some(EnergyCalibration::new("rehab-synthetic", 1.0, 1));
+        for chunk in vec![0.25; sample(secs) as usize].chunks(1024) {
+            state.audio.push(chunk);
+        }
+        state
+    }
+
+    // The fallback Apple path consumes an EXISTING qualification. Supply that
+    // exact precondition from this fixture's retained PCM, without admitting a
+    // label or manufacturing a terminal coverage receipt.
+    fn qualify(state: &mut AppleSealState, start: f32, end: f32) -> OccurrenceIdentity {
+        let occurrence = OccurrenceIdentity::new(
+            &state.session_id, state.capture_epoch, sample(start), sample(end),
+        );
+        let window = state.window_by_samples(sample(start), sample(end)).expect("fixture PCM");
+        assert!(window.samples.iter().all(|value| *value == 0.25));
+        let calibration = state.energy_calibration.as_ref().expect("fixture calibration");
+        let evidence = AcousticEvidence {
+            occurrence: occurrence.clone(),
+            duration_ms: f64::from(end - start) * 1_000.0,
+            energy_integral: window.samples.len() as f64 * 0.25_f64.powi(2),
+            mean_rms_dbfs: 20.0 * 0.25_f64.log10(),
+            peak_dbfs: 20.0 * 0.25_f64.log10(),
+            vad_open_sample: Some(sample(start)),
+            vad_close_sample: Some(sample(end)),
+            evidence_calibration_version: calibration.version.clone(),
+        };
+        assert!(state.acoustic_ledger.lock().unwrap().qualify(&evidence, calibration).is_qualified());
+        occurrence
+    }
+
+    fn physical_state(session: &str, secs: f32, ranges: &[(f32, f32)]) -> AppleSealState {
+        let mut state = state(session, secs);
+        let mut fusion = SileroIngress::new(RATE, session, state.capture_epoch);
+        for &(start, end) in ranges {
+            let observed = fusion.observe(Some((sample(start), sample(end))), true, sample(end));
+            assert_eq!(observed.closed.len(), 1);
+        }
+        state.fusion = Some(fusion);
+        state.fusion_seal_armed = true;
+        state.fusion_context = FusionContextMode::UtteranceOnly;
+        state
+    }
+
+    fn emit(state: &mut AppleSealState, tx: &mpsc::UnboundedSender<EngineEvent>, words: Vec<TranscriptSegment>) {
+        let text = words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
+        let secs = state.audio.session_sample_end() as f32 / RATE as f32;
+        emit_stream_events(vec![LiveStreamEvent::PhraseFinal { text, segments: words }], tx, state, secs);
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn document(state: &AppleSealState) -> String {
+        state.acoustic_ledger.lock().unwrap().rendered_text()
+    }
+
+    fn raw_finals(events: &[EngineEvent]) -> Vec<&str> {
+        events.iter().filter_map(|event| match event {
+            EngineEvent::UtteranceFinal { raw_text, .. } => Some(raw_text.as_str()),
+            _ => None,
+        }).collect()
+    }
+
+    fn count_iwo(text: &str) -> usize {
+        text.split_whitespace().filter(|word| word.eq_ignore_ascii_case("iwo")).count()
+    }
+
+    #[test]
+    fn emit_maps_partial_and_two_phrase_finals() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("two-finals", 2.0, &[(0.0, 1.0), (1.0, 2.0)]);
+        emit_stream_events(vec![LiveStreamEvent::Partial {
+            text: "hello".into(), segments: vec![segment("hello", 0.0, 0.5)],
+        }], &tx, &mut state, 0.5);
+        assert!(document(&state).is_empty(), "preview cannot admit words");
+        emit(&mut state, &tx, vec![segment("hello world", 0.0, 1.0)]);
+        emit(&mut state, &tx, vec![segment("second", 1.0, 2.0)]);
+        let events = drain(&mut rx);
+        assert!(matches!(&events[0], EngineEvent::Preview { rev: 1, text } if text == "hello"));
+        let ids = events.iter().filter_map(|event| match event {
+            EngineEvent::UtteranceFinal { utterance_id, .. } => Some(*utterance_id),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(state.sealed_count, 2);
+        assert_eq!(document(&state), "hello world second");
+    }
+
+    /// The old test synthesized a new window from stale timing and novel text.
+    /// Current contract: novelty alone is not PCM identity. A later exact
+    /// observation preserves the novel phrase without rewriting the first one.
+    #[test]
+    fn boundary_consumed_final_with_novel_text_requires_exact_pcm() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("stale-final", 4.0, &[(0.0, 1.0), (2.0, 3.0)]);
+        emit(&mut state, &tx, vec![segment("prior", 0.0, 1.0)]);
+        drain(&mut rx);
+        emit(&mut state, &tx, vec![segment("novel phrase", 0.0, 1.0)]);
+        assert_eq!(document(&state), "prior");
+        assert!(raw_finals(&drain(&mut rx)).is_empty());
+        emit(&mut state, &tx, vec![segment("novel phrase", 2.0, 3.0)]);
+        assert_eq!(document(&state), "prior novel phrase");
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+    }
+
+    /// Untimed preview cannot be promoted into committed speech. Preserve the
+    /// refusal and prove that the same words with actual timing can still land.
+    #[test]
+    fn frozen_partial_without_segments_requires_exact_pcm() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("untimed-freeze", 3.0, &[(0.0, 2.0)]);
+        let prior = "whole prior utterance retained for exact observation";
+        emit_stream_events(vec![
+            LiveStreamEvent::Partial { text: prior.into(), segments: Vec::new() },
+            LiveStreamEvent::Partial { text: "Next".into(), segments: Vec::new() },
+        ], &tx, &mut state, 2.0);
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|event| matches!(event,
+            EngineEvent::Warning { code, .. } if code == "apple_final_without_pcm_timing"
+        )));
+        assert!(raw_finals(&events).is_empty());
+        assert!(document(&state).is_empty());
+        emit(&mut state, &tx, vec![segment(prior, 0.0, 2.0)]);
+        assert_eq!(document(&state), prior);
+    }
+
+    /// Retention now preserves the bounded tail for terminal gap repair; the
+    /// old immediate-release assertion would destroy required recovery PCM.
+    #[test]
+    fn seals_resolve_their_audio_window_from_retained_pcm() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = state("retained-seals", 6.0);
+        qualify(&mut state, 0.5, 2.0);
+        qualify(&mut state, 2.5, 4.0);
+        emit(&mut state, &tx, vec![segment("first", 0.5, 2.0)]);
+        emit(&mut state, &tx, vec![segment("second", 2.5, 4.0)]);
+        assert_eq!(state.sealed_count, 2);
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["first", "second"]);
+        assert_eq!(state.unresolved_windows, 0);
+        assert_eq!(state.last_sealed_end, 4.0);
+        assert_eq!(state.audio.window(0.0, 1.0).unwrap(), vec![0.25; RATE as usize]);
+        assert!(state.audio.window(2.5, 4.0).is_some());
+    }
+
+    #[test]
+    fn cumulative_apple_final_commits_only_segments_after_last_boundary() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = state("cumulative-segments", 4.0);
+        qualify(&mut state, 0.0, 2.0);
+        qualify(&mut state, 2.0, 3.0);
+        emit(&mut state, &tx, vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0)]);
+        emit(&mut state, &tx, vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0), segment("gamma", 2.0, 3.0)]);
+        let events = drain(&mut rx);
+        let finals = events.iter().filter_map(|event| match event {
+            EngineEvent::UtteranceFinal { raw_text, start_ts, end_ts, .. } => Some((raw_text.as_str(), *start_ts, *end_ts)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(finals, vec![("alpha beta", 0.0, 2.0), ("gamma", 2.0, 3.0)]);
+        assert_eq!(events.iter().filter(|event| matches!(event,
+            EngineEvent::Warning { code, .. } if code == APPLE_FINAL_OVERLAP_WARNING_CODE
+        )).count(), 1);
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+    }
+
+    #[test]
+    fn cumulative_final_commits_only_its_exact_novel_suffix() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("novel-suffix", 3.0, &[(0.0, 2.0), (2.0, 3.0)]);
+        emit(&mut state, &tx, vec![segment("alpha beta", 0.0, 2.0)]);
+        emit(&mut state, &tx, vec![segment("alpha beta revised", 0.0, 2.0)]);
+        assert_eq!(document(&state), "alpha beta", "stale span cannot authenticate a suffix");
+        emit(&mut state, &tx, vec![segment("alpha beta", 0.0, 2.0), segment("revised", 2.0, 3.0)]);
+        assert_eq!(document(&state), "alpha beta revised");
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["alpha beta", "revised"]);
+    }
+
+    #[test]
+    fn five_spoken_occurrences_survive_a_cumulative_restatement_end_to_end() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let ranges = (0..5).map(|i| (i as f32, (i + 1) as f32)).collect::<Vec<_>>();
+        let mut state = physical_state("five-restated", 5.0, &ranges);
+        let words = ranges.iter().map(|&(start, end)| segment("Iwo", start, end)).collect::<Vec<_>>();
+        emit(&mut state, &tx, words[..4].to_vec());
+        assert_eq!(count_iwo(&document(&state)), 4);
+        emit(&mut state, &tx, words);
+        assert_eq!(count_iwo(&document(&state)), 5);
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["Iwo"; 5]);
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 5);
+    }
+
+    /// Prefix identity is acoustic even after Lexicon changes its spelling.
+    /// Drive the configured seal path, then replay Apple against the sealed
+    /// prefix: no text matcher is permitted to mint another occurrence.
+    #[test]
+    fn cumulative_final_prefix_survives_words_the_lexicon_rewrites() {
+        with_lexicon_fixture("cumulative_final_prefix_survives_words_the_lexicon_rewrites", || {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut state = state("rewritten-prefix", 3.0);
+            let occurrence = qualify(&mut state, 0.0, 2.0);
+            emit(&mut state, &tx, vec![segment("uruchom doker", 0.0, 2.0)]);
+            assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
+            assert_eq!(document(&state), "uruchom Docker");
+            state.fusion_seal_armed = true;
+            let mut fusion = SileroIngress::new(RATE, state.session_id.clone(), state.capture_epoch);
+            fusion.observe(Some((0, sample(2.0))), true, sample(2.0));
+            fusion.observe(Some((sample(2.0), sample(3.0))), true, sample(3.0));
+            state.fusion = Some(fusion);
+            emit(&mut state, &tx, vec![segment("uruchom doker", 0.0, 2.0), segment("i restart", 2.0, 3.0)]);
+            assert_eq!(document(&state), "uruchom Docker i restart");
+            assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+            assert!(drain(&mut rx).iter().any(|event| matches!(event,
+                EngineEvent::LedgerMutation { receipt: MutationReceipt::Refuse { .. }, .. }
+            )));
+        });
+    }
+
+    /// The old explicit empty Preview event belongs to presentation. Here the
+    /// current owner clears its volatile state and emits no duplicate final.
+    #[test]
+    fn fully_reheard_cumulative_final_clears_preview_instead_of_repeating_canvas() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("reheard", 3.0, &[(0.0, 2.0)]);
+        emit(&mut state, &tx, vec![segment("heard phrase", 0.0, 2.0)]);
+        drain(&mut rx);
+        emit_stream_events(vec![LiveStreamEvent::Partial {
+            text: "heard phrase".into(), segments: vec![segment("heard phrase", 0.0, 2.0)],
+        }], &tx, &mut state, 3.0);
+        assert_eq!(state.open_partial, "heard phrase");
+        drain(&mut rx);
+        emit(&mut state, &tx, vec![segment("heard phrase", 0.0, 2.0)]);
+        let events = drain(&mut rx);
+        assert!(state.open_partial.is_empty());
+        assert!(state.open_partial_segments.is_empty());
+        assert!(raw_finals(&events).is_empty());
+        assert!(!events.iter().any(|event| matches!(event, EngineEvent::Preview { text, .. } if !text.is_empty())));
+        assert_eq!(document(&state), "heard phrase");
+    }
+
+    #[test]
+    fn legitimate_repeated_words_survive_disjoint_apple_windows() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("repeated-tak", 3.0, &[(0.0, 1.0), (1.0, 2.0)]);
+        emit(&mut state, &tx, vec![segment("tak", 0.0, 1.0)]);
+        emit(&mut state, &tx, vec![segment("tak", 1.0, 2.0)]);
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["tak", "tak"]);
+        assert_eq!(document(&state), "tak tak");
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+    }
+
+    /// Out-of-capture text cannot seal without a nonempty qualified occurrence.
+    #[test]
+    fn seal_window_beyond_captured_audio_is_counted_unresolved() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = state("future-window", 2.0);
+        emit(&mut state, &tx, vec![segment("future phrase", 8.0, 9.0)]);
+        assert_eq!(state.unresolved_windows, 1);
+        assert_eq!(state.last_sealed_end, 0.0);
+        assert_eq!(state.sealed_count, 0);
+        assert!(raw_finals(&drain(&mut rx)).is_empty());
+        assert!(document(&state).is_empty());
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 0);
+    }
+
+    /// Real event producer and real channel, with sender still open at assert.
+    /// No hand-written select loop masquerading as the session implementation.
+    #[tokio::test]
+    async fn live_previews_surface_before_audio_eof() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = state("preview-before-eof", 1.0);
+        for text in ["a", "ab"] {
+            emit_stream_events(vec![LiveStreamEvent::Partial {
+                text: text.into(), segments: vec![segment(text, 0.0, 0.5)],
+            }], &tx, &mut state, 0.5);
+        }
+        for (expected_rev, expected) in [(1, "a"), (2, "ab")] {
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await
+                .expect("preview before EOF").expect("producer stays open");
+            assert!(matches!(event, EngineEvent::Preview { rev, text } if rev == expected_rev && text == expected));
+        }
+        assert!(!rx.is_closed());
+        assert!(document(&state).is_empty());
+        drop(tx);
+    }
+
+    /// Run the same named test in an isolated process with a real custom table.
+    /// Command::env changes only the child's launch environment. Other tests
+    /// keep their own config, and the test never edits the Founder's dictionary.
+    /// The marker chooses the child arm; it is private to this fresh tempdir.
+    fn with_lexicon_fixture(name: &str, check: impl FnOnce()) {
+        if let Some(root) = std::env::var_os("CODESCRIBE_DATA_DIR") {
+            let root = std::path::PathBuf::from(root);
+            if std::fs::read(root.join("rc-w2-lexicon-case")).ok().as_deref()
+                == Some(name.as_bytes())
+            {
+                assert_eq!(crate::config::Config::config_dir(), root.canonicalize().unwrap());
+                assert_eq!(
+                    crate::quality::overlay_quality::apply_custom_lexicon("doker"),
+                    "Docker",
+                    "positive control: the configured rule must change the input",
+                );
+                check();
+                return;
+            }
+        }
+        let directory = tempfile::tempdir().expect("isolated lexicon directory");
+        std::fs::write(directory.path().join("rc-w2-lexicon-case"), name)
+            .expect("child fixture marker");
+        std::fs::write(
+            directory.path().join("lexicon.custom.jsonl"),
+            "{\"term\":\"Docker\",\"mispronunciations\":[\"doker\"],\"source\":\"manual\"}\n",
+        ).expect("deterministic custom rule");
+        let output = std::process::Command::new(std::env::current_exe().expect("unit test binary"))
+            .arg("--exact")
+            .arg(format!("{}::{name}", module_path!().split_once("::").unwrap().1))
+            .arg("--nocapture")
+            .env("CODESCRIBE_DATA_DIR", directory.path())
+            .output()
+            .expect("isolated lexicon test process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child test failed: {stdout}\n{stderr}");
+        assert!(stdout.contains("running 1 test\n"), "exact test must exist: {stdout}");
+        assert!(stdout.contains("1 passed; 0 failed"), "no skipped execution: {stdout}");
+    }
+
+    /// Positive configured rewrite through the real PhraseFinal consumer.
+    /// Light+ capitalization/periods belong to PresentationEmitter, so they
+    /// are deliberately absent here; raw Apple evidence remains unchanged.
+    #[test]
+    fn apple_seal_lexicon_corrects_sealed_final() {
+        with_lexicon_fixture("apple_seal_lexicon_corrects_sealed_final", || {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut state = state("lexicon-phrase", 1.0);
+            let occurrence = qualify(&mut state, 0.0, 1.0);
+            emit(&mut state, &tx, vec![segment("uruchom doker teraz", 0.0, 1.0)]);
+            let events = drain(&mut rx);
+            assert_eq!(raw_finals(&events), vec!["uruchom doker teraz"]);
+            assert_eq!(document(&state), "uruchom Docker teraz");
+            assert_eq!(state.sealed_count, 1);
+            let observations = events.iter().filter_map(|event| match event {
+                EngineEvent::LedgerMutation { observation, label, .. } => {
+                    assert_eq!(observation.occurrence, occurrence);
+                    Some((observation.producer, label.as_str()))
+                }
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(observations, vec![
+                (LedgerObservationProducer::Apple, "uruchom doker teraz"),
+                (LedgerObservationProducer::Lexicon, "uruchom Docker teraz"),
+            ]);
+            assert!(events.iter().any(|event| matches!(event,
+                EngineEvent::UtteranceFinal { text, .. } if text == "uruchom Docker teraz"
+            )));
+            assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
+        });
+    }
+
+    #[test]
+    fn apple_seal_lexicon_leaves_previews_raw() {
+        with_lexicon_fixture("apple_seal_lexicon_leaves_previews_raw", || {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut state = state("raw-lexicon-preview", 1.0);
+            emit_stream_events(vec![LiveStreamEvent::Partial {
+                text: "uruchom doker".into(), segments: vec![segment("uruchom doker", 0.0, 1.0)],
+            }], &tx, &mut state, 1.0);
+            assert!(matches!(rx.try_recv().unwrap(), EngineEvent::Preview { text, .. } if text == "uruchom doker"));
+            assert!(rx.try_recv().is_err());
+            assert!(document(&state).is_empty());
+            assert_eq!(state.sealed_count, 0);
+        });
+    }
+
+    /// The old `:D` string filter has no live worker owner. Blank observations
+    /// still cannot emit blank finals; a nonempty acoustically qualified label
+    /// must not disappear merely because its spelling resembles an artifact.
+    #[test]
+    fn apple_seal_lexicon_empty_text_never_emits_a_blank_final() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("blank-final", 1.0, &[(0.0, 1.0)]);
+        emit(&mut state, &tx, vec![segment("   ", 0.0, 1.0)]);
+        assert!(document(&state).is_empty());
+        assert_eq!(state.sealed_count, 0);
+        assert!(raw_finals(&drain(&mut rx)).is_empty());
+        // Independent positive control: text classification must not substitute
+        // for evidence. A blank callback has already reconciled its own slice.
+        let mut state = physical_state("spoken-symbol", 1.0, &[(0.0, 1.0)]);
+        emit(&mut state, &tx, vec![segment(":D", 0.0, 1.0)]);
+        assert_eq!(document(&state), ":D");
+        assert_eq!(raw_finals(&drain(&mut rx)), vec![":D"]);
+        assert_eq!(state.sealed_count, 1);
+    }
+
+    /// Positive configured rewrite through the real summary fallback. A later
+    /// summary cannot bypass the occurrence owner to publish the document twice.
+    #[test]
+    fn apple_seal_lexicon_corrects_summary_fallback_seal() {
+        with_lexicon_fixture("apple_seal_lexicon_corrects_summary_fallback_seal", || {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut state = state("summary-observers", 2.0);
+            let occurrence = qualify(&mut state, 0.0, 2.0);
+            let summary = LiveStreamEvent::Summary {
+                text: "zbuduj obraz doker".into(),
+                segments: vec![segment("zbuduj obraz doker", 0.0, 2.0)],
+                ok: true,
+                error: None,
+            };
+            emit_stream_events(vec![summary.clone()], &tx, &mut state, 2.0);
+            let events = drain(&mut rx);
+            let producers = events.iter().filter_map(|event| match event {
+                EngineEvent::LedgerMutation { observation, label, .. } => {
+                    assert_eq!(observation.occurrence, occurrence);
+                    Some((observation.producer, label.as_str()))
+                }
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(producers, vec![
+                (LedgerObservationProducer::Apple, "zbuduj obraz doker"),
+                (LedgerObservationProducer::Lexicon, "zbuduj obraz Docker"),
+            ]);
+            assert_eq!(document(&state), "zbuduj obraz Docker");
+            assert_eq!(raw_finals(&events), vec!["zbuduj obraz doker"]);
+            assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
+            assert!(state.open_partial.is_empty());
+            emit_stream_events(vec![summary], &tx, &mut state, 2.0);
+            assert!(drain(&mut rx).is_empty());
+            assert_eq!(state.sealed_count, 1);
+        });
+    }
+
+    #[test]
+    fn apple_seal_preserves_observed_text_until_ledger_repair() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("apple-raw", 1.0, &[(0.0, 1.0)]);
+        emit(&mut state, &tx, vec![segment("uruchom doker teraz", 0.0, 1.0)]);
+        assert_eq!(document(&state), "uruchom doker teraz");
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["uruchom doker teraz"]);
+        let occurrence = OccurrenceIdentity::new("apple-raw", 7, 0, sample(1.0));
+        let late = admit_ledger_label(&mut state, &tx, LabelAdmission {
+            observation: LedgerObservationIdentity::new(LedgerObservationProducer::Lexicon, 99, 0, occurrence),
+            label: "uruchom Docker teraz", energy: EnergyAdmission::RequireExistingQualification,
+        }).unwrap();
+        assert!(matches!(late, MutationReceipt::Refuse { reason: RefuseReason::SealedReplay, .. }));
+        assert_eq!(document(&state), "uruchom doker teraz");
+    }
+
+    #[test]
+    fn apple_tail_patch_seal_enqueues_audio_window_for_the_sealed_utterance() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tail_tx, mut tail_rx) = mpsc::channel(TAIL_PATCH_QUEUE_CAP);
+        let mut state = physical_state("exact-tail", 6.0, &[(0.5, 2.0)]);
+        state.fusion_context = FusionContextMode::SymmetricPad;
+        state.tail_patch = Some(tail_tx);
+        emit(&mut state, &tx, vec![segment("uruchom doker", 0.5, 2.0)]);
+        assert!(raw_finals(&drain(&mut rx)).is_empty(), "Whisper still owns an open frontier");
+        assert!(state.flush_layer1_coalesce(&tx));
+        let request = tail_rx.try_recv().expect("owned PCM request");
+        assert_eq!(request.utterance_id, 1);
+        assert_eq!(request.committed_text, "uruchom doker", "sliced lane preserves raw observed baseline");
+        assert_eq!(request.provider_request.identity.range.sample_start, sample(0.1));
+        assert_eq!(request.provider_request.identity.range.sample_end, sample(2.4));
+        assert_eq!(request.audio, vec![0.25; sample(2.3) as usize]);
+        assert_eq!(request.provider_request.identity.request_id, request.utterance_id);
+        assert_eq!(request.member_occurrences, vec![(1, OccurrenceIdentity::new("exact-tail", 7, sample(0.5), sample(2.0)))]);
+        assert_eq!(state.tail_patch_awaiting_completion, 1);
+        state.complete_whisper_window(&tx, TailPatchCompletion {
+            utterance_id: request.utterance_id,
+            request_identity: Some(request.provider_request.identity),
+            member_occurrences: request.member_occurrences,
+            payload: None,
+        }, 6.0);
+        assert_eq!(state.tail_patch_awaiting_completion, 0);
+        assert_eq!(state.tail_patch_jobs_skipped, 1);
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["uruchom doker"]);
+    }
+
+    #[test]
+    fn seal_window_clamps_start_after_retention_eviction() {
+        let mut state = state("evicted-head", 200.0);
+        let retained_start = state.audio.retained_start_secs();
+        assert!(retained_start > 0.0);
+        let window = resolve_sealed_audio_window(&mut state, 150.0).expect("retained window");
+        assert_eq!(window.sample_start, (f64::from(retained_start) * f64::from(RATE)) as u64);
+        assert_eq!(window.sample_end, sample(150.0));
+        let next = resolve_sealed_audio_window(&mut state, 180.0).expect("next retained window");
+        assert_eq!(next.sample_start, sample(150.0));
+        assert_eq!(next.sample_end, sample(180.0));
+        assert!(resolve_sealed_audio_window(&mut state, 100.0).is_none());
+        assert_eq!(state.unresolved_windows, 1);
+    }
+
+    #[test]
+    fn apple_tail_patch_unresolved_window_enqueues_nothing() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tail_tx, mut tail_rx) = mpsc::channel(TAIL_PATCH_QUEUE_CAP);
+        let mut state = state("unresolved-tail", 2.0);
+        state.tail_patch = Some(tail_tx);
+        emit(&mut state, &tx, vec![segment("future phrase", 8.0, 9.0)]);
+        assert!(!state.flush_layer1_coalesce(&tx));
+        assert!(tail_rx.try_recv().is_err());
+        assert_eq!(state.unresolved_windows, 1);
+        assert_eq!(state.tail_patch_awaiting_completion, 0);
+        assert_eq!(state.sealed_count, 0, "unqualified text cannot seal");
+        assert!(document(&state).is_empty());
+        assert!(raw_finals(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn apple_tail_patch_off_by_default_enqueues_no_jobs() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("tail-off", 4.0, &[(0.5, 2.0)]);
+        assert!(state.tail_patch.is_none(), "arming is injected by session owner");
+        emit(&mut state, &tx, vec![segment("uruchom doker", 0.5, 2.0)]);
+        assert!(!state.flush_layer1_coalesce(&tx));
+        assert_eq!(state.tail_patch_awaiting_completion, 0);
+        assert_eq!(state.tail_patch_backpressure_drops, 0);
+        assert_eq!(state.sealed_count, 1);
+        assert_eq!(raw_finals(&drain(&mut rx)), vec!["uruchom doker"]);
+    }
+
+    #[test]
+    fn apple_tail_patch_backpressure_drops_instead_of_stalling_capture() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tail_tx, mut tail_rx) = mpsc::channel(1);
+        let ranges = (0..10).map(|i| (i as f32 * 0.5, i as f32 * 0.5 + 0.4)).collect::<Vec<_>>();
+        let mut state = physical_state("full-tail", 10.0, &ranges);
+        state.tail_patch = Some(tail_tx);
+        for (i, &(start, end)) in ranges.iter().enumerate() {
+            emit(&mut state, &tx, vec![segment(&format!("segment {i}"), start, end)]);
+        }
+        state.flush_layer1_coalesce(&tx);
+        assert_eq!(state.tail_patch_awaiting_completion, 1);
+        assert_eq!(state.tail_patch_backpressure_drops, 9);
+        assert_eq!(state.sealed_count, 9, "rejected queue jobs return Whisper ownership");
+        let request = tail_rx.try_recv().unwrap();
+        assert!(tail_rx.try_recv().is_err());
+        state.complete_whisper_window(&tx, TailPatchCompletion {
+            utterance_id: request.utterance_id, request_identity: Some(request.provider_request.identity),
+            member_occurrences: request.member_occurrences, payload: None,
+        }, 10.0);
+        assert_eq!(state.tail_patch_awaiting_completion, 0);
+        assert_eq!(state.sealed_count, 10);
+        assert_eq!(raw_finals(&drain(&mut rx)).len(), 10);
+        let before = state.audio.session_sample_end();
+        state.audio.push(&[0.25; 512]);
+        assert_eq!(state.audio.session_sample_end(), before + 512);
+    }
+
+    #[test]
+    fn fusion_slices_admit_disjoint_ledger_occurrences_before_raw_finals() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("slice-order", 4.0, &[(0.0, 1.0), (2.0, 3.0)]);
+        emit(&mut state, &tx, vec![segment("Iwo", 0.0, 1.0), segment("Iwo", 2.0, 3.0)]);
+        let events = drain(&mut rx);
+        assert_eq!(raw_finals(&events), vec!["Iwo", "Iwo"]);
+        for (id, start, end) in [(1, 0.0, 1.0), (2, 2.0, 3.0)] {
+            let occurrence = OccurrenceIdentity::new("slice-order", 7, sample(start), sample(end));
+            let admission = events.iter().position(|event| matches!(event,
+                EngineEvent::LedgerMutation { observation, receipt, label }
+                    if observation.producer == LedgerObservationProducer::Apple
+                        && observation.occurrence == occurrence && receipt.grants_mutation() && label == "Iwo"
+            )).expect("accepted slice-local Apple observation");
+            let seal = events.iter().position(|event| matches!(event,
+                EngineEvent::LedgerSeal { receipt } if receipt.coverage == occurrence
+            )).expect("same occurrence seal");
+            let final_index = events.iter().position(|event| matches!(event,
+                EngineEvent::UtteranceFinal { utterance_id, .. } if *utterance_id == id
+            )).expect("raw final");
+            assert!(admission < seal && seal < final_index);
+        }
+        assert_eq!(document(&state), "Iwo Iwo");
+    }
+
+    /// Sliced replay is stopped by reconciled physical identity before a new
+    /// admission. Also exercise the ledger's independent replay fence directly.
+    #[test]
+    fn fusion_slice_replay_reaches_ledger_identity_refusal() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("slice-replay", 4.0, &[(0.0, 1.0), (2.0, 3.0)]);
+        let words = vec![segment("Iwo", 0.0, 1.0), segment("Iwo", 2.0, 3.0)];
+        emit(&mut state, &tx, words.clone());
+        drain(&mut rx);
+        emit(&mut state, &tx, words);
+        assert!(drain(&mut rx).is_empty(), "reconciled slice must not re-emit events");
+        for (id, start, end) in [(1, 0.0, 1.0), (2, 2.0, 3.0)] {
+            let receipt = admit_ledger_label(&mut state, &tx, LabelAdmission {
+                observation: LedgerObservationIdentity::new(LedgerObservationProducer::Apple, id, 0,
+                    OccurrenceIdentity::new("slice-replay", 7, sample(start), sample(end))),
+                label: "changed replay", energy: EnergyAdmission::RequireExistingQualification,
+            }).unwrap();
+            assert!(!receipt.grants_mutation());
+        }
+        assert_eq!(document(&state), "Iwo Iwo");
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+    }
+
+    #[test]
+    fn five_disjoint_iwo_segments_all_reach_the_final() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("five-words", 3.0, &[(0.0, 2.0)]);
+        emit(&mut state, &tx, (0..5).map(|i| {
+            let start = i as f32 * 0.4;
+            segment("Iwo", start, start + 0.3)
+        }).collect());
+        let events = drain(&mut rx);
+        let finals = raw_finals(&events);
+        assert_eq!(finals.len(), 1, "one physical occurrence contains five words");
+        assert_eq!(count_iwo(finals[0]), 5);
+        assert_eq!(count_iwo(&document(&state)), 5);
+    }
+
+    #[test]
+    fn cumulative_fifth_iwo_is_not_absorbed_as_a_revision() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = physical_state("fifth-iwo", 3.0, &[(0.0, 1.5), (1.6, 1.9)]);
+        let first = (0..4).map(|i| {
+            let start = i as f32 * 0.4;
+            segment("Iwo", start, start + 0.3)
+        }).collect::<Vec<_>>();
+        emit(&mut state, &tx, first.clone());
+        assert_eq!(count_iwo(&document(&state)), 4);
+        let mut cumulative = first;
+        cumulative.push(segment("Iwo", 1.6, 1.9));
+        emit(&mut state, &tx, cumulative);
+        assert_eq!(count_iwo(&document(&state)), 5);
+        assert_eq!(raw_finals(&drain(&mut rx)).iter().map(|text| count_iwo(text)).sum::<usize>(), 5);
+        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
     }
 }

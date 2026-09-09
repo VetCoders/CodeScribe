@@ -557,14 +557,20 @@ pub enum FusionContextMode {
 
 impl FusionContextMode {
     pub fn from_env() -> Self {
-        match std::env::var(SILERO_FUSION_CONTEXT_ENV) {
-            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+        Self::from_env_value(std::env::var(SILERO_FUSION_CONTEXT_ENV).ok().as_deref())
+    }
+
+    /// Pure selector shared by environment loading and token-table tests.
+    /// Missing and non-Unicode environment values both reach `None`.
+    fn from_env_value(raw: Option<&str>) -> Self {
+        match raw {
+            Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
                 "left_pad" | "left-pad" | "pad" => Self::LeftAudioPad,
                 "stable_prompt" | "stable-text" | "prompt" => Self::StableTextPrompt,
                 "utterance_only" | "utterance-only" | "exact" => Self::UtteranceOnly,
                 _ => Self::default(),
             },
-            Err(_) => Self::default(),
+            None => Self::default(),
         }
     }
 
@@ -1316,49 +1322,6 @@ mod tests {
         assert_eq!(ingress.ledger().utterances()[0].range.sample_end, 32_000);
     }
 
-    /// Scoped process-env override that restores the prior value on drop, so a
-    /// context-mode test cannot leak its selector into the next one.
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        /// Set `key`, remembering whatever was there before.
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: context-mode tests that mutate process env are serialized
-            // by `CONTEXT_ENV` below.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        /// Unset `key`, remembering whatever was there before.
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            // SAFETY: as above.
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        /// Put the previous value back, or unset the key when it was absent —
-        /// restoring an empty string instead would not be the same state.
-        fn drop(&mut self) {
-            // SAFETY: restores the serialized test's prior process environment.
-            unsafe {
-                match self.previous.as_ref() {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
-    /// Process env is one slot. Every context-mode test takes this first.
-    static CONTEXT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Executable truth of the context selector, against the registry entry.
     ///
     /// The documented default used to read `utterance`. That token is not one
@@ -1368,31 +1331,23 @@ mod tests {
     /// 400 ms of symmetric context instead. The recognised token is
     /// `utterance_only`; this test is what the registry entry now states.
     #[test]
-    fn context_mode_from_env_is_symmetric_pad_by_default_and_names_its_own_tokens() {
-        let _env = CONTEXT_ENV.lock().unwrap_or_else(|e| e.into_inner());
-
-        {
-            let _guard = EnvGuard::remove(SILERO_FUSION_CONTEXT_ENV);
-            assert_eq!(FusionContextMode::from_env(), FusionContextMode::SymmetricPad);
-            assert_eq!(FusionContextMode::default(), FusionContextMode::SymmetricPad);
-        }
+    fn context_mode_parser_is_symmetric_pad_by_default_and_names_its_own_tokens() {
+        assert_eq!(FusionContextMode::from_env_value(None), FusionContextMode::SymmetricPad);
+        assert_eq!(FusionContextMode::default(), FusionContextMode::SymmetricPad);
 
         for token in ["utterance_only", "utterance-only", "exact", "  EXACT  "] {
-            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
             assert_eq!(
-                FusionContextMode::from_env(),
+                FusionContextMode::from_env_value(Some(token)),
                 FusionContextMode::UtteranceOnly,
                 "{token} selects utterance-only audio"
             );
         }
         for token in ["left_pad", "left-pad", "pad", "Left_Pad"] {
-            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
-            assert_eq!(FusionContextMode::from_env(), FusionContextMode::LeftAudioPad);
+            assert_eq!(FusionContextMode::from_env_value(Some(token)), FusionContextMode::LeftAudioPad);
         }
         for token in ["stable_prompt", "stable-text", "prompt"] {
-            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
             assert_eq!(
-                FusionContextMode::from_env(),
+                FusionContextMode::from_env_value(Some(token)),
                 FusionContextMode::StableTextPrompt
             );
         }
@@ -1401,9 +1356,8 @@ mod tests {
         // resolve to the default. Nothing here fails closed or panics, and none
         // of them silently selects utterance-only.
         for token in ["utterance", "", "   ", "symmetric", "left pad", "0"] {
-            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
             assert_eq!(
-                FusionContextMode::from_env(),
+                FusionContextMode::from_env_value(Some(token)),
                 FusionContextMode::SymmetricPad,
                 "{token:?} is not a recognised token and must fall back to the default"
             );
