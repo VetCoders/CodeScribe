@@ -8,13 +8,56 @@ INSTALL_GUARD="$ROOT/scripts/install-if-idle.sh"
 TEST_ROOT="$(mktemp -d)"
 LOCK_HOLDER_PID=""
 GUARD_PID=""
+# Cancellation is fixture-local data, never a PID/name/process-group kill.
+# Keep the root (and release paths) until Bash has reaped every owned job.
 cleanup() {
-  [[ -z "$LOCK_HOLDER_PID" ]] || kill "$LOCK_HOLDER_PID" 2>/dev/null || true
-  [[ -z "$GUARD_PID" ]] || kill "$GUARD_PID" 2>/dev/null || true
-  rm -rf "$TEST_ROOT"
+  local original_status=$? cleanup_status=0 pid child_status
+  trap '' TERM INT
+  trap - EXIT
+  set +e
+  touch "$TEST_ROOT/cancel" || cleanup_status=1
+  for _ in {1..1000}; do
+    jobs -pr >"$TEST_ROOT/running-jobs"
+    jobs -ps >>"$TEST_ROOT/running-jobs"
+    [[ -s "$TEST_ROOT/running-jobs" ]] || break
+    sleep 0.01
+  done
+  if [[ -s "$TEST_ROOT/running-jobs" ]]; then
+    echo "transcript-bus-path: cleanup timed out; retained $TEST_ROOT" >&2
+    cleanup_status=1
+  else
+    for pid in "$LOCK_HOLDER_PID" "$GUARD_PID"; do
+      [[ -n "$pid" ]] || continue
+      wait "$pid"
+      child_status=$?
+      printf 'cleanup: reaped %s status=%s\n' "$pid" "$child_status"
+      [[ "$child_status" -eq 0 ]] || cleanup_status=1
+    done
+    wait # also reap a job interrupted between spawn and PID assignment
+    if [[ -e "$TEST_ROOT/make.ready" ]]; then
+      if [[ -e "$TEST_ROOT/make.stopped" ]]; then
+        printf 'cleanup: make-stopped %s\n' "$(<"$TEST_ROOT/make.stopped")"
+      else
+        echo "transcript-bus-path: missing fake make terminal receipt" >&2
+        cleanup_status=1
+      fi
+    fi
+    if [[ "$cleanup_status" -eq 0 ]]; then
+      rm -rf "$TEST_ROOT" || cleanup_status=1
+    else
+      echo "transcript-bus-path: cleanup failed; retained $TEST_ROOT" >&2
+    fi
+  fi
+  printf 'cleanup: original=%s cleanup=%s root=%s\n' \
+    "$original_status" "$cleanup_status" "$TEST_ROOT"
+  [[ "$original_status" -eq 0 ]] || exit "$original_status"
+  exit "$cleanup_status"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
+unset FAKE_MAKE_READY FAKE_MAKE_RELEASE
 TEST_HOME="$TEST_ROOT/home"
 mkdir -p "$TEST_HOME"
 
@@ -136,15 +179,113 @@ PY
 FAKE_BIN="$TEST_ROOT/bin"
 FAKE_MAKE_LOG="$TEST_ROOT/fake-make.log"
 mkdir -p "$FAKE_BIN"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'if [[ -n "${FAKE_MAKE_READY:-}" ]]; then' \
-  '  : >"$FAKE_MAKE_READY"' \
-  '  while [[ ! -e "$FAKE_MAKE_RELEASE" ]]; do sleep 0.01; done' \
-  'fi' \
-  'printf "%s\n" "$*" >"$FAKE_MAKE_LOG"' \
-  >"$FAKE_BIN/make"
+cat >"$FAKE_BIN/make" <<'PYMAKE'
+#!/usr/bin/env python3
+# No sleep subprocess: this helper owns no descendants.
+import os
+from pathlib import Path
+import sys
+import time
+
+root = Path(__file__).resolve().parent.parent
+ready = os.environ.get("FAKE_MAKE_READY")
+if ready:
+    deadline = time.monotonic() + 30
+    Path(ready + ".pending").write_text(str(os.getpid()))
+    Path(ready + ".pending").replace(ready)
+    while not Path(os.environ["FAKE_MAKE_RELEASE"]).exists():
+        if (root / "cancel").exists():
+            break
+        if not root.exists() or time.monotonic() >= deadline:
+            raise SystemExit("fake make: owner disappeared or release deadline expired")
+        time.sleep(0.01)
+Path(os.environ["FAKE_MAKE_LOG"]).write_text(" ".join(sys.argv[1:]) + "\n")
+if ready:
+    (root / "make.stopped").write_text(str(os.getpid()))
+PYMAKE
 chmod +x "$FAKE_BIN/make"
+
+hold_shared_lock() {
+  local path="$1" ready="$2" release="$3"
+  python3 - "$path" "$ready" "$release" "$TEST_ROOT" <<'PY' &
+import fcntl
+import os
+from pathlib import Path
+import sys
+import time
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a+") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    root = Path(sys.argv[4])
+    deadline = time.monotonic() + 30
+    ready = Path(sys.argv[2])
+    ready.with_suffix(".pending").write_text(str(os.getpid()))
+    ready.with_suffix(".pending").replace(ready)
+    while not Path(sys.argv[3]).exists():
+        if (root / "cancel").exists():
+            break
+        if not root.exists() or time.monotonic() >= deadline:
+            raise SystemExit("lock holder: owner disappeared or release deadline expired")
+        time.sleep(0.01)
+PY
+  LOCK_HOLDER_PID=$!
+  for _ in {1..500}; do
+    [[ ! -e "$ready" ]] || break
+    sleep 0.01
+  done
+  if [[ ! -e "$ready" ]]; then
+    echo "transcript-bus-path: lock holder for $path did not start" >&2
+    exit 1
+  fi
+}
+
+start_idle_guard() {
+  env \
+    -u CODESCRIBE_TRANSCRIPT_BUS_PATH \
+    -u CODESCRIBE_ENV_PATH \
+    -u XDG_STATE_HOME \
+    -u CODESCRIBE_DATA_DIR \
+    HOME="$TEST_HOME" \
+    PATH="$FAKE_BIN:$PATH" \
+    FAKE_MAKE_LOG="$FAKE_MAKE_LOG" \
+    FAKE_MAKE_READY="$MAKE_READY" \
+    FAKE_MAKE_RELEASE="$MAKE_RELEASE" \
+    CODESCRIBE_TRANSCRIPT_BUS="$TEST_ROOT/legacy.jsonl" \
+    "$INSTALL_GUARD" >"$TEST_ROOT/idle.out" 2>"$TEST_ROOT/idle.err" &
+  GUARD_PID=$!
+  for _ in {1..500}; do
+    [[ ! -e "$MAKE_READY" ]] || break
+    sleep 0.01
+  done
+  if [[ ! -e "$MAKE_READY" ]]; then
+    echo "transcript-bus-path: fake make did not start under install lease" >&2
+    exit 1
+  fi
+}
+
+# Standalone cleanup regression uses these same helpers and EXIT trap. It
+# stops before policy assertions so a policy failure cannot hide this census.
+if [[ "${1:-}" == "--cleanup-fixture" ]]; then
+  MAKE_READY="$TEST_ROOT/make.ready"
+  MAKE_RELEASE="$TEST_ROOT/make.release"
+  hold_shared_lock "$TEST_ROOT/fixture.lock" "$TEST_ROOT/lock.ready" "$TEST_ROOT/lock.release"
+  start_idle_guard
+  printf 'fixture-ready\t%s\t%s\t%s\t%s\n' \
+    "$TEST_ROOT" "$GUARD_PID" "$(<"$MAKE_READY")" "$LOCK_HOLDER_PID"
+  # A builtin wait permits Bash to run INT/TERM traps immediately. Python's
+  # parent launches us with default signal dispositions, unlike shell `&` INT.
+  if ! IFS= read -r -t 20 fixture_command; then
+    echo "transcript-bus-path: fixture controller disappeared/timed out" >&2
+    exit 124
+  fi
+  case "$fixture_command" in
+    complete) exit 0 ;;
+    fail) echo "transcript-bus-path: deliberate assertion failure" >&2; exit 17 ;;
+    *) echo "transcript-bus-path: invalid fixture command" >&2; exit 64 ;;
+  esac
+fi
 
 assert_guard_refuses() {
   local bus="$1"
@@ -152,6 +293,7 @@ assert_guard_refuses() {
   rm -f "$FAKE_MAKE_LOG"
   set +e
   env \
+    -u CODESCRIBE_ENV_PATH \
     -u XDG_STATE_HOME \
     -u CODESCRIBE_DATA_DIR \
     HOME="$TEST_HOME" \
@@ -243,6 +385,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
 PY
 set +e
 env \
+  -u CODESCRIBE_ENV_PATH \
   -u XDG_STATE_HOME \
   -u CODESCRIBE_DATA_DIR \
   HOME="$TEST_HOME" \
@@ -281,6 +424,7 @@ PY
 
 resolve_agent_turn_lease() {
   env \
+    -u CODESCRIBE_ENV_PATH \
     -u XDG_STATE_HOME \
     -u CODESCRIBE_DATA_DIR \
     HOME="$TEST_HOME" \
@@ -291,39 +435,13 @@ if [[ "$(resolve_agent_turn_lease)" != "$TEST_HOME/.codescribe/agent-turn.lock" 
   exit 1
 fi
 
-hold_shared_lock() {
-  local path="$1" ready="$2" release="$3"
-  python3 - "$path" "$ready" "$release" <<'PY' &
-import fcntl
-from pathlib import Path
-import sys
-import time
-
-path = Path(sys.argv[1])
-path.parent.mkdir(parents=True, exist_ok=True)
-with path.open("a+") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-    Path(sys.argv[2]).touch()
-    while not Path(sys.argv[3]).exists():
-        time.sleep(0.01)
-PY
-  LOCK_HOLDER_PID=$!
-  for _ in {1..500}; do
-    [[ ! -e "$ready" ]] || break
-    sleep 0.01
-  done
-  if [[ ! -e "$ready" ]]; then
-    echo "transcript-bus-path: lock holder for $path did not start" >&2
-    exit 1
-  fi
-}
-
 # A merely running app (shared process-lifetime lease on the runtime
 # interlock) must NOT refuse installation (Founder, 2026-09-08).
 INTERLOCK_PATH="$(resolve_interlock)"
 hold_shared_lock "$INTERLOCK_PATH" "$TEST_ROOT/app-lock.ready" "$TEST_ROOT/app-lock.release"
 rm -f "$FAKE_MAKE_LOG"
 env \
+  -u CODESCRIBE_ENV_PATH \
   -u XDG_STATE_HOME \
   -u CODESCRIBE_DATA_DIR \
   HOME="$TEST_HOME" \
@@ -352,27 +470,9 @@ touch "$TEST_ROOT/turn-lock.release"
 wait "$LOCK_HOLDER_PID"
 LOCK_HOLDER_PID=""
 
-# Retired block kept as a marker for the diff reader: the old
-# "runtime-active" refusal case ended here.
-: <<'RETIRED'
-python3 - "$INTERLOCK_PATH" "$LOCK_READY" "$LOCK_RELEASE" <<'PY' &
-import fcntl
-from pathlib import Path
-import sys
-import time
-
-path = Path(sys.argv[1])
-path.parent.mkdir(parents=True, exist_ok=True)
-with path.open("a+") as handle:
-    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-    Path(sys.argv[2]).touch()
-    while not Path(sys.argv[3]).exists():
-        time.sleep(0.01)
-PY
-RETIRED
-
 rm -f "$FAKE_MAKE_LOG"
 env \
+  -u CODESCRIBE_ENV_PATH \
   -u XDG_STATE_HOME \
   -u CODESCRIBE_DATA_DIR \
   HOME="$TEST_HOME" \
@@ -391,26 +491,7 @@ cp "$OPEN_BUS" "$TEST_ROOT/legacy.jsonl"
 rm -f "$FAKE_MAKE_LOG"
 MAKE_READY="$TEST_ROOT/make.ready"
 MAKE_RELEASE="$TEST_ROOT/make.release"
-env \
-  -u CODESCRIBE_TRANSCRIPT_BUS_PATH \
-  -u XDG_STATE_HOME \
-  -u CODESCRIBE_DATA_DIR \
-  HOME="$TEST_HOME" \
-  PATH="$FAKE_BIN:$PATH" \
-  FAKE_MAKE_LOG="$FAKE_MAKE_LOG" \
-  FAKE_MAKE_READY="$MAKE_READY" \
-  FAKE_MAKE_RELEASE="$MAKE_RELEASE" \
-  CODESCRIBE_TRANSCRIPT_BUS="$TEST_ROOT/legacy.jsonl" \
-  "$INSTALL_GUARD" >"$TEST_ROOT/idle.out" 2>"$TEST_ROOT/idle.err" &
-GUARD_PID=$!
-for _ in {1..500}; do
-  [[ ! -e "$MAKE_READY" ]] || break
-  sleep 0.01
-done
-if [[ ! -e "$MAKE_READY" ]]; then
-  echo "transcript-bus-path: fake make did not start under install lease" >&2
-  exit 1
-fi
+start_idle_guard
 set +e
 python3 - "$INTERLOCK_PATH" <<'PY'
 import fcntl
