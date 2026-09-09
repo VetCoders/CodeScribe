@@ -25,8 +25,57 @@ Resolution order:
    `~/.codescribe/transcript-events.jsonl`
 
 The parent directory is created when needed. On Unix the file is forced to
-mode `0600`. Every accepted line is flushed before publication returns. No
-host, date, room, or control-plane path is embedded in Codescribe.
+mode `0600`. Each attempted append includes a flush before publication returns.
+No host, date, room, or control-plane path is embedded in Codescribe.
+
+### Persistence loss and live publication
+
+The file is an observability sink, not admission authority for live text.
+Production `TranscriptBus::open` retains a functional Bus even when opening the
+file fails. `open_at` remains the explicit fallible file-opening API; production
+uses its result through the same `open_with_path` fallback exercised by the local
+failure fixtures. Start, authenticated revision and end publication advance live
+state independently of append success. Failed revision writes still return every
+authenticated entry and replace the existing last-projection snapshot. Failed end
+writes still return exactly one lifecycle terminal with the exact committed bytes,
+occurrence receipts and controller-owned delivery disposition. A duplicate end
+returns no projection, including after persistence recovers.
+
+`sequence` orders in-process publication within one Bus session. It advances for
+attempted lifecycle and evidence publication, including failed persistence. On the
+successful path persisted rows carry these same numbers. A callback's sequence
+does **not** prove a matching file row, receiver admission or durable storage.
+Even successful `File::flush` is not an fsync/power-loss durability receipt.
+`ComposerPending` remains pending; file success or failure never manufactures
+`SinkAccepted`. The existing composer receipt/recovery path receives the same
+terminal payload; the Bus adds no second delivery authority.
+
+On the first open, serialization, append or flush failure, persistence is disabled
+for that Bus's lifetime. The existing tracing diagnostic records the session,
+filename, error and `persistence=disabled_for_session`. Live projection continues.
+There is no retry queue, payload journal, second reducer or fallback transcript
+file: retention is the existing single last-projection snapshot, replaced by the
+next committed projection. Process exit can lose unpersisted text. The UI has no
+typed persistence indicator in the current bridge contract; failure is discoverable
+in logs, and the visible document is live reducer truth, not a saved-file claim.
+A dedicated UI persistence warning would require an explicit bridge/status and
+Swift consumer extension; neither a display label nor delivery state encodes it.
+
+An append may leave a prefix; a failed flush may leave a complete row. The Bus
+never retries either and never reuses its sequence. A later session attempts a new
+open with fresh lifecycle and no prior document. If the existing nonempty file
+does not end in a newline, opening it fails explicitly and the new live Bus remains
+usable without appending to that incomplete row. It neither truncates evidence nor
+adds a newline that would pretend the partial row was valid. After explicit
+external repair/rotation, a subsequent session can persist normally. A complete
+row left by uncertain flush needs no replay; a later session may append after it.
+This is not cross-process append locking or automatic damaged-log repair.
+
+External tailers can therefore have an incomplete prefix of a session, an
+unterminated final row, or no rows for a live session. They cannot reconstruct
+missing bytes or infer successful delivery/idle state from that absence. Existing
+install guards may conservatively refuse a stale unmatched start; this Bus cut
+does not change installation or repair an external consumer's lifecycle policy.
 
 ## Event families
 
@@ -72,7 +121,8 @@ stream output fails after publishing a draft; the partial text is never sealed
 as a completed document. The controller has exactly one terminal publisher
 (`end_transcript_bus`); the delayed hold start unwinds every pre-active exit
 through `unwind_hold_start`, so no started session is left without its
-terminal line. The first terminal line wins; later calls are no-ops.
+terminal publication. Persistence failure can omit its file line as described
+above. The first terminal publication wins; later calls are no-ops.
 
 A product recording can only begin after **acoustic admission**: the
 controller resolves the input device without opening it, requires a measured
@@ -110,6 +160,12 @@ contains:
   readers may ignore them and Rust decoding defaults them to absent.
 - the complete canvas contract: `phase`, `can_paste`, `can_insert`,
   `can_copy`, `can_retranscribe`, `can_format`, and `terminal`.
+- additive `lifecycle_terminal` and typed `delivery` on evidence projections.
+  Revision rows use `false` and `unattempted`. The in-process `session_ended`
+  projection uses `true` and the controller's disposition (`unattempted`,
+  `composer_pending`, `sink_accepted`, or `retained`). Its text-free persisted
+  lifecycle row remains `codescribe.transcript.v1` and does not carry these two
+  fields. Reading that row is not proof of composer admission.
 
 The projection contract is one snapshot, not a bag of Swift inputs:
 
@@ -122,7 +178,8 @@ The projection contract is one snapshot, not a bag of Swift inputs:
 | `can_copy`                          | The committed render is non-empty                                                                                                                                                                                                                       |
 | `can_retranscribe`                  | The session WAV exists and the take has ended                                                                                                                                                                                                           |
 | `can_format`                        | The take has ended and the committed render is non-empty                                                                                                                                                                                                |
-| `terminal`                          | The controller's unique `session_ended` transition was processed; later authenticated user revisions preserve terminal state                                                                                                                            |
+| `terminal`                          | A terminal document revision or the controller's unique `session_ended` transition; a user/formatter revision can precede lifecycle end |
+| `lifecycle_terminal`                | Only the controller's unique `session_ended` projection; document revisions never release capture ownership or consume the delivery obligation |
 
 `resolve_delivery_route(OverlayInsert, ...)` remains the only destination
 decision. The projection layer queries its result; it does not create another
