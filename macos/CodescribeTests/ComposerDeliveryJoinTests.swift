@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import os
 
 @testable import Codescribe
 
@@ -7,9 +8,11 @@ import XCTest
 /// receiver acknowledgement on the way out.
 ///
 /// Everything here is written against production owners — `RealComposerDictation`
-/// for the gesture, `AgentChatStore` for admission, `OverlayState` for the
-/// projection boundary. The only substituted surface is the FFI object, because
-/// it is the process boundary; no policy is re-implemented in a fake.
+/// for the gesture, `AgentChatStore` for admission and composer ownership,
+/// `OverlayState` for the projection boundary. The only substituted surfaces are
+/// the two process boundaries: the FFI capture object, and the chat engine whose
+/// real implementation is a Rust turn. Queueing, dispatch and every ownership
+/// decision stay in the production store; no policy is re-implemented in a fake.
 ///
 /// The claim under test is narrow and specific: **a route that was selected, an
 /// event that was queued and a callback that was invoked are all statements
@@ -79,6 +82,91 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     func setGeneratedTitle(backendId: String, title: String) -> Bool { true }
     func exportThreadMarkdown(backendId: String, assistantOnly: Bool) -> String? { nil }
     func generateThreadId() -> String { "t_generated" }
+  }
+
+  /// Reply state a turn can be suspended on, so a test can hold one thread's
+  /// turn "in flight" while asserting what happens to a *different* thread's
+  /// unsent composer. The lock is what makes it safe off the main actor:
+  /// `streamReply` is a nonisolated protocol requirement.
+  private final class HeldReplyState: Sendable {
+    private struct Storage {
+      var continuations: [CheckedContinuation<String, Error>] = []
+      var startedTexts: [String] = []
+    }
+
+    private let storage = OSAllocatedUnfairLock(initialState: Storage())
+
+    var startedTexts: [String] { storage.withLock { $0.startedTexts } }
+
+    func recordStart(_ text: String) {
+      storage.withLock { $0.startedTexts.append(text) }
+    }
+
+    func suspend(_ continuation: CheckedContinuation<String, Error>) {
+      storage.withLock { $0.continuations.append(continuation) }
+    }
+
+    func finishNext(_ reply: String) {
+      let continuation = storage.withLock {
+        $0.continuations.isEmpty ? nil : $0.continuations.removeFirst()
+      }
+      continuation?.resume(returning: reply)
+    }
+  }
+
+  private final class HeldReplyEngine: AgentChatEngine {
+    let state = HeldReplyState()
+
+    func isAvailable() -> Bool { true }
+    func availabilityDetail() -> String? { nil }
+    func generateThreadTitle(_ text: String) async throws -> String? { nil }
+
+    func streamReply(
+      _ text: String,
+      threadId: String,
+      attachmentPaths: [String],
+      onDelta: @escaping @MainActor (String) -> Void,
+      onReasoning: @escaping @MainActor (String) -> Void,
+      onToolExecuting: @escaping @MainActor (String, String) -> Void,
+      onToolResult: @escaping @MainActor (String, String, Bool, String) -> Void
+    ) async throws -> String {
+      state.recordStart(text)
+      return try await withCheckedThrowingContinuation { state.suspend($0) }
+    }
+
+    func cancelReply(threadId: String) -> Bool { true }
+  }
+
+  // MARK: Isolation
+
+  /// The accepted-turn queue and the attachment sidecar both live in shared
+  /// defaults, so a suite that sends must leave them exactly as it found them or
+  /// the next store's restart replay inherits this suite's queue and chips.
+  private static let sharedDefaultsKeys = [
+    AgentChatStore.acceptedTurnsDefaultsKey,
+    AgentChatStore.attachmentMetadataDefaultsKey,
+  ]
+
+  override func setUp() {
+    super.setUp()
+    Self.sharedDefaultsKeys.forEach(UserDefaults.standard.removeObject(forKey:))
+  }
+
+  override func tearDown() {
+    Self.sharedDefaultsKeys.forEach(UserDefaults.standard.removeObject(forKey:))
+    super.tearDown()
+  }
+
+  private func waitUntil(
+    timeout: TimeInterval = 2,
+    _ message: String = "condition not met in time",
+    _ condition: () -> Bool
+  ) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !condition(), Date() < deadline {
+      try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    XCTAssertTrue(condition(), message)
   }
 
   private struct Fixture: Sendable {
@@ -479,6 +567,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     f.store.select(f.threadB)
     f.store.draft = "typed in B"
     f.store.pendingAttachments = [PendingAttachment(url: URL(fileURLWithPath: "/tmp/b.png"))]
+    let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
 
     let receipt = f.store.receiveDictationTranscript("words from A")
 
@@ -489,6 +578,13 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
     f.store.select(f.threadA)
     XCTAssertEqual(f.store.draft, "words from A", "A's words surface in A")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty, "B's image did not travel to A")
+
+    // The return trip is the other half of the same claim: B's composition was
+    // parked, not consumed to make A's assertion true.
+    f.store.select(f.threadB)
+    XCTAssertEqual(f.store.draft, "typed in B", "B is exactly as the user left it")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), bAttachmentIDs, "the same staged files")
   }
 
   /// When the capturing thread is the one on screen, the words land in the live
@@ -563,5 +659,260 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
     XCTAssertEqual(f.store.draft, "draft words", "the words are in the composer, unsent")
     XCTAssertTrue(f.store.threads.allSatisfy { $0.messages.isEmpty }, "nothing was submitted")
+  }
+
+  // MARK: Thread-owned composer — every thread keeps its own unsent work
+
+  /// The full round trip with work on both sides: A is mid-sentence, B is
+  /// mid-sentence with an image staged, and A's take lands while B is on screen.
+  /// Both compositions must survive both directions of the switch, and A's
+  /// delivered words must join *A's* sentence rather than B's.
+  func testEveryThreadKeepsItsOwnComposerAcrossAFullRoundTrip() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "half a thought in A"
+    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+
+    f.store.select(f.threadB)
+    f.store.draft = "half a thought in B"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/round-trip-b.png")])
+    let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
+
+    XCTAssertEqual(f.store.receiveDictationTranscript("spoken for A"), .parked(threadID: f.threadA))
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(
+      f.store.draft, "half a thought in A\nspoken for A",
+      "the delivery joins A's own sentence, not the one typed in B")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty, "A never staged anything")
+
+    f.store.select(f.threadB)
+    XCTAssertEqual(f.store.draft, "half a thought in B")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), bAttachmentIDs)
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(
+      f.store.draft, "half a thought in A\nspoken for A",
+      "returning a second time is not a second delivery")
+  }
+
+  /// Two takes finish for A while B is on screen. Selecting A shows each
+  /// document exactly once, and selecting A again does not repeat them.
+  func testRepeatedSelectionSurfacesEachDeliveredDocumentExactlyOnce() {
+    let f = makeFixture(recording: [false, true])
+    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    f.store.select(f.threadB)
+
+    XCTAssertEqual(f.store.receiveDictationTranscript("first take"), .parked(threadID: f.threadA))
+    XCTAssertEqual(f.store.receiveDictationTranscript("second take"), .parked(threadID: f.threadA))
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "first take\nsecond take")
+    let focusAfterFirstArrival = f.store.composerFocusRequest
+
+    f.store.select(f.threadB)
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "first take\nsecond take", "no document is delivered twice")
+    XCTAssertEqual(
+      f.store.composerFocusRequest, focusAfterFirstArrival,
+      "an already-surfaced document does not grab the caret again")
+  }
+
+  /// A delivery for a thread the user is not reading changes nothing they can
+  /// see: not the selection, not the composer, not the caret.
+  func testADeliveryForAnUnselectedThreadChangesNothingOnScreen() {
+    let f = makeFixture(recording: [false, true])
+    _ = f.store.beginComposerCaptureRequest(threadID: f.threadA)
+    f.store.select(f.threadB)
+    f.store.draft = "mid-sentence in B"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/untouched-b.png")])
+    let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
+    let focusBefore = f.store.composerFocusRequest
+
+    XCTAssertEqual(f.store.receiveDictationTranscript("for A only"), .parked(threadID: f.threadA))
+
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
+    XCTAssertEqual(f.store.draft, "mid-sentence in B")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), bAttachmentIDs)
+    XCTAssertEqual(f.store.composerFocusRequest, focusBefore, "no caret jump for a parked take")
+  }
+
+  // MARK: Every selection entrypoint hands the composer over
+
+  /// The rail assigns the published property directly rather than calling
+  /// `select`. Ownership lives in the property observer precisely so that this
+  /// path cannot be the one that forgets.
+  func testDirectSelectionAssignmentHandsTheComposerOverToo() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "typed in A"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/direct-a.png")])
+    let aAttachmentIDs = f.store.pendingAttachments.map(\.id)
+
+    f.store.selectedThreadID = f.threadB
+
+    XCTAssertEqual(f.store.draft, "", "B never had a composition")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty, "A's image stays with A")
+
+    f.store.selectedThreadID = f.threadA
+    XCTAssertEqual(f.store.draft, "typed in A")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), aAttachmentIDs)
+  }
+
+  /// Starting a new conversation opens an empty composer. It must not do that by
+  /// destroying the sentence in progress, and the images staged for the previous
+  /// thread must not follow the user into the new one.
+  func testANewThreadOpensAnEmptyComposerAndParksTheUnfinishedOne() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "unfinished in A"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/new-thread-a.png")])
+    let aAttachmentIDs = f.store.pendingAttachments.map(\.id)
+
+    f.store.newThread()
+
+    XCTAssertNotEqual(f.store.selectedThreadID, f.threadA)
+    XCTAssertEqual(f.store.draft, "", "a fresh thread starts with an empty box")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty, "staged images do not follow the user")
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "unfinished in A", "the sentence was parked, not deleted")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), aAttachmentIDs)
+  }
+
+  /// Negative control. A thread that has never held a composition contributes
+  /// nothing on selection — the composer is empty because that thread's box is
+  /// empty, not because a previous owner's text leaked in and was cleared.
+  func testSelectingAThreadWithNoStoredCompositionLeavesAnEmptyComposer() {
+    let f = makeFixture(recording: [false, true])
+
+    f.store.select(f.threadB)
+
+    XCTAssertEqual(f.store.draft, "")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty)
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "", "an empty thread stores nothing to hand back")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty)
+  }
+
+  /// Filtering and reloading the rail rebuilds rows. Compositions are keyed by
+  /// the thread's stable id, which those paths preserve, so unsent work survives
+  /// a search round trip instead of following whichever row ends up selected.
+  func testSearchAndRefreshRestoreReturnEachThreadToItsOwnComposition() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "written in A"
+    f.store.select(f.threadB)
+    f.store.draft = "written in B"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/search-b.png")])
+    let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
+
+    f.store.searchThreads("Thread")
+    f.store.searchThreads("")
+    f.store.refreshThreads()
+
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB, "filtering is not a selection gesture")
+    XCTAssertEqual(f.store.draft, "written in B")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), bAttachmentIDs)
+
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "written in A", "A's words came back to A across the rebuild")
+  }
+
+  // MARK: Sending consumes one owner's composition
+
+  /// Send empties the composer it was sent from and nothing else.
+  func testSendConsumesOnlyTheSelectedThreadsComposition() {
+    let f = makeFixture(recording: [false, true])
+    f.store.select(f.threadB)
+    f.store.draft = "still unsent in B"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/send-b.png")])
+    let bAttachmentIDs = f.store.pendingAttachments.map(\.id)
+
+    f.store.select(f.threadA)
+    f.store.draft = "ask A"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/send-a.png")])
+    f.store.send()
+
+    XCTAssertEqual(f.store.draft, "", "A's own composer was consumed")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty)
+    let sent = f.store.threads.first { $0.id == f.threadA }?.messages.first { $0.role == .you }
+    XCTAssertEqual(sent?.text, "ask A")
+    XCTAssertEqual(sent?.attachments.count, 1, "the send carried A's staged file, not B's")
+
+    f.store.select(f.threadB)
+    XCTAssertEqual(f.store.draft, "still unsent in B", "B's message was never sent for it")
+    XCTAssertEqual(f.store.pendingAttachments.map(\.id), bAttachmentIDs)
+  }
+
+  /// A turn accepted, queued behind an active one, and finally streamed in A
+  /// touches no part of B's unsent composition at any point in that lifecycle.
+  func testAQueuedAndStreamingTurnNeverEmptiesAnotherThreadsComposer() async {
+    let engine = HeldReplyEngine()
+    let store = AgentChatStore(engine: engine, threadsProvider: StubThreadsProvider())
+    let threadA = store.threads.first { $0.backendId == "t_a" }!.id
+    let threadB = store.threads.first { $0.backendId == "t_b" }!.id
+
+    store.select(threadB)
+    store.draft = "waiting in B"
+    store.addAttachments([URL(fileURLWithPath: "/tmp/queued-b.png")])
+    let bAttachmentIDs = store.pendingAttachments.map(\.id)
+
+    store.select(threadA)
+    store.draft = "first ask"
+    store.send()
+    await waitUntil("A's first turn should start") { engine.state.startedTexts.count == 1 }
+
+    store.draft = "second ask"
+    store.send()
+    XCTAssertEqual(store.queuedTurns.map(\.text), ["second ask"], "the second ask is queued")
+
+    engine.state.finishNext("first reply")
+    await waitUntil("the queued turn should start") { engine.state.startedTexts.count == 2 }
+    engine.state.finishNext("second reply")
+    await waitUntil("the queue should drain") {
+      store.queuedTurns.isEmpty && store.activeComposerTurn == nil
+    }
+
+    store.select(threadB)
+    XCTAssertEqual(store.draft, "waiting in B", "B's sentence outlived A's whole turn lifecycle")
+    XCTAssertEqual(store.pendingAttachments.map(\.id), bAttachmentIDs)
+  }
+
+  // MARK: Deletion recovers words instead of migrating them
+
+  /// Deleting a thread the user is not looking at takes its staged files with it
+  /// and leaves its words recoverable — never silently poured into whichever
+  /// thread happens to be selected.
+  func testDeletingAnUnselectedThreadRecoversItsWordsAndStrandsNoAttachments() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "left behind in A"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/deleted-a.png")])
+
+    f.store.select(f.threadB)
+    f.store.draft = "still typing in B"
+
+    f.store.delete(f.store.threads.first { $0.id == f.threadA }!)
+
+    XCTAssertEqual(f.store.retainedComposerDelivery, "left behind in A")
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB, "deleting elsewhere does not move the rail")
+    XCTAssertEqual(f.store.draft, "still typing in B")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty, "the deleted thread's image is not re-staged")
+  }
+
+  /// Deleting the thread that is on screen moves the selection. Its composition
+  /// must not travel with the cursor to the next thread.
+  func testDeletingTheSelectedThreadNeverMigratesItsCompositionToTheNextOne() {
+    let f = makeFixture(recording: [false, true])
+    f.store.draft = "about to be deleted"
+    f.store.addAttachments([URL(fileURLWithPath: "/tmp/deleted-selected.png")])
+
+    f.store.delete(f.store.threads.first { $0.id == f.threadA }!)
+
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
+    XCTAssertEqual(f.store.draft, "", "the next thread's composer is its own, and it is empty")
+    XCTAssertTrue(f.store.pendingAttachments.isEmpty)
+    XCTAssertEqual(
+      f.store.retainedComposerDelivery, "about to be deleted",
+      "the words are recoverable, not dropped and not auto-sent")
+    XCTAssertTrue(
+      f.store.threads.allSatisfy { $0.messages.isEmpty }, "recovery never submits anything")
   }
 }

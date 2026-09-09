@@ -549,6 +549,28 @@ enum ComposerDeliveryReceipt: Equatable {
   case empty
 }
 
+/// One thread's unsent composer state: the text the user typed and the files
+/// they staged, held under that thread's own stable id.
+///
+/// The composer is a single surface, but the composition behind it belongs to a
+/// conversation. Without that ownership the surface is a global scratchpad: the
+/// words typed in B are still on screen when A is selected, so a delivery for A
+/// joins B's sentence, B's staged image travels to A, and creating or deleting a
+/// thread destroys whatever was in the box. Identity is the thread id, never the
+/// rail position, the title or the moment of selection.
+struct ThreadComposition: Equatable {
+  var text: String = ""
+  var attachments: [PendingAttachment] = []
+  /// True while this composition holds a delivered document its owner has not
+  /// seen yet, because the take finished while another thread was selected. It
+  /// is what makes "surface it once" observable — not a second copy of the text.
+  var hasUnseenDelivery: Bool = false
+
+  static let empty = ThreadComposition()
+
+  var isEmpty: Bool { text.isEmpty && attachments.isEmpty }
+}
+
 /// UI-only gesture seam over the shared recording controller.
 @MainActor
 protocol ComposerDictating: AnyObject {
@@ -565,14 +587,27 @@ final class AgentChatStore: ObservableObject {
     // Every selection change re-routes the voice-assistive lane to the thread
     // the user is looking at (operator contract 2026-08-13). Observers do not
     // fire during init — the seeding path publishes once explicitly.
-    didSet { publishAssistiveTarget() }
+    //
+    // This is also the single seam where the composer changes hands. Every way
+    // the selection can move — `select`, `newThread`, `delete`, a search or
+    // refresh restore, a direct assignment from the rail — passes through here,
+    // so ownership cannot be forgotten on one of them. A fresh store has an
+    // empty composer and no stored composition, which is why the seeding
+    // assignment in `init` needs no handoff.
+    didSet {
+      handOffComposition(from: oldValue, to: selectedThreadID)
+      publishAssistiveTarget()
+    }
   }
+  /// The composer text of the *selected* thread. Live truth while that thread is
+  /// on screen; parked into `threadCompositions` the moment the selection moves.
   @Published var draft: String = ""
   /// Monotonic UI command consumed by the composer. It carries no text and
   /// deliberately does not mutate the selected thread or staged attachments.
   @Published private(set) var composerFocusRequest: UInt64 = 0
-  /// Images staged in the composer for the next message. Cleared when the
-  /// message is dispatched.
+  /// Images staged in the composer for the next message, belonging to the
+  /// *selected* thread. Cleared when that thread's message is dispatched and
+  /// parked with its owner when the selection moves.
   @Published var pendingAttachments: [PendingAttachment] = []
   @Published private(set) var pendingToolApprovals: [PendingToolApproval] = []
 
@@ -613,10 +648,18 @@ final class AgentChatStore: ObservableObject {
   /// hands after the press.
   private(set) var composerCaptureHandle: CsCaptureHandle?
 
-  /// Terminal documents whose owning thread was not selected when they arrived.
-  /// Held per thread so a delivery for A can never overwrite, relocate, or
-  /// silently inherit the draft the user is typing in B.
-  private var parkedComposerDeliveries: [UUID: String] = [:]
+  /// Unsent compositions of every thread that is *not* selected, keyed by the
+  /// owning thread's stable id.
+  ///
+  /// This holds both halves of the same truth: what the user typed in a thread
+  /// before switching away, and a terminal document that arrived for a thread
+  /// while the user was reading another one. They are one record because they
+  /// are one box — a delivery for A can never overwrite, relocate or silently
+  /// inherit the draft being typed in B, and A's box is still A's when the user
+  /// comes back. The selected thread is deliberately absent from this map: its
+  /// composition is the live `draft`/`pendingAttachments`, so there is exactly
+  /// one writable copy of any thread's composer state at any moment.
+  private var threadCompositions: [UUID: ThreadComposition] = [:]
   /// A delivery no thread could take (its owner is gone). Surfaced for explicit
   /// recovery rather than discarded.
   @Published private(set) var retainedComposerDelivery: String?
@@ -763,8 +806,10 @@ final class AgentChatStore: ObservableObject {
       || threadsBeforeSearch?.contains { $0.id == owner } == true
     guard ownerExists else {
       // The capture's thread was deleted while the take was in flight. There is
-      // no destination left; say so with the words intact.
-      parkedComposerDeliveries[owner] = nil
+      // no destination left; say so with the words intact. Anything the owner
+      // still held is recovered alongside them rather than dropped with the key.
+      let stranded = threadCompositions.removeValue(forKey: owner) ?? .empty
+      retainComposerDelivery(stranded.text)
       retainComposerDelivery(text)
       return .retained(text)
     }
@@ -773,9 +818,53 @@ final class AgentChatStore: ObservableObject {
       requestComposerFocus()
       return .admitted(threadID: owner)
     }
-    parkedComposerDeliveries[owner] = appendComposerDelivery(
-      text, to: parkedComposerDeliveries[owner] ?? "")
+    var parked = threadCompositions[owner] ?? .empty
+    parked.text = appendComposerDelivery(text, to: parked.text)
+    parked.hasUnseenDelivery = true
+    threadCompositions[owner] = parked
     return .parked(threadID: owner)
+  }
+
+  /// Move the composer from one thread to another. The only place either
+  /// `draft` or `pendingAttachments` changes hands.
+  ///
+  /// Saving happens before restoring and both are keyed by thread id, so no
+  /// ordering of selection changes can leak one thread's words into another's
+  /// box. An outgoing thread with nothing in it stores nothing, which keeps the
+  /// map a record of real unsent work rather than a graveyard of visited rows.
+  private func handOffComposition(from previous: UUID?, to next: UUID?) {
+    guard previous != next else { return }
+    if let previous {
+      let outgoing = ThreadComposition(text: draft, attachments: pendingAttachments)
+      if outgoing.isEmpty {
+        threadCompositions.removeValue(forKey: previous)
+      } else {
+        threadCompositions[previous] = outgoing
+      }
+    }
+    let incoming = next.flatMap { threadCompositions.removeValue(forKey: $0) } ?? .empty
+    draft = incoming.text
+    pendingAttachments = incoming.attachments
+    // A document that arrived while the user was elsewhere is surfaced once,
+    // when its thread first comes back on screen. Coming back a second time is
+    // not a second delivery: the text is already in the box and the flag is
+    // spent, so nothing is appended twice and nothing steals focus again.
+    if incoming.hasUnseenDelivery { requestComposerFocus() }
+  }
+
+  /// Take a thread's whole composition out of the store, wherever it lives.
+  ///
+  /// The selected thread's composition is the live composer, so removing a map
+  /// entry alone would silently leave it on screen for whoever is selected next.
+  private func takeComposition(of id: UUID) -> ThreadComposition {
+    if selectedThreadID == id {
+      let live = ThreadComposition(text: draft, attachments: pendingAttachments)
+      draft = ""
+      pendingAttachments = []
+      threadCompositions.removeValue(forKey: id)
+      return live
+    }
+    return threadCompositions.removeValue(forKey: id) ?? .empty
   }
 
   /// Join a delivered document onto an existing draft without gluing words.
@@ -784,22 +873,17 @@ final class AgentChatStore: ObservableObject {
     return existing.hasSuffix("\n") ? existing + text : existing + "\n" + text
   }
 
+  /// Keep ownerless words visible. Joining rather than assigning matters: a
+  /// second orphaned document must not quietly erase the first one waiting for
+  /// the user to act on it.
   private func retainComposerDelivery(_ text: String) {
-    retainedComposerDelivery = text
+    guard !text.isEmpty else { return }
+    retainedComposerDelivery = appendComposerDelivery(text, to: retainedComposerDelivery ?? "")
   }
 
   /// Consume a retained delivery once the user has acted on it.
   func clearRetainedComposerDelivery() {
     retainedComposerDelivery = nil
-  }
-
-  /// Move a parked delivery into the draft of the thread it belongs to, at the
-  /// moment that thread becomes visible. Called from `select`; separate so a
-  /// test can drive it without a full selection cycle.
-  func drainParkedComposerDelivery(for id: UUID) {
-    guard let parked = parkedComposerDeliveries.removeValue(forKey: id) else { return }
-    draft = appendComposerDelivery(parked, to: draft)
-    requestComposerFocus()
   }
 
   /// Terminal lifecycle beat for the shared recorder: the microphone is free.
@@ -1032,6 +1116,9 @@ final class AgentChatStore: ObservableObject {
     self.selectedThreadID = seeded.first?.id
     // didSet does not fire inside init — publish the seed selection once so
     // the assistive lane routes to what the rail shows from the first frame.
+    // The composition handoff is deliberately not replayed here: a new store
+    // has an empty composer and no stored composition, so there is no previous
+    // owner to park and nothing to restore.
     publishAssistiveTarget()
     engine?.installToolApprovalHandler { [weak self] request in
       guard let self else { return }
@@ -1173,12 +1260,16 @@ final class AgentChatStore: ObservableObject {
 
   // MARK: Thread ops
 
+  /// Open an empty conversation. The composer the user was in is parked with the
+  /// thread that owns it, not discarded: starting a new thread while a sentence
+  /// is unfinished used to delete that sentence and carry its staged images into
+  /// the new thread. A fresh thread has no composition, so the box is empty
+  /// because it belongs to nobody yet — not because it was cleared.
   func newThread() {
     let t = ChatThread(title: "New thread", meta: "now", messages: [])
     threads.insert(t, at: 0)
     selectedThreadID = t.id
     threadListRevision &+= 1
-    draft = ""
   }
 
   func refreshThreads() {
@@ -1323,12 +1414,13 @@ final class AgentChatStore: ObservableObject {
     return saved.map { current[$0.id] ?? $0 } + threads.filter { !savedIDs.contains($0.id) }
   }
 
+  /// Show a thread. Its own composition — what was typed there, what was staged
+  /// there, and any take that finished while the user was reading somewhere
+  /// else — comes back with it, restored by the selection handoff rather than
+  /// poured into whatever draft happened to be on screen.
   func select(_ id: UUID) {
     selectedThreadID = id
     loadMessagesIfNeeded(id)
-    // A take that finished while the user was reading another thread waits
-    // here, not in whatever draft happened to be on screen at the time.
-    drainParkedComposerDelivery(for: id)
   }
 
   func toggleFavorite(_ thread: ChatThread) {
@@ -1422,11 +1514,14 @@ final class AgentChatStore: ObservableObject {
     if activeComposerTurn?.threadID == thread.id {
       activeComposerTurn = nil
     }
-    // A parked delivery for a thread being deleted has nowhere left to land.
-    // Surface it for explicit recovery instead of losing it with the thread.
-    if let stranded = parkedComposerDeliveries.removeValue(forKey: thread.id) {
-      retainComposerDelivery(stranded)
-    }
+    // The composition of a thread being deleted has nowhere left to land. Its
+    // words — typed, delivered, or both — become explicit recovery instead of
+    // being lost with the thread, and taking it here, before the selection can
+    // move, is what stops it from migrating into whoever is selected next.
+    // Staged files go with their owner: they are still on disk, but nothing
+    // silently re-stages a deleted conversation's images somewhere else.
+    let orphaned = takeComposition(of: thread.id)
+    retainComposerDelivery(orphaned.text)
     threads.removeAll { $0.id == thread.id }
     threadsBeforeSearch?.removeAll { $0.id == thread.id }
     threadListRevision &+= 1
@@ -1571,6 +1666,10 @@ final class AgentChatStore: ObservableObject {
       "send: building request attachmentPaths.count=\(staged.count, privacy: .public) text.isEmpty=\(text.isEmpty, privacy: .public)"
     )
     guard !text.isEmpty || !staged.isEmpty, let threadID = selectedThreadID else { return }
+    // Sending consumes the composer of the thread it is sent from, and only
+    // that one. Every other thread's unsent work is held under its own id in
+    // `threadCompositions`, which this path never touches — a turn accepted,
+    // queued or streamed in one conversation cannot empty the box in another.
     draft = ""
     pendingAttachments = []
     accept(text: text, staged: staged, threadID: threadID)
