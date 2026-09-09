@@ -1368,18 +1368,16 @@ dmg-signed: dist-preflight-signed
 # opt-in via Settings → Dictation download (or make download-model).
 # Ends with the fail-closed payload gate (signed ≠ complete; see 0.13.2 MiniLM miss).
 release-standard: dist-preflight-signed
-	@CODESCRIBE_CODESIGN_IDENTITY="$(CODESCRIBE_DIST_CODESIGN_IDENTITY)" \
+	@set -eu; \
+	receipt_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/codescribe-release.XXXXXXXXXX"); \
+	trap 'rm -rf "$$receipt_dir"' EXIT; \
+	trap 'exit 130' INT; trap 'exit 143' TERM; \
+	run_id=$${receipt_dir##*/}; \
+	CODESCRIBE_CODESIGN_IDENTITY="$(CODESCRIBE_DIST_CODESIGN_IDENTITY)" \
 	 CODESCRIBE_LICENSE_PUBLIC_KEY_HEX="$(CODESCRIBE_DIST_LICENSE_KEY)" \
 	 SPARKLE_ED_PUBLIC_KEY="$(CODESCRIBE_DIST_SPARKLE_KEY)" \
-	 ./scripts/build-dmg.sh --sign --notarize
-	@VERSION=$$(awk -F '"' '/^version[[:space:]]*=/{print $$2; exit}' Cargo.toml); \
-	HEAD_SHA=$$(git rev-parse --short=9 HEAD 2>/dev/null || echo nogit); \
-	DMG=$$(ls -t Codescribe_$${VERSION}-*-$${HEAD_SHA}.dmg 2>/dev/null | head -1); \
-	if [ -z "$$DMG" ]; then \
-		echo "ERROR: no slim DMG for HEAD $$HEAD_SHA / version $$VERSION after build"; \
-		exit 1; \
-	fi; \
-	./scripts/verify-dmg-payload.sh "$$DMG" --variant slim --version "$$VERSION"
+	 ./scripts/build-dmg.sh --sign --notarize --receipt "$$receipt_dir/artifact" --receipt-run "$$run_id"; \
+	bash scripts/lib/release-artifact-receipt.sh verify "$$receipt_dir/artifact" "$$run_id" slim
 
 # Install the already-built Release .app without re-signing. Re-signing with
 # Apple Development (install-app) drops the notarization ticket and gives the
@@ -1419,18 +1417,16 @@ release-stable: release-standard install-app-release
 # Ends with the fail-closed payload gate (full = Silero + Whisper embedded,
 # MiniLM runtime resource).
 release-full: dist-preflight-signed ensure-models
-	@CODESCRIBE_CODESIGN_IDENTITY="$(CODESCRIBE_DIST_CODESIGN_IDENTITY)" \
+	@set -eu; \
+	receipt_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/codescribe-release.XXXXXXXXXX"); \
+	trap 'rm -rf "$$receipt_dir"' EXIT; \
+	trap 'exit 130' INT; trap 'exit 143' TERM; \
+	run_id=$${receipt_dir##*/}; \
+	CODESCRIBE_CODESIGN_IDENTITY="$(CODESCRIBE_DIST_CODESIGN_IDENTITY)" \
 	 CODESCRIBE_LICENSE_PUBLIC_KEY_HEX="$(CODESCRIBE_DIST_LICENSE_KEY)" \
 	 SPARKLE_ED_PUBLIC_KEY="$(CODESCRIBE_DIST_SPARKLE_KEY)" \
-	 ./scripts/build-dmg.sh --sign --notarize --embed-whisper --dmg-suffix _full
-	@VERSION=$$(awk -F '"' '/^version[[:space:]]*=/{print $$2; exit}' Cargo.toml); \
-	HEAD_SHA=$$(git rev-parse --short=9 HEAD 2>/dev/null || echo nogit); \
-	DMG=$$(ls -t Codescribe_$${VERSION}-*-$${HEAD_SHA}_full.dmg 2>/dev/null | head -1); \
-	if [ -z "$$DMG" ]; then \
-		echo "ERROR: no full DMG for HEAD $$HEAD_SHA / version $$VERSION after build"; \
-		exit 1; \
-	fi; \
-	./scripts/verify-dmg-payload.sh "$$DMG" --variant full --version "$$VERSION"
+	 ./scripts/build-dmg.sh --sign --notarize --embed-whisper --dmg-suffix _full --receipt "$$receipt_dir/artifact" --receipt-run "$$run_id"; \
+	bash scripts/lib/release-artifact-receipt.sh verify "$$receipt_dir/artifact" "$$run_id" full
 
 # Both public variants: slim first, then fat _full.
 release-dmgs: release-standard release-full
@@ -1476,3 +1472,9 @@ download-embedder:
 
 ensure-models:
 	@./scripts/ensure-models.sh
+
+# Hermetic release producer/consumer contract; run only after W2 closure.
+# gate: test-release-artifact-receipt class=hermetic ci=no -- actual release recipes and producer with isolated external-tool stand-ins
+.PHONY: test-release-artifact-receipt
+test-release-artifact-receipt:
+	@bash scripts/tests/release-artifact-receipt-test.sh
