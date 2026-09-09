@@ -126,6 +126,15 @@ where
     K: FnOnce() -> Option<String>,
 {
     let (name, _, _) = pins(vendor)?;
+    // A stored key wins: vendor account tokens are an identity for the
+    // vendor's own backend and are refused by the public API endpoints
+    // (live 2026-09-09: `401 … Missing scopes: api.responses.write`).
+    if let Some(bearer) = key().filter(|s| !s.trim().is_empty()) {
+        return Ok(SpeechAuth {
+            bearer,
+            source: AuthSource::ApiKey,
+        });
+    }
     if signed_in {
         let bearer = oauth().await?;
         if bearer.trim().is_empty() {
@@ -136,15 +145,9 @@ where
             source: AuthSource::OAuth,
         });
     }
-    let bearer = key()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or(SpeechError::MissingCredentials(name))?;
-    Ok(SpeechAuth {
-        bearer,
-        source: AuthSource::ApiKey,
-    })
+    Err(SpeechError::MissingCredentials(name))
 }
-/// OAuth first, and only an absent account admits API key fallback.
+/// Stored API key first; the signed-in account only serves a vendor with no key.
 pub async fn resolve_vendor_auth(
     vendor: ProviderKind,
     fallback_key: Option<&str>,

@@ -76,6 +76,25 @@ pub struct OpenAiProvider {
     provider: ProviderKind,
 }
 
+/// Which credential a request goes out on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthRoute {
+    /// Keychain/env API key: `Authorization: Bearer` plus `x-api-key`.
+    ApiKey,
+    /// Signed-in vendor account token: bearer only, refreshed per request.
+    Account,
+}
+
+/// Credential precedence for one request: a non-empty stored key wins, the
+/// signed-in account is the fallback for a lane that has no key at all.
+fn auth_route(account_auth_sealed: bool, stored_key: Option<&str>) -> AuthRoute {
+    match stored_key {
+        Some(_) => AuthRoute::ApiKey,
+        None if account_auth_sealed => AuthRoute::Account,
+        None => AuthRoute::ApiKey,
+    }
+}
+
 impl OpenAiProvider {
     /// Build from the resolved assistive lane topology while retaining only
     /// its credential account. The secret itself is fetched by [`Self::stream`]
@@ -195,10 +214,26 @@ impl AgentProvider for OpenAiProvider {
             stream: true,
         };
 
-        // Account-auth lanes fetch a fresh access token per request (60s-skew
+        // A stored API key outranks the signed-in account. The vendor account
+        // token is an identity for the vendor's own backend and never carries
+        // `api.responses.write`; sending it to the public Responses endpoint
+        // is a guaranteed 401 (live 2026-09-09 16:15: "Missing scopes:
+        // api.responses.write" with a valid key sitting in the Keychain).
+        let request_api_key = self
+            .api_key_account
+            .as_deref()
+            .and_then(keychain::runtime_key);
+        let stored_key = request_api_key
+            .as_deref()
+            .or(Some(self.api_key.as_str()))
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        let route = auth_route(self.use_account_auth, stored_key);
+
+        // Account-auth requests fetch a fresh access token per request (60s-skew
         // auto-refresh) — never a token frozen at provider construction. The
         // manager formats the `Bearer` header itself, so this is the raw token.
-        let account_token = if self.use_account_auth {
+        let account_token = if route == AuthRoute::Account {
             Some(
                 account_auth::access_token(self.provider)
                     .await
@@ -212,19 +247,11 @@ impl AgentProvider for OpenAiProvider {
         } else {
             None
         };
-        let request_api_key = self
-            .api_key_account
-            .as_deref()
-            .and_then(keychain::runtime_key);
-        let auth_secret = account_token
-            .as_deref()
-            .or(request_api_key.as_deref())
-            .unwrap_or(&self.api_key);
+        let auth_secret = account_token.as_deref().or(stored_key).unwrap_or("");
 
-        let auth_header_mode = if self.use_account_auth {
-            AuthHeaderMode::BearerOnly
-        } else {
-            AuthHeaderMode::BearerAndApiKey
+        let auth_header_mode = match route {
+            AuthRoute::Account => AuthHeaderMode::BearerOnly,
+            AuthRoute::ApiKey => AuthHeaderMode::BearerAndApiKey,
         };
         let manager = ResponsesStreamingManager::new(
             &self.client,
@@ -819,9 +846,9 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        OpenAiProvider, ProviderKind, build_request_input, build_request_input_items,
-        chained_instructions, format_tool_output, forward_events_and_track_chain,
-        reasoning_summary_request, request_messages, to_data_uri,
+        AuthRoute, OpenAiProvider, ProviderKind, auth_route, build_request_input,
+        build_request_input_items, chained_instructions, format_tool_output,
+        forward_events_and_track_chain, reasoning_summary_request, request_messages, to_data_uri,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -1218,6 +1245,74 @@ mod tests {
                 .expect("image_url string")
                 .starts_with("data:image/png;base64,")
         );
+    }
+
+    #[test]
+    fn stored_key_outranks_signed_in_account() {
+        assert_eq!(auth_route(true, Some("sk-live")), AuthRoute::ApiKey);
+        assert_eq!(auth_route(false, Some("sk-live")), AuthRoute::ApiKey);
+        assert_eq!(auth_route(true, None), AuthRoute::Account);
+        assert_eq!(auth_route(false, None), AuthRoute::ApiKey);
+    }
+
+    /// Founder 2026-09-09 16:15: signed in with ChatGPT AND a valid key in the
+    /// Keychain, every agent turn died with `HTTP 401 … Missing scopes:
+    /// api.responses.write` because the account token was sent first. With a
+    /// key present the request must go out on the key (bearer + x-api-key)
+    /// and never ask the account layer for a token — no tokens are stored in
+    /// this test, so an account fetch would surface as an auth error instead
+    /// of the mocked stream.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn account_lane_with_a_stored_key_sends_the_key() {
+        const TEST_KEY_ACCOUNT: &str = "CODESCRIBE_TEST_OPENAI_ACCOUNT_LANE_KEY";
+        let mut server = mockito::Server::new_async().await;
+        let endpoint = format!("{}/v1/responses", server.url());
+        let mut env = ScopedEnv::new();
+        env.set(TEST_KEY_ACCOUNT, "synthetic-lane-key");
+        let provider = OpenAiProvider {
+            client: Client::new(),
+            endpoint,
+            api_key: String::new(),
+            api_key_account: Some(TEST_KEY_ACCOUNT.to_string()),
+            default_model: "gpt-test-assistive".to_string(),
+            use_previous_response_id: false,
+            previous_response_id: Arc::new(Mutex::new(None)),
+            initial_response_timeout: Duration::from_secs(2),
+            inter_chunk_timeout: Duration::from_secs(2),
+            use_account_auth: true,
+            provider: ProviderKind::OpenAiResponses,
+        };
+        let body = [
+            r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_key_first"}}"#,
+            "",
+            r#"data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_key_first","status":"failed","error":{"code":"synthetic_end","message":"done"}}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let mock = server
+            .mock("POST", "/v1/responses")
+            .match_header("authorization", "Bearer synthetic-lane-key")
+            .match_header("x-api-key", "synthetic-lane-key")
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let messages = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text("key before account".to_string())],
+        )];
+        let mut rx = provider
+            .stream(&messages, &[], &StreamOptions::default())
+            .await
+            .expect("stream must go out on the stored key, not the account");
+        while rx.recv().await.is_some() {}
+        mock.assert_async().await;
     }
 
     #[tokio::test]
