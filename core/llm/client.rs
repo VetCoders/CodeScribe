@@ -81,6 +81,10 @@ struct NdjsonChunk {
     is_final: Option<bool>,
     error: Option<String>,
     message: Option<String>,
+    /// `stt-jsonl-v1` server-side identity of this stream (`resp_stt_…`),
+    /// carried on `transcript.final` and `stream.closed`. Logged so a take can
+    /// be traced on the gateway; never used for routing.
+    response_id: Option<String>,
 }
 
 /// Audio validation error type for pre-flight checks
@@ -547,6 +551,10 @@ async fn transcribe_ndjson_segment(
                     anyhow::bail!("NDJSON STT error: {}", err);
                 }
                 if chunk.kind.as_deref() == Some("stream.closed") {
+                    info!(
+                        "[NDJSON STT] stream.closed response_id={}",
+                        chunk.response_id.as_deref().unwrap_or("none")
+                    );
                     break 'lines;
                 }
                 if let Some(text) = chunk.text {
@@ -554,9 +562,10 @@ async fn transcribe_ndjson_segment(
                         || chunk.is_final.unwrap_or(false)
                     {
                         info!(
-                            "[NDJSON STT] Final: {} chars after {} partials",
+                            "[NDJSON STT] Final: {} chars after {} partials response_id={}",
                             text.len(),
-                            partial_count
+                            partial_count,
+                            chunk.response_id.as_deref().unwrap_or("none")
                         );
                         final_text = Some(text);
                     } else {
