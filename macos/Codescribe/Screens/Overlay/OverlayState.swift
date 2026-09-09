@@ -1472,6 +1472,25 @@ final class OverlayState {
       && formatterReceipt != nil
     let signalsFirstSuccessfulTerminal =
       !terminal && projection.terminal && projection.phase == OverlayMode.formatted.rawValue
+    // Initialize before the first event can obtain a receiver receipt or retain
+    // refused bytes. The first observed projection may already end this session.
+    if isNewSession {
+      deliveredText = ""
+      deliveredTextSessionId = nil
+      composerDeliverySessionId = nil
+      retainedComposerDelivery = nil
+      qualityCapturedProvenance = nil
+      userRevisionProvenance = nil
+      revisionCommitPending = false
+      formatterCommitPending = false
+      pendingRevisionSessionId = nil
+      pendingRevisionSource = nil
+      revisionCommitError = nil
+      formatterError = nil
+      revisionFocusCommitTask?.cancel()
+      revisionFocusCommitTask = nil
+    }
+
     // The reducer emits two different terminals. `apply_manual_edit` is a
     // presentation revision — a Light+ mint or a formatter receipt — and it can
     // legitimately arrive BEFORE the controller publishes `session_ended`.
@@ -1509,23 +1528,10 @@ final class OverlayState {
     canRetranscribe = projection.canRetranscribe
     canFormat = projection.canFormat
     terminal = projection.terminal
-    finalized = projection.terminal
-
-    if isNewSession {
-      deliveredText = ""
-      deliveredTextSessionId = nil
-      composerDeliverySessionId = nil
-      retainedComposerDelivery = nil
-      qualityCapturedProvenance = nil
-      userRevisionProvenance = nil
-      revisionCommitPending = false
-      formatterCommitPending = false
-      pendingRevisionSessionId = nil
-      pendingRevisionSource = nil
-      revisionCommitError = nil
-      formatterError = nil
-      revisionFocusCommitTask?.cancel()
-      revisionFocusCommitTask = nil
+    // A document revision cannot consume the capture's pending stopped callback.
+    // Preserve an already-finalized lifecycle when revising its document later.
+    if !projection.terminal || isLifecycleTerminal {
+      finalized = projection.terminal
     }
 
     userRevisionProvenance = revisionReceipt
