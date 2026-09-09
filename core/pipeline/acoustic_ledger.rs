@@ -292,6 +292,8 @@ pub enum RefuseReason {
     SealedReplay,
     /// The exact same observation identity was already answered in this batch.
     BatchDuplicate,
+    /// A machine observation returned no lexical evidence.
+    EmptyLabel,
 }
 
 impl RefuseReason {
@@ -300,6 +302,7 @@ impl RefuseReason {
         match self {
             Self::SealedReplay => "sealed_replay",
             Self::BatchDuplicate => "batch_duplicate",
+            Self::EmptyLabel => "empty_label",
         }
     }
 }
@@ -682,6 +685,13 @@ impl AcousticLedger {
             };
         }
 
+        if text.trim().is_empty() && observation.producer != ObservationProducer::ManualHuman {
+            return MutationReceipt::Refuse {
+                occurrence: observation.occurrence.clone(),
+                reason: RefuseReason::EmptyLabel,
+            };
+        }
+
         if let Some(held) = self.committed.get(&observation.occurrence) {
             let held = held.clone();
             let outranks = observation.producer.authority_rank() > held.producer.authority_rank();
@@ -857,6 +867,42 @@ impl AcousticLedger {
         frontier.schedule(producer)
     }
 
+    /// Account for real Apple words arriving after all earlier jobs returned
+    /// without a label. Only this exact qualified occurrence may gain its first
+    /// Apple and slice-local Lexicon observations. No old return is removed and
+    /// no producer may run twice; successful seals and ordinary scheduling keep
+    /// their existing fences. The caller already holds the words and immediately
+    /// admits Apple followed by its Lexicon no-change observation.
+    pub fn schedule_late_apple_label(
+        &mut self,
+        observation: &ObservationIdentity,
+        text: &str,
+    ) -> bool {
+        let occurrence = &observation.occurrence;
+        if observation.producer != ObservationProducer::Apple
+            || text.trim().is_empty()
+            || !self.serial_of(occurrence).is_some_and(AcousticSerial::vad_closed)
+            || self.is_sealed(occurrence)
+            || self.committed.contains_key(occurrence)
+            || self.answered.contains(observation)
+        {
+            return false;
+        }
+        let Some(frontier) = self.frontiers.get_mut(occurrence) else {
+            return false;
+        };
+        if !frontier.is_closed()
+            || !frontier.returned.contains(&ObservationProducer::Whisper)
+            || frontier.scheduled.contains(&ObservationProducer::Apple)
+            || frontier.scheduled.contains(&ObservationProducer::Lexicon)
+        {
+            return false;
+        }
+        frontier.schedule(ObservationProducer::Apple);
+        frontier.schedule(ObservationProducer::Lexicon);
+        true
+    }
+
     /// Record that a scheduled producer finished with a range.
     ///
     /// Returns `true` only for the transition from open to closed. Repeated
@@ -900,6 +946,9 @@ impl AcousticLedger {
             .ok_or(SealRefusal::FrontierUnknown)?;
         if !frontier.is_closed() {
             return Err(SealRefusal::FrontierOpen);
+        }
+        if self.text_of(occurrence).is_none_or(|text| text.trim().is_empty()) {
+            return Err(SealRefusal::LabelMissing);
         }
         let answered = self
             .answered
@@ -2015,6 +2064,8 @@ pub enum SealRefusal {
     /// No frontier was ever scheduled for the range, so closure is unknown.
     /// Unknown is not closed.
     FrontierUnknown,
+    /// All scheduled observers returned, but none supplied a usable label.
+    LabelMissing,
     /// An admitted observation for the range has no decision receipt.
     ObservationsWithoutReceipts,
     /// The terminal seal was asked for while an occurrence in the epoch is
@@ -2032,6 +2083,7 @@ impl SealRefusal {
             Self::VadDidNotClose => "vad_did_not_close",
             Self::FrontierOpen => "frontier_open",
             Self::FrontierUnknown => "frontier_unknown",
+            Self::LabelMissing => "label_missing",
             Self::ObservationsWithoutReceipts => "observations_without_receipts",
             Self::OccurrenceStillOpen => "occurrence_still_open",
             Self::CoverageIncomplete => "coverage_incomplete",
@@ -2340,6 +2392,120 @@ mod tests {
         occurrence: OccurrenceIdentity,
     ) -> ObservationIdentity {
         ObservationIdentity::new(producer, 7, generation, occurrence)
+    }
+
+    fn whisper_only_qualified_ledger() -> (AcousticLedger, OccurrenceIdentity) {
+        let occurrence = occ(0, 16_000);
+        let mut ledger = AcousticLedger::new();
+        let calibration = EnergyCalibration::new("label-finality", 1.0, 1);
+        let evidence = AcousticEvidence {
+            occurrence: occurrence.clone(),
+            duration_ms: 1_000.0,
+            energy_integral: 100.0,
+            mean_rms_dbfs: -20.0,
+            peak_dbfs: -10.0,
+            vad_open_sample: Some(0),
+            vad_close_sample: Some(16_000),
+            evidence_calibration_version: calibration.version.clone(),
+        };
+        assert!(ledger.qualify(&evidence, &calibration).is_qualified());
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Whisper]);
+        (ledger, occurrence)
+    }
+
+    #[test]
+    fn empty_whisper_then_real_apple_preserves_returns_and_receipt_history() {
+        let (mut ledger, occurrence) = whisper_only_qualified_ledger();
+        let serial = ledger.serial_of(&occurrence).unwrap().clone();
+        let whisper = obs(ObservationProducer::Whisper, 0, occurrence.clone());
+        assert_eq!(ledger.admit(&whisper, " "), MutationReceipt::Refuse {
+            occurrence: occurrence.clone(), reason: RefuseReason::EmptyLabel,
+        });
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        assert_eq!(ledger.seal(&occurrence), Err(SealRefusal::LabelMissing));
+        assert_eq!(ledger.seal_terminal("s1", 1), Err(SealRefusal::LabelMissing));
+        let prior = ledger.frontier_of(&occurrence).unwrap().clone();
+        let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
+        assert!(ledger.schedule_late_apple_label(&apple, "real words"));
+        assert!(prior.returned.is_subset(&ledger.frontier_of(&occurrence).unwrap().returned));
+        assert_eq!(ledger.admit(&apple, "real words"), MutationReceipt::Insert {
+            occurrence: occurrence.clone(),
+        });
+        assert!(!ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let lexicon = obs(ObservationProducer::Lexicon, 0, occurrence.clone());
+        assert!(matches!(ledger.admit(&lexicon, "real words"), MutationReceipt::Preserve { .. }));
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Lexicon));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        assert_eq!(seal.layer_trail_ordinals, vec![0, 1, 2]);
+        assert_eq!(seal.serials, vec![serial]);
+        assert_eq!(seal.coverage, occurrence);
+        assert_eq!(ledger.text_of(&occurrence), Some("real words"));
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_empty_returns_do_not_seal_or_erase_evidence() {
+        let (mut ledger, occurrence) = whisper_only_qualified_ledger();
+        let whisper = obs(ObservationProducer::Whisper, 0, occurrence.clone());
+        assert!(matches!(ledger.admit(&whisper, ""), MutationReceipt::Refuse {
+            reason: RefuseReason::EmptyLabel, ..
+        }));
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        let frontier = ledger.frontier_of(&occurrence).unwrap().clone();
+        assert!(matches!(ledger.admit(&whisper, ""), MutationReceipt::Refuse {
+            reason: RefuseReason::BatchDuplicate, ..
+        }));
+        assert!(!ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        assert_eq!(ledger.frontier_of(&occurrence), Some(&frontier));
+        assert_eq!(ledger.layer_trail().len(), 2);
+        assert!(ledger.is_empty());
+        assert_eq!(ledger.seal(&occurrence), Err(SealRefusal::LabelMissing));
+    }
+
+    #[test]
+    fn late_apple_requires_exact_qualification_and_never_relaunches_observers() {
+        let (mut ledger, occurrence) = whisper_only_qualified_ledger();
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        let frontier = ledger.frontier_of(&occurrence).unwrap().clone();
+        for foreign in [
+            OccurrenceIdentity::new("other", 1, 0, 16_000),
+            OccurrenceIdentity::new("s1", 2, 0, 16_000),
+            occ(1, 16_000),
+            occ(0, 16_001),
+        ] {
+            assert!(!ledger.schedule_late_apple_label(
+                &obs(ObservationProducer::Apple, 0, foreign), "words"));
+        }
+        let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
+        assert!(!ledger.schedule_late_apple_label(&apple, " "));
+        assert!(!ledger.schedule_late_apple_label(
+            &obs(ObservationProducer::Whisper, 1, occurrence.clone()), "words"));
+        assert_eq!(ledger.frontier_of(&occurrence), Some(&frontier));
+        assert!(ledger.schedule_late_apple_label(&apple, "words"));
+        assert!(!ledger.schedule_late_apple_label(&apple, "words"));
+        assert!(!ledger.schedule_observer(occurrence.clone(), ObservationProducer::Whisper));
+        assert!(ledger.frontier_of(&occurrence).unwrap().returned.contains(&ObservationProducer::Whisper));
+    }
+
+    #[test]
+    fn successful_label_seal_refuses_late_machine_but_preserves_human_provenance() {
+        let (mut ledger, occurrence) = whisper_only_qualified_ledger();
+        let whisper = obs(ObservationProducer::Whisper, 0, occurrence.clone());
+        assert!(ledger.admit(&whisper, "successful words").grants_mutation());
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
+        assert!(!ledger.schedule_late_apple_label(&apple, "late words"));
+        assert!(matches!(ledger.admit(&apple, "late words"), MutationReceipt::Refuse {
+            reason: RefuseReason::SealedReplay, ..
+        }));
+        assert_eq!(ledger.text_of(&occurrence), Some("successful words"));
+        let human = obs(ObservationProducer::ManualHuman, 1, occurrence.clone());
+        assert!(ledger.admit(&human, "human correction").grants_mutation());
+        assert_eq!(ledger.manual_edits().len(), 1);
+        assert_eq!(ledger.manual_edits()[0].supersedes_seal, seal.receipt_id);
+        assert_eq!(ledger.seal(&occurrence), Ok(&seal));
+        assert_eq!(ledger.post_seal_decisions(&occurrence).len(), 2);
     }
 
     /// Only concrete observer launches extend a frontier. A formatter setting
