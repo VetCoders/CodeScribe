@@ -10,6 +10,7 @@ use tokio::time::Duration;
 use tracing::{info, warn};
 
 use crate::asr_session::recorder::{Layer1Decision, RecorderLifecycleEvents};
+use crate::audio::streaming_recorder::CaptureTurnIntent;
 use crate::config::{Config, RuntimeSettingsSnapshot};
 use crate::pipeline::acoustic_ledger::AcousticLedger;
 use crate::pipeline::contracts::{EngineEvent, EventSink, LayerSummary};
@@ -47,6 +48,13 @@ pub struct SessionConfig {
     pub stream_log_path: Option<std::path::PathBuf>,
     /// VAD silence threshold for utterance boundary (None = use default).
     pub utterance_silence_sec: Option<f32>,
+    /// How many turns the capture gesture that opened this session owns.
+    ///
+    /// Frozen per take by the surface that started it. The session reads it
+    /// only to decide whether a sealed occurrence may open a *live* paid
+    /// formatter slot; acoustic segmentation, ledger qualification, and Layer 1
+    /// tail repair are identical for both variants.
+    pub capture_turn: CaptureTurnIntent,
     /// Injected, already-authorized Layer 1 refiner decision (C1).
     ///
     /// The pipeline only consumes this — construction, consent, and mode
@@ -461,6 +469,9 @@ pub async fn collect_buffered_engine_events(
             language,
             stream_log_path: None,
             utterance_silence_sec: None,
+            // Offline harness: no UI gesture opened this, so it inherits the
+            // ordinary hands-free contract rather than inventing a composer take.
+            capture_turn: CaptureTurnIntent::HandsFree,
             // Offline replay harness: Layer 1 arming is a live-recording
             // decision owned elsewhere.
             layer1: Layer1Decision::Disarmed,

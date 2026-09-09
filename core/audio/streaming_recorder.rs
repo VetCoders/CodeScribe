@@ -29,6 +29,68 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+/// How many turns one capture gesture owns.
+///
+/// This is per-take capture intent, never a stored preference and never a mode
+/// flag. It is decided by the surface that opened the microphone and frozen for
+/// exactly that take: the hands-free lanes keep the utterance-epoch contract
+/// they always had, and one composer gesture owns one explicit turn.
+///
+/// It deliberately does **not** describe destination, engine, or acoustic
+/// evidence. Silero segmentation, ledger qualification, and Layer 1 tail repair
+/// are unaffected by either variant — only the UI-visible epoch lifecycle and
+/// the *live* paid formatter lane read this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureTurnIntent {
+    /// Hotkey toggle, hold, tray, and the assistive overlay.
+    ///
+    /// Trailing silence past the configured threshold closes an utterance
+    /// epoch, and every sealed occurrence may reach the live formatter as it
+    /// happens. This is the pre-existing behaviour of every non-composer lane.
+    #[default]
+    HandsFree,
+    /// One composer gesture, one explicit take.
+    ///
+    /// Silence never closes the take — only an explicit stop does — and no
+    /// paid formatting is launched per silence-delimited fragment. The turn is
+    /// formatted once at terminal processing instead.
+    SingleTurn,
+}
+
+impl CaptureTurnIntent {
+    /// The per-take utterance silence threshold this intent asks the recorder
+    /// for, given the configured hands-free value.
+    ///
+    /// `None` is the pipeline's legacy contract: one continuous stream for the
+    /// whole take, no epoch decisions at all. It is the *engine lifecycle* that
+    /// rests, not the VAD — Silero keeps running for identity and tail repair.
+    pub fn utterance_silence_sec(self, configured_sec: f32) -> Option<f32> {
+        match self {
+            Self::HandsFree => Some(configured_sec),
+            Self::SingleTurn => None,
+        }
+    }
+
+    /// Whether a sealed occurrence may open a paid formatter slot *while the
+    /// take is still live*.
+    ///
+    /// A one-turn take collects the whole turn and formats it once at terminal
+    /// processing, so per-fragment provider calls are refused at the arming
+    /// seam rather than deduplicated after the fact.
+    pub const fn schedules_live_formatting(self) -> bool {
+        matches!(self, Self::HandsFree)
+    }
+
+    /// Whether the take may be formatted once when it terminates.
+    ///
+    /// Exactly the complement of [`Self::schedules_live_formatting`]: a
+    /// hands-free take has already paid per occurrence and must not be charged
+    /// a second time at stop.
+    pub const fn formats_once_at_terminal(self) -> bool {
+        matches!(self, Self::SingleTurn)
+    }
+}
+
 /// Ledger refusal of the terminal transcript after a successful capture stop.
 ///
 /// Raised by [`StreamingRecorder::stop`] when the acoustic ledger reports
@@ -130,6 +192,9 @@ pub async fn replay_production_session(
         language,
         stream_log_path: None,
         utterance_silence_sec,
+        // Replay reproduces a hands-free recording: the composer take is a UI
+        // gesture with no offline equivalent, so this seam never fabricates one.
+        capture_turn: CaptureTurnIntent::HandsFree,
         layer1,
         lifecycle_events: None,
         terminal_audio: None,
@@ -157,6 +222,10 @@ pub struct StreamingRecorder {
     sample_rate: u32,
     utterance_callback: Option<Arc<dyn Fn(String) + Send + Sync>>,
     utterance_silence_sec: Option<f32>,
+    /// How many turns the next/active take owns. Set by the surface that opened
+    /// the microphone and cleared back to the default between sessions, so a
+    /// one-turn composer take can never leak into the next hands-free one.
+    capture_turn: CaptureTurnIntent,
     /// Counter for audio chunks dropped due to channel backpressure.
     dropped_chunks: Arc<AtomicU64>,
     /// Sink used by `start_event_session`. Caller must configure it explicitly.
@@ -200,6 +269,7 @@ impl StreamingRecorder {
             sample_rate,
             utterance_callback: None,
             utterance_silence_sec: None,
+            capture_turn: CaptureTurnIntent::HandsFree,
             dropped_chunks: Arc::new(AtomicU64::new(0)),
             event_sink: None,
             level_callback: None,
@@ -228,6 +298,7 @@ impl StreamingRecorder {
             sample_rate,
             utterance_callback: None,
             utterance_silence_sec: None,
+            capture_turn: CaptureTurnIntent::HandsFree,
             dropped_chunks: Arc::new(AtomicU64::new(0)),
             event_sink: None,
             level_callback: None,
@@ -277,6 +348,21 @@ impl StreamingRecorder {
     /// pipeline default.
     pub fn set_utterance_silence_sec(&mut self, silence_sec: Option<f32>) {
         self.utterance_silence_sec = silence_sec;
+    }
+
+    /// Declare how many turns the next take owns.
+    ///
+    /// Read when the session starts and frozen into `SessionConfig`, so it has
+    /// to be set before [`Self::start_event_session`]. The controller resets it
+    /// to [`CaptureTurnIntent::HandsFree`] between sessions: a one-turn
+    /// composer take must never widen into the hands-free take that follows it.
+    pub fn set_capture_turn_intent(&mut self, capture_turn: CaptureTurnIntent) {
+        self.capture_turn = capture_turn;
+    }
+
+    /// The capture intent frozen for the next/active take.
+    pub fn capture_turn_intent(&self) -> CaptureTurnIntent {
+        self.capture_turn
     }
 
     /// Set the per-block input-level tap consumed by UI meters (overlay
@@ -410,6 +496,7 @@ impl StreamingRecorder {
 
         let log_path = stream_log_path();
         let utterance_silence_sec = self.utterance_silence_sec;
+        let capture_turn = self.capture_turn;
 
         let (layer1, _decision_receipt) = crate::asr_session::layer1_decision(&runtime_settings);
         let (lifecycle_handle, lifecycle_events) = recorder_lifecycle_channel();
@@ -430,6 +517,7 @@ impl StreamingRecorder {
                     language,
                     stream_log_path: log_path,
                     utterance_silence_sec,
+                    capture_turn,
                     layer1,
                     lifecycle_events: Some(lifecycle_events),
                     terminal_audio: Some(terminal_rx),

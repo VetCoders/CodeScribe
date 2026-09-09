@@ -56,8 +56,8 @@ pub use types::{HotkeyAction, HotkeyInput, HotkeyType, State};
 use crate::presentation::status_projection::PresentationStatusProjection;
 use crate::presentation::transcript_bus::TranscriptSessionEndReason;
 use crate::presentation::{
-    PresentationEmitter, TranscriptBus, TranscriptMode, TranscriptSession, UserRevisionCommit,
-    UserRevisionIntent,
+    PresentationEmitter, TerminalFormatterRequest, TranscriptBus, TranscriptMode,
+    TranscriptSession, UserRevisionCommit, UserRevisionIntent,
 };
 use anyhow::{Context, Result};
 use codescribe_core::llm::ai_formatting::format_text_with_status_for_policy;
@@ -71,7 +71,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::audio::streaming_recorder::{StreamingRecorder, TerminalSealRefused};
+use crate::audio::streaming_recorder::{CaptureTurnIntent, StreamingRecorder, TerminalSealRefused};
 use crate::config::models::ModelManager;
 use crate::config::{Config, RuntimeSettingsSnapshot, UserSettings};
 use crate::os::clipboard;
@@ -1663,6 +1663,10 @@ impl RecordingController {
     fn clear_recorder_callbacks(recorder: &mut StreamingRecorder) {
         recorder.set_utterance_callback(None);
         recorder.set_utterance_silence_sec(None);
+        // A one-turn composer take must never widen into the next hands-free
+        // one. This runs before every start and after every stop, so the
+        // override cannot outlive the take that asked for it.
+        recorder.set_capture_turn_intent(CaptureTurnIntent::HandsFree);
         recorder.set_event_sink(None);
         recorder.set_level_callback(None);
     }
@@ -2307,7 +2311,8 @@ impl RecordingController {
 
         match current_state {
             State::Idle => {
-                self.start_toggle_recording(event.assistive).await?;
+                self.start_toggle_recording(event.assistive, CaptureTurnIntent::HandsFree)
+                    .await?;
             }
             State::RecToggle => {
                 info!("Toggle pressed; entering stop flow (state=REC_TOGGLE)");
@@ -3083,8 +3088,102 @@ impl RecordingController {
         Ok(())
     }
 
+    /// Start one explicit Agent-composer take on the shared controller.
+    ///
+    /// One gesture, one turn. This is the same recorder, the same ledger and
+    /// the same reducer every other lane uses — the only thing that differs is
+    /// the per-take [`CaptureTurnIntent`], which keeps hands-free utterance
+    /// epochs out of a take the user ends explicitly.
+    ///
+    /// Refused unless the controller is idle: a composer press must never
+    /// hijack, restart or silently inherit a capture some other surface owns.
+    pub async fn start_composer_turn_recording(&self) -> Result<()> {
+        let state = self.current_state().await;
+        if state != State::Idle {
+            return Err(anyhow::anyhow!(
+                "composer take refused: shared controller is {state}, not IDLE"
+            ));
+        }
+        self.start_toggle_recording(true, CaptureTurnIntent::SingleTurn)
+            .await
+    }
+
+    /// Format one composer turn exactly once, at terminal processing.
+    ///
+    /// Returns the text the stop path should deliver. Every early return is a
+    /// provider call that never happens rather than one that is made and
+    /// discarded:
+    ///
+    /// - a hands-free take already paid per occurrence during capture;
+    /// - a take with no terminal authority has nothing to format;
+    /// - an empty or whitespace-only turn produces no request at all;
+    /// - a formatter refusal (failed, policy-skipped, healthy no-op) keeps the
+    ///   committed document exactly as the ledger sealed it.
+    ///
+    /// On success the committed revision is the delivered text, so the Bus, the
+    /// delivery buffer and the ledger CAS keep seeing the same bytes.
+    async fn format_composer_turn_once(
+        &self,
+        capture_turn: CaptureTurnIntent,
+        committed_text: String,
+    ) -> String {
+        if !capture_turn.formats_once_at_terminal() {
+            return committed_text;
+        }
+        // Snapshot into a local first. Under Rust 2024 the read guard produced
+        // inside a `let ... else` scrutinee outlives the diverging branch, and
+        // this task takes the same lock again further down.
+        let active_presentation = self.active_presentation.read().await.clone();
+        let Some(presentation) = active_presentation else {
+            warn!("Composer turn: no terminal transcript authority; delivering committed text");
+            return committed_text;
+        };
+        let Some(TerminalFormatterRequest {
+            session_id,
+            source_revision,
+            source_text,
+        }) = presentation.terminal_formatter_request()
+        else {
+            debug!("Composer turn: nothing to format at terminal; no provider call issued");
+            return committed_text;
+        };
+        let runtime_settings = self.runtime_settings_arc().await;
+        let language = runtime_settings.values().whisper_language;
+        // The one paid call this take is allowed. Same production entry point
+        // the explicit overlay formatter uses; no second lane, no retry loop.
+        let result = format_text_with_status_for_policy(
+            &source_text,
+            language.whisper_hint(),
+            runtime_settings.as_ref(),
+        )
+        .await;
+        match presentation.apply_formatter_revision(session_id, source_revision, result) {
+            Ok(commit) => {
+                info!(
+                    revision = commit.revision,
+                    receipt = %commit.provenance_receipt,
+                    "Composer turn formatted once at terminal processing"
+                );
+                commit.rendered_text
+            }
+            Err(refusal) => {
+                info!(%refusal, "Composer turn terminal formatting refused; committed text stands");
+                committed_text
+            }
+        }
+    }
+
     /// Start recording in toggle mode (immediate, no delay)
-    async fn start_toggle_recording(&self, is_assistive: bool) -> Result<()> {
+    ///
+    /// `capture_turn` is the per-take intent of the surface that opened the
+    /// microphone. Hotkey, tray and overlay pass
+    /// [`CaptureTurnIntent::HandsFree`] and keep their utterance-epoch
+    /// contract; the Agent composer passes [`CaptureTurnIntent::SingleTurn`].
+    async fn start_toggle_recording(
+        &self,
+        is_assistive: bool,
+        capture_turn: CaptureTurnIntent,
+    ) -> Result<()> {
         // Acquire serial lock to prevent race conditions
         let _guard = self.serial_lock.lock().await;
 
@@ -3237,7 +3336,12 @@ impl RecordingController {
         // Toggle mode: continuous recording; silence only triggers per-utterance send.
         recorder.recorder.config.auto_silence = false;
         recorder.recorder.set_on_vad_stop(|| {});
-        recorder.set_utterance_silence_sec(Some(toggle_silence_sec));
+        // The intent owns the epoch question, not the mode flags: hands-free
+        // keeps the configured threshold, a one-turn take asks for the legacy
+        // single continuous stream. Silero, ledger qualification and Layer 1
+        // tail repair are unaffected either way.
+        recorder.set_utterance_silence_sec(capture_turn.utterance_silence_sec(toggle_silence_sec));
+        recorder.set_capture_turn_intent(capture_turn);
 
         // Set session mode for delta routing BEFORE starting the pipeline,
         // so the very first deltas route to the correct overlay.
@@ -3438,6 +3542,10 @@ impl RecordingController {
             let stopped =
                 stop_recorder_for_terminal(recorder, session_id_snapshot.as_deref()).await;
             rec_stop_secs = phase2.elapsed().as_secs_f64();
+            // Read the take's own intent before the per-take state is cleared.
+            // The recorder is the single owner of this fact; the stop path must
+            // not re-derive it from the assistive flag or the active screen.
+            let capture_turn = recorder.capture_turn_intent();
             Self::clear_recorder_callbacks(recorder);
             drop(recorder_guard);
             // The session is over whichever way `stop()` went; the engine that
@@ -3468,6 +3576,12 @@ impl RecordingController {
 
             let phase3 = std::time::Instant::now();
             info!("stop_toggle_inner: PHASE 3 — reducer-owned transcript already delivered");
+            // One composer gesture, one turn, one formatting pass. A hands-free
+            // take returns unchanged here — it already formatted per occurrence
+            // while it was live.
+            let streaming_text = self
+                .format_composer_turn_once(capture_turn, streaming_text)
+                .await;
             if let Some(path) = raw_audio_path_opt.as_deref() {
                 retain_session_audio(
                     session_id_snapshot.as_deref(),

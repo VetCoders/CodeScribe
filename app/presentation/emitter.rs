@@ -137,6 +137,20 @@ pub struct UserRevisionIntent {
 /// Rust-authored acknowledgement for one committed user revision. Swift uses
 /// this only as request status; visible text still arrives through projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One terminal document offered for exactly one paid formatter pass.
+///
+/// Produced only by [`TranscriptReducer::terminal_formatter_request`]. An empty
+/// or whitespace-only turn produces no request at all, so "format nothing" is
+/// an absent provider call rather than a refused one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalFormatterRequest {
+    pub session_id: String,
+    /// Compare-and-swap revision the formatter result must be admitted against.
+    pub source_revision: u64,
+    /// Exact committed bytes handed to the provider.
+    pub source_text: String,
+}
+
 pub struct UserRevisionCommit {
     pub session_id: String,
     pub source_revision: u64,
@@ -441,6 +455,30 @@ impl TranscriptReducer {
     ) -> Result<String, UserRevisionRefusal> {
         self.authenticated_revision_occurrences(session_id, source_revision)?;
         Ok(self.committed_rendered_text())
+    }
+
+    /// The single paid formatter pass a one-turn take is owed at terminal
+    /// processing, or `None` when there is nothing to format: no committed
+    /// document, not yet terminal, or an empty/whitespace-only turn.
+    ///
+    /// Read-only. It authenticates nothing and mints nothing; it hands the
+    /// controller the exact bytes plus the CAS pair the result must be admitted
+    /// against, so the one formatter corridor stays
+    /// [`Self::terminal_revision_source`] → provider → `apply_formatter_revision`.
+    pub fn terminal_formatter_request(&self) -> Option<TerminalFormatterRequest> {
+        if !self.terminal {
+            return None;
+        }
+        let session_id = self.document_by_occurrence.keys().next()?.session.clone();
+        let source_text = self.committed_rendered_text();
+        if source_text.trim().is_empty() {
+            return None;
+        }
+        Some(TerminalFormatterRequest {
+            session_id,
+            source_revision: self.revision,
+            source_text,
+        })
     }
 
     /// The Light+ revision this terminal document is owed, or `None` when
@@ -896,6 +934,22 @@ impl PresentationEmitter {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .terminal_revision_source(session_id, source_revision)
+    }
+
+    /// The one paid formatter pass this terminal take is owed, if any.
+    ///
+    /// Literal delivery keeps its contract: a raw take is never reshaped, so it
+    /// asks for no provider call at all. Everything else is decided by the
+    /// reducer — no committed document, not terminal yet, or an empty turn all
+    /// mean no request, and therefore no provider call to skip afterwards.
+    pub fn terminal_formatter_request(&self) -> Option<TerminalFormatterRequest> {
+        if self.literal_delivery() {
+            return None;
+        }
+        self.session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_formatter_request()
     }
 
     /// Admit only a successful formatter result into the existing revision
@@ -2172,6 +2226,47 @@ mod tests {
         assert!(ledger.schedule_observer(occurrence.clone(), ObservationProducer::Formatter,));
         assert!(!ledger.note_frontier_return(&occurrence, ObservationProducer::Lexicon));
         (ledger, reducer, occurrence)
+    }
+
+    /// rc-w2-composer-turn: a one-turn take is offered to the provider exactly
+    /// once, and an empty turn is never offered at all.
+    ///
+    /// The count that matters is the number of *requests*, so this asserts the
+    /// request itself rather than a call counter bolted beside it: no request
+    /// means the controller issues no provider call.
+    #[test]
+    fn terminal_formatter_request_is_one_exact_cas_pair_for_a_nonempty_turn() {
+        let (_ledger, mut reducer, _occurrence) = open_formatter_frontier();
+
+        assert!(
+            reducer.terminal_formatter_request().is_none(),
+            "a take that has not reached terminal owes no formatting"
+        );
+
+        reducer.mark_terminal_lifecycle();
+        let request = reducer
+            .terminal_formatter_request()
+            .expect("a terminal nonempty turn is owed exactly one formatting pass");
+        assert_eq!(request.session_id, "formatter-session");
+        assert_eq!(request.source_revision, reducer.revision);
+        assert_eq!(request.source_text, reducer.committed_rendered_text());
+        assert_eq!(
+            reducer
+                .terminal_revision_source(&request.session_id, request.source_revision)
+                .expect("the request must authenticate against the CAS pair it carries"),
+            request.source_text
+        );
+    }
+
+    #[test]
+    fn terminal_formatter_request_is_absent_for_an_empty_turn() {
+        let mut reducer = TranscriptReducer::default();
+        reducer.mark_terminal_lifecycle();
+
+        assert!(
+            reducer.terminal_formatter_request().is_none(),
+            "an empty turn must produce no provider call to refuse afterwards"
+        );
     }
 
     #[test]

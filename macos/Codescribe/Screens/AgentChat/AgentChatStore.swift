@@ -585,6 +585,29 @@ final class AgentChatStore: ObservableObject {
     dictationThreadID == nil || dictationThreadID == selectedThreadID
   }
 
+  /// True when a composer gesture — not a hotkey, tray or overlay one — opened
+  /// the live capture.
+  ///
+  /// The latch below is set the moment the composer press begins and cleared on
+  /// every terminal phase, so it is exactly "this composer started what is
+  /// running". The shared controller being globally busy is a different fact,
+  /// and stopping on that alone would let a composer press kill a dictation the
+  /// user started somewhere else.
+  var ownsLiveDictation: Bool {
+    dictationThreadID != nil
+  }
+
+  /// Give back a composer gesture that turned out to belong to another surface.
+  ///
+  /// The press optimistically latched ownership at click latency; discovering
+  /// that a foreign take holds the microphone must return the composer to rest
+  /// without touching that take, and without leaving the mic pinned in a
+  /// non-actionable `.preparing`.
+  func releaseUnownedDictationGesture() {
+    setDictationPhase(.idle)
+    dictationBlocked = true
+  }
+
   /// Injected real adapter (Core). `nil` in previews / mock → mic is inert.
   var dictation: ComposerDictating?
 

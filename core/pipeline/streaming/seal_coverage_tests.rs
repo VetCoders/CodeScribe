@@ -422,6 +422,7 @@ async fn private_archive_live_producer_bench() {
             language: Some("pl".into()),
             stream_log_path: None,
             utterance_silence_sec: None,
+            capture_turn: crate::audio::streaming_recorder::CaptureTurnIntent::HandsFree,
             layer1,
             lifecycle_events: None,
             terminal_audio: Some(terminal_audio),
