@@ -44,6 +44,28 @@ pub const LONG_SILENCE_FENCE_SECS: f32 = 0.55;
 /// Default left-audio pad when [`FusionContextMode::LeftAudioPad`] is armed.
 pub const DEFAULT_LEFT_PAD_SECS: f32 = 0.40;
 
+/// Symmetric decode context around a Silero utterance, in seconds.
+///
+/// Context only: the padded range is the audio a decoder may *see*. The
+/// occurrence it may *own* stays the unpadded utterance range.
+pub const DEFAULT_SYMMETRIC_PAD_SECS: f32 = 0.40;
+
+/// Symmetric pad applied to a raw Silero threshold crossing when the seal
+/// speech set is built.
+///
+/// This is the chunker's own `pre_roll_sec`/`speech_pad_sec` (64 ms): a
+/// threshold crossing is where Silero became *sure*, not where the word began,
+/// and the same quantum the capture path already trusts is what makes the
+/// acoustic set comparable with committed occurrence ranges.
+pub const ACOUSTIC_SPEECH_PAD_SECS: f32 = 0.064;
+
+/// Two padded speech ranges separated by no more than this are one range.
+///
+/// Same figure the energy ladder already merges on (`ACTIVE_SPEECH_MERGE_GAP_MS`
+/// in `capture_receipt`), so the acoustic set and the fallback set describe
+/// coverage at the same granularity instead of two different ones.
+pub const ACOUSTIC_SPEECH_MERGE_GAP_SECS: f32 = 0.200;
+
 /// Maximum sideband facts retained for later span attachment. Live consumers
 /// receive every freshly emitted fact; only the retrospective lookup window is
 /// bounded.
@@ -178,6 +200,113 @@ impl UtteranceLedger {
     }
 }
 
+/// The session's raw acoustic speech set: where Silero crossed its threshold.
+///
+/// This is deliberately **not** [`UtteranceLedger`]. An utterance range carries
+/// padded STT-window semantics — it opens `pre_roll` before the crossing, stays
+/// open across pauses shorter than the utterance gap, and closes on the capture
+/// cursor rather than on the last speech frame. That padding is correct for
+/// deciding *who owns which occurrence*, and wrong for asking *how much of this
+/// take was speech*: measured on take `e186c4db` (2026-09-09) the utterance set
+/// reported 2 974 s of "speech" for a 2 990 s recording whose offline Silero
+/// measurement was 454 s. The 31 minutes of dropout noise after the operator
+/// stopped talking were never speech; they were one padded window.
+///
+/// So the two live side by side and answer different questions. Ownership keeps
+/// its padded ranges; coverage asks this set.
+#[derive(Debug, Clone, Default)]
+pub struct AcousticSpeechSet {
+    /// Closed `[start, end)` crossings in PCM order, unpadded.
+    closed: Vec<(u64, u64)>,
+    /// Crossing opened but not yet closed.
+    open_start: Option<u64>,
+}
+
+impl AcousticSpeechSet {
+    /// Record a `SpeechStart` crossing.
+    ///
+    /// A second start with no intervening end keeps the earlier one: the
+    /// earlier sample is the conservative boundary, and moving it forward would
+    /// silently shrink the speech the set is meant to account for.
+    fn open(&mut self, sample: u64) {
+        if self.open_start.is_none() {
+            self.open_start = Some(sample);
+        }
+    }
+
+    /// Record a `SpeechEnd` crossing. An end with nothing open is ignored: it
+    /// describes a segment this set never saw begin, and inventing a start for
+    /// it would manufacture speech evidence.
+    fn close(&mut self, sample: u64) {
+        if let Some(start) = self.open_start.take() {
+            self.closed.push((start, sample.max(start)));
+        }
+    }
+
+    /// Unpadded crossings, with any still-open range closed at `samples_seen`.
+    ///
+    /// Stop mid-word is the normal case, so the open range is real speech up to
+    /// the capture cursor — not something to drop.
+    pub fn raw_ranges(&self, samples_seen: u64) -> Vec<(u64, u64)> {
+        let mut ranges = self.closed.clone();
+        if let Some(start) = self.open_start {
+            ranges.push((start, samples_seen.max(start)));
+        }
+        ranges
+    }
+
+    /// Padded, gap-merged speech ranges on the session PCM clock.
+    ///
+    /// Padding is symmetric and clamped to `[0, samples_seen]`: a crossing at
+    /// sample 0 cannot pad below zero, and a crossing at EOF cannot claim audio
+    /// the session never captured. Short crossings survive — a 60 ms word is
+    /// speech that the ledger is entitled to be asked about, and dropping it
+    /// here would quietly shrink the very set that proves coverage.
+    pub fn ranges(
+        &self,
+        session: &str,
+        capture_epoch: u64,
+        samples_seen: u64,
+        pad_samples: u64,
+        merge_gap_samples: u64,
+    ) -> Vec<TailSampleRange> {
+        let mut padded: Vec<(u64, u64)> = self
+            .raw_ranges(samples_seen)
+            .into_iter()
+            .filter(|(start, end)| end >= start)
+            .map(|(start, end)| {
+                (
+                    start.saturating_sub(pad_samples),
+                    end.saturating_add(pad_samples).min(samples_seen),
+                )
+            })
+            .filter(|(start, end)| end > start)
+            .collect();
+        padded.sort_unstable();
+
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(padded.len());
+        for (start, end) in padded {
+            if let Some((_, previous_end)) = merged.last_mut()
+                && start <= previous_end.saturating_add(merge_gap_samples)
+            {
+                *previous_end = (*previous_end).max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+
+        merged
+            .into_iter()
+            .map(|(sample_start, sample_end)| TailSampleRange {
+                session: session.to_string(),
+                capture_epoch,
+                sample_start,
+                sample_end,
+            })
+            .collect()
+    }
+}
+
 /// What one observed capture chunk means to every consumer of the session's
 /// single spectrum.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -207,6 +336,14 @@ pub struct SileroIngress {
     next_sideband_sequence: u64,
     last_speech_end: Option<u64>,
     sideband: VecDeque<SidebandEvidence>,
+    /// Raw threshold crossings, unbounded on purpose.
+    ///
+    /// [`MAX_RETAINED_SIDEBAND_EVIDENCE`] bounds the *lookup window* for
+    /// retrospective span attachment, which is a different job. A 50-minute
+    /// take produces a few hundred crossings, and a coverage set that silently
+    /// dropped its oldest ranges would report the beginning of the session as
+    /// uncovered speech that was never speech.
+    speech: AcousticSpeechSet,
 }
 
 impl SileroIngress {
@@ -220,6 +357,7 @@ impl SileroIngress {
             next_sideband_sequence: 0,
             last_speech_end: None,
             sideband: VecDeque::new(),
+            speech: AcousticSpeechSet::default(),
         }
     }
 
@@ -229,6 +367,25 @@ impl SileroIngress {
 
     pub fn ledger_mut(&mut self) -> &mut UtteranceLedger {
         &mut self.ledger
+    }
+
+    /// Seal-time speech ranges: threshold crossings, padded by
+    /// [`ACOUSTIC_SPEECH_PAD_SECS`] and merged across gaps up to
+    /// [`ACOUSTIC_SPEECH_MERGE_GAP_SECS`], on this session's identity.
+    ///
+    /// No occurrence is minted, moved or resized by this call. It reports what
+    /// the microphone heard; the ledger keeps deciding what was committed.
+    pub fn acoustic_speech_ranges(&self, samples_seen: u64) -> Vec<TailSampleRange> {
+        let rate = self.sample_rate.max(1) as f32;
+        let pad = (ACOUSTIC_SPEECH_PAD_SECS * rate).round().max(0.0) as u64;
+        let merge_gap = (ACOUSTIC_SPEECH_MERGE_GAP_SECS * rate).round().max(0.0) as u64;
+        self.speech.ranges(
+            &self.session,
+            self.capture_epoch,
+            samples_seen,
+            pad,
+            merge_gap,
+        )
     }
 
     /// Whether Silero actually loaded. `false` means every frame reads as
@@ -287,9 +444,13 @@ impl SileroIngress {
     }
 
     /// Convert the chunker's exact Silero boundaries into ordered pipeline
-    /// evidence. This is intentionally separate from [`Self::observe`]: the
-    /// fusion ledger retains its padded STT window semantics, while sideband
-    /// evidence names the unpadded threshold crossings exactly.
+    /// evidence, and record the same crossings in the acoustic speech set.
+    ///
+    /// This is intentionally separate from [`Self::observe`]: the fusion ledger
+    /// retains its padded STT window semantics, while these crossings name the
+    /// unpadded thresholds exactly. Both are derived here, from one drained
+    /// batch, so the set that measures speech and the evidence that reports it
+    /// cannot describe different samples.
     pub(crate) fn observe_boundaries(
         &mut self,
         boundaries: &[VadBoundaryEvidence],
@@ -298,6 +459,7 @@ impl SileroIngress {
         for boundary in boundaries {
             match boundary.kind {
                 VadBoundaryKind::SpeechStart => {
+                    self.speech.open(boundary.sample);
                     if let Some(pause_start) = self.last_speech_end.take()
                         && pause_start < boundary.sample
                     {
@@ -319,6 +481,7 @@ impl SileroIngress {
                     ));
                 }
                 VadBoundaryKind::SpeechEnd => {
+                    self.speech.close(boundary.sample);
                     emitted.push(self.push_sideband(
                         boundary.sample,
                         boundary.sample,
@@ -359,16 +522,31 @@ impl SileroIngress {
     }
 
     /// Seal any still-open Supervisor segment at capture EOF.
+    ///
+    /// The acoustic crossing is closed on the same cursor as the utterance, so
+    /// a stop mid-word leaves one consistent EOF boundary in both sets rather
+    /// than a speech range that outlives the audio.
     pub fn flush(&mut self, samples_seen: u64) -> Option<u64> {
         let _ = self.vad.flush();
+        self.speech.close(samples_seen);
         self.ledger.close_open(samples_seen)
     }
 }
 
 /// How a Whisper window is cut relative to a Silero utterance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FusionContextMode {
-    /// Audio is exactly the Silero utterance. Default.
+    /// Utterance plus symmetric context on both sides, clipped at the
+    /// long-silence fence, at end of captured PCM, and at the neighbouring
+    /// utterance. Default.
+    ///
+    /// A decoder handed exactly the utterance sees a word begin on sample one
+    /// and end on the last sample; the first and last syllable arrive with no
+    /// acoustic run-up. The context is what the decoder listens to, never what
+    /// the occurrence claims — see [`bound_context_range`].
+    #[default]
+    SymmetricPad,
+    /// Audio is exactly the Silero utterance.
     UtteranceOnly,
     /// Small left pad, clipped at the last long-silence fence.
     LeftAudioPad,
@@ -383,14 +561,16 @@ impl FusionContextMode {
             Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
                 "left_pad" | "left-pad" | "pad" => Self::LeftAudioPad,
                 "stable_prompt" | "stable-text" | "prompt" => Self::StableTextPrompt,
-                _ => Self::UtteranceOnly,
+                "utterance_only" | "utterance-only" | "exact" => Self::UtteranceOnly,
+                _ => Self::default(),
             },
-            Err(_) => Self::UtteranceOnly,
+            Err(_) => Self::default(),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::SymmetricPad => "symmetric_pad",
             Self::UtteranceOnly => "utterance_only",
             Self::LeftAudioPad => "left_audio_pad",
             Self::StableTextPrompt => "stable_text_prompt",
@@ -398,17 +578,53 @@ impl FusionContextMode {
     }
 }
 
-/// Cut the audio range a provider may see. Long silence is a hard fence.
+/// Everything that may stop decode context from growing.
+///
+/// All four are hard limits, not preferences. Crossing any one of them either
+/// hands the decoder audio that belongs to a different acoustic event, or audio
+/// that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ContextBounds {
+    /// End sample of the last long-silence cut before this utterance. `0` when
+    /// no fence applies. Context never reaches back across it.
+    pub long_silence_fence: u64,
+    /// One past the last sample the session has actually captured. Right
+    /// context stops here; asking beyond it resolves to no window at all.
+    pub capture_end: u64,
+    /// Start of the next utterance, when one exists. Right context stops
+    /// before a neighbour so a decode window cannot straddle two occurrences.
+    pub next_utterance_start: Option<u64>,
+    /// End of the previous utterance, when one exists. Left context stops
+    /// after a neighbour, for the same reason.
+    pub previous_utterance_end: Option<u64>,
+}
+
+/// Cut the audio range a provider may see.
+///
+/// The returned range is **context, not ownership**. Occurrence identity is
+/// minted from the unpadded utterance range by the caller and is not derived
+/// from this value; widening the window can improve the words a decoder
+/// produces, and can never widen what the resulting label owns. Long silence,
+/// end of captured PCM and the neighbouring utterances are hard fences.
 pub fn bound_context_range(
     utterance: &TailSampleRange,
-    last_long_silence_end: u64,
     mode: FusionContextMode,
     pad_samples: u64,
+    bounds: &ContextBounds,
 ) -> TailSampleRange {
+    let last_long_silence_end = bounds.long_silence_fence;
     let mut range = utterance.clone();
-    if mode == FusionContextMode::LeftAudioPad {
+
+    let wants_left_pad = matches!(
+        mode,
+        FusionContextMode::LeftAudioPad | FusionContextMode::SymmetricPad
+    );
+    if wants_left_pad {
         let want = utterance.sample_start.saturating_sub(pad_samples);
         range.sample_start = want.max(last_long_silence_end);
+        if let Some(previous_end) = bounds.previous_utterance_end {
+            range.sample_start = range.sample_start.max(previous_end.min(utterance.sample_start));
+        }
     }
     if range.sample_start < last_long_silence_end
         && last_long_silence_end < range.sample_end
@@ -417,6 +633,18 @@ pub fn bound_context_range(
         // Fence is inside the requested pad — clip, never cross.
         range.sample_start = last_long_silence_end.max(utterance.sample_start);
     }
+
+    if mode == FusionContextMode::SymmetricPad {
+        let mut want = utterance.sample_end.saturating_add(pad_samples);
+        if bounds.capture_end > 0 {
+            want = want.min(bounds.capture_end.max(utterance.sample_end));
+        }
+        if let Some(next_start) = bounds.next_utterance_start {
+            want = want.min(next_start.max(utterance.sample_end));
+        }
+        range.sample_end = want.max(utterance.sample_end);
+    }
+
     if range.sample_start > range.sample_end {
         range.sample_start = range.sample_end;
     }
@@ -684,31 +912,369 @@ mod tests {
     #[test]
     fn left_pad_never_crosses_long_silence() {
         let utterance = range(48_000, 64_000);
-        let silence_end = 40_000;
+        let bounds = ContextBounds {
+            long_silence_fence: 40_000,
+            capture_end: 80_000,
+            ..ContextBounds::default()
+        };
         let padded = bound_context_range(
             &utterance,
-            silence_end,
             FusionContextMode::LeftAudioPad,
             16_000,
+            &bounds,
         );
-        assert_eq!(padded.sample_start, silence_end);
+        assert_eq!(padded.sample_start, bounds.long_silence_fence);
         assert_eq!(padded.sample_end, 64_000);
 
         let utterance_only = bound_context_range(
             &utterance,
-            silence_end,
             FusionContextMode::UtteranceOnly,
             16_000,
+            &bounds,
         );
         assert_eq!(utterance_only.sample_start, 48_000);
+        assert_eq!(utterance_only.sample_end, 64_000);
 
         let prompt = bound_context_range(
             &utterance,
-            silence_end,
             FusionContextMode::StableTextPrompt,
             16_000,
+            &bounds,
         );
         assert_eq!(prompt.sample_start, 48_000);
+        assert_eq!(prompt.sample_end, 64_000);
+    }
+
+    /// The default cut reaches both ways. 400 ms at 16 kHz is 6 400 samples;
+    /// nothing in the way means the decoder hears the run-up and the run-out.
+    #[test]
+    fn symmetric_context_reaches_both_sides_when_nothing_fences_it() {
+        let utterance = range(48_000, 64_000);
+        let bounds = ContextBounds {
+            capture_end: 160_000,
+            ..ContextBounds::default()
+        };
+
+        let padded =
+            bound_context_range(&utterance, FusionContextMode::SymmetricPad, 6_400, &bounds);
+
+        assert_eq!(padded.sample_start, 41_600);
+        assert_eq!(padded.sample_end, 70_400);
+        assert_eq!(
+            FusionContextMode::default(),
+            FusionContextMode::SymmetricPad,
+            "symmetric context is the default cut, not an env-only mode"
+        );
+    }
+
+    /// Every limit is hard. Whichever binds first wins, and none of them may
+    /// push a bound back inside the utterance the caller owns.
+    #[test]
+    fn symmetric_context_stops_at_fence_eof_and_neighbours() {
+        let utterance = range(48_000, 64_000);
+
+        let fenced = bound_context_range(
+            &utterance,
+            FusionContextMode::SymmetricPad,
+            6_400,
+            &ContextBounds {
+                long_silence_fence: 44_000,
+                capture_end: 160_000,
+                ..ContextBounds::default()
+            },
+        );
+        assert_eq!(fenced.sample_start, 44_000, "left context clips at the fence");
+
+        let at_eof = bound_context_range(
+            &utterance,
+            FusionContextMode::SymmetricPad,
+            6_400,
+            &ContextBounds {
+                capture_end: 66_000,
+                ..ContextBounds::default()
+            },
+        );
+        assert_eq!(
+            at_eof.sample_end, 66_000,
+            "right context cannot claim audio the session never captured"
+        );
+
+        let crowded = bound_context_range(
+            &utterance,
+            FusionContextMode::SymmetricPad,
+            6_400,
+            &ContextBounds {
+                capture_end: 160_000,
+                next_utterance_start: Some(67_000),
+                previous_utterance_end: Some(45_000),
+                ..ContextBounds::default()
+            },
+        );
+        assert_eq!(crowded.sample_start, 45_000, "left context stops after the previous span");
+        assert_eq!(crowded.sample_end, 67_000, "right context stops before the next span");
+
+        // A capture cursor already behind the utterance end (EOF quantisation)
+        // must not invert the window or shrink what the caller asked to decode.
+        let quantised = bound_context_range(
+            &utterance,
+            FusionContextMode::SymmetricPad,
+            6_400,
+            &ContextBounds {
+                capture_end: 63_000,
+                ..ContextBounds::default()
+            },
+        );
+        assert_eq!(quantised.sample_start, 41_600);
+        assert_eq!(quantised.sample_end, 64_000);
+        assert!(quantised.sample_start <= quantised.sample_end);
+    }
+
+    /// Padding is context. It never becomes ownership: the utterance range the
+    /// caller mints occurrence identity from is untouched by any mode, and the
+    /// context window always contains it.
+    #[test]
+    fn decode_context_never_widens_the_owned_utterance_range() {
+        let utterance = range(48_000, 64_000);
+        let bounds = ContextBounds {
+            capture_end: 160_000,
+            ..ContextBounds::default()
+        };
+
+        for mode in [
+            FusionContextMode::SymmetricPad,
+            FusionContextMode::UtteranceOnly,
+            FusionContextMode::LeftAudioPad,
+            FusionContextMode::StableTextPrompt,
+        ] {
+            let context = bound_context_range(&utterance, mode, 6_400, &bounds);
+            assert!(
+                context.sample_start <= utterance.sample_start
+                    && context.sample_end >= utterance.sample_end,
+                "{} context must contain the owned range",
+                mode.as_str()
+            );
+            assert_eq!(context.session, utterance.session);
+            assert_eq!(context.capture_epoch, utterance.capture_epoch);
+        }
+
+        // The owned range is a separate value and stays exactly as minted.
+        assert_eq!(utterance.sample_start, 48_000);
+        assert_eq!(utterance.sample_end, 64_000);
+    }
+
+    /// Two bursts of speech with real silence between them are two acoustic
+    /// ranges, symmetrically padded by 64 ms — not one padded window that
+    /// swallows the pause. This is the whole point of the set: on take
+    /// `e186c4db` the utterance view called 99.5% of a 50-minute recording
+    /// speech, against an offline measurement of 454 s.
+    #[test]
+    fn acoustic_speech_set_keeps_separate_bursts_separate() {
+        let mut ingress = SileroIngress::new(16_000, "bursts", 7);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 16_000,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 32_000,
+                speech_probability: 0.1,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 48_000,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 64_000,
+                speech_probability: 0.1,
+            },
+        ]);
+
+        let ranges = ingress.acoustic_speech_ranges(80_000);
+        assert_eq!(ranges.len(), 2, "a one-second pause is not speech");
+        // 64 ms at 16 kHz = 1 024 samples, applied on both sides.
+        assert_eq!(ranges[0].sample_start, 14_976);
+        assert_eq!(ranges[0].sample_end, 33_024);
+        assert_eq!(ranges[1].sample_start, 46_976);
+        assert_eq!(ranges[1].sample_end, 65_024);
+        assert_eq!(ranges[0].session, "bursts");
+        assert_eq!(ranges[0].capture_epoch, 7);
+
+        let speech_samples: u64 = ranges
+            .iter()
+            .map(|range| range.sample_end - range.sample_start)
+            .sum();
+        assert!(
+            speech_samples < 80_000,
+            "the acoustic set must be smaller than the take, not equal to it"
+        );
+    }
+
+    /// A gap at or under 200 ms is VAD quantisation inside one phrase, not a
+    /// pause the coverage receipt should have to account for twice.
+    #[test]
+    fn acoustic_speech_set_merges_gaps_up_to_two_hundred_milliseconds() {
+        let mut ingress = SileroIngress::new(16_000, "merge", 0);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 16_000,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 32_000,
+                speech_probability: 0.1,
+            },
+            // 150 ms later — 2 400 samples, inside the merge gap once padded.
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 34_400,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 48_000,
+                speech_probability: 0.1,
+            },
+        ]);
+
+        let ranges = ingress.acoustic_speech_ranges(64_000);
+        assert_eq!(ranges.len(), 1, "150 ms inside a phrase is one range");
+        assert_eq!(ranges[0].sample_start, 14_976);
+        assert_eq!(ranges[0].sample_end, 49_024);
+    }
+
+    /// Stop mid-word is ordinary. The open crossing is speech up to the capture
+    /// cursor, and padding may not invent audio past it.
+    #[test]
+    fn acoustic_speech_set_closes_an_open_crossing_at_capture_end() {
+        let mut ingress = SileroIngress::new(16_000, "eof", 0);
+        ingress.observe_boundaries(&[VadBoundaryEvidence {
+            kind: VadBoundaryKind::SpeechStart,
+            sample: 16_000,
+            speech_probability: 0.9,
+        }]);
+
+        let ranges = ingress.acoustic_speech_ranges(24_000);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].sample_start, 14_976);
+        assert_eq!(
+            ranges[0].sample_end, 24_000,
+            "the right pad is clamped at the capture cursor, never past it"
+        );
+
+        // `flush` closes the same crossing on the same cursor as the utterance.
+        ingress.flush(24_000);
+        let flushed = ingress.acoustic_speech_ranges(24_000);
+        assert_eq!(flushed, ranges, "flush must not move an EOF boundary");
+    }
+
+    /// A 60 ms word is speech. The set records it; nothing in this cut is
+    /// allowed to introduce a minimum-duration rejection that silently drops
+    /// short legitimate utterances.
+    #[test]
+    fn acoustic_speech_set_preserves_words_shorter_than_250ms() {
+        let mut ingress = SileroIngress::new(16_000, "short", 0);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 16_000,
+                speech_probability: 0.9,
+            },
+            // 60 ms of speech — under every "minimum utterance" figure argued
+            // for on this lane.
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 16_960,
+                speech_probability: 0.1,
+            },
+        ]);
+
+        let ranges = ingress.acoustic_speech_ranges(48_000);
+        assert_eq!(ranges.len(), 1, "a short word is still speech");
+        assert_eq!(ranges[0].sample_start, 14_976);
+        assert_eq!(ranges[0].sample_end, 17_984);
+    }
+
+    /// Padding at the very start of a take clamps at sample zero rather than
+    /// underflowing, and an end crossing with nothing open manufactures no
+    /// speech at all.
+    #[test]
+    fn acoustic_speech_set_clamps_at_zero_and_refuses_orphan_ends() {
+        let mut ingress = SileroIngress::new(16_000, "edges", 0);
+        ingress.observe_boundaries(&[VadBoundaryEvidence {
+            kind: VadBoundaryKind::SpeechEnd,
+            sample: 4_000,
+            speech_probability: 0.1,
+        }]);
+        assert!(
+            ingress.acoustic_speech_ranges(48_000).is_empty(),
+            "an end with no start is not evidence of speech"
+        );
+
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 100,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 8_000,
+                speech_probability: 0.1,
+            },
+        ]);
+
+        let ranges = ingress.acoustic_speech_ranges(48_000);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].sample_start, 0, "the left pad clamps at zero");
+        assert_eq!(ranges[0].sample_end, 9_024);
+    }
+
+    /// The two sets answer different questions and must not be confused. The
+    /// padded utterance view stays open across the pause; the acoustic view
+    /// does not.
+    #[test]
+    fn acoustic_set_and_utterance_ledger_measure_different_things() {
+        let mut ingress = SileroIngress::new(16_000, "divergent", 0);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 16_000,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 32_000,
+                speech_probability: 0.1,
+            },
+        ]);
+        // One padded STT window spanning the whole take, the way the fusion
+        // ledger legitimately mints ownership.
+        ingress.observe(Some((0, 160_000)), true, 160_000);
+
+        let utterance_samples: u64 = ingress
+            .ledger()
+            .utterances()
+            .iter()
+            .map(|utterance| utterance.range.sample_end - utterance.range.sample_start)
+            .sum();
+        let acoustic_samples: u64 = ingress
+            .acoustic_speech_ranges(160_000)
+            .iter()
+            .map(|range| range.sample_end - range.sample_start)
+            .sum();
+
+        assert_eq!(utterance_samples, 160_000, "ownership keeps its padded window");
+        assert_eq!(acoustic_samples, 18_048, "coverage measures the crossings");
+        assert!(
+            acoustic_samples < utterance_samples,
+            "the coverage set is the smaller, honest one"
+        );
     }
 
     /// Regression proof: active boundary events (UtteranceFinal discriminant) and

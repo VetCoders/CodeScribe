@@ -77,7 +77,8 @@ use super::session::{
     compute_tail_patch_job, emit_session_finalised, log_tail_patch_session_receipt,
 };
 use super::silero_fusion::{
-    FusionContextMode, FusionWord, SileroIngress, bound_context_range, slice_apple_words,
+    ContextBounds, FusionContextMode, FusionWord, SileroIngress, bound_context_range,
+    slice_apple_words,
 };
 use super::stream_log::append_to_stream_log;
 
@@ -130,18 +131,46 @@ pub const APPLE_FINAL_OVERLAP_WARNING_CODE: &str = "apple_final_window_overlap_n
 /// The refusal token is diagnostics-only and never force-seals the document.
 pub const LEDGER_TERMINAL_SEAL_REFUSED_WARNING_CODE: &str = "acoustic_ledger_terminal_seal_refused";
 
-/// Text-free token naming what the retired char-diff made of one Layer 1 job.
+/// What the retired char-diff made of one Layer 1 job, and what actually
+/// happened to that job's payload.
 ///
-/// The one-throne path admits Whisper through `AcousticLedger` on occurrence
-/// identity, so this verdict carries no authority: it never becomes a label, a
-/// receipt, or a mutation. It exists so the discarded legacy decision stays
-/// observable without the transcript text ever entering a log line.
-fn legacy_char_diff_verdict(outcome: &TailPatchOutcome) -> &'static str {
-    match outcome {
-        TailPatchOutcome::Patches(_) => "patches",
-        TailPatchOutcome::NoChange => "no_change",
-        TailPatchOutcome::UnderCommit(_) => "under_commit",
-        TailPatchOutcome::Skipped { .. } => "skipped",
+/// The two are separate facts and were being read as one. `verdict = "skipped"`
+/// reads like a rejection, and on 2026-09-09 three such lines were cited as
+/// three lost Whisper labels on take `e186c4db`; correlating PCM spans against
+/// Bus revisions showed all three had been admitted and had persisted to
+/// revision 85. The verdict never decided that. The one-throne path admits
+/// Whisper through `AcousticLedger` on occurrence identity, and `payload` is
+/// forwarded on every successful job regardless of what the char-diff said.
+///
+/// So the receipt states both, and states which one has authority. Text-free by
+/// construction: no transcript ever reaches a log line through here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyCharDiffReceipt {
+    /// The retired decision, as a token.
+    verdict: &'static str,
+    /// Whether the provider payload continued to occurrence admission. `true`
+    /// for every `Ok` job — including `skipped` and `under_commit`.
+    payload_forwarded: bool,
+    /// Who actually decides admission. Never this verdict.
+    admission_authority: &'static str,
+}
+
+/// Ledger admission is bound to occurrence identity, never to a text diff.
+const LEDGER_ADMISSION_AUTHORITY: &str = "acoustic_ledger_occurrence_identity";
+
+fn legacy_char_diff_receipt(
+    outcome: &TailPatchOutcome,
+    payload_forwarded: bool,
+) -> LegacyCharDiffReceipt {
+    LegacyCharDiffReceipt {
+        verdict: match outcome {
+            TailPatchOutcome::Patches(_) => "patches",
+            TailPatchOutcome::NoChange => "no_change",
+            TailPatchOutcome::UnderCommit(_) => "under_commit",
+            TailPatchOutcome::Skipped { .. } => "skipped",
+        },
+        payload_forwarded,
+        admission_authority: LEDGER_ADMISSION_AUTHORITY,
     }
 }
 
@@ -315,13 +344,17 @@ impl AppleTailPatchLane {
         match result {
             Ok(job) => {
                 // Counts only. A `Patches` outcome carries transcript text, so
-                // the verdict is reduced to a token before it reaches the log —
-                // and it is dropped here either way: the ledger admits Whisper
-                // by occurrence identity, never by this char-diff.
+                // the verdict is reduced to a token before it reaches the log.
+                // The payload is forwarded whatever the verdict says — the
+                // receipt names both facts so neither can be read as the other.
+                let receipt = legacy_char_diff_receipt(&job.outcome, true);
                 debug!(
                     utterance_id = job.utterance_id,
-                    verdict = legacy_char_diff_verdict(&job.outcome),
-                    "Layer 1 char-diff verdict discarded — occurrence admission owns the label"
+                    legacy_verdict = receipt.verdict,
+                    payload_forwarded = receipt.payload_forwarded,
+                    admission_authority = receipt.admission_authority,
+                    "Layer 1 char-diff verdict is diagnostic only; the payload continues to \
+                     occurrence admission"
                 );
                 TailPatchCompletion {
                     utterance_id: job.utterance_id,
@@ -333,6 +366,8 @@ impl AppleTailPatchLane {
             Err(error) => {
                 warn!(
                     utterance_id = fallback_id,
+                    payload_forwarded = false,
+                    admission_authority = LEDGER_ADMISSION_AUTHORITY,
                     "Layer 1 provider job failed; Apple text is preserved: {error}"
                 );
                 TailPatchCompletion {
@@ -1044,7 +1079,10 @@ impl AppleSealState {
             tail_patch_refusals: 0,
             fusion: None,
             fusion_seal_armed: false,
-            fusion_context: FusionContextMode::UtteranceOnly,
+            // One source of truth for the default cut. Without a Silero
+            // ingress nothing reads this field; when one arms, `from_env`
+            // resolves the same default unless an operator overrode it.
+            fusion_context: FusionContextMode::default(),
             pending_silero_words: BTreeMap::new(),
             unmatched_silero_words: Vec::new(),
             warned_unmatched_words: BTreeSet::new(),
@@ -1970,9 +2008,13 @@ fn seal_sliced_by_silero(
     }
 
     let rate = state.sample_rate.max(1) as f32;
-    let pad_samples = (super::silero_fusion::DEFAULT_LEFT_PAD_SECS * rate).round() as u64;
-    let long_silence = (super::silero_fusion::LONG_SILENCE_FENCE_SECS * rate).round() as u64;
     let context = state.fusion_context;
+    let pad_secs = match context {
+        FusionContextMode::SymmetricPad => super::silero_fusion::DEFAULT_SYMMETRIC_PAD_SECS,
+        _ => super::silero_fusion::DEFAULT_LEFT_PAD_SECS,
+    };
+    let pad_samples = (pad_secs * rate).round() as u64;
+    let long_silence = (super::silero_fusion::LONG_SILENCE_FENCE_SECS * rate).round() as u64;
 
     // Candidate labels remain paint until the physical extent closes. Retain
     // every observation until reconciliation; equality of text is irrelevant.
@@ -2069,11 +2111,12 @@ fn seal_sliced_by_silero(
             },
         );
 
-        let fence = ledger
+        let previous = ledger
             .utterances()
             .iter()
             .rev()
-            .find(|prev| prev.closed && prev.range.sample_end <= silero.range.sample_start)
+            .find(|prev| prev.closed && prev.range.sample_end <= silero.range.sample_start);
+        let fence = previous
             .map(|prev| {
                 let gap = silero
                     .range
@@ -2086,8 +2129,28 @@ fn seal_sliced_by_silero(
                 }
             })
             .unwrap_or(0);
-        let request_range = bound_context_range(&silero.range, fence, context, pad_samples);
-        let window = state.window_by_samples(request_range.sample_start, request_range.sample_end);
+        let bounds = ContextBounds {
+            long_silence_fence: fence,
+            capture_end: state.audio.session_sample_end(),
+            next_utterance_start: ledger
+                .utterances()
+                .iter()
+                .find(|next| next.range.sample_start >= silero.range.sample_end)
+                .map(|next| next.range.sample_start),
+            previous_utterance_end: previous.map(|prev| prev.range.sample_end),
+        };
+        let request_range = bound_context_range(&silero.range, context, pad_samples, &bounds);
+        // Context is an improvement, never a precondition. `window_by_samples`
+        // refuses a range it cannot serve exactly, so a padded window whose
+        // edges fell off retention (or landed past the archive) must fall back
+        // to the occurrence's own span rather than costing Layer 1 the job
+        // entirely. Ownership is unaffected either way — `occurrence` above was
+        // minted from `silero.range`, not from this window.
+        let window = state
+            .window_by_samples(request_range.sample_start, request_range.sample_end)
+            .or_else(|| {
+                state.window_by_samples(silero.range.sample_start, silero.range.sample_end)
+            });
         let _current_piece_owned = if apple_admitted.is_some()
             && let Some(window) = window
         {
@@ -2349,8 +2412,36 @@ fn admit_full_pass_gap_segments(
     admitted
 }
 
-fn coverage_speech_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
-    let vad_ranges = state
+/// Which instrument produced the speech set a coverage receipt was measured
+/// against. Text-free; it names the producer, never what was said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverageSpeechSource {
+    /// Raw Silero threshold crossings — the acoustic answer.
+    SileroBoundaries,
+    /// Padded fusion ownership windows — wider than the truth, and the answer
+    /// only when spans exist without any observed crossing. In production that
+    /// combination contradicts the one-VAD contract (an utterance is minted
+    /// from an edge), so the producer field is what makes it visible rather
+    /// than silently absorbed into the same number as the acoustic set.
+    FusionUtterances,
+    /// Capture energy ladder — neither instrument produced anything.
+    CaptureEnergy,
+}
+
+impl CoverageSpeechSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SileroBoundaries => "silero_boundaries",
+            Self::FusionUtterances => "fusion_utterances",
+            Self::CaptureEnergy => "capture_energy",
+        }
+    }
+}
+
+/// Padded fusion ownership windows, summed. Diagnostics only: this is the
+/// number that called 99.5% of take `e186c4db` speech.
+fn fusion_utterance_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
+    state
         .fusion
         .as_ref()
         .map(|fusion| {
@@ -2362,19 +2453,92 @@ fn coverage_speech_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
                 .map(|utterance| utterance.range.clone())
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    if vad_ranges.is_empty() {
-        session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)
+        .unwrap_or_default()
+}
+
+/// Choose the producer: the narrowest acoustic evidence that actually exists.
+///
+/// Observed crossings first — a set that exists is proof the VAD ran, which is
+/// stronger than any availability flag. Then the padded fusion windows, which
+/// are wider than the truth but are still speech evidence. Only when neither
+/// instrument produced anything does the capture energy ladder answer.
+///
+/// The order matters more than the reason for an empty set. Narrowing when a
+/// narrower measurement exists is the whole cut; falling back when nothing
+/// exists is what keeps a VAD-less take measurable instead of trivially
+/// "complete".
+fn select_coverage_speech_source(
+    acoustic_present: bool,
+    utterances_present: bool,
+) -> CoverageSpeechSource {
+    if acoustic_present {
+        CoverageSpeechSource::SileroBoundaries
+    } else if utterances_present {
+        CoverageSpeechSource::FusionUtterances
     } else {
-        vad_ranges
+        CoverageSpeechSource::CaptureEnergy
     }
+}
+
+/// The speech set a terminal coverage receipt is measured against.
+///
+/// Raw Silero threshold crossings are the acoustic authority: they say where
+/// speech actually was. Fusion utterance ranges say who owns which occurrence,
+/// which is a different question — their padded windows stay open across pauses
+/// and close on the capture cursor, so using them as the speech set counts
+/// silence as speech the ledger then "fails" to cover.
+fn coverage_speech_ranges_with_source(
+    state: &AppleSealState,
+) -> (Vec<TailSampleRange>, CoverageSpeechSource) {
+    let samples_seen = state.audio.session_sample_end();
+    let Some(fusion) = state.fusion.as_ref() else {
+        return (
+            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate),
+            CoverageSpeechSource::CaptureEnergy,
+        );
+    };
+    let acoustic = fusion.acoustic_speech_ranges(samples_seen);
+    let utterances = fusion_utterance_ranges(state);
+    match select_coverage_speech_source(!acoustic.is_empty(), !utterances.is_empty()) {
+        CoverageSpeechSource::SileroBoundaries => (acoustic, CoverageSpeechSource::SileroBoundaries),
+        CoverageSpeechSource::FusionUtterances => {
+            (utterances, CoverageSpeechSource::FusionUtterances)
+        }
+        CoverageSpeechSource::CaptureEnergy => (
+            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate),
+            CoverageSpeechSource::CaptureEnergy,
+        ),
+    }
+}
+
+fn coverage_speech_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
+    coverage_speech_ranges_with_source(state).0
 }
 
 fn publish_terminal_coverage(
     state: &AppleSealState,
     ev_tx: &mpsc::UnboundedSender<EngineEvent>,
 ) -> SealCoverageReceipt {
-    let speech = coverage_speech_ranges(state);
+    let (speech, source) = coverage_speech_ranges_with_source(state);
+    let speech_samples = sum_range_samples(&speech);
+    let utterance_ranges = fusion_utterance_ranges(state);
+
+    // Both numbers on one line, text-free. The acoustic set is what the receipt
+    // was measured against; the utterance sum is what the receipt used to be
+    // measured against, kept visible so a regression on this lane is one grep
+    // away instead of a re-derivation from a 50-minute take.
+    info!(
+        session_id = %state.session_id,
+        capture_epoch = state.capture_epoch,
+        producer = source.as_str(),
+        speech_ranges = speech.len(),
+        speech_samples,
+        utterance_ranges = utterance_ranges.len(),
+        utterance_samples = sum_range_samples(&utterance_ranges),
+        capture_samples = state.audio.session_sample_end(),
+        "seal_speech_set"
+    );
+
     let mut ledger = state
         .acoustic_ledger
         .lock()
@@ -2391,6 +2555,15 @@ fn publish_terminal_coverage(
         comparison: None,
     });
     receipt
+}
+
+/// Total samples described by a set of ranges, without merging overlaps.
+/// Diagnostics arithmetic only — the receipt does its own merge.
+fn sum_range_samples(ranges: &[TailSampleRange]) -> u64 {
+    ranges
+        .iter()
+        .map(|range| range.sample_end.saturating_sub(range.sample_start))
+        .sum()
 }
 
 fn drain_formatter_observers(
@@ -2424,22 +2597,10 @@ fn repair_terminal_seal_coverage(
 ) -> SealCoverageReceipt {
     let threshold_samples =
         u64::from(state.sample_rate).saturating_mul(SEAL_COVERAGE_INCOMPLETE_MS) / 1_000;
-    let speech_ranges = state
-        .fusion
-        .as_ref()
-        .map(|fusion| {
-            fusion
-                .ledger()
-                .utterances()
-                .iter()
-                .filter(|utterance| utterance.closed)
-                .map(|utterance| utterance.range.clone())
-                .collect::<Vec<_>>()
-        })
-        .filter(|ranges| !ranges.is_empty())
-        .unwrap_or_else(|| {
-            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)
-        });
+    // One speech set for the whole terminal path. Repairing against a wider set
+    // than the one the published receipt is measured against would send Whisper
+    // after "gaps" that were never speech.
+    let speech_ranges = coverage_speech_ranges(state);
     let initial = {
         let ledger = state
             .acoustic_ledger
@@ -7200,5 +7361,242 @@ mod storm_tests {
             "idle callbacks must reuse retained word storage"
         );
         assert_eq!(state.unmatched_silero_words.len(), 104);
+    }
+}
+
+/// rc-w1-live-ledger: acoustic speech coverage, occurrence-safe decode context,
+/// and the diagnostic-versus-ledger receipt.
+///
+/// A separate `#[cfg(test)]` module on purpose. The file's main `mod tests` is
+/// parked behind `#[cfg(any())]` (51 of this file's 65 `#[test]` functions),
+/// so contracts written there are invisible to the compiler and to the suite.
+/// These falsifiers are meant to run.
+#[cfg(test)]
+mod rc_w1_live_ledger_tests {
+    use super::*;
+    use crate::audio::chunker::{VadBoundaryEvidence, VadBoundaryKind};
+
+    const RATE: u32 = 16_000;
+
+    fn at(secs: f32) -> u64 {
+        (secs * RATE as f32) as u64
+    }
+
+    fn push_capture(state: &mut AppleSealState, secs: f32) {
+        let total = (secs * RATE as f32) as usize;
+        let session = vec![0.25f32; total];
+        for chunk in session.chunks(1024) {
+            state.audio.push(chunk);
+        }
+    }
+
+    fn crossing(kind: VadBoundaryKind, sample: u64) -> VadBoundaryEvidence {
+        VadBoundaryEvidence {
+            kind,
+            sample,
+            speech_probability: match kind {
+                VadBoundaryKind::SpeechStart => 0.9,
+                VadBoundaryKind::SpeechEnd => 0.1,
+            },
+        }
+    }
+
+    /// The producer decision, exhaustively: the narrowest evidence that exists
+    /// wins, and an absence of every instrument still reaches the energy ladder
+    /// rather than reporting nothing to cover.
+    #[test]
+    fn coverage_producer_picks_the_narrowest_evidence_that_exists() {
+        use CoverageSpeechSource::*;
+
+        assert_eq!(
+            select_coverage_speech_source(true, true),
+            SileroBoundaries,
+            "crossings outrank the padded ownership windows"
+        );
+        assert_eq!(
+            select_coverage_speech_source(true, false),
+            SileroBoundaries
+        );
+        assert_eq!(
+            select_coverage_speech_source(false, true),
+            FusionUtterances,
+            "spans without crossings still measure speech, and are named as such"
+        );
+        assert_eq!(
+            select_coverage_speech_source(false, false),
+            CaptureEnergy,
+            "no instrument produced anything: the energy ladder keeps the take measurable"
+        );
+    }
+
+    /// The regression this cut exists for. A padded ownership window spanning a
+    /// whole take must not be counted as speech; the crossings inside it are.
+    ///
+    /// Shape taken from take `e186c4db` (2026-09-09): one utterance window that
+    /// stayed open across 50 minutes reported 99.5% of the recording as speech,
+    /// against an offline Silero measurement of 454 s.
+    #[test]
+    fn coverage_speech_set_measures_crossings_not_the_padded_ownership_window() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-coverage".into(), 0);
+        push_capture(&mut state, 10.0);
+
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        // Two seconds of real speech inside a ten-second take.
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+            crossing(VadBoundaryKind::SpeechStart, at(8.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(9.0)),
+        ]);
+        // One padded ownership window covering the entire take, exactly as the
+        // fusion ledger legitimately mints it.
+        ingress.observe(Some((0, at(10.0))), true, at(10.0));
+        state.fusion = Some(ingress);
+
+        let (speech, source) = coverage_speech_ranges_with_source(&state);
+        assert_eq!(source, CoverageSpeechSource::SileroBoundaries);
+        assert_eq!(speech.len(), 2, "two bursts, not one window");
+        assert_eq!(speech[0].session, "rc-w1-coverage");
+
+        let acoustic_samples = sum_range_samples(&speech);
+        let utterance_samples = sum_range_samples(&fusion_utterance_ranges(&state));
+        assert_eq!(utterance_samples, at(10.0), "ownership keeps its window");
+        // Two 1 s bursts, each padded 64 ms on both sides.
+        assert_eq!(acoustic_samples, 2 * (at(1.0) + 2 * 1_024));
+        assert!(
+            acoustic_samples * 4 < utterance_samples,
+            "the coverage set must shrink to the speech, not to the take"
+        );
+    }
+
+    /// Without a fusion ingress at all, the capture energy ladder still answers.
+    /// This lane may not remove the fallback that keeps a VAD-less take
+    /// measurable.
+    #[test]
+    fn coverage_falls_back_to_capture_energy_without_a_fusion_ingress() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-no-vad".into(), 0);
+        push_capture(&mut state, 4.0);
+        assert!(state.fusion.is_none());
+
+        let (_, source) = coverage_speech_ranges_with_source(&state);
+        assert_eq!(source, CoverageSpeechSource::CaptureEnergy);
+    }
+
+    /// An open crossing at stop is speech up to the capture cursor, and the
+    /// coverage set may not claim audio past what was captured.
+    #[test]
+    fn coverage_speech_set_clamps_an_open_crossing_at_end_of_capture() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-eof".into(), 0);
+        push_capture(&mut state, 3.0);
+
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.observe_boundaries(&[crossing(VadBoundaryKind::SpeechStart, at(2.0))]);
+        state.fusion = Some(ingress);
+
+        let (speech, source) = coverage_speech_ranges_with_source(&state);
+        assert_eq!(source, CoverageSpeechSource::SileroBoundaries);
+        assert_eq!(speech.len(), 1);
+        assert_eq!(speech[0].sample_start, at(2.0) - 1_024);
+        assert_eq!(
+            speech[0].sample_end,
+            at(3.0),
+            "the right pad stops at the last captured sample"
+        );
+    }
+
+    /// A word shorter than any proposed minimum-utterance figure is still
+    /// speech the receipt must account for. Nothing on this lane may quietly
+    /// drop it.
+    #[test]
+    fn coverage_speech_set_keeps_a_short_word() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-short".into(), 0);
+        push_capture(&mut state, 5.0);
+
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        // 80 ms of speech.
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(1.0) + 1_280),
+        ]);
+        state.fusion = Some(ingress);
+
+        let (speech, _) = coverage_speech_ranges_with_source(&state);
+        assert_eq!(speech.len(), 1, "a short word is not discarded");
+        assert_eq!(speech[0].sample_start, at(1.0) - 1_024);
+        assert_eq!(speech[0].sample_end, at(1.0) + 1_280 + 1_024);
+    }
+
+    /// The terminal repair path and the published receipt must measure against
+    /// the same set, or repair chases gaps the receipt never claimed.
+    #[test]
+    fn repair_and_publish_read_one_speech_set() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-one-set".into(), 0);
+        push_capture(&mut state, 6.0);
+
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+        ]);
+        ingress.observe(Some((0, at(6.0))), true, at(6.0));
+        state.fusion = Some(ingress);
+
+        // `repair_terminal_seal_coverage` and `publish_terminal_coverage` both
+        // resolve their speech set through this one function.
+        let first = coverage_speech_ranges(&state);
+        let second = coverage_speech_ranges(&state);
+        assert_eq!(first, second);
+        assert_eq!(
+            sum_range_samples(&first),
+            at(1.0) + 2 * 1_024,
+            "one burst, padded — not the six-second ownership window"
+        );
+    }
+
+    /// The disputed 2026-09-09 labels were admitted, not lost. A `skipped`
+    /// char-diff verdict is diagnostics; the payload it "skipped" is forwarded
+    /// to occurrence admission all the same, and the receipt says both.
+    #[test]
+    fn a_legacy_skip_verdict_does_not_discard_the_forwarded_payload() {
+        // The exact shape of the three disputed jobs: the char-diff clamped on
+        // change ratio, and every one of those payloads still reached the
+        // ledger and persisted to the Bus.
+        let skipped = legacy_char_diff_receipt(
+            &TailPatchOutcome::skipped(
+                SkipReasonCode::ChangeRatio,
+                "ratio 1.31 exceeds max 0.50",
+            ),
+            true,
+        );
+        assert_eq!(skipped.verdict, "skipped");
+        assert!(
+            skipped.payload_forwarded,
+            "a skipped verdict must not read as a discarded payload"
+        );
+        assert_eq!(skipped.admission_authority, LEDGER_ADMISSION_AUTHORITY);
+
+        for (outcome, verdict) in [
+            (TailPatchOutcome::NoChange, "no_change"),
+            (
+                TailPatchOutcome::skipped(SkipReasonCode::ChangeRatio, "ratio 1.90"),
+                "skipped",
+            ),
+            (TailPatchOutcome::Patches(Vec::new()), "patches"),
+        ] {
+            let receipt = legacy_char_diff_receipt(&outcome, true);
+            assert_eq!(receipt.verdict, verdict);
+            assert!(
+                receipt.payload_forwarded,
+                "every completed job forwards its payload regardless of verdict"
+            );
+            assert_ne!(
+                receipt.admission_authority, receipt.verdict,
+                "the verdict is never the admission authority"
+            );
+        }
+
+        // A failed job is the one case with no payload, and it says so.
+        let failed = legacy_char_diff_receipt(&TailPatchOutcome::NoChange, false);
+        assert!(!failed.payload_forwarded);
     }
 }
