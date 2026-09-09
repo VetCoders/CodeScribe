@@ -585,26 +585,58 @@ final class AgentChatStore: ObservableObject {
     dictationThreadID == nil || dictationThreadID == selectedThreadID
   }
 
-  /// True when a composer gesture — not a hotkey, tray or overlay one — opened
-  /// the live capture.
-  ///
-  /// The latch below is set the moment the composer press begins and cleared on
-  /// every terminal phase, so it is exactly "this composer started what is
-  /// running". The shared controller being globally busy is a different fact,
-  /// and stopping on that alone would let a composer press kill a dictation the
-  /// user started somewhere else.
-  var ownsLiveDictation: Bool {
-    dictationThreadID != nil
+  /// Local request bookkeeping, never a recorder-issued capture identity.
+  /// Lifecycle paint may select a delivery thread but cannot create this receipt.
+  private var composerCaptureRequestID: UUID?
+  private var composerCaptureStartCompleted = false
+
+  var ownsLiveDictation: Bool { composerCaptureStartCompleted }
+  var hasComposerCaptureRequest: Bool { composerCaptureRequestID != nil }
+
+  /// Click-latency paint must not latch a destination or authorize a stop.
+  func prepareDictationGesture() {
+    dictationPhase = .preparing
   }
 
-  /// Give back a composer gesture that turned out to belong to another surface.
-  ///
-  /// The press optimistically latched ownership at click latency; discovering
-  /// that a foreign take holds the microphone must return the composer to rest
-  /// without touching that take, and without leaving the mic pinned in a
-  /// non-actionable `.preparing`.
+  /// Called only after the adapter observed idle, before submitting its start.
+  /// Capture the gesture's thread, even if selection changed during that query.
+  func beginComposerCaptureRequest(threadID: UUID?) -> UUID {
+    let requestID = UUID()
+    composerCaptureRequestID = requestID
+    composerCaptureStartCompleted = false
+    dictationThreadID = threadID
+    let destination = threads.first { $0.id == threadID }
+      ?? threadsBeforeSearch?.first { $0.id == threadID }
+    engine?.setAssistiveTargetThread(backendId: destination?.backendId)
+    return requestID
+  }
+
+  func isCurrentComposerCaptureRequest(_ requestID: UUID) -> Bool {
+    composerCaptureRequestID == requestID
+  }
+
+  /// A terminal lifecycle beat invalidates the request before an async reply
+  /// can promote it. Success is local request evidence, not controller identity.
+  func completeComposerCaptureStart(_ requestID: UUID, live: Bool) {
+    guard isCurrentComposerCaptureRequest(requestID) else { return }
+    composerCaptureStartCompleted = live
+    dictationPhase = live ? .recording : .idle
+    // Even an idle reply may race queued terminal text. Keep its destination.
+  }
+
+  /// Consume local stop permission once; terminal delivery still owns the latch.
+  func awaitComposerCaptureTerminal() {
+    composerCaptureStartCompleted = false
+    dictationPhase = .idle
+  }
+
   func releaseUnownedDictationGesture() {
-    setDictationPhase(.idle)
+    // A stopped/failed local request may still have terminal text in flight.
+    if hasComposerCaptureRequest {
+      dictationPhase = .idle
+    } else {
+      setDictationPhase(.idle)
+    }
     dictationBlocked = true
   }
 
@@ -625,14 +657,15 @@ final class AgentChatStore: ObservableObject {
   /// Set by the real adapter as the dictation session transitions. No-op-safe
   /// when no adapter is wired.
   ///
-  /// This is the single choke point every lifecycle path funnels through
-  /// (composer gesture, hotkey, tray, orphan compensator), so the ownership latch
-  /// lives here rather than at any one caller.
+  /// Shared lifecycle phases retain the delivery destination for assistive
+  /// callers too. They never grant composer stop permission.
   func setDictationPhase(_ phase: ComposerDictationPhase) {
     switch phase {
     case .preparing, .recording:
       if dictationThreadID == nil { dictationThreadID = selectedThreadID }
     case .idle, .failed:
+      composerCaptureRequestID = nil
+      composerCaptureStartCompleted = false
       let hadSession = dictationThreadID != nil
       dictationThreadID = nil
       // Selection changes were suppressed while the capture was latched — resync
@@ -651,6 +684,8 @@ final class AgentChatStore: ObservableObject {
   /// able to return the surface to rest. A `.failed` banner is kept so its own
   /// self-clearing timer can run out.
   func endDictationSession() {
+    composerCaptureRequestID = nil
+    composerCaptureStartCompleted = false
     dictationBlocked = false
     if case .failed = dictationPhase {
       dictationThreadID = nil
@@ -663,14 +698,20 @@ final class AgentChatStore: ObservableObject {
   /// Surface a recoverable dictation failure with a self-clearing inline message
   /// (auto-returns to `.idle` after a few seconds so the composer doesn't keep a
   /// stale error banner).
-  func reportDictationFailure(_ message: String) {
-    setDictationPhase(.failed(message))
+  func reportDictationFailure(_ message: String, preservingDelivery: Bool = false) {
+    if preservingDelivery {
+      composerCaptureStartCompleted = false
+      dictationPhase = .failed(message)
+    } else {
+      setDictationPhase(.failed(message))
+    }
     let token = UUID()
     dictationFailureToken = token
     Task { @MainActor in
       try? await Task.sleep(nanoseconds: 4_000_000_000)
       guard dictationFailureToken == token, case .failed = dictationPhase else { return }
-      setDictationPhase(.idle)
+      // Banner expiry is display cleanup, not a terminal delivery receipt.
+      dictationPhase = .idle
     }
   }
 

@@ -27,12 +27,15 @@ final class ComposerTurnOwnershipTests: XCTestCase {
 
   private enum CaptureFailure: Error { case refused }
 
+  // Configure only between joined gestures; the adapter serializes controller calls.
   private final class FakeCaptureSurface: ComposerCaptureControlling, @unchecked Sendable {
     /// Answers handed to successive `isRecording()` calls; the last one repeats.
     private var recordingAnswers: [Bool]
     private var answerCursor = 0
     var startFails = false
     var stopFails = false
+    var onStart: (@MainActor @Sendable () -> Void)?
+    var onQuery: (@MainActor @Sendable () -> Void)?
     private(set) var calls: [CaptureCall] = []
 
     init(recording: [Bool]) {
@@ -41,6 +44,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
 
     func isRecording() async -> Bool {
       calls.append(.isRecording)
+      await onQuery?()
       let answer = recordingAnswers[min(answerCursor, recordingAnswers.count - 1)]
       answerCursor += 1
       return answer
@@ -48,6 +52,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
 
     func startComposerTurnRecording() async throws {
       calls.append(.startComposerTurn)
+      await onStart?()
       if startFails { throw CaptureFailure.refused }
     }
 
@@ -55,6 +60,22 @@ final class ComposerTurnOwnershipTests: XCTestCase {
       calls.append(.stop)
       if stopFails { throw CaptureFailure.refused }
     }
+  }
+
+  private final class SpyRoutingEngine: AgentChatEngine {
+    private(set) var lastTarget: String?
+    func isAvailable() -> Bool { true }
+    func availabilityDetail() -> String? { nil }
+    func generateThreadTitle(_ text: String) async throws -> String? { nil }
+    func streamReply(
+      _ text: String, threadId: String, attachmentPaths: [String],
+      onDelta: @escaping @MainActor (String) -> Void,
+      onReasoning: @escaping @MainActor (String) -> Void,
+      onToolExecuting: @escaping @MainActor (String, String) -> Void,
+      onToolResult: @escaping @MainActor (String, String, Bool, String) -> Void
+    ) async throws -> String { "" }
+    func cancelReply(threadId: String) -> Bool { false }
+    func setAssistiveTargetThread(backendId: String?) { lastTarget = backendId }
   }
 
   private final class StubThreadsProvider: ChatThreadsProviding {
@@ -77,7 +98,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     func generateThreadId() -> String { "t_generated" }
   }
 
-  private struct Fixture {
+  private struct Fixture: Sendable {
     let store: AgentChatStore
     let dictation: RealComposerDictation
     let surface: FakeCaptureSurface
@@ -97,11 +118,9 @@ final class ComposerTurnOwnershipTests: XCTestCase {
       store: store, dictation: dictation, surface: surface, threadA: threadA, threadB: threadB)
   }
 
-  /// Let the adapter's detached `Task { @MainActor in ... }` run to completion.
-  private func settle() async {
-    for _ in 0..<8 {
-      await Task.yield()
-    }
+  /// Join the actual gesture task; scheduler yields do not prove completion.
+  private func settle(_ fixture: Fixture) async {
+    await fixture.dictation.transitionTask?.value
   }
 
   // MARK: The entry point itself
@@ -110,7 +129,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     let f = makeFixture(recording: [false, false])
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     XCTAssertTrue(
       f.surface.calls.contains(.startComposerTurn),
@@ -126,7 +145,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     XCTAssertFalse(f.store.ownsLiveDictation)
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     XCTAssertFalse(
       f.surface.calls.contains(.stop),
@@ -145,22 +164,24 @@ final class ComposerTurnOwnershipTests: XCTestCase {
   }
 
   func testOwnLiveCaptureIsStoppedByTheSecondPress() async {
-    let f = makeFixture(recording: [true, false])
-    // The latch the composer's own start would have set.
-    f.store.setDictationPhase(.recording)
+    let f = makeFixture(recording: [false, true, true])
+    f.dictation.toggle()
+    await settle(f)
     XCTAssertTrue(f.store.ownsLiveDictation)
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     XCTAssertTrue(f.surface.calls.contains(.stop), "the owning surface ends its own take")
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA, "terminal text still has a destination")
   }
 
   func testThreadAKeepsTheCaptureAfterSelectingThreadB() async {
     let f = makeFixture(recording: [false, true])
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
     XCTAssertEqual(f.store.dictationThreadID, f.threadA)
 
     f.store.select(f.threadB)
@@ -173,6 +194,10 @@ final class ComposerTurnOwnershipTests: XCTestCase {
       f.store.dictationOwnsSelectedThread,
       "thread B must see the mic as busy, not as its own live capture"
     )
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertTrue(f.surface.calls.contains(.stop))
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
   }
 
   // MARK: Recoverable lifecycle
@@ -182,7 +207,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
 
     f.dictation.toggle()
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     XCTAssertEqual(
       f.surface.calls.filter { $0 == .startComposerTurn }.count, 1,
@@ -191,28 +216,146 @@ final class ComposerTurnOwnershipTests: XCTestCase {
   }
 
   func testStartFailureLeavesTheMicPressableAgain() async {
-    let f = makeFixture(recording: [false, false])
+    let f = makeFixture(recording: [false, true])
     f.surface.startFails = true
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     guard case .failed = f.store.dictationPhase else {
       return XCTFail("a refused start must surface as a recoverable failure")
     }
     XCTAssertNil(f.store.dictationThreadID, "a take that never began owns nothing")
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    f.store.setDictationPhase(.recording) // A foreign lifecycle cannot revive the failed request.
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertFalse(f.surface.calls.contains(.stop))
   }
 
-  func testStopFailureLeavesTheMicPressableAgain() async {
-    let f = makeFixture(recording: [true, false])
-    f.store.setDictationPhase(.recording)
+  func testStopFailureRevokesStopPermissionButPreservesTerminalDestination() async {
+    let f = makeFixture(recording: [false, true, true])
+    f.dictation.toggle()
+    await settle(f)
     f.surface.stopFails = true
 
     f.dictation.toggle()
-    await settle()
+    await settle(f)
 
     guard case .failed = f.store.dictationPhase else {
       return XCTFail("a refused stop must surface as a recoverable failure")
     }
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    f.store.setDictationPhase(.recording) // A later foreign phase cannot grant another stop.
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls.filter { $0 == .stop }.count, 1)
+    f.store.endDictationSession()
+    XCTAssertNil(f.store.dictationThreadID)
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
   }
+
+  func testForeignLifecycleDuringTheControllerQueryCannotAuthorizeStop() async {
+    let f = makeFixture(recording: [true])
+    f.surface.onQuery = { [store = f.store] in store.setDictationPhase(.recording) }
+
+    f.dictation.toggle()
+    XCTAssertNil(f.store.dictationThreadID, "optimistic display has no destination")
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    await settle(f)
+
+    XCTAssertEqual(f.surface.calls, [.isRecording])
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertNil(f.store.dictationThreadID)
+    XCTAssertTrue(f.store.dictationBlocked)
+  }
+
+  func testTerminalThenForeignPhaseBeforeStartReplyCannotReviveLocalOwnership() async {
+    let f = makeFixture(recording: [false, true])
+    f.surface.onStart = { [store = f.store, threadB = f.threadB] in
+      store.endDictationSession()
+      store.select(threadB)
+      store.setDictationPhase(.recording) // Another surface started after our terminal.
+    }
+
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    f.dictation.toggle()
+    await settle(f)
+
+    XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
+    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertNil(f.store.dictationThreadID)
+  }
+
+  func testTerminalDuringStopQueryRevokesPreviouslyCompletedStart() async {
+    let f = makeFixture(recording: [false, true, true])
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    f.surface.onQuery = { [store = f.store] in
+      store.endDictationSession()
+      store.setDictationPhase(.recording)
+    }
+
+    f.dictation.toggle()
+    await settle(f)
+
+    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(f.store.ownsLiveDictation)
+  }
+
+  func testSelectionDuringIdleQueryKeepsGestureDestination() async {
+    let f = makeFixture(recording: [false, true])
+    let engine = SpyRoutingEngine()
+    f.store.engine = engine
+    f.surface.onQuery = { [store = f.store, threadB = f.threadB] in store.select(threadB) }
+    f.surface.onStart = { XCTAssertEqual(engine.lastTarget, "t_a") }
+
+    f.dictation.toggle()
+    await settle(f)
+
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+  }
+
+  func testPendingTerminalDestinationCannotAuthorizeStopOrBeReplacedByStart() async {
+    let f = makeFixture(recording: [false, true, true])
+    f.dictation.toggle()
+    await settle(f)
+    f.dictation.toggle()
+    await settle(f)
+    let completedCalls = f.surface.calls
+    f.store.select(f.threadB)
+    f.store.setDictationPhase(.recording)
+
+    f.dictation.toggle()
+    await settle(f)
+
+    XCTAssertEqual(f.surface.calls, completedCalls)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    f.store.endDictationSession()
+    XCTAssertNil(f.store.dictationThreadID)
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+  }
+
+  func testTerminalDuringStopQueryCannotTurnThatGestureIntoANewStart() async {
+    let f = makeFixture(recording: [false, true, false])
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.onQuery = { [store = f.store] in store.endDictationSession() }
+
+    f.dictation.toggle()
+    await settle(f)
+
+    XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
+    XCTAssertFalse(f.surface.calls.contains(.stop))
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertNil(f.store.dictationThreadID)
+  }
+
 }
