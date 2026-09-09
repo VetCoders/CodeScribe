@@ -1,11 +1,11 @@
-//! Durable clean transcript events for operator and control-plane consumers.
+//! Live clean transcript projections with best-effort private NDJSON persistence.
 //!
 //! The bus observes only occurrence-authenticated revisions emitted by the
 //! [`PresentationEmitter`]. It never opens audio, accepts arbitrary text,
 //! re-transcribes a file, or reconstructs text from UI deltas.
 
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::OpenOptions;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -364,18 +364,18 @@ pub struct CleanTranscriptEvent {
 }
 
 /// Synchronous low-frequency observer. Each lifecycle or authenticated ledger
-/// projection is flushed so a live tailer sees it before process exit.
+/// projection attempts a flush; persistence loss cannot suppress live text.
 pub struct TranscriptBus {
     session: TranscriptSession,
     path: PathBuf,
     writer: Mutex<TranscriptBusWriter>,
 }
 
-/// One lock owns lifecycle and bytes together. This makes the sequence stored
-/// on disk authoritative even when engine-close and a late reducer callback
-/// arrive from different threads.
+/// One lock orders live lifecycle and projections. Sequence is in-process
+/// publication order, never an acknowledgment of file persistence or delivery.
 struct TranscriptBusWriter {
-    file: File,
+    /// Disabled for the rest of this session after any uncertain append.
+    file: Option<Box<dyn Write + Send>>,
     sequence: u64,
     started: bool,
     sealed: bool,
@@ -435,7 +435,7 @@ impl TranscriptBus {
     }
 
     /// Observe one reducer revision and copy its ledger receipts byte-for-byte.
-    /// The Bus owns only append sequence and emission time; it cannot admit,
+    /// The Bus owns only publication sequence and emission time; it cannot admit,
     /// reduce, choose labels, or infer finality.
     pub fn publish_revision(
         &self,
@@ -547,7 +547,6 @@ impl TranscriptBus {
             };
             if let Err(error) = self.write_evidence_event_locked(&mut writer, &event) {
                 self.log_write_error(error);
-                break;
             }
             writer.last_projection = Some(event.clone());
             emitted.push(event);
@@ -564,13 +563,37 @@ impl TranscriptBus {
     /// Resolve the production path and open the session bus. Failure disables
     /// only observability; it must never stop microphone capture or delivery.
     pub fn open(session: TranscriptSession) -> Option<Self> {
-        let path = transcript_bus_path();
-        match Self::open_at(session, path, None) {
-            Ok(bus) => Some(bus),
+        Some(Self::open_with_path(session, transcript_bus_path()))
+    }
+
+    /// The production fallback, with an explicit path for local failure fixtures.
+    fn open_with_path(session: TranscriptSession, path: PathBuf) -> Self {
+        match Self::open_at(session.clone(), path.clone(), None) {
+            Ok(bus) => bus,
             Err(error) => {
-                tracing::warn!(%error, "clean transcript bus unavailable");
-                None
+                let bus = Self::with_writer(session, path, None);
+                bus.log_write_error(error);
+                bus
             }
+        }
+    }
+
+    fn with_writer(
+        session: TranscriptSession,
+        path: PathBuf,
+        file: Option<Box<dyn Write + Send>>,
+    ) -> Self {
+        Self {
+            session,
+            path,
+            writer: Mutex::new(TranscriptBusWriter {
+                file,
+                sequence: 0,
+                started: false,
+                sealed: false,
+                ended: false,
+                last_projection: None,
+            }),
         }
     }
 
@@ -586,37 +609,37 @@ impl TranscriptBus {
         }
 
         let mut options = OpenOptions::new();
-        options.create(true).append(true).write(true);
+        options.create(true).append(true).read(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path)?;
+        let mut file = options.open(&path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
 
-        let bus = Self {
-            session,
-            path,
-            writer: Mutex::new(TranscriptBusWriter {
-                file,
-                sequence: 0,
-                started: false,
-                sealed: false,
-                ended: false,
-                last_projection: None,
-            }),
-        };
-        Ok(bus)
+        // A prior partial write is not an append boundary. Do not join a new
+        // session onto it, truncate evidence, or retry the unknown payload.
+        if file.metadata()?.len() > 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "transcript bus has an incomplete trailing row; persistence disabled",
+                ));
+            }
+        }
+        Ok(Self::with_writer(session, path, Some(Box::new(file))))
     }
 
-    /// Publish the recording start exactly once. Controllers call this only
-    /// after audio starts; commit/final observers also call it defensively so
-    /// the first visible transcript event can never precede its session start.
+    /// Announce the recording start exactly once, even if persistence fails.
+    /// The controller owns when this happens; retries cannot append another start.
     pub fn publish_started(&self) {
         let mut writer = self
             .writer
@@ -632,11 +655,10 @@ impl TranscriptBus {
     }
 
     /// Publish the session's terminal lifecycle line exactly once, and only
-    /// after a `session_started` was written. Text-free: it carries no
+    /// after a start was announced in process. Text-free: it carries no
     /// transcript authority (evidence seals, if any, precede it) — it tells an
-    /// observer the controller left this session, so `session_started`
-    /// without a later `session_ended` means "take still live", even when
-    /// zero occurrences sealed. `reason` is the typed cause; a session that was
+    /// in-process observer the controller left this session, even when zero
+    /// occurrences sealed. A file tailer may miss this line on persistence loss. `reason` is the typed cause; a session that was
     /// superseded or failed before recording says so instead of masquerading
     /// as a completed take.
     ///
@@ -699,66 +721,61 @@ impl TranscriptBus {
             // Ledger-observed: authorship is the app, expressed by absence.
             source: None,
         };
-        match self.write_event_locked(&mut writer, event) {
-            Ok(()) => {
-                writer.ended = true;
-                tracing::info!(path = %self.path.display(), session_id = %self.session.session_id, sealed = writer.sealed, ?reason, "clean transcript bus session ended");
-                let mut terminal =
-                    writer
-                        .last_projection
-                        .clone()
-                        .unwrap_or_else(|| TranscriptBusEvidenceEvent {
-                            schema: "codescribe.transcript-evidence.v1".to_string(),
-                            sequence: writer.sequence,
-                            emitted_at: String::new(),
-                            session_id: self.session.session_id.clone(),
-                            mode: self.session.mode,
-                            reducer_revision: 0,
-                            reducer_action: "session_ended".to_string(),
-                            occurrence_session_id: String::new(),
-                            capture_epoch: 0,
-                            sample_start: 0,
-                            sample_end: 0,
-                            document_index: 0,
-                            label: String::new(),
-                            rendered_text: String::new(),
-                            phase,
-                            can_paste: availability.can_paste,
-                            can_insert: availability.can_insert,
-                            can_copy: availability.can_copy,
-                            can_retranscribe: availability.can_retranscribe,
-                            can_format: availability.can_format,
-                            terminal: true,
-                            lifecycle_terminal: true,
-                            delivery,
-                            acoustic_receipts: Vec::new(),
-                            seal_coverage: None,
-                            comparison: None,
-                        });
-                terminal.sequence = writer.sequence;
-                terminal.emitted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
-                terminal.reducer_action = "session_ended".to_string();
-                terminal.phase = phase;
-                terminal.can_paste = availability.can_paste;
-                terminal.can_insert = availability.can_insert;
-                terminal.can_copy = availability.can_copy;
-                terminal.can_retranscribe = availability.can_retranscribe;
-                terminal.can_format = availability.can_format;
-                terminal.terminal = true;
-                // This projection is cloned from the last committed evidence
-                // event, which was not a lifecycle line. Say what it now is.
-                terminal.lifecycle_terminal = true;
-                // The last committed evidence event carried `Unattempted`; the
-                // lifecycle line is the one place a disposition is stated.
-                terminal.delivery = delivery;
-                writer.last_projection = Some(terminal.clone());
-                Some(terminal)
-            }
-            Err(error) => {
-                self.log_write_error(error);
-                None
-            }
+        if let Err(error) = self.write_event_locked(&mut writer, event) {
+            self.log_write_error(error);
         }
+        writer.ended = true;
+        tracing::info!(path = %self.path.display(), session_id = %self.session.session_id, sealed = writer.sealed, ?reason, "clean transcript bus session ended");
+        let mut terminal =
+            writer
+                .last_projection
+                .clone()
+                .unwrap_or_else(|| TranscriptBusEvidenceEvent {
+                    schema: "codescribe.transcript-evidence.v1".to_string(),
+                    sequence: writer.sequence,
+                    emitted_at: String::new(),
+                    session_id: self.session.session_id.clone(),
+                    mode: self.session.mode,
+                    reducer_revision: 0,
+                    reducer_action: "session_ended".to_string(),
+                    occurrence_session_id: String::new(),
+                    capture_epoch: 0,
+                    sample_start: 0,
+                    sample_end: 0,
+                    document_index: 0,
+                    label: String::new(),
+                    rendered_text: String::new(),
+                    phase,
+                    can_paste: availability.can_paste,
+                    can_insert: availability.can_insert,
+                    can_copy: availability.can_copy,
+                    can_retranscribe: availability.can_retranscribe,
+                    can_format: availability.can_format,
+                    terminal: true,
+                    lifecycle_terminal: true,
+                    delivery,
+                    acoustic_receipts: Vec::new(),
+                    seal_coverage: None,
+                    comparison: None,
+                });
+        terminal.sequence = writer.sequence;
+        terminal.emitted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
+        terminal.reducer_action = "session_ended".to_string();
+        terminal.phase = phase;
+        terminal.can_paste = availability.can_paste;
+        terminal.can_insert = availability.can_insert;
+        terminal.can_copy = availability.can_copy;
+        terminal.can_retranscribe = availability.can_retranscribe;
+        terminal.can_format = availability.can_format;
+        terminal.terminal = true;
+        // This projection is cloned from the last committed evidence
+        // event, which was not a lifecycle line. Say what it now is.
+        terminal.lifecycle_terminal = true;
+        // The last committed evidence event carried `Unattempted`; the
+        // lifecycle line is the one place a disposition is stated.
+        terminal.delivery = delivery;
+        writer.last_projection = Some(terminal.clone());
+        Some(terminal)
     }
 
     /// The resolved path consumed by an external NDJSON tailer.
@@ -770,6 +787,7 @@ impl TranscriptBus {
         if writer.started {
             return Ok(false);
         }
+        writer.started = true;
         self.write_event_locked(
             writer,
             CleanTranscriptEvent {
@@ -803,7 +821,6 @@ impl TranscriptBus {
                 source: None,
             },
         )?;
-        writer.started = true;
         Ok(true)
     }
 
@@ -818,12 +835,8 @@ impl TranscriptBus {
         event.mode = self.session.mode;
         event.emitted_at = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
 
-        let mut encoded = serde_json::to_vec(&event).map_err(io::Error::other)?;
-        encoded.push(b'\n');
-        writer.file.write_all(&encoded)?;
-        writer.file.flush()?;
         writer.sequence = next_sequence;
-        Ok(())
+        Self::append_projection_locked(writer, &event)
     }
 
     fn write_evidence_event_locked(
@@ -831,12 +844,29 @@ impl TranscriptBus {
         writer: &mut TranscriptBusWriter,
         event: &TranscriptBusEvidenceEvent,
     ) -> io::Result<()> {
-        let mut encoded = serde_json::to_vec(event).map_err(io::Error::other)?;
-        encoded.push(b'\n');
-        writer.file.write_all(&encoded)?;
-        writer.file.flush()?;
         writer.sequence = event.sequence;
-        Ok(())
+        Self::append_projection_locked(writer, event)
+    }
+
+    fn append_projection_locked(
+        writer: &mut TranscriptBusWriter,
+        event: &impl Serialize,
+    ) -> io::Result<()> {
+        let Some(file) = writer.file.as_mut() else {
+            return Ok(());
+        };
+        let result = (|| {
+            let mut encoded = serde_json::to_vec(event).map_err(io::Error::other)?;
+            encoded.push(b'\n');
+            file.write_all(&encoded)?;
+            file.flush()
+        })();
+        if result.is_err() {
+            // write_all may already have appended a prefix; flush failure may
+            // leave a complete row. Neither permits retry or sequence reuse.
+            writer.file = None;
+        }
+        result
     }
 
     fn log_write_error(&self, error: io::Error) {
@@ -845,7 +875,7 @@ impl TranscriptBus {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("transcript-events.jsonl");
-        tracing::warn!(%error, file, "clean transcript event write failed");
+        tracing::warn!(%error, file, session_id = %self.session.session_id, persistence = "disabled_for_session", "clean transcript persistence unavailable; live projection continues without append proof");
     }
 }
 
@@ -886,6 +916,352 @@ fn expand_tilde(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::emitter::{TranscriptReducer, UserRevisionIntent};
+    use codescribe_core::pipeline::acoustic_ledger::{
+        AcousticEvidence, DocumentRevisionProvenance, EnergyCalibration, ObservationIdentity,
+        ObservationProducer, OccurrenceIdentity,
+    };
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Fault {
+        remaining: Option<usize>,
+        flush: bool,
+        writes: usize,
+        flushes: usize,
+    }
+
+    /// Real file-backed writes with controlled prefix/flush failures. Clearing
+    /// the fault makes the underlying sink usable, so no-retry is falsifiable.
+    struct FaultWriter {
+        inner: Box<dyn Write + Send>,
+        fault: Arc<Mutex<Fault>>,
+    }
+
+    impl Write for FaultWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut fault = self.fault.lock().unwrap();
+            fault.writes += 1;
+            if fault.remaining == Some(0) {
+                return Err(io::Error::other("controlled append failure"));
+            }
+            let limit = fault.remaining.unwrap_or(bytes.len()).min(bytes.len());
+            let written = self.inner.write(&bytes[..limit])?;
+            if let Some(remaining) = &mut fault.remaining {
+                *remaining -= written;
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            let mut fault = self.fault.lock().unwrap();
+            fault.flushes += 1;
+            if fault.flush {
+                return Err(io::Error::other("controlled flush failure"));
+            }
+            self.inner.flush()
+        }
+    }
+
+    fn session(id: &str) -> TranscriptSession {
+        TranscriptSession {
+            session_id: id.to_string(),
+            mode: TranscriptMode::Agent,
+            has_latched_target: false,
+            latched_target_is_self: false,
+        }
+    }
+
+    fn inject_fault(bus: &TranscriptBus) -> Arc<Mutex<Fault>> {
+        let fault = Arc::new(Mutex::new(Fault::default()));
+        let mut writer = bus.writer.lock().unwrap();
+        let inner = writer.file.take().expect("real file before injection");
+        writer.file = Some(Box::new(FaultWriter {
+            inner,
+            fault: Arc::clone(&fault),
+        }));
+        fault
+    }
+
+    /// Synthetic calibrated evidence admitted by the actual ledger and reducer.
+    /// Two entries catch an append failure that incorrectly breaks the loop.
+    fn committed_fixture(id: &str) -> (AcousticLedger, TranscriptReducer, TranscriptRevision) {
+        let mut ledger = AcousticLedger::new();
+        let mut reducer = TranscriptReducer::default();
+        let calibration = EnergyCalibration::new("bus-fault-fixture", 1.0, 1);
+        let mut revision = None;
+        for (index, label) in ["Zażółć", "gęślą\n jaźń."].into_iter().enumerate() {
+            let start = index as u64 * 16_000;
+            let occurrence = OccurrenceIdentity::new(id, 7, start, start + 16_000);
+            let evidence = AcousticEvidence {
+                occurrence: occurrence.clone(),
+                duration_ms: 1_000.0,
+                energy_integral: 10.0,
+                mean_rms_dbfs: -12.0,
+                peak_dbfs: -3.0,
+                vad_open_sample: Some(start),
+                vad_close_sample: Some(start + 16_000),
+                evidence_calibration_version: calibration.version.clone(),
+            };
+            assert!(ledger.qualify(&evidence, &calibration).is_qualified());
+            let observation = ObservationIdentity::new(
+                ObservationProducer::Apple,
+                index as u64 + 1,
+                0,
+                occurrence,
+            );
+            let receipt = ledger.admit(&observation, label);
+            revision = reducer.apply_ledger_mutation(&ledger, &observation, &receipt);
+            assert!(revision.is_some());
+        }
+        (ledger, reducer, revision.unwrap())
+    }
+
+    fn assert_committed(
+        events: &[TranscriptBusEvidenceEvent],
+        revision: &TranscriptRevision,
+        id: &str,
+    ) {
+        assert_eq!(events.len(), 2);
+        assert!(!revision.rendered_text.is_empty());
+        for (event, entry) in events.iter().zip(&revision.entries) {
+            assert_eq!(event.session_id, id);
+            assert_eq!(event.rendered_text.as_bytes(), revision.rendered_text.as_bytes());
+            assert_eq!(event.occurrence_session_id, entry.occurrence.session);
+            assert_eq!(event.capture_epoch, entry.occurrence.capture_epoch);
+            assert_eq!(event.sample_start, entry.occurrence.sample_start);
+            assert_eq!(event.sample_end, entry.occurrence.sample_end);
+            let receipt = &event.acoustic_receipts[0];
+            assert_eq!(receipt.session_id, id);
+            assert_eq!(receipt.word_evidence_receipts, entry.word_evidence_receipts);
+            assert_eq!(receipt.layer_decision_receipts, entry.layer_decision_receipts);
+            assert_eq!(receipt.seal_receipt, entry.seal_receipt);
+            assert_eq!(receipt.manual_edit_receipt, entry.manual_edit_receipt);
+            assert_eq!(event.delivery, TranscriptDelivery::Unattempted);
+            assert!(!event.lifecycle_terminal);
+        }
+    }
+
+    fn end_once(bus: &TranscriptBus, expected: &str) -> TranscriptBusEvidenceEvent {
+        let terminal = bus.publish_ended(
+            TranscriptSessionEndReason::Completed,
+            true,
+            TranscriptDelivery::ComposerPending,
+        ).expect("live terminal survives persistence failure");
+        assert_eq!(terminal.rendered_text.as_bytes(), expected.as_bytes());
+        assert!(terminal.lifecycle_terminal);
+        assert!(terminal.terminal);
+        assert!(terminal.can_copy);
+        assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
+        assert!(bus.publish_ended(
+            TranscriptSessionEndReason::Completed,
+            true,
+            TranscriptDelivery::SinkAccepted,
+        ).is_none());
+        assert_eq!(bus.writer.lock().unwrap().last_projection.as_ref(), Some(&terminal));
+        terminal
+    }
+
+    #[test]
+    fn open_failure_keeps_the_production_bus_and_exact_terminal_text() {
+        let temp = tempfile::tempdir().unwrap();
+        // Opening a directory as a file fails without touching user permissions.
+        let bus = TranscriptBus::open_with_path(session("open-fault"), temp.path().to_path_buf());
+        assert!(bus.writer.lock().unwrap().file.is_none());
+        bus.publish_started();
+        let (ledger, _, revision) = committed_fixture("open-fault");
+        let events = bus.publish_revision(&revision, &ledger);
+        assert_committed(&events, &revision, "open-fault");
+        let terminal = end_once(&bus, &revision.rendered_text);
+        assert_eq!(terminal.session_id, "open-fault");
+        assert_eq!(terminal.acoustic_receipts, events[1].acoustic_receipts);
+        assert_eq!(terminal.sequence, 4);
+    }
+
+    #[test]
+    fn persistence_failure_is_logged_without_logging_the_committed_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("diagnostics.log");
+        let log_file = std::fs::File::create(&log_path).unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || log_file.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let bus = TranscriptBus::open_with_path(session("diagnostic-fault"), temp.path().to_path_buf());
+            bus.publish_started();
+            let (ledger, _, revision) = committed_fixture("diagnostic-fault");
+            bus.publish_revision(&revision, &ledger);
+            end_once(&bus, &revision.rendered_text);
+        });
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("diagnostic-fault"));
+        assert!(log.contains("disabled_for_session"));
+        assert!(log.contains("without append proof"));
+        assert!(!log.contains("Zażółć"));
+    }
+
+    #[test]
+    fn failed_start_and_revision_writes_do_not_suppress_committed_entries() {
+        for fail_start in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("events.jsonl");
+            let bus = TranscriptBus::open_at(session("write-fault"), path.clone(), None).unwrap();
+            let fault = inject_fault(&bus);
+            if fail_start {
+                fault.lock().unwrap().remaining = Some(0);
+            }
+            bus.publish_started();
+            bus.publish_started();
+            fault.lock().unwrap().remaining = Some(0);
+            let (ledger, _, revision) = committed_fixture("write-fault");
+            let events = bus.publish_revision(&revision, &ledger);
+            assert_committed(&events, &revision, "write-fault");
+            assert_eq!(events[0].sequence, 2);
+            assert_eq!(events[1].sequence, 3);
+            end_once(&bus, &revision.rendered_text);
+            assert!(bus.writer.lock().unwrap().file.is_none());
+            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), usize::from(!fail_start));
+        }
+    }
+
+    #[test]
+    fn terminal_write_and_flush_failures_keep_one_delivery_obligation() {
+        for flush in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("events.jsonl");
+            let bus = TranscriptBus::open_at(session("end-fault"), path.clone(), None).unwrap();
+            let fault = inject_fault(&bus);
+            bus.publish_started();
+            let (ledger, _, revision) = committed_fixture("end-fault");
+            let events = bus.publish_revision(&revision, &ledger);
+            assert_committed(&events, &revision, "end-fault");
+            if flush {
+                fault.lock().unwrap().flush = true;
+            } else {
+                fault.lock().unwrap().remaining = Some(0);
+            }
+            let terminal = end_once(&bus, &revision.rendered_text);
+            assert_eq!(terminal.sequence, 4);
+            assert_eq!(terminal.acoustic_receipts, events[1].acoustic_receipts);
+            assert!(bus.writer.lock().unwrap().file.is_none());
+            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), if flush { 4 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn prefix_failure_is_not_retried_and_new_sessions_do_not_append_to_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let bus = TranscriptBus::open_at(session("prefix"), path.clone(), None).unwrap();
+        let fault = inject_fault(&bus);
+        bus.publish_started();
+        let before = std::fs::read(&path).unwrap();
+        fault.lock().unwrap().remaining = Some(19);
+        let (ledger, _, revision) = committed_fixture("prefix");
+        assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "prefix");
+        let partial = std::fs::read(&path).unwrap();
+        assert_eq!(partial.len(), before.len() + 19);
+        assert!(!partial.ends_with(b"\n"));
+        let writes = fault.lock().unwrap().writes;
+        fault.lock().unwrap().remaining = None;
+        end_once(&bus, &revision.rendered_text);
+        assert_eq!(fault.lock().unwrap().writes, writes);
+        assert_eq!(std::fs::read(&path).unwrap(), partial);
+
+        let next = TranscriptBus::open_with_path(session("next"), path.clone());
+        next.publish_started();
+        let empty = next.publish_ended(
+            TranscriptSessionEndReason::Completed, false, TranscriptDelivery::Unattempted,
+        ).unwrap();
+        assert!(empty.rendered_text.is_empty());
+        assert_eq!(empty.session_id, "next");
+        assert_eq!(empty.phase, TranscriptProjectionPhase::NoSpeech);
+        assert_eq!(std::fs::read(&path).unwrap(), partial);
+
+        // Explicit fixture rotation restores persistence for a future session;
+        // production does not rotate, truncate, or replay unknown bytes itself.
+        std::fs::rename(&path, temp.path().join("incomplete.jsonl")).unwrap();
+        let recovered = TranscriptBus::open_with_path(session("recovered"), path.clone());
+        recovered.publish_started();
+        let (ledger, _, revision) = committed_fixture("recovered");
+        assert_committed(&recovered.publish_revision(&revision, &ledger), &revision, "recovered");
+        end_once(&recovered, &revision.rendered_text);
+        let rows = std::fs::read_to_string(path).unwrap();
+        assert_eq!(rows.lines().count(), 4);
+        for line in rows.lines() {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(row["session_id"], "recovered");
+        }
+    }
+
+    #[test]
+    fn uncertain_flush_is_not_replayed_when_sink_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let bus = TranscriptBus::open_at(session("flush"), path.clone(), None).unwrap();
+        let fault = inject_fault(&bus);
+        bus.publish_started();
+        fault.lock().unwrap().flush = true;
+        let (ledger, _, revision) = committed_fixture("flush");
+        assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "flush");
+        let uncertain = std::fs::read(&path).unwrap();
+        let writes = fault.lock().unwrap().writes;
+        let flushes = fault.lock().unwrap().flushes;
+        fault.lock().unwrap().flush = false;
+        end_once(&bus, &revision.rendered_text);
+        assert_eq!(std::fs::read(&path).unwrap(), uncertain);
+        assert_eq!(fault.lock().unwrap().writes, writes);
+        assert_eq!(fault.lock().unwrap().flushes, flushes);
+        let next = TranscriptBus::open_with_path(session("after-flush"), path.clone());
+        next.publish_started();
+        let terminal = next.publish_ended(
+            TranscriptSessionEndReason::Completed, false, TranscriptDelivery::Unattempted,
+        ).unwrap();
+        assert!(terminal.rendered_text.is_empty());
+        let rows = std::fs::read_to_string(path).unwrap();
+        assert_eq!(rows.lines().count(), 4);
+        for line in rows.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_user_revision_survives_failure_without_reopening_delivery() {
+        for failing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("events.jsonl");
+            let bus = TranscriptBus::open_at(session("edit"), path.clone(), None).unwrap();
+            let fault = inject_fault(&bus);
+            bus.publish_started();
+            let (mut ledger, mut reducer, revision) = committed_fixture("edit");
+            assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "edit");
+            let seal = ledger.seal_terminal("edit", 7).unwrap();
+            let sealed = reducer.apply_ledger_seal(&seal).unwrap();
+            bus.publish_revision(&sealed, &ledger);
+            end_once(&bus, &sealed.rendered_text);
+            assert!(bus.publish_revision(&revision, &ledger).is_empty());
+            if failing {
+                fault.lock().unwrap().remaining = Some(0);
+            }
+            let edited = reducer.apply_user_revision(&mut ledger, &UserRevisionIntent {
+                session_id: "edit".to_string(),
+                source_revision: sealed.revision,
+                rendered_text: "Poprawione — dokładne bajty.\nDrugi wiersz.".to_string(),
+                provenance: DocumentRevisionProvenance::UserEdit,
+            }).unwrap();
+            let events = bus.publish_revision(&edited, &ledger);
+            assert_committed(&events, &edited, "edit");
+            assert!(events.iter().all(|event| event.terminal && event.reducer_action == "apply_manual_edit"));
+            assert!(bus.publish_ended(
+                TranscriptSessionEndReason::Completed, true, TranscriptDelivery::ComposerPending,
+            ).is_none());
+            assert_eq!(bus.writer.lock().unwrap().last_projection.as_ref(), events.last());
+            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), if failing { 6 } else { 8 });
+        }
+    }
 
     #[test]
     fn evidence_v1_without_additive_seal_receipts_still_decodes() {
