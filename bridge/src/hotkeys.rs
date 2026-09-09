@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use codescribe::controller::{
-    HotkeyAction, HotkeyInput, HotkeyType, RecordingController, State, admission,
+    CaptureStopOutcome, HotkeyAction, HotkeyInput, HotkeyType, RecordingController, State,
+    admission,
 };
 use codescribe::os::hold_badge::BadgeMode;
 use codescribe::os::hotkeys::{self, HoldAction, HoldMode, HotkeyEvent};
@@ -29,7 +30,8 @@ use crate::agent_delivery::{
 };
 use crate::recording::{
     CsAdmissionReadiness, CsEnergyCalibrationReport, CsLayerSummary, CsPresentationStatusEvent,
-    CsTranscriptProjectionEvent, CsTranscription, CsTranscriptionListener,
+    CsCaptureHandle, CsConditionalStop, CsTranscriptProjectionEvent, CsTranscription,
+    CsTranscriptionListener,
 };
 use crate::{CsError, application_runtime};
 
@@ -608,6 +610,25 @@ async fn optimistically_show_overlay(event: &HotkeyEvent) {
     if !starts_redesign_overlay {
         return;
     }
+    let indicator_mode = match event {
+        HotkeyEvent::ToggleAssistive
+        | HotkeyEvent::Hold {
+            mode: HoldMode::Chat | HoldMode::Selection,
+            ..
+        } => BadgeMode::Assistive,
+        HotkeyEvent::ToggleNormal | HotkeyEvent::ToggleRaw => BadgeMode::Toggle,
+        _ => BadgeMode::Hold,
+    };
+    arm_preparing_overlay(indicator_mode).await;
+}
+
+/// Paint the optimistic "preparing" overlay for a gesture that is about to
+/// start a session, and arm the compensator that guarantees its terminal half.
+///
+/// Extracted so the Agent composer take — a UI gesture, not an OS hotkey —
+/// reaches exactly the same overlay contract as the assistive toggle instead of
+/// growing a second, drifting copy of it.
+async fn arm_preparing_overlay(indicator_mode: BadgeMode) {
     if let Some(existing) = current_controller(&shared_controller())
         && existing.current_state().await != State::Idle
     {
@@ -617,15 +638,6 @@ async fn optimistically_show_overlay(event: &HotkeyEvent) {
         // Arm the compensator BEFORE the direct call so the terminal guarantee
         // holds even if the dispatch that follows never transitions state.
         PREPARING_PENDING.store(true, Ordering::Release);
-        let indicator_mode = match event {
-            HotkeyEvent::ToggleAssistive
-            | HotkeyEvent::Hold {
-                mode: HoldMode::Chat | HoldMode::Selection,
-                ..
-            } => BadgeMode::Assistive,
-            HotkeyEvent::ToggleNormal | HotkeyEvent::ToggleRaw => BadgeMode::Toggle,
-            _ => BadgeMode::Hold,
-        };
         tray_status::set_tray_indicator_mode(indicator_mode);
         tray_status::update_tray_status(TrayStatus::Starting);
         listener.on_recording_preparing();
@@ -825,11 +837,69 @@ impl CodescribeHotkeys {
         .await?
     }
 
-    /// Start the same toggle flow in the assistive lane. Overlay owns this
-    /// route — the Agent composer mic is a separate, UI-initiated capture.
+    /// Start the same toggle flow in the assistive lane.
+    ///
+    /// This is the hands-free assistive route: the overlay and the right-Option
+    /// double tap. It keeps utterance silence epochs. The Agent composer mic is
+    /// a separate, UI-initiated capture — see
+    /// [`Self::start_composer_turn_recording`].
     pub async fn start_assistive_recording(&self) -> Result<(), CsError> {
         application_runtime::run(async move {
             start_recording_with_event(HotkeyEvent::ToggleAssistive).await
+        })
+        .await?
+    }
+
+    /// Start one explicit Agent-composer take: one gesture, one turn.
+    ///
+    /// Deliberately not a `HotkeyEvent`: no OS gesture produces this, the
+    /// composer button does. It reaches the same shared `RecordingController`,
+    /// the same capture-ownership gate and the same optimistic overlay as the
+    /// assistive toggle, and differs only in the per-take capture intent it
+    /// carries — the take stays open through silence until an explicit stop.
+    /// Returns the controller-admitted identity of the take this press opened.
+    /// Swift keeps it and hands it back to stop exactly that capture.
+    pub async fn start_composer_turn_recording(&self) -> Result<CsCaptureHandle, CsError> {
+        application_runtime::run(async move {
+            let controller =
+                ensure_controller(&shared_controller(), tokio::runtime::Handle::current());
+            start_composer_turn_with_capture_gate(controller)
+                .await
+                .map(|capture_id| CsCaptureHandle { capture_id })
+                .map_err(|error| CsError::Recording {
+                    msg: error.to_string(),
+                })
+        })
+        .await?
+    }
+
+    /// Stop one named capture, and refuse if a different take now owns the mic.
+    ///
+    /// This is the composer's only stop entry. `stop_recording` above stays the
+    /// unconditional surface for the hotkey and tray, which legitimately stop
+    /// whatever is live; a UI gesture may not, because between the moment the
+    /// user pressed and the moment this call lands the microphone can have
+    /// changed hands.
+    pub async fn stop_composer_turn_recording(
+        &self,
+        handle: CsCaptureHandle,
+    ) -> Result<CsConditionalStop, CsError> {
+        application_runtime::run(async move {
+            let Some(controller) = current_controller(&shared_controller()) else {
+                return Ok(CsConditionalStop::NoLiveCapture);
+            };
+            controller
+                .stop_capture_if_owned(&handle.capture_id)
+                .await
+                .map(|outcome| match outcome {
+                    CaptureStopOutcome::Stopped => CsConditionalStop::Stopped,
+                    CaptureStopOutcome::ForeignCapture => CsConditionalStop::ForeignCapture,
+                    CaptureStopOutcome::NoLiveCapture => CsConditionalStop::NoLiveCapture,
+                    CaptureStopOutcome::AlreadyStopping => CsConditionalStop::AlreadyStopping,
+                })
+                .map_err(|error| CsError::Recording {
+                    msg: error.to_string(),
+                })
         })
         .await?
     }
@@ -1198,6 +1268,47 @@ async fn dispatch_recording_with_capture_gate(
 
     optimistically_show_overlay(&event).await;
     let dispatch = dispatch_recording_hotkey_event(event, Arc::clone(&controller)).await;
+    compensate_orphaned_preparing(&controller).await;
+    if controller.current_state().await == State::Idle {
+        let _ = CAPTURE_OWNER.compare_exchange(
+            CAPTURE_OWNER_CONTROLLER,
+            CAPTURE_OWNER_NONE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    dispatch
+}
+
+/// Run one composer take through the same one-controller capture lifecycle the
+/// hotkey dispatch uses: claim ownership before any controller work, paint the
+/// optimistic overlay, dispatch, compensate an orphaned "preparing", and release
+/// ownership once the controller is back at `Idle`.
+///
+/// A composer press only ever *starts* a take; stopping goes through
+/// `stop_composer_turn_recording`, which names the capture it intends to end.
+/// That split is why there is no stop branch here to get wrong.
+///
+/// Returns the controller-admitted capture identity of the take it opened.
+async fn start_composer_turn_with_capture_gate(
+    controller: Arc<RecordingController>,
+) -> anyhow::Result<String> {
+    if controller.current_state().await != State::Idle {
+        return Err(anyhow::anyhow!(
+            "Another transcription capture already owns the microphone"
+        ));
+    }
+    CAPTURE_OWNER
+        .compare_exchange(
+            CAPTURE_OWNER_NONE,
+            CAPTURE_OWNER_CONTROLLER,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| anyhow::anyhow!("Another transcription capture is already starting"))?;
+
+    arm_preparing_overlay(BadgeMode::Assistive).await;
+    let dispatch = controller.start_composer_turn_recording().await;
     compensate_orphaned_preparing(&controller).await;
     if controller.current_state().await == State::Idle {
         let _ = CAPTURE_OWNER.compare_exchange(

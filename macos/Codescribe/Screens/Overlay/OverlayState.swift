@@ -233,7 +233,7 @@ final class OverlayState {
   var errorMessage: String?
   private(set) var presentationStatus: OverlayPresentationStatus?
   private(set) var errorLifecycleDetail =
-    "Recording stopped before a transcript was available."
+"No transcript was delivered."
   /// Prompt-free policy snapshot from C02's persisted settings owner. These
   /// values are replaced only by a fresh engine read, never by optimistic UI.
   private(set) var autoPasteEnabled = true
@@ -322,11 +322,40 @@ final class OverlayState {
   /// already-admitted projection to grow its canvas; no transcript bytes leave
   /// this passive overlay boundary.
   @ObservationIgnored var onTranscriptPresentationChanged: (() -> Void)?
+  /// Hand the terminal document to the Agent composer and read back what the
+  /// receiver did with it.
+  ///
+  /// The return value is the whole point: the overlay is the postman, and a
+  /// postman does not sign for the parcel. Only an `.admitted` or `.parked`
+  /// receipt lets this state release the capture destination or record the
+  /// delivery as done. A `.retained` receipt keeps the text on screen and
+  /// recoverable instead of painting a success the composer never saw.
+  @ObservationIgnored var onComposerTranscript: ((String, String) -> ComposerDeliveryReceipt)?
   /// Content-free success seam. No transcript crosses this callback.
   var onSuccessfulDictation: (() -> Void)?
 
   /// Strong refs for the one ordered Rust-callback ingress.
   @ObservationIgnored private let listener: CsTranscriptionListener
+  @ObservationIgnored private var receiverOwnsRecovery: (() -> Bool)?
+  @ObservationIgnored private var acceptsCaptureTerminal: ((String) -> Bool)?
+  @ObservationIgnored var onCaptureEnded: ((String) -> Void)?
+  @ObservationIgnored private var retiredProjectionSessions: Set<String> = []
+  @ObservationIgnored private var admittedComposerSessions: Set<String> = []
+
+  func connectComposer(to store: AgentChatStore) {
+    receiverOwnsRecovery = { [weak store] in store != nil }
+    onComposerTranscript = { [weak store] text, sessionID in
+      store?.receiveDictationTranscript(text, captureID: sessionID) ?? .retained(text)
+    }
+    acceptsCaptureTerminal = { [weak store] sessionID in
+      guard let store else { return true }
+      return !store.hasComposerCaptureRequest || store.composerCaptureHandle?.captureId == sessionID
+    }
+    onCaptureEnded = { [weak store] sessionID in
+      store?.finishDictationCapture(sessionID: sessionID)
+    }
+  }
+
   @ObservationIgnored private let eventStream: AsyncStream<OverlayListenerEvent>
   @ObservationIgnored private var eventTask: Task<Void, Never>?
 
@@ -338,12 +367,19 @@ final class OverlayState {
   /// The exact rendered text at the terminal projection.
   private var deliveredText: String = ""
   private var deliveredTextSessionId: String?
+  /// Missing/refusing callbacks retain documents by identity across sessions.
+  /// This is fallback presentation; the connected store owns recovery actions.
+  private var retainedComposerDocuments: [(id: String, text: String)] = []
+  var retainedComposerDelivery: String? {
+    retainedComposerDocuments.isEmpty ? nil
+      : retainedComposerDocuments.map(\.text).joined(separator: "\n")
+  }
   private var qualityCapturedProvenance: String?
   private var pendingRevisionSessionId: String?
   private var pendingRevisionSource: UInt64?
   private var revisionFocusCommitTask: Task<Void, Never>?
   /// Last reducer-owned projection painted by Swift. The reducer owns ordering
-  /// and finality; the overlay does not second-guess an event that reached it.
+  /// and finality within a session; retired sessions cannot repaint the current one.
   private var finalized = false
   /// Latest immutable projection event only; Rust `TranscriptRevision` remains
   /// the document owner and Rust `AcousticSerial` remains evidence authority.
@@ -1383,7 +1419,7 @@ final class OverlayState {
     errorMessage = message
     errorLifecycleDetail =
       captureHadStarted
-      ? "Recording stopped before a transcript was available."
+      ? "No transcript was delivered."
       : "Recording did not start."
     finalized = true
     showToast(toast)
@@ -1430,6 +1466,21 @@ final class OverlayState {
   /// prevent text delivery; retain the current chrome until a known phase arrives.
   func applyTranscriptProjection(_ projection: CsTranscriptProjectionEvent) {
     defer { onTranscriptPresentationChanged?() }
+    // Retired projections may still carry undelivered words, but cannot paint
+    // or finalize the newer capture. Retry the identity-addressed receiver only.
+    let foreignComposerTerminal = projection.terminal && projection.lifecycleTerminal
+      && acceptsCaptureTerminal?(projection.sessionId) == false
+    if retiredProjectionSessions.contains(projection.sessionId)
+      || foreignComposerTerminal
+    {
+      if projection.terminal && projection.lifecycleTerminal {
+        if projection.delivery == .composerPending {
+          admitComposerDelivery(projection, affectsCurrentCapture: false)
+        }
+        onCaptureEnded?(projection.sessionId)
+      }
+      return
+    }
     let priorProjection = latestTranscriptProjection
     let isNewSession = priorProjection?.sessionId != projection.sessionId
     let draftWasDirty = isRevisionDraftDirty
@@ -1455,7 +1506,45 @@ final class OverlayState {
       && formatterReceipt != nil
     let signalsFirstSuccessfulTerminal =
       !terminal && projection.terminal && projection.phase == OverlayMode.formatted.rawValue
-    if projection.terminal {
+    // Initialize before the first event can obtain a receiver receipt or retain
+    // refused bytes. The first observed projection may already end this session.
+    if isNewSession {
+      if let priorProjection { retiredProjectionSessions.insert(priorProjection.sessionId) }
+      deliveredText = ""
+      deliveredTextSessionId = nil
+      qualityCapturedProvenance = nil
+      userRevisionProvenance = nil
+      revisionCommitPending = false
+      formatterCommitPending = false
+      pendingRevisionSessionId = nil
+      pendingRevisionSource = nil
+      revisionCommitError = nil
+      formatterError = nil
+      revisionFocusCommitTask?.cancel()
+      revisionFocusCommitTask = nil
+    }
+
+    // The reducer emits two different terminals. `apply_manual_edit` is a
+    // presentation revision — a Light+ mint or a formatter receipt — and it can
+    // legitimately arrive BEFORE the controller publishes `session_ended`.
+    // Treating it as the lifecycle terminal released the capture and consumed
+    // the delivery slot early, so the real delivery event then failed its own
+    // dedup check and the take was never handed to the composer. Only the
+    // lifecycle line ends the capture.
+    // Typed, not parsed: the producer states whether this is the line that ends
+    // the session or a revision of its final document.
+    let isLifecycleTerminal = projection.terminal && projection.lifecycleTerminal
+    if isLifecycleTerminal {
+      // Deliver BEFORE releasing capture. `abortRecordingSession` fires the
+      // app-level stopped callback, which clears the composer's thread latch —
+      // the receiver needs that latch to know which conversation owns the take.
+      // Typed destination from the producer; the human-facing `label` is never
+      // consulted, because a delivery protocol that reads a display string is
+      // one copy-edit away from silently routing a take nowhere.
+      if projection.delivery == .composerPending {
+        admitComposerDelivery(projection)
+      }
+      onCaptureEnded?(projection.sessionId)
       // Release capture before flipping `finalized`; abort uses the previous
       // value to decide whether the app-level stopped callback is still owed.
       abortRecordingSession()
@@ -1473,21 +1562,10 @@ final class OverlayState {
     canRetranscribe = projection.canRetranscribe
     canFormat = projection.canFormat
     terminal = projection.terminal
-    finalized = projection.terminal
-
-    if isNewSession {
-      deliveredText = ""
-      deliveredTextSessionId = nil
-      qualityCapturedProvenance = nil
-      userRevisionProvenance = nil
-      revisionCommitPending = false
-      formatterCommitPending = false
-      pendingRevisionSessionId = nil
-      pendingRevisionSource = nil
-      revisionCommitError = nil
-      formatterError = nil
-      revisionFocusCommitTask?.cancel()
-      revisionFocusCommitTask = nil
+    // A document revision cannot consume the capture's pending stopped callback.
+    // Preserve an already-finalized lifecycle when revising its document later.
+    if !projection.terminal || isLifecycleTerminal {
+      finalized = projection.terminal
     }
 
     userRevisionProvenance = revisionReceipt
@@ -1524,6 +1602,67 @@ final class OverlayState {
       if revisionReceipt != nil {
         captureQualityIfEdited(action: "revision")
       }
+    }
+  }
+
+  /// Offer one terminal document to the composer and record only what the
+  /// receiver actually accepted.
+  ///
+  /// Every early return is a case where no delivery may be claimed:
+  ///
+  /// - an empty document is nothing to deliver, so it claims neither success
+  ///   nor failure;
+  /// - a duplicate lifecycle terminal for a session already handed over must
+  ///   not insert a second copy;
+  /// - a missing callback means no receiver is wired at all — the text stays
+  ///   retained and visible rather than being reported as delivered.
+  private func admitComposerDelivery(
+    _ projection: CsTranscriptProjectionEvent, affectsCurrentCapture: Bool = true
+  ) {
+    guard !admittedComposerSessions.contains(projection.sessionId) else { return }
+    // This take was routed to the composer, so the overlay's own deadline must
+    // never submit it — not on the happy path, and least of all on the path
+    // where the handover failed. Auto-sending words the composer never received
+    // would be the loudest possible version of the bug this cut closes.
+    if affectsCurrentCapture { agentAutoSendCancelled = true }
+    let text = projection.renderedText
+    guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+    guard let onComposerTranscript else {
+      retainComposerDelivery(text, sessionID: projection.sessionId, notice: "no composer receiver",
+        showsNotice: affectsCurrentCapture)
+      return
+    }
+    switch onComposerTranscript(text, projection.sessionId) {
+    case .admitted, .parked:
+      // The receiver holds the bytes. Only now is this session's delivery slot
+      // consumed: the text is in a draft the user can edit and send explicitly.
+      admittedComposerSessions.insert(projection.sessionId)
+      retainedComposerDocuments.removeAll { $0.id == projection.sessionId }
+    case .retained(let refused):
+      if receiverOwnsRecovery?() == true {
+        retainedComposerDocuments.removeAll { $0.id == projection.sessionId }
+        if affectsCurrentCapture { showFooterNotice("kept in composer recovery") }
+        return
+      }
+      retainComposerDelivery(refused, sessionID: projection.sessionId, notice: "kept for recovery",
+        showsNotice: affectsCurrentCapture)
+    case .empty:
+      break
+    }
+  }
+
+  /// Keep a refused delivery accessible. This is not an error state for the
+  /// transcript — the words are real and sealed exactly as they were; what
+  /// failed is the handover, and saying so is the honest chrome.
+  private func retainComposerDelivery(
+    _ text: String, sessionID: String, notice: String, showsNotice: Bool = true
+  ) {
+    if !retainedComposerDocuments.contains(where: { $0.id == sessionID }) {
+      retainedComposerDocuments.append((id: sessionID, text: text))
+    }
+    if showsNotice {
+      errorMessage = nil
+      showFooterNotice(notice)
     }
   }
 
@@ -1606,7 +1745,7 @@ final class OverlayState {
     pendingNoSpeechMessage = nil
     noSpeechNotice = OverlayState.defaultNoSpeechNotice
     presentationStatus = nil
-    errorLifecycleDetail = "Recording stopped before a transcript was available."
+    errorLifecycleDetail = "No transcript was delivered."
     finalized = false
     agentFinalTranscriptAppeared = false
     agentAutoSendCancelled = false
@@ -1738,7 +1877,7 @@ final class OverlayState {
       renderedText: renderedText, phase: phase.rawValue, canPaste: isFormatted, canInsert: isFormatted,
       canCopy: !renderedText.isEmpty, canRetranscribe: phase == .noSpeech || isFormatted,
       canFormat: isFormatted,
-      terminal: terminal, acousticReceipts: [])
+      terminal: terminal, lifecycleTerminal: terminal, delivery: .unattempted, acousticReceipts: [])
   }
 }
 

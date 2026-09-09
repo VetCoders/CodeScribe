@@ -8,7 +8,7 @@ use codescribe::presentation::status_projection::{
     PresentationStatusKind, PresentationStatusProjection,
 };
 use codescribe::presentation::transcript_bus::{
-    ProjectedAcousticReceipt, TranscriptBusEvidenceEvent,
+    ProjectedAcousticReceipt, TranscriptBusEvidenceEvent, TranscriptDelivery,
 };
 use codescribe_core::pipeline::contracts::{AnnotationKind, LayerSource, LayerSummary};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -77,7 +77,54 @@ pub struct CsTranscriptProjectionEvent {
     pub can_retranscribe: bool,
     pub can_format: bool,
     pub terminal: bool,
+    /// True only for the session's lifecycle terminal. A terminal *revision* of
+    /// the document is not the end of the capture, and only this flag tells the
+    /// two apart without reading an action string.
+    pub lifecycle_terminal: bool,
+    /// Controller-owned delivery disposition, forwarded verbatim. Swift branches
+    /// on this typed state; the human-facing `label` above stays presentation and
+    /// never carries control meaning.
+    pub delivery: CsTranscriptDelivery,
     pub acoustic_receipts: Vec<CsProjectedAcousticReceipt>,
+}
+
+/// Swift-visible mirror of [`TranscriptDelivery`]. One variant per controller
+/// disposition, so no consumer has to parse a label to learn a destination.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsTranscriptDelivery {
+    /// No stop-path delivery ran for this take.
+    Unattempted,
+    /// Destined for the Agent composer draft of the capturing thread, and not
+    /// yet admitted by it. This is an obligation, never a success claim.
+    ComposerPending,
+    /// A system sink accepted the text at the OS boundary.
+    SinkAccepted,
+    /// No sink took the text; it stays recoverable.
+    Retained,
+}
+
+/// The controller-admitted identity of one capture.
+///
+/// Issued by `start_composer_turn_recording` and required by the conditional
+/// stop. Swift holds it as opaque evidence: it proves *which* take a gesture
+/// opened, so a stop can be refused when a different take now owns the mic.
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CsCaptureHandle {
+    pub capture_id: String,
+}
+
+/// Typed outcome of a conditional stop. Every variant is a state the caller can
+/// act on; none of them is an error string to match.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsConditionalStop {
+    /// The identity matched the live capture and the stop path ran.
+    Stopped,
+    /// A different capture owns the microphone. It was left running.
+    ForeignCapture,
+    /// Nothing is capturing. Nothing was stopped and nothing was started.
+    NoLiveCapture,
+    /// This capture is already inside its own stop path. Not stopped twice.
+    AlreadyStopping,
 }
 
 /// Passive, typed product status from Rust presentation authority. This is a
@@ -122,6 +169,19 @@ impl CsProjectedAcousticReceipt {
     }
 }
 
+impl CsTranscriptDelivery {
+    /// One total mapping. A new Rust disposition must be given a Swift variant
+    /// here rather than silently collapsing into an existing one.
+    pub(crate) fn from_bus_delivery(delivery: TranscriptDelivery) -> Self {
+        match delivery {
+            TranscriptDelivery::Unattempted => Self::Unattempted,
+            TranscriptDelivery::ComposerPending => Self::ComposerPending,
+            TranscriptDelivery::SinkAccepted => Self::SinkAccepted,
+            TranscriptDelivery::Retained => Self::Retained,
+        }
+    }
+}
+
 impl CsTranscriptProjectionEvent {
     pub(crate) fn from_bus_event(event: &TranscriptBusEvidenceEvent) -> Self {
         Self {
@@ -146,6 +206,8 @@ impl CsTranscriptProjectionEvent {
             can_retranscribe: event.can_retranscribe,
             can_format: event.can_format,
             terminal: event.terminal,
+            lifecycle_terminal: event.lifecycle_terminal,
+            delivery: CsTranscriptDelivery::from_bus_delivery(event.delivery),
             acoustic_receipts: event
                 .acoustic_receipts
                 .iter()
@@ -734,7 +796,9 @@ pub fn request_mic_permission() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codescribe::presentation::transcript_bus::{TranscriptMode, TranscriptProjectionPhase};
+    use codescribe::presentation::transcript_bus::{
+        TranscriptDelivery, TranscriptMode, TranscriptProjectionPhase,
+    };
 
     #[test]
     fn bus_projection_conversion_preserves_every_authority_field() {
@@ -760,6 +824,8 @@ mod tests {
             can_retranscribe: true,
             can_format: true,
             terminal: true,
+            lifecycle_terminal: true,
+            delivery: TranscriptDelivery::ComposerPending,
             acoustic_receipts: vec![ProjectedAcousticReceipt {
                 acoustic_serial_version: 2,
                 acoustic_serial: "sha256:acoustic".to_string(),
@@ -809,6 +875,8 @@ mod tests {
                 can_retranscribe: true,
                 can_format: true,
                 terminal: true,
+                lifecycle_terminal: true,
+                delivery: CsTranscriptDelivery::ComposerPending,
                 acoustic_receipts: vec![CsProjectedAcousticReceipt {
                     acoustic_serial_version: 2,
                     acoustic_serial: "sha256:acoustic".to_string(),

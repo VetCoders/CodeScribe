@@ -531,6 +531,46 @@ enum ComposerDictationPhase: Equatable {
   case failed(String)
 }
 
+/// What the composer actually did with one terminal document.
+///
+/// The delivering side reads this instead of assuming: a route that was chosen,
+/// an event that was queued, or a callback that was invoked are all statements
+/// about the postman, not about the recipient. Only this receipt is admission.
+enum ComposerDeliveryReceipt: Equatable {
+  /// Appended to the live composer draft of the thread that owns the capture.
+  case admitted(threadID: UUID)
+  /// The owning thread is not the selected one. The store holds the text for
+  /// that thread and will surface it there — the current draft is untouched.
+  case parked(threadID: UUID)
+  /// No thread could take it. The exact bytes come back so the caller keeps
+  /// them visible and recoverable instead of dropping them.
+  case retained(String)
+  /// Nothing to deliver. This claims neither success nor failure.
+  case empty
+}
+
+/// One thread's unsent composer state: the text the user typed and the files
+/// they staged, held under that thread's own stable id.
+///
+/// The composer is a single surface, but the composition behind it belongs to a
+/// conversation. Without that ownership the surface is a global scratchpad: the
+/// words typed in B are still on screen when A is selected, so a delivery for A
+/// joins B's sentence, B's staged image travels to A, and creating or deleting a
+/// thread destroys whatever was in the box. Identity is the thread id, never the
+/// rail position, the title or the moment of selection.
+struct ThreadComposition: Equatable {
+  var text: String = ""
+  var attachments: [PendingAttachment] = []
+  /// True while this composition holds a delivered document its owner has not
+  /// seen yet, because the take finished while another thread was selected. It
+  /// is what makes "surface it once" observable — not a second copy of the text.
+  var hasUnseenDelivery: Bool = false
+
+  static let empty = ThreadComposition()
+
+  var isEmpty: Bool { text.isEmpty && attachments.isEmpty }
+}
+
 /// UI-only gesture seam over the shared recording controller.
 @MainActor
 protocol ComposerDictating: AnyObject {
@@ -547,14 +587,27 @@ final class AgentChatStore: ObservableObject {
     // Every selection change re-routes the voice-assistive lane to the thread
     // the user is looking at (operator contract 2026-08-13). Observers do not
     // fire during init — the seeding path publishes once explicitly.
-    didSet { publishAssistiveTarget() }
+    //
+    // This is also the single seam where the composer changes hands. Every way
+    // the selection can move — `select`, `newThread`, `delete`, a search or
+    // refresh restore, a direct assignment from the rail — passes through here,
+    // so ownership cannot be forgotten on one of them. A fresh store has an
+    // empty composer and no stored composition, which is why the seeding
+    // assignment in `init` needs no handoff.
+    didSet {
+      handOffComposition(from: oldValue, to: selectedThreadID)
+      publishAssistiveTarget()
+    }
   }
+  /// The composer text of the *selected* thread. Live truth while that thread is
+  /// on screen; parked into `threadCompositions` the moment the selection moves.
   @Published var draft: String = ""
   /// Monotonic UI command consumed by the composer. It carries no text and
   /// deliberately does not mutate the selected thread or staged attachments.
   @Published private(set) var composerFocusRequest: UInt64 = 0
-  /// Images staged in the composer for the next message. Cleared when the
-  /// message is dispatched.
+  /// Images staged in the composer for the next message, belonging to the
+  /// *selected* thread. Cleared when that thread's message is dispatched and
+  /// parked with its owner when the selection moves.
   @Published var pendingAttachments: [PendingAttachment] = []
   @Published private(set) var pendingToolApprovals: [PendingToolApproval] = []
 
@@ -585,6 +638,135 @@ final class AgentChatStore: ObservableObject {
     dictationThreadID == nil || dictationThreadID == selectedThreadID
   }
 
+  /// Local request bookkeeping, never a recorder-issued capture identity.
+  /// Lifecycle paint may select a delivery thread but cannot create this receipt.
+  private var composerCaptureRequestID: UUID?
+  private var composerCaptureStartCompleted = false
+  /// The controller's own identity for the take this gesture opened. Unlike the
+  /// booleans above, this is not a local belief: the controller minted it, and
+  /// handing it back is what lets a stop be refused when the microphone changed
+  /// hands after the press.
+  private(set) var composerCaptureHandle: CsCaptureHandle?
+
+  /// Unsent compositions of every thread that is *not* selected, keyed by the
+  /// owning thread's stable id.
+  ///
+  /// This holds both halves of the same truth: what the user typed in a thread
+  /// before switching away, and a terminal document that arrived for a thread
+  /// while the user was reading another one. They are one record because they
+  /// are one box — a delivery for A can never overwrite, relocate or silently
+  /// inherit the draft being typed in B, and A's box is still A's when the user
+  /// comes back. The selected thread is deliberately absent from this map: its
+  /// composition is the live `draft`/`pendingAttachments`, so there is exactly
+  /// one writable copy of any thread's composer state at any moment.
+  private var threadCompositions: [UUID: ThreadComposition] = [:]
+  /// A delivery no thread could take (its owner is gone). Surfaced for explicit
+  /// recovery rather than discarded.
+  struct ComposerRecoveryDocument: Identifiable {
+    let id: String
+    let text: String
+  }
+
+  @Published private(set) var composerRecoveryDocuments: [ComposerRecoveryDocument] = []
+  // Read-only aggregate presentation; documents, never this joined string,
+  // are the recovery/action authority.
+  var retainedComposerDelivery: String? {
+    composerRecoveryDocuments.isEmpty ? nil
+      : composerRecoveryDocuments.map(\.text).joined(separator: "\n")
+  }
+  private var captureOwners: [String: UUID] = [:]
+  private var captureDeliveryReceipts: [String: ComposerDeliveryReceipt] = [:]
+  private var endedCaptureIDs: Set<String> = []
+  private let persistenceDefaults: UserDefaults
+
+  /// True once this request's single stop permission has been spent and the
+  /// surface is waiting for terminal delivery. It is the difference between "a
+  /// start is in flight" (never interruptible) and "a stop already happened and
+  /// its terminal may never arrive" (recoverable).
+  private(set) var composerCaptureAwaitingTerminal = false
+
+  var ownsLiveDictation: Bool { composerCaptureStartCompleted }
+  var hasComposerCaptureRequest: Bool { composerCaptureRequestID != nil }
+
+  /// Click-latency paint must not latch a destination or authorize a stop.
+  func prepareDictationGesture() {
+    dictationPhase = .preparing
+  }
+
+  /// Called only after the adapter observed idle, before submitting its start.
+  /// Capture the gesture's thread, even if selection changed during that query.
+  func beginComposerCaptureRequest(threadID: UUID?) -> UUID {
+    let requestID = UUID()
+    composerCaptureRequestID = requestID
+    composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
+    dictationThreadID = threadID
+    let destination = threads.first { $0.id == threadID }
+      ?? threadsBeforeSearch?.first { $0.id == threadID }
+    engine?.setAssistiveTargetThread(backendId: destination?.backendId)
+    return requestID
+  }
+
+  func isCurrentComposerCaptureRequest(_ requestID: UUID) -> Bool {
+    composerCaptureRequestID == requestID
+  }
+
+  /// Register the controller handle before any further suspension. A terminal
+  /// already received for this identity cannot be resurrected by a late reply.
+  func completeComposerCaptureStart(
+    _ requestID: UUID, live: Bool, handle: CsCaptureHandle?
+  ) {
+    guard isCurrentComposerCaptureRequest(requestID) else { return }
+    if let handle, let owner = dictationThreadID {
+      captureOwners[handle.captureId] = owner
+    }
+    if let handle, endedCaptureIDs.contains(handle.captureId) {
+      endDictationSession()
+      return
+    }
+    composerCaptureStartCompleted = live
+    composerCaptureHandle = handle
+    dictationPhase = live ? .recording : .idle
+    // Even an idle reply may race queued terminal text. Keep its destination.
+  }
+
+  /// Consume local stop permission once; terminal delivery still owns the latch.
+  func awaitComposerCaptureTerminal() {
+    composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = true
+    dictationPhase = .idle
+  }
+
+  /// Release a request whose take the controller says no longer exists.
+  ///
+  /// Identity-aware recovery, driven by the controller's answer and an explicit
+  /// user gesture — never by a timer that erases the latch on a schedule and
+  /// takes a still-live delivery destination with it. Any text still owed to
+  /// the released thread arrives later with no owner and is retained, which is
+  /// a visible outcome rather than a silent drop.
+  func reconcileComposerCaptureLost() {
+    composerCaptureRequestID = nil
+    composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
+    composerCaptureHandle = nil
+    dictationBlocked = false
+    let hadSession = dictationThreadID != nil
+    dictationThreadID = nil
+    if hadSession { publishAssistiveTarget(force: true) }
+    if case .failed = dictationPhase { return }
+    dictationPhase = .idle
+  }
+
+  func releaseUnownedDictationGesture() {
+    // A stopped/failed local request may still have terminal text in flight.
+    if hasComposerCaptureRequest {
+      dictationPhase = .idle
+    } else {
+      setDictationPhase(.idle)
+    }
+    dictationBlocked = true
+  }
+
   /// Injected real adapter (Core). `nil` in previews / mock → mic is inert.
   var dictation: ComposerDictating?
 
@@ -602,14 +784,17 @@ final class AgentChatStore: ObservableObject {
   /// Set by the real adapter as the dictation session transitions. No-op-safe
   /// when no adapter is wired.
   ///
-  /// This is the single choke point every lifecycle path funnels through
-  /// (composer gesture, hotkey, tray, orphan compensator), so the ownership latch
-  /// lives here rather than at any one caller.
+  /// Shared lifecycle phases retain the delivery destination for assistive
+  /// callers too. They never grant composer stop permission.
   func setDictationPhase(_ phase: ComposerDictationPhase) {
     switch phase {
     case .preparing, .recording:
       if dictationThreadID == nil { dictationThreadID = selectedThreadID }
     case .idle, .failed:
+      composerCaptureRequestID = nil
+      composerCaptureStartCompleted = false
+      composerCaptureAwaitingTerminal = false
+      composerCaptureHandle = nil
       let hadSession = dictationThreadID != nil
       dictationThreadID = nil
       // Selection changes were suppressed while the capture was latched — resync
@@ -617,6 +802,151 @@ final class AgentChatStore: ObservableObject {
       if hadSession { publishAssistiveTarget(force: true) }
     }
     dictationPhase = phase
+  }
+
+  /// Take one terminal document for the thread that owned the capture.
+  ///
+  /// Delivery returns to the *capturing* thread, never to whatever the rail
+  /// happens to show now. When those differ the text is parked for its owner
+  /// and the current draft is left exactly as the user left it: stealing the
+  /// selection to make an append land is how a voice note ends up in the wrong
+  /// conversation, and relocating a draft is how one gets lost.
+  ///
+  /// The returned receipt is the only admission evidence. A missing owner or a
+  /// deleted thread yields `.retained` with the exact bytes, so the caller can
+  /// keep them on screen instead of reporting a delivery that never happened.
+  @discardableResult
+  func receiveDictationTranscript(_ text: String, captureID: String) -> ComposerDeliveryReceipt {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return .empty }
+    if let receipt = captureDeliveryReceipts[captureID] { return receipt }
+    guard let owner = captureOwners[captureID] else {
+      retainComposerDelivery(text, id: "capture:" + captureID)
+      let receipt = ComposerDeliveryReceipt.retained(text)
+      captureDeliveryReceipts[captureID] = receipt
+      return receipt
+    }
+    let ownerExists =
+      threads.contains { $0.id == owner }
+      || threadsBeforeSearch?.contains { $0.id == owner } == true
+    guard ownerExists else {
+      // The capture's thread was deleted while the take was in flight. There is
+      // no destination left; say so with the words intact. Anything the owner
+      // still held is recovered alongside them rather than dropped with the key.
+      let stranded = threadCompositions.removeValue(forKey: owner) ?? .empty
+      retainComposerDelivery(stranded.text, id: "thread:" + owner.uuidString)
+      retainComposerDelivery(text, id: "capture:" + captureID)
+      let receipt = ComposerDeliveryReceipt.retained(text)
+      captureDeliveryReceipts[captureID] = receipt
+      return receipt
+    }
+    if selectedThreadID == owner {
+      draft = appendComposerDelivery(text, to: draft)
+      requestComposerFocus()
+      let receipt = ComposerDeliveryReceipt.admitted(threadID: owner)
+      captureDeliveryReceipts[captureID] = receipt
+      return receipt
+    }
+    var parked = threadCompositions[owner] ?? .empty
+    parked.text = appendComposerDelivery(text, to: parked.text)
+    parked.hasUnseenDelivery = true
+    threadCompositions[owner] = parked
+    let receipt = ComposerDeliveryReceipt.parked(threadID: owner)
+    captureDeliveryReceipts[captureID] = receipt
+    return receipt
+  }
+
+  /// Move the composer from one thread to another. The only place either
+  /// `draft` or `pendingAttachments` changes hands.
+  ///
+  /// Saving happens before restoring and both are keyed by thread id, so no
+  /// ordering of selection changes can leak one thread's words into another's
+  /// box. An outgoing thread with nothing in it stores nothing, which keeps the
+  /// map a record of real unsent work rather than a graveyard of visited rows.
+  private func handOffComposition(from previous: UUID?, to next: UUID?) {
+    guard previous != next else { return }
+    if let previous {
+      let outgoing = ThreadComposition(text: draft, attachments: pendingAttachments)
+      if outgoing.isEmpty {
+        threadCompositions.removeValue(forKey: previous)
+      } else {
+        threadCompositions[previous] = outgoing
+      }
+    }
+    let incoming = next.flatMap { threadCompositions.removeValue(forKey: $0) } ?? .empty
+    draft = incoming.text
+    pendingAttachments = incoming.attachments
+    // A document that arrived while the user was elsewhere is surfaced once,
+    // when its thread first comes back on screen. Coming back a second time is
+    // not a second delivery: the text is already in the box and the flag is
+    // spent, so nothing is appended twice and nothing steals focus again.
+    if incoming.hasUnseenDelivery { requestComposerFocus() }
+  }
+
+  /// Take a thread's whole composition out of the store, wherever it lives.
+  ///
+  /// The selected thread's composition is the live composer, so removing a map
+  /// entry alone would silently leave it on screen for whoever is selected next.
+  private func takeComposition(of id: UUID) -> ThreadComposition {
+    if selectedThreadID == id {
+      let live = ThreadComposition(text: draft, attachments: pendingAttachments)
+      draft = ""
+      pendingAttachments = []
+      threadCompositions.removeValue(forKey: id)
+      return live
+    }
+    return threadCompositions.removeValue(forKey: id) ?? .empty
+  }
+
+  /// Join a delivered document onto an existing draft without gluing words.
+  private func appendComposerDelivery(_ text: String, to existing: String) -> String {
+    guard !existing.isEmpty else { return text }
+    return existing.hasSuffix("\n") ? existing + text : existing + "\n" + text
+  }
+
+  /// Identity, not equal words, suppresses transport retries. No age/count cap
+  /// may silently discard an unsent document.
+  private func retainComposerDelivery(_ text: String, id: String) {
+    guard !text.isEmpty, !composerRecoveryDocuments.contains(where: { $0.id == id }) else { return }
+    composerRecoveryDocuments.append(ComposerRecoveryDocument(id: id, text: text))
+  }
+
+  @discardableResult
+  func insertComposerRecovery(_ id: String, into threadID: UUID) -> Bool {
+    guard selectedThreadID == threadID, threads.contains(where: { $0.id == threadID }),
+      let document = composerRecoveryDocuments.first(where: { $0.id == id })
+    else { return false }
+    draft = appendComposerDelivery(document.text, to: draft)
+    composerRecoveryDocuments.removeAll { $0.id == id }
+    requestComposerFocus()
+    return true
+  }
+
+  @discardableResult
+  func copyComposerRecovery(_ id: String, write: (String) -> Bool) -> Bool {
+    guard let document = composerRecoveryDocuments.first(where: { $0.id == id }),
+      write(document.text)
+    else { return false }
+    composerRecoveryDocuments.removeAll { $0.id == id }
+    return true
+  }
+
+  func dismissComposerRecovery(_ id: String) {
+    composerRecoveryDocuments.removeAll { $0.id == id }
+  }
+
+  /// A receipt for A can never release B, including while B's start is awaiting
+  /// its controller handle. Identity-less lifecycle paint is insufficient.
+  @discardableResult
+  func finishDictationCapture(sessionID: String?) -> Bool {
+    if let sessionID {
+      endedCaptureIDs.insert(sessionID)
+      guard composerCaptureHandle?.captureId == sessionID else { return false }
+    } else if hasComposerCaptureRequest {
+      return false
+    }
+    endDictationSession()
+    return true
   }
 
   /// Terminal lifecycle beat for the shared recorder: the microphone is free.
@@ -628,6 +958,10 @@ final class AgentChatStore: ObservableObject {
   /// able to return the surface to rest. A `.failed` banner is kept so its own
   /// self-clearing timer can run out.
   func endDictationSession() {
+    composerCaptureRequestID = nil
+    composerCaptureStartCompleted = false
+    composerCaptureAwaitingTerminal = false
+    composerCaptureHandle = nil
     dictationBlocked = false
     if case .failed = dictationPhase {
       dictationThreadID = nil
@@ -640,14 +974,20 @@ final class AgentChatStore: ObservableObject {
   /// Surface a recoverable dictation failure with a self-clearing inline message
   /// (auto-returns to `.idle` after a few seconds so the composer doesn't keep a
   /// stale error banner).
-  func reportDictationFailure(_ message: String) {
-    setDictationPhase(.failed(message))
+  func reportDictationFailure(_ message: String, preservingDelivery: Bool = false) {
+    if preservingDelivery {
+      composerCaptureStartCompleted = false
+      dictationPhase = .failed(message)
+    } else {
+      setDictationPhase(.failed(message))
+    }
     let token = UUID()
     dictationFailureToken = token
     Task { @MainActor in
       try? await Task.sleep(nanoseconds: 4_000_000_000)
       guard dictationFailureToken == token, case .failed = dictationPhase else { return }
-      setDictationPhase(.idle)
+      // Banner expiry is display cleanup, not a terminal delivery receipt.
+      dictationPhase = .idle
     }
   }
 
@@ -769,6 +1109,12 @@ final class AgentChatStore: ObservableObject {
 
   private var inFlightSends: [UUID: InFlightSend] = [:]
 
+  func waitForComposerTurns(in threadID: UUID) async {
+    while let send = inFlightSends[threadID] {
+      await send.task.value
+    }
+  }
+
   /// Bookkeeping for the one title request allowed on a first textual turn,
   /// regardless of source: the composer `send()` and the voice ingest path
   /// (`ingestVoiceTurn` → `ingestVoiceDone`/`Error`/`Cancelled`) share this
@@ -808,8 +1154,10 @@ final class AgentChatStore: ObservableObject {
     threads: [ChatThread]? = nil,
     voiceTurnCanceller: VoiceTurnCancelling? = nil,
     licenseService: LicenseService? = nil,
-    loadsThreadIndexEagerly: Bool = true
+    loadsThreadIndexEagerly: Bool = true,
+    persistenceDefaults: UserDefaults = .standard
   ) {
+    self.persistenceDefaults = persistenceDefaults
     self.engine = engine
     self.threadsProvider = threadsProvider
     self.voiceTurnCanceller = voiceTurnCanceller
@@ -839,6 +1187,9 @@ final class AgentChatStore: ObservableObject {
     self.selectedThreadID = seeded.first?.id
     // didSet does not fire inside init — publish the seed selection once so
     // the assistive lane routes to what the rail shows from the first frame.
+    // The composition handoff is deliberately not replayed here: a new store
+    // has an empty composer and no stored composition, so there is no previous
+    // owner to park and nothing to restore.
     publishAssistiveTarget()
     engine?.installToolApprovalHandler { [weak self] request in
       guard let self else { return }
@@ -980,12 +1331,16 @@ final class AgentChatStore: ObservableObject {
 
   // MARK: Thread ops
 
+  /// Open an empty conversation. The composer the user was in is parked with the
+  /// thread that owns it, not discarded: starting a new thread while a sentence
+  /// is unfinished used to delete that sentence and carry its staged images into
+  /// the new thread. A fresh thread has no composition, so the box is empty
+  /// because it belongs to nobody yet — not because it was cleared.
   func newThread() {
     let t = ChatThread(title: "New thread", meta: "now", messages: [])
     threads.insert(t, at: 0)
     selectedThreadID = t.id
     threadListRevision &+= 1
-    draft = ""
   }
 
   func refreshThreads() {
@@ -1130,6 +1485,10 @@ final class AgentChatStore: ObservableObject {
     return saved.map { current[$0.id] ?? $0 } + threads.filter { !savedIDs.contains($0.id) }
   }
 
+  /// Show a thread. Its own composition — what was typed there, what was staged
+  /// there, and any take that finished while the user was reading somewhere
+  /// else — comes back with it, restored by the selection handoff rather than
+  /// poured into whatever draft happened to be on screen.
   func select(_ id: UUID) {
     selectedThreadID = id
     loadMessagesIfNeeded(id)
@@ -1226,6 +1585,14 @@ final class AgentChatStore: ObservableObject {
     if activeComposerTurn?.threadID == thread.id {
       activeComposerTurn = nil
     }
+    // The composition of a thread being deleted has nowhere left to land. Its
+    // words — typed, delivered, or both — become explicit recovery instead of
+    // being lost with the thread, and taking it here, before the selection can
+    // move, is what stops it from migrating into whoever is selected next.
+    // Staged files go with their owner: they are still on disk, but nothing
+    // silently re-stages a deleted conversation's images somewhere else.
+    let orphaned = takeComposition(of: thread.id)
+    retainComposerDelivery(orphaned.text, id: "thread:" + thread.id.uuidString)
     threads.removeAll { $0.id == thread.id }
     threadsBeforeSearch?.removeAll { $0.id == thread.id }
     threadListRevision &+= 1
@@ -1370,6 +1737,10 @@ final class AgentChatStore: ObservableObject {
       "send: building request attachmentPaths.count=\(staged.count, privacy: .public) text.isEmpty=\(text.isEmpty, privacy: .public)"
     )
     guard !text.isEmpty || !staged.isEmpty, let threadID = selectedThreadID else { return }
+    // Sending consumes the composer of the thread it is sent from, and only
+    // that one. Every other thread's unsent work is held under its own id in
+    // `threadCompositions`, which this path never touches — a turn accepted,
+    // queued or streamed in one conversation cannot empty the box in another.
     draft = ""
     pendingAttachments = []
     accept(text: text, staged: staged, threadID: threadID)
@@ -2221,7 +2592,7 @@ final class AgentChatStore: ObservableObject {
   }
 
   private func readDurableAcceptedTurns() -> [DurableAcceptedTurn] {
-    guard let data = UserDefaults.standard.data(forKey: Self.acceptedTurnsDefaultsKey) else {
+    guard let data = persistenceDefaults.data(forKey: Self.acceptedTurnsDefaultsKey) else {
       return []
     }
     do {
@@ -2232,7 +2603,7 @@ final class AgentChatStore: ObservableObject {
       queueLog.error(
         "durable accepted-turns decode failed; quarantining payload: \(error.localizedDescription, privacy: .public)"
       )
-      UserDefaults.standard.removeObject(forKey: Self.acceptedTurnsDefaultsKey)
+      persistenceDefaults.removeObject(forKey: Self.acceptedTurnsDefaultsKey)
       return []
     }
   }
@@ -2240,7 +2611,7 @@ final class AgentChatStore: ObservableObject {
   private func writeDurableAcceptedTurns(_ turns: [DurableAcceptedTurn]) {
     do {
       let data = try JSONEncoder().encode(turns)
-      UserDefaults.standard.set(data, forKey: Self.acceptedTurnsDefaultsKey)
+      persistenceDefaults.set(data, forKey: Self.acceptedTurnsDefaultsKey)
     } catch {
       // Flagship durable queue must never fail silently (PR-68 review).
       queueLog.error(
@@ -2339,7 +2710,7 @@ final class AgentChatStore: ObservableObject {
   }
 
   private func readAttachmentMetadataSidecar() -> [String: [PersistedAttachmentTurn]] {
-    guard let data = UserDefaults.standard.data(forKey: Self.attachmentMetadataDefaultsKey) else {
+    guard let data = persistenceDefaults.data(forKey: Self.attachmentMetadataDefaultsKey) else {
       return [:]
     }
     do {
@@ -2348,7 +2719,7 @@ final class AgentChatStore: ObservableObject {
       attachLog.error(
         "attachment metadata decode failed; quarantining payload: \(error.localizedDescription, privacy: .public)"
       )
-      UserDefaults.standard.removeObject(forKey: Self.attachmentMetadataDefaultsKey)
+      persistenceDefaults.removeObject(forKey: Self.attachmentMetadataDefaultsKey)
       return [:]
     }
   }
@@ -2356,7 +2727,7 @@ final class AgentChatStore: ObservableObject {
   private func writeAttachmentMetadataSidecar(_ sidecar: [String: [PersistedAttachmentTurn]]) {
     do {
       let data = try JSONEncoder().encode(sidecar)
-      UserDefaults.standard.set(data, forKey: Self.attachmentMetadataDefaultsKey)
+      persistenceDefaults.set(data, forKey: Self.attachmentMetadataDefaultsKey)
     } catch {
       attachLog.error(
         "attachment metadata encode failed (threads=\(sidecar.count, privacy: .public)): \(error.localizedDescription, privacy: .public)"

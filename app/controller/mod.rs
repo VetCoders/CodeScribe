@@ -54,10 +54,10 @@ pub use helpers::{
 pub use types::{HotkeyAction, HotkeyInput, HotkeyType, State};
 
 use crate::presentation::status_projection::PresentationStatusProjection;
-use crate::presentation::transcript_bus::TranscriptSessionEndReason;
+use crate::presentation::transcript_bus::{TranscriptDelivery, TranscriptSessionEndReason};
 use crate::presentation::{
-    PresentationEmitter, TranscriptBus, TranscriptMode, TranscriptSession, UserRevisionCommit,
-    UserRevisionIntent,
+    PresentationEmitter, TerminalFormatterRequest, TranscriptBus, TranscriptMode,
+    TranscriptSession, UserRevisionCommit, UserRevisionIntent,
 };
 use anyhow::{Context, Result};
 use codescribe_core::llm::ai_formatting::format_text_with_status_for_policy;
@@ -71,7 +71,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::audio::streaming_recorder::{StreamingRecorder, TerminalSealRefused};
+use crate::audio::streaming_recorder::{CaptureTurnIntent, StreamingRecorder, TerminalSealRefused};
 use crate::config::models::ModelManager;
 use crate::config::{Config, RuntimeSettingsSnapshot, UserSettings};
 use crate::os::clipboard;
@@ -346,6 +346,35 @@ async fn stop_recorder_for_terminal(
 /// Exactly-once gate for stop-path delivery. Returns `true` when this take may
 /// deliver and records it. A take without an id cannot be deduplicated and
 /// always passes; the toggle path's `:stopping` suffix is not part of identity.
+/// Marker the toggle stop appends to the live session slot so a second start
+/// cannot mistake a take that is winding down for a take that is still open.
+const STOPPING_SUFFIX: &str = ":stopping";
+
+/// What a stop that names its capture actually did.
+///
+/// Typed because every one of these is a state the caller must act on
+/// differently, and because "the stop returned Ok" is not the same claim as
+/// "the take this gesture opened is the take that stopped".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureStopOutcome {
+    /// The stop path ran for the intended capture.
+    Stopped,
+    /// A different capture owns the microphone; it was left running and no
+    /// new take was started in its place.
+    ForeignCapture,
+    /// Nothing is capturing. Nothing stopped, nothing started.
+    NoLiveCapture,
+    /// The named capture is already inside its own stop path.
+    AlreadyStopping,
+}
+
+/// A one-turn take is opened by the Agent composer and by nothing else — that
+/// surface is the only caller that sets [`CaptureTurnIntent::SingleTurn`]. Its
+/// destination is therefore the composer draft, not a system paste sink.
+const fn take_delivers_to_composer(capture_turn: CaptureTurnIntent) -> bool {
+    matches!(capture_turn, CaptureTurnIntent::SingleTurn)
+}
+
 fn claim_take_delivery(delivered: &mut Option<String>, take_id: Option<&str>) -> bool {
     let Some(take_id) = take_id
         .map(|id| id.trim().trim_end_matches(":stopping"))
@@ -493,6 +522,15 @@ pub struct RecordingController {
 
     /// Lock to serialize finish_recording calls
     serial_lock: Arc<Mutex<()>>,
+
+    /// Where the stop path sent this take's committed document.
+    ///
+    /// Written once per take by `deliver_stop_transcript`, reset at every
+    /// start, read once by `end_transcript_bus` so the terminal lifecycle line
+    /// states a destination instead of leaving an observer to infer one from a
+    /// label. It records what the controller *attempted*; only the receiving
+    /// surface can turn `ComposerPending` into an admitted delivery.
+    delivery_disposition: Arc<RwLock<TranscriptDelivery>>,
 
     /// Flag set by VAD (silence detection) when recording should auto-stop
     vad_triggered: Arc<AtomicBool>,
@@ -709,6 +747,7 @@ impl RecordingController {
             hold_start_generation: Arc::new(AtomicU64::new(0)),
             start_transition_in_flight: Arc::new(AtomicBool::new(false)),
             serial_lock: Arc::new(Mutex::new(())),
+            delivery_disposition: Arc::new(RwLock::new(TranscriptDelivery::Unattempted)),
             vad_triggered: Arc::new(AtomicBool::new(false)),
             assistive_loop_active: Arc::new(AtomicBool::new(false)),
             toggle_user_has_text: Arc::new(AtomicBool::new(false)),
@@ -1470,9 +1509,31 @@ impl RecordingController {
         text: &str,
         assistive: bool,
         force_ai: bool,
+        capture_turn: CaptureTurnIntent,
         seal_refused: bool,
     ) {
         let trimmed = text.trim();
+        // A one-turn take has exactly one destination: the Agent composer draft
+        // of the thread that owned the capture. It must not also post a
+        // synthetic paste into whatever app happens to be frontmost — two
+        // destinations for one take is how a transcript lands where nobody was
+        // looking. The disposition is `ComposerPending` on purpose: the route
+        // is decided here, admission is not, and only the receiver can say so.
+        if take_delivers_to_composer(capture_turn) {
+            let disposition = if trimmed.is_empty() {
+                // An empty capture claims no delivery at all.
+                TranscriptDelivery::Retained
+            } else {
+                TranscriptDelivery::ComposerPending
+            };
+            self.record_delivery_disposition(disposition).await;
+            info!(
+                seal_refused,
+                pending = !trimmed.is_empty(),
+                "delivery_route: intent=agent_composer route=ComposerDraft"
+            );
+            return;
+        }
         let config = self.get_config().await;
         let notes_save_only = config.quick_notes_enabled && config.quick_notes_save_only;
         let intent = delivery_intent_from_session(assistive, force_ai, notes_save_only);
@@ -1498,10 +1559,16 @@ impl RecordingController {
             decision.route,
             DeliveryRoute::ClipboardPaste | DeliveryRoute::DeferredInsert
         ) {
+            // No sink was selected. The committed text is still readable in the
+            // overlay and the session archive, so this is retained, not lost.
+            self.record_delivery_disposition(TranscriptDelivery::Retained)
+                .await;
             return;
         }
         if cfg!(test) {
             info!("stop-path paste skipped in tests");
+            self.record_delivery_disposition(TranscriptDelivery::Retained)
+                .await;
             return;
         }
         {
@@ -1519,17 +1586,39 @@ impl RecordingController {
                 .await
         };
         match outcome {
-            Ok(result) => info!(
-                delivery = ?result.delivery,
-                target = ?result.target_app_name,
-                frontmost = ?result.frontmost_app_name,
-                shortcut = ?result.deferred_insert_shortcut,
-                failure = ?result.deferred_insert_failure,
-                seal_refused,
-                "stop-path delivery finished"
-            ),
-            Err(err) => warn!(seal_refused, "stop-path delivery failed: {err:#}"),
+            Ok(result) => {
+                // `Noop` is the sink declining the payload, not accepting it.
+                let disposition = if matches!(result.delivery, OverlayPasteDelivery::Noop) {
+                    TranscriptDelivery::Retained
+                } else {
+                    TranscriptDelivery::SinkAccepted
+                };
+                self.record_delivery_disposition(disposition).await;
+                info!(
+                    delivery = ?result.delivery,
+                    target = ?result.target_app_name,
+                    frontmost = ?result.frontmost_app_name,
+                    shortcut = ?result.deferred_insert_shortcut,
+                    failure = ?result.deferred_insert_failure,
+                    seal_refused,
+                    ?disposition,
+                    "stop-path delivery finished"
+                );
+            }
+            Err(err) => {
+                // A failed sink keeps the text recoverable; it never becomes an
+                // accepted delivery just because the attempt returned.
+                self.record_delivery_disposition(TranscriptDelivery::Retained)
+                    .await;
+                warn!(seal_refused, "stop-path delivery failed: {err:#}");
+            }
         }
+    }
+
+    /// Record what this take's stop path attempted. One writer, one read at the
+    /// terminal lifecycle line; nothing else in the controller interprets it.
+    async fn record_delivery_disposition(&self, disposition: TranscriptDelivery) {
+        *self.delivery_disposition.write().await = disposition;
     }
 
     /// Degrade path when a synthetic paste is not safe to post: park the payload
@@ -1663,6 +1752,10 @@ impl RecordingController {
     fn clear_recorder_callbacks(recorder: &mut StreamingRecorder) {
         recorder.set_utterance_callback(None);
         recorder.set_utterance_silence_sec(None);
+        // A one-turn composer take must never widen into the next hands-free
+        // one. This runs before every start and after every stop, so the
+        // override cannot outlive the take that asked for it.
+        recorder.set_capture_turn_intent(CaptureTurnIntent::HandsFree);
         recorder.set_event_sink(None);
         recorder.set_level_callback(None);
     }
@@ -1713,10 +1806,14 @@ impl RecordingController {
         // Every path back to Idle ends the Bus session exactly once (text-free
         // lifecycle line), so an observer can tell "the take is over" apart
         // from "the take is live" even when zero occurrences sealed.
+        // Read the disposition before the reset clears it: the terminal
+        // lifecycle line is the one place a destination is stated.
+        let delivery = *self.delivery_disposition.read().await;
         Self::end_transcript_bus(
             &self.active_transcript_bus,
             reason,
             session_wav_exists,
+            delivery,
             &self.event_broadcast,
         )
         .await;
@@ -1740,11 +1837,12 @@ impl RecordingController {
         slot: &RwLock<Option<Arc<TranscriptBus>>>,
         reason: TranscriptSessionEndReason,
         session_wav_exists: bool,
+        delivery: TranscriptDelivery,
         event_broadcast: &broadcast::Sender<IpcEvent>,
     ) {
         let ended_bus = slot.write().await.take();
         if let Some(bus) = ended_bus
-            && let Some(event) = bus.publish_ended(reason, session_wav_exists)
+            && let Some(event) = bus.publish_ended(reason, session_wav_exists, delivery)
         {
             Self::broadcast_transcript_projection(event_broadcast, &event);
         }
@@ -1770,10 +1868,13 @@ impl RecordingController {
             }
             Self::clear_recorder_callbacks(rec);
         }
+        // A hold that never became a recording delivered nothing; the take is
+        // not "failed delivery", it had no delivery attempt at all.
         Self::end_transcript_bus(
             &session.active_transcript_bus,
             abort.bus_reason(),
             false,
+            TranscriptDelivery::Unattempted,
             &session.event_broadcast,
         )
         .await;
@@ -2307,7 +2408,8 @@ impl RecordingController {
 
         match current_state {
             State::Idle => {
-                self.start_toggle_recording(event.assistive).await?;
+                self.start_toggle_recording(event.assistive, CaptureTurnIntent::HandsFree)
+                    .await?;
             }
             State::RecToggle => {
                 info!("Toggle pressed; entering stop flow (state=REC_TOGGLE)");
@@ -3084,7 +3186,16 @@ impl RecordingController {
     }
 
     /// Start recording in toggle mode (immediate, no delay)
-    async fn start_toggle_recording(&self, is_assistive: bool) -> Result<()> {
+    ///
+    /// `capture_turn` is the per-take intent of the surface that opened the
+    /// microphone. Hotkey, tray and overlay pass
+    /// [`CaptureTurnIntent::HandsFree`] and keep their utterance-epoch
+    /// contract; the Agent composer passes [`CaptureTurnIntent::SingleTurn`].
+    async fn start_toggle_recording(
+        &self,
+        is_assistive: bool,
+        capture_turn: CaptureTurnIntent,
+    ) -> Result<()> {
         // Acquire serial lock to prevent race conditions
         let _guard = self.serial_lock.lock().await;
 
@@ -3097,6 +3208,8 @@ impl RecordingController {
             );
             return Ok(());
         }
+        // A new take inherits no destination from the previous one.
+        *self.delivery_disposition.write().await = TranscriptDelivery::Unattempted;
         let runtime_settings = self.runtime_settings_arc().await;
         let config = runtime_settings.values();
         let _start_guard = AtomicFlagGuard::new(Arc::clone(&self.start_transition_in_flight));
@@ -3237,7 +3350,12 @@ impl RecordingController {
         // Toggle mode: continuous recording; silence only triggers per-utterance send.
         recorder.recorder.config.auto_silence = false;
         recorder.recorder.set_on_vad_stop(|| {});
-        recorder.set_utterance_silence_sec(Some(toggle_silence_sec));
+        // The intent owns the epoch question, not the mode flags: hands-free
+        // keeps the configured threshold, a one-turn take asks for the legacy
+        // single continuous stream. Silero, ledger qualification and Layer 1
+        // tail repair are unaffected either way.
+        recorder.set_utterance_silence_sec(capture_turn.utterance_silence_sec(toggle_silence_sec));
+        recorder.set_capture_turn_intent(capture_turn);
 
         // Set session mode for delta routing BEFORE starting the pipeline,
         // so the very first deltas route to the correct overlay.
@@ -3334,8 +3452,16 @@ impl RecordingController {
     /// callback), recovery forces `Idle` so the next toggle press registers, the
     /// badge clears, and the tray stops claiming idle over a hung recording.
     async fn stop_toggle_and_adjudicate(&self) -> Result<()> {
+        self.stop_toggle_and_adjudicate_for(None).await.map(|_| ())
+    }
+
+    /// The watchdog-wrapped toggle stop, optionally bound to one capture.
+    async fn stop_toggle_and_adjudicate_for(
+        &self,
+        expected: Option<&str>,
+    ) -> Result<CaptureStopOutcome> {
         if *self.state.read().await != State::RecToggle {
-            return Ok(());
+            return Ok(CaptureStopOutcome::NoLiveCapture);
         }
 
         // Watchdog: full stop+adjudicate (recorder.stop + live truth + post-process
@@ -3343,7 +3469,12 @@ impl RecordingController {
         // contention or recorder.stop blocked on a cpal callback —
         // force recovery to Idle so subsequent toggle presses register, badge clears,
         // and tray reflects truth instead of showing Idle while recording is hung.
-        match tokio::time::timeout(STOP_TIMEOUT, self.stop_toggle_and_adjudicate_inner()).await {
+        match tokio::time::timeout(
+            STOP_TIMEOUT,
+            self.stop_toggle_and_adjudicate_inner(expected),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 error!(
@@ -3370,7 +3501,10 @@ impl RecordingController {
     /// The session-id snapshot before the rename is a self-deadlock guard: under
     /// Rust 2024 a read guard held as an if-let scrutinee outlives the body and
     /// would block this same task's write.
-    async fn stop_toggle_and_adjudicate_inner(&self) -> Result<()> {
+    async fn stop_toggle_and_adjudicate_inner(
+        &self,
+        expected: Option<&str>,
+    ) -> Result<CaptureStopOutcome> {
         // Phase-timed instrumentation: the watchdog above wraps this entire fn
         // in STOP_TIMEOUT, but until now we couldn't tell WHICH await hung.
         // Operator reported "hands-off, double option, który potrafi wywołać
@@ -3390,7 +3524,18 @@ impl RecordingController {
         );
 
         if *self.state.read().await != State::RecToggle {
-            return Ok(());
+            return Ok(CaptureStopOutcome::NoLiveCapture);
+        }
+
+        // Identity gate, inside the same `serial_lock` section as the stop it
+        // authorizes. A take that replaced this one between the caller's query
+        // and this call is refused here, and nothing is started in its place.
+        match self.capture_gate(expected).await {
+            CaptureStopOutcome::Stopped => {}
+            refused => {
+                info!(?refused, "conditional stop refused: capture identity mismatch");
+                return Ok(refused);
+            }
         }
 
         info!("Stopping toggle recording with final-pass adjudication");
@@ -3407,7 +3552,7 @@ impl RecordingController {
         // first so the read guard drops at the semicolon.
         let session_id_snapshot = self.session_id.read().await.clone();
         if let Some(ref session_id) = session_id_snapshot {
-            *self.session_id.write().await = Some(format!("{session_id}:stopping"));
+            *self.session_id.write().await = Some(format!("{session_id}{STOPPING_SUFFIX}"));
         }
 
         self.set_state(State::Busy).await;
@@ -3438,6 +3583,10 @@ impl RecordingController {
             let stopped =
                 stop_recorder_for_terminal(recorder, session_id_snapshot.as_deref()).await;
             rec_stop_secs = phase2.elapsed().as_secs_f64();
+            // Read the take's own intent before the per-take state is cleared.
+            // The recorder is the single owner of this fact; the stop path must
+            // not re-derive it from the assistive flag or the active screen.
+            let capture_turn = recorder.capture_turn_intent();
             Self::clear_recorder_callbacks(recorder);
             drop(recorder_guard);
             // The session is over whichever way `stop()` went; the engine that
@@ -3447,11 +3596,15 @@ impl RecordingController {
                 Ok(stopped) => stopped,
                 Err(err) => {
                     if let Some(refusal) = err.downcast_ref::<TerminalSealRefused>() {
+                        // A refused seal still has committed words. They keep the
+                        // take's own destination; refusal degrades the claim, not
+                        // the route.
                         self.deliver_stop_transcript(
                             session_id_snapshot.as_deref(),
                             &refusal.committed_text,
                             assistive,
                             force_ai,
+                            capture_turn,
                             true,
                         )
                         .await;
@@ -3468,6 +3621,12 @@ impl RecordingController {
 
             let phase3 = std::time::Instant::now();
             info!("stop_toggle_inner: PHASE 3 — reducer-owned transcript already delivered");
+            // One composer gesture, one turn, one formatting pass. A hands-free
+            // take returns unchanged here — it already formatted per occurrence
+            // while it was live.
+            let streaming_text = self
+                .format_composer_turn_once(capture_turn, streaming_text)
+                .await;
             if let Some(path) = raw_audio_path_opt.as_deref() {
                 retain_session_audio(
                     session_id_snapshot.as_deref(),
@@ -3482,6 +3641,7 @@ impl RecordingController {
                 &streaming_text,
                 assistive,
                 force_ai,
+                capture_turn,
                 false,
             )
             .await;
@@ -3516,7 +3676,7 @@ impl RecordingController {
             rec_stop_secs, phase3_secs, cleanup_secs, "stop_toggle_inner: mechanical stop timing"
         );
 
-        result.map(|_| ())
+        result.map(|_| CaptureStopOutcome::Stopped)
     }
 
     /// Recovery path when stop_toggle_and_adjudicate exceeds STOP_TIMEOUT.
@@ -3568,13 +3728,159 @@ impl RecordingController {
     /// SwiftUI overlay), routing to the same stop path the hotkey would have
     /// taken for this session shape.
     pub async fn stop_recording_from_external_surface(&self) -> Result<()> {
+        self.stop_external_capture(None).await.map(|_| ())
+    }
+
+    /// The one routing body both the unconditional and the identity-checked
+    /// external stop share, so the two can never drift on which stop path a
+    /// session shape takes.
+    async fn stop_external_capture(&self, expected: Option<&str>) -> Result<CaptureStopOutcome> {
         let current_state = self.current_state().await;
         let assistive = *self.assistive_mode.read().await;
         if should_use_toggle_adjudicated_stop(current_state, assistive, toggle_final_pass_enabled())
         {
-            self.stop_toggle_and_adjudicate().await
+            self.stop_toggle_and_adjudicate_for(expected).await
         } else {
-            self.finish_recording().await
+            self.finish_recording_for(expected).await
+        }
+    }
+
+    /// Start one explicit Agent-composer take on the shared controller.
+    ///
+    /// One gesture, one turn. This is the same recorder, the same ledger and
+    /// the same reducer every other lane uses — the only thing that differs is
+    /// the per-take [`CaptureTurnIntent`], which keeps hands-free utterance
+    /// epochs out of a take the user ends explicitly.
+    ///
+    /// Refused unless the controller is idle: a composer press must never
+    /// hijack, restart or silently inherit a capture some other surface owns.
+    ///
+    /// Returns the identity of the capture the controller actually admitted.
+    /// Reading it *after* the start is what makes it evidence rather than a
+    /// hopeful guess: a start that produced no session slot produced no take,
+    /// and its caller receives no stop permission to hand back later.
+    pub async fn start_composer_turn_recording(&self) -> Result<String> {
+        let state = self.current_state().await;
+        if state != State::Idle {
+            return Err(anyhow::anyhow!(
+                "composer take refused: shared controller is {state}, not IDLE"
+            ));
+        }
+        // Snapshot the live slot first. `start_toggle_recording` returns `Ok`
+        // without opening anything when the state changed under its own lock,
+        // and in that case the slot still holds SOMEONE ELSE'S take. Handing
+        // that id back would grant this gesture stop permission over a capture
+        // it never opened — the exact authority this cut exists to withhold.
+        let previous = self.session_id.read().await.clone();
+        self.start_toggle_recording(true, CaptureTurnIntent::SingleTurn)
+            .await?;
+        let admitted = self.session_id.read().await.clone();
+        match admitted {
+            Some(id) if previous.as_deref() != Some(id.as_str()) => Ok(id),
+            _ => Err(anyhow::anyhow!(
+                "composer take started without an admitted capture identity"
+            )),
+        }
+    }
+
+    /// Compare a caller's admitted capture identity against the live session.
+    ///
+    /// **Callers must already hold `serial_lock`.** Every start and every stop
+    /// crosses that same lock, so the comparison and the stop it authorizes are
+    /// one critical section: a replacement take cannot slip between them.
+    ///
+    /// `expected == None` is the existing unconditional hotkey/tray contract and
+    /// is deliberately preserved: those surfaces stop whatever is live.
+    async fn capture_gate(&self, expected: Option<&str>) -> CaptureStopOutcome {
+        let Some(expected) = expected else {
+            return CaptureStopOutcome::Stopped;
+        };
+        // Snapshot into a local first (Rust 2024 temporary scope): the guard
+        // from a `let ... else` scrutinee would outlive the branch and this
+        // task takes controller locks again downstream.
+        let live = self.session_id.read().await.clone();
+        let Some(live) = live else {
+            return CaptureStopOutcome::NoLiveCapture;
+        };
+        if live == expected {
+            CaptureStopOutcome::Stopped
+        } else if live.strip_suffix(STOPPING_SUFFIX) == Some(expected) {
+            CaptureStopOutcome::AlreadyStopping
+        } else {
+            CaptureStopOutcome::ForeignCapture
+        }
+    }
+
+    /// Stop the capture this caller opened, and only that one.
+    ///
+    /// A foreign take survives untouched and no new take is started in its
+    /// place: refusing is the whole point of naming the capture.
+    pub async fn stop_capture_if_owned(&self, capture_id: &str) -> Result<CaptureStopOutcome> {
+        self.stop_external_capture(Some(capture_id)).await
+    }
+
+    /// Format one composer turn exactly once, at terminal processing.
+    ///
+    /// Returns the text the stop path should deliver. Every early return is a
+    /// provider call that never happens rather than one that is made and
+    /// discarded:
+    ///
+    /// - a hands-free take already paid per occurrence during capture;
+    /// - a take with no terminal authority has nothing to format;
+    /// - an empty or whitespace-only turn produces no request at all;
+    /// - a formatter refusal (failed, policy-skipped, healthy no-op) keeps the
+    ///   committed document exactly as the ledger sealed it.
+    ///
+    /// On success the committed revision is the delivered text, so the Bus, the
+    /// delivery buffer and the ledger CAS keep seeing the same bytes.
+    async fn format_composer_turn_once(
+        &self,
+        capture_turn: CaptureTurnIntent,
+        committed_text: String,
+    ) -> String {
+        if !capture_turn.formats_once_at_terminal() {
+            return committed_text;
+        }
+        // Snapshot into a local first. Under Rust 2024 the read guard produced
+        // inside a `let ... else` scrutinee outlives the diverging branch, and
+        // this task takes the same lock again further down.
+        let active_presentation = self.active_presentation.read().await.clone();
+        let Some(presentation) = active_presentation else {
+            warn!("Composer turn: no terminal transcript authority; delivering committed text");
+            return committed_text;
+        };
+        let Some(TerminalFormatterRequest {
+            session_id,
+            source_revision,
+            source_text,
+        }) = presentation.terminal_formatter_request()
+        else {
+            debug!("Composer turn: nothing to format at terminal; no provider call issued");
+            return committed_text;
+        };
+        let runtime_settings = self.runtime_settings_arc().await;
+        let language = runtime_settings.values().whisper_language;
+        // The one paid call this take is allowed. Same production entry point
+        // the explicit overlay formatter uses; no second lane, no retry loop.
+        let result = format_text_with_status_for_policy(
+            &source_text,
+            language.whisper_hint(),
+            runtime_settings.as_ref(),
+        )
+        .await;
+        match presentation.apply_formatter_revision(session_id, source_revision, result) {
+            Ok(commit) => {
+                info!(
+                    revision = commit.revision,
+                    receipt = %commit.provenance_receipt,
+                    "Composer turn formatted once at terminal processing"
+                );
+                commit.rendered_text
+            }
+            Err(refusal) => {
+                info!(%refusal, "Composer turn terminal formatting refused; committed text stands");
+                committed_text
+            }
         }
     }
 
@@ -3586,13 +3892,43 @@ impl RecordingController {
     /// 3. Formats the transcript (if assistive mode enabled)
     /// 4. Pastes the result into the active application
     pub async fn finish_recording(&self) -> Result<()> {
-        // Cancel any pending hold-start
-        self.cancel_pending_hold_start().await;
+        self.finish_recording_for(None).await.map(|_| ())
+    }
 
-        // Acquire serial lock to prevent concurrent finish calls
+    /// `finish_recording`, optionally bound to one admitted capture. The gate
+    /// runs under the same `serial_lock` the stop itself holds.
+    ///
+    /// The two branches differ in one deliberate way. The unconditional path is
+    /// the untouched hotkey/tray contract. The named path must decide *before*
+    /// it touches shared scheduling state: invalidating a pending hold-start is
+    /// a side effect on somebody else's take, and a stop that is about to be
+    /// refused has no business causing one.
+    async fn finish_recording_for(&self, expected: Option<&str>) -> Result<CaptureStopOutcome> {
+        if expected.is_none() {
+            // Cancel any pending hold-start
+            self.cancel_pending_hold_start().await;
+
+            // Acquire serial lock to prevent concurrent finish calls
+            let _guard = self.serial_lock.lock().await;
+
+            return self
+                .finish_recording_locked()
+                .await
+                .map(|()| CaptureStopOutcome::Stopped);
+        }
+
         let _guard = self.serial_lock.lock().await;
-
-        self.finish_recording_locked().await
+        match self.capture_gate(expected).await {
+            CaptureStopOutcome::Stopped => {}
+            refused => {
+                info!(?refused, "conditional finish refused: capture identity mismatch");
+                return Ok(refused);
+            }
+        }
+        self.cancel_pending_hold_start().await;
+        self.finish_recording_locked()
+            .await
+            .map(|()| CaptureStopOutcome::Stopped)
     }
 
     /// Internal finish_recording implementation (assumes lock is held)
@@ -3694,6 +4030,9 @@ impl RecordingController {
                         &refusal.committed_text,
                         assistive,
                         force_ai,
+                        // The hold path has no composer surface: no caller here
+                        // can open a one-turn take.
+                        CaptureTurnIntent::HandsFree,
                         true,
                     )
                     .await;
@@ -3720,6 +4059,7 @@ impl RecordingController {
             &streaming_text,
             assistive,
             force_ai,
+            CaptureTurnIntent::HandsFree,
             false,
         )
         .await;
@@ -3895,6 +4235,165 @@ mod terminal_delivery_target_falsifiers {
 
         assert!(controller.paste_target_app_name().await.is_none());
     }
+
+    /// One take, one destination. A composer turn belongs to the Agent draft of
+    /// the thread that opened it; posting a synthetic paste as well is how a
+    /// voice note lands in whatever window happened to be frontmost.
+    #[tokio::test]
+    async fn a_composer_turn_is_owed_to_the_composer_and_to_nothing_else() {
+        let controller = RecordingController::new_without_keychain();
+
+        controller
+            .deliver_stop_transcript(
+                Some("take-composer"),
+                "words for the draft",
+                true,
+                false,
+                CaptureTurnIntent::SingleTurn,
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            *controller.delivery_disposition.read().await,
+            TranscriptDelivery::ComposerPending
+        );
+    }
+
+    /// `ComposerPending` is an obligation, so an empty capture must not create
+    /// one. Nothing was said; nothing is owed.
+    #[tokio::test]
+    async fn an_empty_composer_turn_creates_no_delivery_obligation() {
+        let controller = RecordingController::new_without_keychain();
+
+        controller
+            .deliver_stop_transcript(
+                Some("take-empty"),
+                "   \n  ",
+                true,
+                false,
+                CaptureTurnIntent::SingleTurn,
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            *controller.delivery_disposition.read().await,
+            TranscriptDelivery::Retained
+        );
+    }
+
+    /// A refused seal degrades the coverage claim, not the route. The committed
+    /// words still belong to the composer that captured them.
+    #[tokio::test]
+    async fn a_refused_seal_keeps_the_composer_as_the_destination() {
+        let controller = RecordingController::new_without_keychain();
+
+        controller
+            .deliver_stop_transcript(
+                Some("take-refused"),
+                "partial but real words",
+                true,
+                false,
+                CaptureTurnIntent::SingleTurn,
+                true,
+            )
+            .await;
+
+        assert_eq!(
+            *controller.delivery_disposition.read().await,
+            TranscriptDelivery::ComposerPending
+        );
+    }
+
+    /// The converse, which is the assertion that keeps the branch honest: a
+    /// hands-free take is never owed to the composer.
+    #[tokio::test]
+    async fn a_hands_free_take_is_never_owed_to_the_composer() {
+        let controller = RecordingController::new_without_keychain();
+
+        controller
+            .deliver_stop_transcript(
+                Some("take-hands-free"),
+                "dictated words",
+                false,
+                false,
+                CaptureTurnIntent::HandsFree,
+                false,
+            )
+            .await;
+
+        assert_ne!(
+            *controller.delivery_disposition.read().await,
+            TranscriptDelivery::ComposerPending
+        );
+    }
+
+    /// A named stop refuses when a different capture owns the microphone, and
+    /// says nothing is live when nothing is. Both are refusals, and they are
+    /// different refusals: one must leave a foreign take running.
+    #[tokio::test]
+    async fn the_capture_gate_tells_a_foreign_take_apart_from_no_take() {
+        let controller = RecordingController::new_without_keychain();
+
+        assert_eq!(
+            controller.capture_gate(Some("mine")).await,
+            CaptureStopOutcome::NoLiveCapture
+        );
+
+        *controller.session_id.write().await = Some("theirs".to_string());
+        assert_eq!(
+            controller.capture_gate(Some("mine")).await,
+            CaptureStopOutcome::ForeignCapture
+        );
+
+        *controller.session_id.write().await = Some("mine".to_string());
+        assert_eq!(
+            controller.capture_gate(Some("mine")).await,
+            CaptureStopOutcome::Stopped
+        );
+
+        *controller.session_id.write().await = Some(format!("mine{STOPPING_SUFFIX}"));
+        assert_eq!(
+            controller.capture_gate(Some("mine")).await,
+            CaptureStopOutcome::AlreadyStopping
+        );
+    }
+
+    /// The hotkey and tray contract is unchanged: an unnamed stop still stops
+    /// whatever is live, including a take it did not open.
+    #[tokio::test]
+    async fn an_unnamed_stop_keeps_its_unconditional_contract() {
+        let controller = RecordingController::new_without_keychain();
+        *controller.session_id.write().await = Some("someone-elses-take".to_string());
+
+        assert_eq!(
+            controller.capture_gate(None).await,
+            CaptureStopOutcome::Stopped
+        );
+    }
+
+    /// A conditional stop that loses the identity race must not fall through to
+    /// the stop path. The foreign take keeps the microphone.
+    #[tokio::test]
+    async fn a_conditional_stop_for_a_foreign_take_does_not_run_the_stop_path() {
+        let controller = RecordingController::new_without_keychain();
+        controller.set_state(State::RecToggle).await;
+        *controller.session_id.write().await = Some("theirs".to_string());
+
+        let outcome = controller
+            .stop_capture_if_owned("mine")
+            .await
+            .expect("a refusal is an outcome, not an error");
+
+        assert_eq!(outcome, CaptureStopOutcome::ForeignCapture);
+        assert_eq!(controller.current_state().await, State::RecToggle);
+        assert_eq!(
+            controller.session_id.read().await.as_deref(),
+            Some("theirs"),
+            "the foreign take's identity is untouched"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3922,7 +4421,7 @@ mod serving_status_producer_falsifiers {
         controller.set_state(State::RecToggle).await;
 
         controller
-            .stop_toggle_and_adjudicate_inner()
+            .stop_toggle_and_adjudicate_inner(None)
             .await
             .expect("idle recorder stops cleanly");
 

@@ -139,6 +139,7 @@ struct Composer: View {
       .animation(.easeOut(duration: 0.12), value: isDragging)
 
       dictationFeedback
+      recoveryDocuments
 
       // Affordance row
       HStack(spacing: 16) {
@@ -170,6 +171,49 @@ struct Composer: View {
       // same run-loop turn. Yield once so the native field editor exists.
       await Task.yield()
       focusNativeComposer()
+    }
+  }
+
+  private var recoveryDocuments: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      ForEach(store.composerRecoveryDocuments) { document in
+        DisclosureGroup("Recovered text — review before using") {
+          ScrollView {
+            Text(document.text)
+              .font(CSFont.mono(12, .regular))
+              .foregroundStyle(CSColor.textFaintAlt)
+              .textSelection(.enabled)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+          .frame(maxHeight: 160)
+          .accessibilityIdentifier("composer.recovery.text." + document.id)
+          HStack {
+            Button("Insert into current draft") {
+              if let threadID = store.selectedThreadID {
+                store.insertComposerRecovery(document.id, into: threadID)
+              }
+            }
+            .disabled(store.selectedThreadID == nil)
+            .accessibilityIdentifier("composer.recovery.insert." + document.id)
+            Button("Copy") {
+              store.copyComposerRecovery(document.id) { text in
+                NSPasteboard.general.clearContents()
+                return NSPasteboard.general.setString(text, forType: .string)
+              }
+            }
+            .accessibilityIdentifier("composer.recovery.copy." + document.id)
+            Button("Dismiss", role: .destructive) {
+              store.dismissComposerRecovery(document.id)
+            }
+            .accessibilityIdentifier("composer.recovery.dismiss." + document.id)
+          }
+          .buttonStyle(.borderless)
+        }
+        .padding(8)
+        .background(CSColor.surfaceRaised(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: CSRadius.composer))
+        .accessibilityIdentifier("composer.recovery.inspect." + document.id)
+      }
     }
   }
 

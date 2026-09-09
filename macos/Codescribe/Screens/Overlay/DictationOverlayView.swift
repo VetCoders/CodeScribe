@@ -399,7 +399,16 @@ struct DictationOverlayView: View {
         CSIconView(icon: .error, size: 18, weight: .regular)
           .foregroundStyle(CSColor.terracotta)
         VStack(alignment: .leading, spacing: 2) {
-          Text(state.errorMessage ?? "Transcription failed")
+          // "Transcription failed" is only true when there is nothing to show.
+          // A take whose words exist but whose handover did not land is a
+          // delivery failure, and saying otherwise buries a recoverable
+          // transcript under a verdict about the audio.
+          Text(
+            state.errorMessage
+              ?? (state.retainedComposerDelivery != nil
+                ? "Delivery interrupted — the transcript is still here"
+                : state.activeText.isEmpty ? "Transcription failed" : "Delivery interrupted")
+          )
             .csFont(15, .medium)
             .foregroundStyle(palette.bodyText.color)
             .fixedSize(horizontal: false, vertical: true)

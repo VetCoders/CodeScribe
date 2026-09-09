@@ -134,6 +134,20 @@ pub struct UserRevisionIntent {
     pub provenance: DocumentRevisionProvenance,
 }
 
+/// One terminal document offered for exactly one paid formatter pass.
+///
+/// Produced only by [`TranscriptReducer::terminal_formatter_request`]. An empty
+/// or whitespace-only turn produces no request at all, so "format nothing" is
+/// an absent provider call rather than a refused one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalFormatterRequest {
+    pub session_id: String,
+    /// Compare-and-swap revision the formatter result must be admitted against.
+    pub source_revision: u64,
+    /// Exact committed bytes handed to the provider.
+    pub source_text: String,
+}
+
 /// Rust-authored acknowledgement for one committed user revision. Swift uses
 /// this only as request status; visible text still arrives through projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +455,30 @@ impl TranscriptReducer {
     ) -> Result<String, UserRevisionRefusal> {
         self.authenticated_revision_occurrences(session_id, source_revision)?;
         Ok(self.committed_rendered_text())
+    }
+
+    /// The single paid formatter pass a one-turn take is owed at terminal
+    /// processing, or `None` when there is nothing to format: no committed
+    /// document, not yet terminal, or an empty/whitespace-only turn.
+    ///
+    /// Read-only. It authenticates nothing and mints nothing; it hands the
+    /// controller the exact bytes plus the CAS pair the result must be admitted
+    /// against, so the one formatter corridor stays
+    /// [`Self::terminal_revision_source`] → provider → `apply_formatter_revision`.
+    pub fn terminal_formatter_request(&self) -> Option<TerminalFormatterRequest> {
+        if !self.terminal {
+            return None;
+        }
+        let session_id = self.document_by_occurrence.keys().next()?.session.clone();
+        let source_text = self.committed_rendered_text();
+        if source_text.trim().is_empty() {
+            return None;
+        }
+        Some(TerminalFormatterRequest {
+            session_id,
+            source_revision: self.revision,
+            source_text,
+        })
     }
 
     /// The Light+ revision this terminal document is owed, or `None` when
@@ -898,6 +936,22 @@ impl PresentationEmitter {
             .terminal_revision_source(session_id, source_revision)
     }
 
+    /// The one paid formatter pass this terminal take is owed, if any.
+    ///
+    /// Literal delivery keeps its contract: a raw take is never reshaped, so it
+    /// asks for no provider call at all. Everything else is decided by the
+    /// reducer — no committed document, not terminal yet, or an empty turn all
+    /// mean no request, and therefore no provider call to skip afterwards.
+    pub fn terminal_formatter_request(&self) -> Option<TerminalFormatterRequest> {
+        if self.literal_delivery() {
+            return None;
+        }
+        self.session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .terminal_formatter_request()
+    }
+
     /// Admit only a successful formatter result into the existing revision
     /// corridor. Failure, skipped policy, and healthy no-op are visible
     /// refusals and therefore mint no ledger/history/Copy-last evidence.
@@ -1192,10 +1246,13 @@ impl EventSink for PresentationEmitter {
 /// does not compile or execute them under the W2 embargo.
 #[cfg(test)]
 mod tests {
-    use super::{PresentationEmitter, TranscriptReducer, UserRevisionIntent, UserRevisionRefusal};
+    use super::{
+        PresentationEmitter, TerminalFormatterRequest, TranscriptReducer, UserRevisionCommit,
+        UserRevisionIntent, UserRevisionRefusal,
+    };
     use crate::presentation::transcript_bus::{
-        TranscriptBus, TranscriptBusEvidenceEvent, TranscriptMode, TranscriptProjectionPhase,
-        TranscriptSession, TranscriptSessionEndReason,
+        TranscriptBus, TranscriptBusEvidenceEvent, TranscriptDelivery, TranscriptMode,
+        TranscriptProjectionPhase, TranscriptSession, TranscriptSessionEndReason,
     };
     use crate::presentation::transcript_projection::TranscriptProjectionReader;
     use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
@@ -1351,7 +1408,7 @@ mod tests {
         emitter.on_event(&mutation);
         emitter.finish().await;
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("committed book must produce a terminal projection");
 
         assert_eq!(delivery.lock().await.as_str(), "Iwo");
@@ -1523,7 +1580,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
 
         let commit = emitter
@@ -1669,7 +1726,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
 
         let source = emitter
@@ -1826,7 +1883,7 @@ mod tests {
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -1944,7 +2001,7 @@ mod tests {
             receipt: terminal_seal,
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true)
+            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -2174,6 +2231,47 @@ mod tests {
         (ledger, reducer, occurrence)
     }
 
+    /// rc-w2-composer-turn: a one-turn take is offered to the provider exactly
+    /// once, and an empty turn is never offered at all.
+    ///
+    /// The count that matters is the number of *requests*, so this asserts the
+    /// request itself rather than a call counter bolted beside it: no request
+    /// means the controller issues no provider call.
+    #[test]
+    fn terminal_formatter_request_is_one_exact_cas_pair_for_a_nonempty_turn() {
+        let (_ledger, mut reducer, _occurrence) = open_formatter_frontier();
+
+        assert!(
+            reducer.terminal_formatter_request().is_none(),
+            "a take that has not reached terminal owes no formatting"
+        );
+
+        reducer.mark_terminal_lifecycle();
+        let request = reducer
+            .terminal_formatter_request()
+            .expect("a terminal nonempty turn is owed exactly one formatting pass");
+        assert_eq!(request.session_id, "formatter-session");
+        assert_eq!(request.source_revision, reducer.revision);
+        assert_eq!(request.source_text, reducer.committed_rendered_text());
+        assert_eq!(
+            reducer
+                .terminal_revision_source(&request.session_id, request.source_revision)
+                .expect("the request must authenticate against the CAS pair it carries"),
+            request.source_text
+        );
+    }
+
+    #[test]
+    fn terminal_formatter_request_is_absent_for_an_empty_turn() {
+        let mut reducer = TranscriptReducer::default();
+        reducer.mark_terminal_lifecycle();
+
+        assert!(
+            reducer.terminal_formatter_request().is_none(),
+            "an empty turn must produce no provider call to refuse afterwards"
+        );
+    }
+
     #[test]
     fn preserve_refuse_and_empty_propose_return_formatter_without_fake_observation() {
         for (disposition, proposed_label) in [
@@ -2237,5 +2335,34 @@ mod tests {
         assert_eq!(ledger.text_of(&occurrence), Some("Iwo!"));
         assert_eq!(ledger.qualified_occurrences().count(), qualified_before);
         assert_eq!(reducer.document_by_occurrence.len(), 1);
+    }
+
+    /// Acceptance: both emitter request/acknowledgement types keep the derives
+    /// their doc comments promise.
+    ///
+    /// An attribute inserted between a doc comment and its struct stranded
+    /// `UserRevisionCommit`'s derives onto the type that followed it, which also
+    /// gave that type two identical `derive` attributes. Neither defect is
+    /// visible by reading either declaration alone. This exercises `Debug`,
+    /// `Clone` and `PartialEq` on both, so the compiler answers the question.
+    #[test]
+    fn the_emitter_request_and_commit_types_keep_their_declared_derives() {
+        let request = TerminalFormatterRequest {
+            session_id: "derive-session".to_string(),
+            source_revision: 3,
+            source_text: "one turn".to_string(),
+        };
+        assert_eq!(request.clone(), request);
+        assert!(format!("{request:?}").contains("derive-session"));
+
+        let commit = UserRevisionCommit {
+            session_id: "derive-session".to_string(),
+            source_revision: 3,
+            revision: 4,
+            rendered_text: "one turn.".to_string(),
+            provenance_receipt: "formatter-derive".to_string(),
+        };
+        assert_eq!(commit.clone(), commit);
+        assert!(format!("{commit:?}").contains("formatter-derive"));
     }
 }

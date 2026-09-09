@@ -51,6 +51,7 @@ use crate::audio::capture_receipt::{
     CaptureLevelAccumulator, CapturePathMeta, begin_session_energy_clock,
     emit_capture_level_receipt, session_active_speech_ranges,
 };
+use crate::audio::streaming_recorder::CaptureTurnIntent;
 use crate::config::{FormattingPolicy, RuntimeSettingsSnapshot};
 use crate::llm::ai_formatting::{
     AiFormatResult, AiFormatStatus, format_text_with_status_for_policy,
@@ -420,6 +421,27 @@ const fn formatter_lane_is_armed(
     ai_formatting_enabled && !matches!(policy, FormattingPolicy::Off) && lane_available
 }
 
+/// Whether *this take* may open a paid formatter slot while it is still live.
+///
+/// The configuration predicate above answers "is a formatter reachable at all";
+/// this one adds the only other question the worker has: does the gesture that
+/// opened the microphone want per-occurrence formatting as it happens?
+///
+/// A one-turn composer take answers no. It is not deduplicated downstream and
+/// it is not counted and discarded — the sender simply never exists, so
+/// `schedule_formatter_after_terminal_label` cannot reserve a permit and no
+/// `Formatter` observer is ever scheduled on the ledger frontier. The turn is
+/// formatted once at terminal processing by the controller instead.
+const fn live_formatter_lane_is_armed(
+    capture_turn: CaptureTurnIntent,
+    ai_formatting_enabled: bool,
+    policy: FormattingPolicy,
+    lane_available: bool,
+) -> bool {
+    capture_turn.schedules_live_formatting()
+        && formatter_lane_is_armed(ai_formatting_enabled, policy, lane_available)
+}
+
 /// Surface one Layer 1 lane degrade as a counts-only warning event.
 ///
 /// The message is the typed reason token and nothing else — no transcript,
@@ -528,6 +550,7 @@ pub(crate) async fn apple_stream_transcription_session(
         language,
         stream_log_path,
         utterance_silence_sec,
+        capture_turn,
         layer1,
         mut lifecycle_events,
         terminal_audio,
@@ -617,7 +640,8 @@ pub(crate) async fn apple_stream_transcription_session(
     // Formatting consumes only facts frozen into this exact per-take snapshot.
     // Arming the transport does not schedule a ledger observer; a concrete
     // occurrence must acquire a bounded queue permit first.
-    let formatter_on = formatter_lane_is_armed(
+    let formatter_on = live_formatter_lane_is_armed(
+        capture_turn,
         runtime_settings.values().ai_formatting_enabled,
         runtime_settings.formatting_policy(),
         runtime_settings
@@ -625,6 +649,12 @@ pub(crate) async fn apple_stream_transcription_session(
             .formatting()
             .request_available(),
     );
+    if !capture_turn.schedules_live_formatting() {
+        info!(
+            "One-turn capture: the live formatter lane stays unarmed for this take, so no \
+             silence-delimited fragment can open a paid provider slot"
+        );
+    }
     let mut formatter_jobs = FuturesOrdered::<BoxFuture<'static, FormatterCompletion>>::new();
     let formatter_runtime_settings = Arc::clone(&runtime_settings);
     let formatter_language = language.clone();
@@ -8201,5 +8231,58 @@ mod rc_w2_test_rehab {
         assert_eq!(count_iwo(&document(&state)), 5);
         assert_eq!(raw_finals(&drain(&mut rx)).iter().map(|text| count_iwo(text)).sum::<usize>(), 5);
         assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+    }
+}
+
+/// rc-w2-composer-turn: the live paid-formatter arming seam.
+///
+/// Deliberately its own module. The file's main `mod tests` carries a large
+/// parked surface; a falsifier for a new production owner must not inherit that
+/// state, and must not be silently disabled with it.
+#[cfg(test)]
+mod composer_turn_formatter_arming_tests {
+    use super::{CaptureTurnIntent, FormattingPolicy, live_formatter_lane_is_armed};
+
+    /// Every configuration that would arm the live lane for a hands-free take.
+    const FULLY_ARMED: (bool, FormattingPolicy, bool) = (true, FormattingPolicy::Correction, true);
+
+    #[test]
+    fn a_one_turn_take_never_arms_the_live_formatter_lane() {
+        let (enabled, policy, available) = FULLY_ARMED;
+        assert!(
+            !live_formatter_lane_is_armed(CaptureTurnIntent::SingleTurn, enabled, policy, available),
+            "a composer turn must not open paid provider slots per sealed fragment, \
+             even with formatting fully enabled, a non-Off policy and a live lane"
+        );
+    }
+
+    #[test]
+    fn a_hands_free_take_keeps_its_existing_live_lane() {
+        let (enabled, policy, available) = FULLY_ARMED;
+        assert!(
+            live_formatter_lane_is_armed(CaptureTurnIntent::HandsFree, enabled, policy, available),
+            "hotkey, tray and overlay takes keep the per-occurrence formatter they had"
+        );
+    }
+
+    /// The intent is an additional refusal, never a way to arm a lane the
+    /// configuration itself refuses.
+    #[test]
+    fn hands_free_cannot_arm_a_lane_the_configuration_refuses() {
+        for (enabled, policy, available) in [
+            (false, FormattingPolicy::Correction, true),
+            (true, FormattingPolicy::Off, true),
+            (true, FormattingPolicy::Correction, false),
+        ] {
+            assert!(
+                !live_formatter_lane_is_armed(
+                    CaptureTurnIntent::HandsFree,
+                    enabled,
+                    policy,
+                    available
+                ),
+                "capture intent must not override formatter configuration or transport ownership"
+            );
+        }
     }
 }

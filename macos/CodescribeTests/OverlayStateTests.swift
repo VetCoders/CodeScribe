@@ -217,6 +217,8 @@ final class OverlayStateTests: XCTestCase {
     canRetranscribe: Bool = false,
     canFormat: Bool = false,
     terminal: Bool = false,
+    lifecycleTerminal: Bool? = nil,
+    delivery: CsTranscriptDelivery = .unattempted,
     includesWordEvidence: Bool = true,
     sessionId: String = "overlay-state-tests",
     reducerRevision: UInt64? = nil,
@@ -273,9 +275,247 @@ final class OverlayStateTests: XCTestCase {
         canRetranscribe: canRetranscribe,
         canFormat: canFormat,
         terminal: terminal,
+        lifecycleTerminal: lifecycleTerminal ?? terminal,
+        delivery: delivery,
         acousticReceipts: [receipt]
       )
     )
+  }
+
+  // W2 contracts: synthetic projections enter the production boundary; unrun
+  // until the integrator restores Swift gates and regenerates the bindings.
+  func testComposerCallbackCarriesTheProjectionSessionIdentity() {
+    let state = OverlayState()
+    var identities: [String] = []
+    state.onComposerTranscript = { _, sessionID in
+      identities.append(sessionID)
+      return .admitted(threadID: UUID())
+    }
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "B", reducerAction: "session_ended")
+    projectText("same", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    XCTAssertEqual(identities, ["A", "B"])
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "B")
+  }
+
+  func testMissingReceiverRecoverySurvivesNewSessionAndDeduplicatesIdentityOnly() {
+    let state = OverlayState()
+    let text = "  identical\t🙂  "
+    for sessionID in ["A", "A", "B", "A"] {
+      projectText(text, to: state, terminal: true, delivery: .composerPending,
+        sessionId: sessionID, reducerAction: "session_ended")
+    }
+    XCTAssertEqual(state.retainedComposerDelivery, text + "\n" + text)
+    state.onComposerTranscript = { _, _ in .admitted(threadID: UUID()) }
+    projectText(text, to: state, terminal: true, delivery: .composerPending,
+      sessionId: "A", reducerAction: "session_ended")
+    XCTAssertEqual(state.retainedComposerDelivery, text)
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "B")
+  }
+
+  func testFirstObservedComposerTerminalAdmitsExactBytesOnce() throws {
+    for receipt in [
+      ComposerDeliveryReceipt.admitted(threadID: UUID()),
+      ComposerDeliveryReceipt.parked(threadID: UUID()),
+    ] {
+      let state = OverlayState()
+      let text = "  Zażółć\nrepeat repeat\t🙂  "
+      var received: [String] = []
+      state.onComposerTranscript = { text, _ in
+        received.append(text)
+        return receipt
+      }
+
+      projectText(text, to: state, terminal: true, delivery: .composerPending,
+        sessionId: "S", reducerAction: "session_ended")
+      let terminal = try XCTUnwrap(state.latestTranscriptProjection)
+      state.applyTranscriptProjection(terminal)
+
+      XCTAssertEqual(received.count, 1)
+      XCTAssertEqual(received.first.map { Array($0.utf8) }, Array(text.utf8))
+      XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+      XCTAssertNil(state.retainedComposerDelivery)
+    }
+  }
+
+  func testNewSessionFirstTerminalReplacesPriorReceiptWithoutDuplicateAdmission() throws {
+    let state = OverlayState()
+    var received: [String] = []
+    state.onComposerTranscript = { text, _ in
+      received.append(text)
+      return .admitted(threadID: UUID())
+    }
+    projectText("prior R", to: state, terminal: true, delivery: .composerPending,
+      sessionId: "R", reducerAction: "session_ended")
+    state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+
+    let text = "  new S\nS  "
+    projectText(text, to: state, terminal: true, delivery: .composerPending,
+      sessionId: "S", reducerAction: "session_ended")
+    state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+
+    XCTAssertEqual(received, ["prior R", text])
+    XCTAssertEqual(Array(state.activeText.utf8), Array(text.utf8))
+    XCTAssertNil(state.retainedComposerDelivery)
+  }
+
+  func testFirstTerminalMissingOrRefusingReceiverRetainsBytesAndAllowsAdmissionRetry() throws {
+    for hasPriorSession in [false, true] {
+      for hasReceiver in [false, true] {
+        let state = OverlayState()
+        if hasPriorSession {
+          state.onComposerTranscript = { _, _ in .admitted(threadID: UUID()) }
+          projectText("prior R", to: state, terminal: true, delivery: .composerPending,
+            sessionId: "R", reducerAction: "session_ended")
+        }
+        var refused: [String] = []
+        state.onComposerTranscript = nil
+        if hasReceiver {
+          state.onComposerTranscript = { text, _ in
+            refused.append(text)
+            return .retained(text)
+          }
+        }
+        let text = "  refused S\nrepeat repeat\t🙂  "
+        projectText(text, to: state, phase: "error", terminal: true,
+          delivery: .composerPending, sessionId: "S", reducerAction: "session_ended")
+        let terminal = try XCTUnwrap(state.latestTranscriptProjection)
+        XCTAssertEqual(state.retainedComposerDelivery.map { Array($0.utf8) }, Array(text.utf8))
+        state.applyTranscriptProjection(terminal)
+        XCTAssertEqual(state.retainedComposerDelivery.map { Array($0.utf8) }, Array(text.utf8))
+        XCTAssertEqual(refused, hasReceiver ? [text, text] : [])
+
+        var admitted: [String] = []
+        state.onComposerTranscript = { text, _ in
+          admitted.append(text)
+          return .admitted(threadID: UUID())
+        }
+        state.applyTranscriptProjection(terminal)
+        state.applyTranscriptProjection(terminal)
+        XCTAssertEqual(admitted, [text], "refusal must not consume admission")
+        XCTAssertNil(state.retainedComposerDelivery)
+      }
+    }
+  }
+
+  func testFirstTerminalDisposesDeliveryBeforeStoppedClearsCaptureOwner() throws {
+    for accepts in [false, true] {
+      let state = OverlayState()
+      // Capture callbacks can precede the first transcript projection.
+      state.handleRecordingStarted()
+      let owner = UUID()
+      var captureOwner: UUID? = owner
+      var order: [String] = []
+      state.onComposerTranscript = { text, _ in
+        XCTAssertEqual(captureOwner, owner)
+        order.append("delivery")
+        return accepts ? .admitted(threadID: owner) : .retained(text)
+      }
+      state.onRecordingStopped = { [weak state] in
+        order.append("stopped")
+        if !accepts { XCTAssertEqual(state?.retainedComposerDelivery, "S words") }
+        captureOwner = nil
+      }
+      projectText("S words", to: state, terminal: true, delivery: .composerPending,
+        sessionId: "S", reducerAction: "session_ended")
+      XCTAssertEqual(order, ["delivery", "stopped"])
+      XCTAssertNil(captureOwner)
+      if accepts {
+        state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+        XCTAssertEqual(order, ["delivery", "stopped"])
+      }
+    }
+  }
+
+  func testDocumentRevisionBeforeLifecycleTerminalPreservesDeliveryAndStoppedOrder() throws {
+    for manualReceipt in ["user-edit-test-1", "formatter-test-1"] {
+      let state = OverlayState()
+      state.handleRecordingStarted()
+      let owner = UUID()
+      var captureOwner: UUID? = owner
+      var order: [String] = []
+      state.onComposerTranscript = { text, _ in
+        XCTAssertEqual(captureOwner, owner)
+        XCTAssertEqual(text, "revised S")
+        order.append("delivery")
+        return .admitted(threadID: owner)
+      }
+      state.onRecordingStopped = {
+        order.append("stopped")
+        captureOwner = nil
+      }
+      projectText("revised S", to: state, terminal: true, lifecycleTerminal: false,
+        sessionId: "S", reducerAction: "apply_manual_edit", manualEditReceipt: manualReceipt)
+      XCTAssertTrue(order.isEmpty)
+      XCTAssertEqual(captureOwner, owner)
+      XCTAssertTrue(state.audioReady, "a document revision does not release capture")
+      XCTAssertEqual(state.activeText, "revised S")
+
+      projectText("revised S", to: state, terminal: true, delivery: .composerPending,
+        sessionId: "S", reducerAction: "session_ended")
+      state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+      XCTAssertEqual(order, ["delivery", "stopped"])
+      XCTAssertNil(captureOwner)
+      XCTAssertFalse(state.audioReady)
+    }
+  }
+
+  func testFirstAndDuplicateComposerTerminalsNeverAutoSendAtElapsedDeadline() async throws {
+    for receiverKind in ["missing", "refused", "admitted", "parked", "empty"] {
+      let clock = OverlayStateTestClock()
+      let engine = OverlayStateTestEngine()
+      let state = OverlayState(nowProvider: { clock.now })
+      state.engine = engine
+      state.applyIndicatorMode(.assistive)
+      state.handleRecordingStarted()
+      if receiverKind != "missing" {
+        state.onComposerTranscript = { text, _ in
+          switch receiverKind {
+          case "admitted": return .admitted(threadID: UUID())
+          case "parked": return .parked(threadID: UUID())
+          case "empty": return .empty
+          default: return .retained(text)
+          }
+        }
+      }
+      let text = receiverKind == "empty" ? "" : "S words"
+      projectText(text, to: state, terminal: true, delivery: .composerPending,
+        sessionId: "S", reducerAction: "session_ended")
+      let terminal = try XCTUnwrap(state.latestTranscriptProjection)
+      for _ in 0..<2 {
+        clock.now += OverlayState.autoHideDelaySeconds
+        state.fireAutoHideNowForTests()
+        // Drain the MainActor task that an erroneous auto-send would enqueue.
+        await Task { @MainActor in }.value
+        XCTAssertTrue(engine.sentAssistiveTexts.isEmpty)
+        state.applyTranscriptProjection(terminal)
+      }
+    }
+  }
+
+  func testEmptyAndNonComposerTerminalsDoNotConsumeComposerAdmission() throws {
+    for delivery in [CsTranscriptDelivery.unattempted, .sinkAccepted, .retained, .composerPending] {
+      let state = OverlayState()
+      var received: [String] = []
+      state.onComposerTranscript = { text, _ in
+        received.append(text)
+        return .admitted(threadID: UUID())
+      }
+      let initialText = delivery == .composerPending ? " \n\t " : "sink words"
+      projectText(initialText, to: state, terminal: true, delivery: delivery,
+        sessionId: "S", reducerAction: "session_ended")
+      state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+      XCTAssertTrue(received.isEmpty)
+      XCTAssertNil(state.retainedComposerDelivery)
+
+      projectText("actual composer words", to: state, terminal: true, delivery: .composerPending,
+        sessionId: "S", reducerAction: "session_ended")
+      state.applyTranscriptProjection(try XCTUnwrap(state.latestTranscriptProjection))
+      XCTAssertEqual(received, ["actual composer words"])
+    }
   }
 
   private func refusalStatus() -> CsPresentationStatusEvent {
@@ -1830,6 +2070,8 @@ final class OverlayStateTests: XCTestCase {
         canRetranscribe: terminal,
         canFormat: !terminal,
         terminal: terminal,
+        lifecycleTerminal: terminal,
+        delivery: .unattempted,
         acousticReceipts: [receipt]
       )
     )

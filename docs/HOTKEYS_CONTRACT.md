@@ -37,6 +37,41 @@ committed-text correction, and transcript publication. Only downstream UI and
 delivery differ. Assistive keeps the Dictation overlay closed; a process-wide
 start gate prevents any competing recorder from opening.
 
+### Agent composer mic (a capture gesture, not a hotkey)
+
+The composer microphone button is **not** an assistive toggle. Until
+rc-w2-composer-turn it called `start_assistive_recording`, so the take inherited
+the hands-free lane wholesale: trailing silence past `toggle_silence_sec` closed
+an utterance epoch, and each sealed fragment could open its own paid formatter
+slot. A two-minute composer take therefore behaved as a stream of five-second
+epochs with several provider calls behind it.
+
+The composer now calls `CodescribeHotkeys.start_composer_turn_recording`, which
+carries a per-take `CaptureTurnIntent::SingleTurn` from the button, through the
+bridge, into the controller's pipeline configuration. Everything else is shared:
+one `RecordingController`, one recorder, one `AcousticLedger`, one
+`PresentationEmitter`. What differs is exactly two facts:
+
+- **Epochs.** `CaptureTurnIntent::SingleTurn` asks the recorder for
+  `utterance_silence_sec: None` — the pipeline's legacy contract of one
+  continuous stream for the whole take. Silence never ends the take; only an
+  explicit stop does. This rests the *engine lifecycle*, not the VAD: Silero
+  segmentation, ledger qualification and Layer 1 tail repair run unchanged.
+- **Formatting.** The live per-occurrence formatter lane is never armed for a
+  one-turn take (`live_formatter_lane_is_armed`), so no silence-delimited
+  fragment can reserve a provider slot. The turn is instead formatted once at
+  terminal processing, through the same
+  `terminal_revision_source` → provider → `apply_formatter_revision` corridor as
+  the explicit overlay formatter. An empty turn issues no request at all.
+
+Ownership is a composer fact, not a global one. `AgentChatStore` latches
+`dictationThreadID` at the gesture; the composer press stops only a take it
+owns. A live hotkey, tray or overlay dictation reads as busy and is never ended
+by a composer press. `ToggleNormal`, `ToggleAssistive` and both hold gestures
+keep `CaptureTurnIntent::HandsFree` and their existing behaviour; the intent is
+reset to hands-free between takes, so a composer turn cannot leak into the next
+hands-free one.
+
 **Thread routing (operator contract 2026-08-13).** An assistive turn always
 lands in the thread the Agent rail currently has selected — the thread the
 user is looking at. The rail publishes every selection change through
