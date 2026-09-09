@@ -5,7 +5,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEMUX="$ROOT/scripts/bus-demux.py"
 INSTALL_GUARD="$ROOT/scripts/install-if-idle.sh"
-TEST_ROOT="$(mktemp -d)"
+# Supply the parent in the template: bare mktemp may choose a platform default.
+TEST_TMP_PARENT="${TMPDIR:-/tmp}"
+TEST_ROOT="$(mktemp -d "${TEST_TMP_PARENT%/}/transcript-bus-path.XXXXXXXX")"
 LOCK_HOLDER_PID=""
 GUARD_PID=""
 # Cancellation is fixture-local data, never a PID/name/process-group kill.

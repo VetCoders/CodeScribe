@@ -15,7 +15,7 @@ import tempfile
 import time
 
 root = Path(sys.argv[1])
-sandbox = Path(tempfile.mkdtemp(prefix="codescribe-cleanup-"))
+sandbox = Path(tempfile.mkdtemp(prefix="codescribe cleanup "))
 (sandbox / "home").mkdir()
 (sandbox / "tmp").mkdir()
 # Do not inherit a real dotenv, Bus, lock path or fake-make protocol.
@@ -24,6 +24,29 @@ env = {
     "TMPDIR": str(sandbox / "tmp"),
     "PATH": str(Path(shutil.which("python3")).parent) + os.pathsep + os.defpath,
 }
+
+# Require an explicit parent even on hosts where bare mktemp honors TMPDIR.
+# The shim validates arguments, then uses the real utility to allocate; the
+# readiness assertion below independently checks the actual resolved parent.
+real_mktemp = shutil.which("mktemp", path=env["PATH"])
+assert real_mktemp is not None
+allocation_bin = sandbox / "allocation bin"
+allocation_bin.mkdir()
+allocator = allocation_bin / "mktemp"
+allocator.write_text("""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+
+if (len(sys.argv) != 3 or sys.argv[1] != "-d"
+        or not Path(sys.argv[2]).is_absolute()
+        or Path(sys.argv[2]).parent.resolve() != Path(os.environ["TMPDIR"]).resolve()):
+    print("explicit-parent regression: missing or foreign template parent", file=sys.stderr)
+    raise SystemExit(65)
+os.execv(""" + repr(real_mktemp) + """, ["mktemp", *sys.argv[1:]])
+""")
+allocator.chmod(0o700)
+env["PATH"] = str(allocation_bin) + os.pathsep + env["PATH"]
 
 
 def ready_line(process, timeout=15):
@@ -58,6 +81,13 @@ completed = 0
 safe_to_remove = True
 try:
     assert ready_line(sentinel) == "sentinel-ready"
+    # Negative controls allocate nothing, including in the unowned parent.
+    for arguments in (("-d",), ("-d", "/tmp/foreign.XXXXXXXX")):
+        rejected = subprocess.run([str(allocator), *arguments], env=env,
+                                  capture_output=True, text=True, timeout=5)
+        assert rejected.returncode == 65 and not rejected.stdout, rejected
+        assert "explicit-parent regression" in rejected.stderr, rejected.stderr
+    print("cleanup-regression: explicit-parent negative-controls=2", flush=True)
     for name, expected in scenarios:
         fixture = None
         owned = []
