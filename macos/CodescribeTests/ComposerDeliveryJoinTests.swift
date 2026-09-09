@@ -36,6 +36,8 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     var stopOutcome: CsConditionalStop = .stopped
     var stopThrows = false
     var onQuery: (@MainActor @Sendable () -> Void)?
+    var onStart: (@MainActor @Sendable () async -> Void)?
+    var onStop: (@MainActor @Sendable () async -> Void)?
     private(set) var calls: [CaptureCall] = []
 
     init(recording: [Bool]) { self.recordingAnswers = recording }
@@ -50,11 +52,13 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
     func startComposerTurnRecording() async throws -> CsCaptureHandle {
       calls.append(.startComposerTurn)
+      await onStart?()
       return CsCaptureHandle(captureId: admittedCaptureId)
     }
 
     func stopComposerTurnRecording(handle: CsCaptureHandle) async throws -> CsConditionalStop {
       calls.append(.stop(handle.captureId))
+      await onStop?()
       if stopThrows { throw CaptureFailure.transport }
       return stopOutcome
     }
@@ -417,7 +421,8 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertFalse(f.store.ownsLiveDictation)
     XCTAssertFalse(f.store.hasComposerCaptureRequest)
     XCTAssertNil(f.store.composerCaptureHandle)
-    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["early text"])
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
+    XCTAssertEqual(f.store.draft, "early text")
   }
 
   func testRecoveryRetriesAndIdenticalDistinctTakesKeepExactDocumentsUntilExplicitAction() throws {
@@ -485,19 +490,17 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
   }
 
-  func testRealAdapterRegistersHandleBeforePostStartQueryCanDeliverTerminal() async {
+  func testRealAdapterJoinsTerminalThatArrivesBeforeStartAcknowledgment() async {
     let f = makeFixture(recording: [false, true])
     let state = OverlayState()
     state.connectComposer(to: f.store)
-    f.surface.onQuery = { [self] in
-      if f.store.composerCaptureHandle?.captureId == "capture-A" {
-        sessionEnded("during query", to: state, sessionId: "capture-A")
-      }
+    f.surface.onStart = { [self] in
+      sessionEnded("before acknowledgment", to: state, sessionId: "capture-A")
     }
     f.dictation.toggle()
     await settle(f)
-    f.surface.onQuery = nil
-    XCTAssertEqual(f.store.draft, "during query")
+    f.surface.onStart = nil
+    XCTAssertEqual(f.store.draft, "before acknowledgment")
     XCTAssertFalse(f.store.ownsLiveDictation)
     XCTAssertNil(f.store.composerCaptureHandle)
     XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
@@ -525,9 +528,8 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
   // MARK: Acceptance 3 — recovery without a blind timer
 
-  /// A stop whose transport failed leaves the destination intact, and the next
-  /// press reconciles against the controller's own answer rather than a timer.
-  func testFailedStopIsReconciledByTheNextGestureNotByATimeout() async {
+  /// A false query is not a terminal receipt, including after transport failure.
+  func testFailedStopCannotBeReconciledByFalseRecordingTelemetry() async {
     let f = makeFixture(recording: [false, true, true, false, false])
     f.dictation.toggle()
     await settle(f)
@@ -539,33 +541,170 @@ final class ComposerDeliveryJoinTests: XCTestCase {
       f.store.dictationThreadID, f.threadA, "a failed stop keeps the pending destination")
     XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
 
-    // The terminal never arrives. The user presses again; the controller reports
-    // idle, which is the fact the request is released against.
+    let calls = f.surface.calls
     f.surface.stopThrows = false
     f.dictation.toggle()
     await settle(f)
 
     XCTAssertEqual(
-      f.surface.calls.filter { $0 == .startComposerTurn }.count, 2,
-      "the surface must be usable again after a stop that never terminated")
+      f.surface.calls, calls,
+      "the pending request must not query or start again")
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    sessionEnded("eventual words", to: state, sessionId: "capture-A")
+    XCTAssertEqual(f.store.draft, "eventual words")
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
   }
 
   /// A start still in flight is never replaced by a second press. Reconciliation
   /// applies only once stop permission has been spent.
   func testAPendingStartIsNotReplacedByASecondPress() async {
     let f = makeFixture(recording: [false, false, false])
-
+    let gate = Gate(expectation(description: "start awaiting admission"))
+    f.surface.onStart = { await gate.wait() }
     f.dictation.toggle()
-    await settle(f)
+    await fulfillment(of: [gate.entered], timeout: 1)
     XCTAssertTrue(f.store.hasComposerCaptureRequest)
-    XCTAssertFalse(f.store.ownsLiveDictation, "an idle reply completes no start")
+    XCTAssertFalse(f.store.ownsLiveDictation, "no admitted handle yet")
 
     f.dictation.toggle()
+    gate.release()
     await settle(f)
 
     XCTAssertEqual(
       f.surface.calls.filter { $0 == .startComposerTurn }.count, 1,
       "a request that never spent stop permission still blocks a replacement")
+  }
+
+  @MainActor
+  private final class Gate {
+    let entered: XCTestExpectation
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    init(_ entered: XCTestExpectation) { self.entered = entered }
+    func wait() async {
+      guard !released else { return }
+      await withCheckedContinuation { continuation in
+        continuations.append(continuation)
+        if continuations.count == 1 { entered.fulfill() }
+      }
+    }
+    func release() {
+      released = true
+      let pending = continuations
+      continuations.removeAll()
+      for continuation in pending { continuation.resume() }
+    }
+  }
+
+  func testFailureBannerExpiryKeepsPendingPresentationAndOriginalDelivery() async {
+    let f = makeFixture(recording: [false])
+    let expiry = Gate(expectation(description: "banner clock registered"))
+    f.store.waitForDictationFailureExpiry = { await expiry.wait() }
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.stopThrows = true
+    f.dictation.toggle()
+    await settle(f)
+    await fulfillment(of: [expiry.entered], timeout: 1)
+    let bannerTask = f.store.dictationFailureTask
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    expiry.release()
+    await bannerTask?.value
+    XCTAssertEqual(f.store.dictationPhase, .preparing)
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    let calls = f.surface.calls
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, calls)
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    sessionEnded("  A exact words  ", to: state, sessionId: "capture-A")
+    sessionEnded("  A exact words  ", to: state, sessionId: "capture-A")
+    XCTAssertEqual(f.store.draft, "B typed")
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "  A exact words  ")
+  }
+
+  func testStaleStopRepliesAndFailuresCannotRepaintOrReleaseSuccessor() async {
+    let outcomes: [CsConditionalStop?] = [.stopped, .foreignCapture, .noLiveCapture, .alreadyStopping, .pending, .admissionUnavailable, nil]
+    for outcome in outcomes {
+      let f = makeFixture(recording: [false])
+      f.dictation.toggle()
+      await settle(f)
+      let stop = Gate(expectation(description: "old Stop held"))
+      f.surface.onStop = { await stop.wait() }
+      f.surface.stopThrows = outcome == nil
+      f.surface.stopOutcome = outcome ?? .stopped
+      f.dictation.toggle()
+      await fulfillment(of: [stop.entered], timeout: 1)
+      let state = OverlayState()
+      state.connectComposer(to: f.store)
+      sessionEnded("old words", to: state, sessionId: "capture-A")
+      f.store.select(f.threadB)
+      f.store.draft = "new draft"
+      admitCapture(f.store, threadID: f.threadB, id: "successor")
+      stop.release()
+      await settle(f)
+      XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "successor")
+      XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+      XCTAssertEqual(f.store.dictationPhase, .recording)
+      XCTAssertEqual(f.store.draft, "new draft")
+      XCTAssertTrue(f.store.ownsLiveDictation)
+    }
+  }
+
+  func testStaleFailureBannerCannotPaintIdleOverSuccessor() async {
+    let f = makeFixture(recording: [false])
+    let expiry = Gate(expectation(description: "old failure expiry registered"))
+    f.store.waitForDictationFailureExpiry = { await expiry.wait() }
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.stopThrows = true
+    f.dictation.toggle()
+    await settle(f)
+    await fulfillment(of: [expiry.entered], timeout: 1)
+    let oldBanner = f.store.dictationFailureTask
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    sessionEnded("A", to: state, sessionId: "capture-A")
+    f.surface.admittedCaptureId = "successor"
+    f.store.select(f.threadB)
+    f.dictation.toggle()
+    await settle(f)
+    expiry.release()
+    await oldBanner?.value
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "successor")
+    XCTAssertEqual(f.store.dictationPhase, .recording)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+  }
+
+  func testEarlyTerminalJoinsInitiatingThreadAfterAcknowledgedStartBarrier() async {
+    let f = makeFixture(recording: [false])
+    let start = Gate(expectation(description: "start reply held"))
+    f.surface.onStart = { await start.wait() }
+    f.dictation.toggle()
+    await fulfillment(of: [start.entered], timeout: 1)
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    f.store.select(f.threadB)
+    f.store.draft = "B draft"
+    sessionEnded("early A", to: state, sessionId: "capture-A")
+    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["early A"])
+    f.dictation.toggle()
+    start.release()
+    await settle(f)
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.draft, "B draft")
+    XCTAssertTrue(f.store.composerRecoveryDocuments.isEmpty)
+    sessionEnded("early A", to: state, sessionId: "capture-A")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "early A")
+    XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
   }
 
   // MARK: Acceptance 5 — presentation terminal is not delivery terminal

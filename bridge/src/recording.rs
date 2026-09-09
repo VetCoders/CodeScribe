@@ -125,6 +125,10 @@ pub enum CsConditionalStop {
     NoLiveCapture,
     /// This capture is already inside its own stop path. Not stopped twice.
     AlreadyStopping,
+    /// A tracked controller task still owes settlement. Keep capture ownership.
+    Pending,
+    /// No task was admitted. Keep the handle; an explicit retry is safe.
+    AdmissionUnavailable,
 }
 
 /// Passive, typed product status from Rust presentation authority. This is a
