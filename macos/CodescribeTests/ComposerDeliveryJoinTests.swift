@@ -212,12 +212,13 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     lifecycleTerminal: Bool,
     delivery: CsTranscriptDelivery,
     reducerAction: String,
-    manualEditReceipt: String? = nil
+    manualEditReceipt: String? = nil,
+    presentationReceipt: CsProjectedPresentationReceipt? = nil
   ) {
     nextSequence += 1
     let sequence = nextSequence
-    let sampleStart = (sequence - 1) * 16_000
-    let sampleEnd = sequence * 16_000
+    let sampleStart = presentationReceipt?.sampleStart ?? (sequence - 1) * 16_000
+    let sampleEnd = presentationReceipt?.sampleEnd ?? sequence * 16_000
     let receipt = CsProjectedAcousticReceipt(
       acousticSerialVersion: 1,
       acousticSerial: "join-acoustic-\(sequence)",
@@ -234,8 +235,9 @@ final class ComposerDeliveryJoinTests: XCTestCase {
       evidenceCalibrationVersion: "test-v1",
       wordEvidenceReceipts: ["join-word-\(sequence)"],
       layerDecisionReceipts: ["join-layer-\(sequence)"],
-      sealReceipt: terminal ? "join-seal-\(sequence)" : nil,
-      manualEditReceipt: manualEditReceipt
+      sealReceipt: presentationReceipt?.sourceSealReceipt ?? (terminal ? "join-seal-\(sequence)" : nil),
+      manualEditReceipt: manualEditReceipt,
+      presentationReceipt: presentationReceipt
     )
     state.applyTranscriptProjection(
       CsTranscriptProjectionEvent(
@@ -291,6 +293,49 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     project(
       text, to: state, sessionId: sessionId, phase: "formatted", terminal: true,
       lifecycleTerminal: true, delivery: delivery, reducerAction: "session_ended")
+  }
+
+  /// Synthetic receiver fixture. Rust's nonempty ledger/Bus mapping test proves
+  /// minting; this test proves that presentation provenance cannot settle capture.
+  func testIncrementalLightProofStaysListeningUntilOneOwnedLifecycleDelivery() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "join-session")
+    f.store.select(f.threadA)
+    f.store.draft = "typed"
+    var stopped = 0
+    state.onRecordingStopped = { stopped += 1 }
+    let proof = CsProjectedPresentationReceipt(
+      receiptId: "fixture-light-plus-1", provenance: "light-plus", sessionId: "join-session",
+      sourceRevision: 0, revision: 1, captureEpoch: 1, sampleStart: 0, sampleEnd: 16_000,
+      sourceSealReceipt: "fixture-occurrence-seal-1", sourceLabel: "pierwsze zdanie",
+      leftContext: "", leftContextSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      shapedText: "Pierwsze zdanie.")
+    project("Pierwsze zdanie.", to: state, phase: "listening", terminal: false,
+      lifecycleTerminal: false, delivery: .unattempted, reducerAction: "apply_incremental_shaping",
+      presentationReceipt: proof)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "join-session")
+    XCTAssertEqual(f.store.draft, "typed")
+    XCTAssertEqual(stopped, 0)
+    XCTAssertEqual(state.latestTranscriptProjection?.acousticReceipts.first?.presentationReceipt, proof)
+    XCTAssertNil(state.latestTranscriptProjection?.acousticReceipts.first?.manualEditReceipt)
+    project("Pierwsze zdanie. dalsze słowa", to: state, phase: "listening", terminal: false,
+      lifecycleTerminal: false, delivery: .unattempted, reducerAction: "apply_ledger_decision",
+      presentationReceipt: proof)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.draft, "typed")
+    XCTAssertEqual(stopped, 0)
+    sessionEnded("Pierwsze zdanie. dalsze słowa", to: state)
+    let delivered = f.store.draft
+    let stoppedOnce = stopped
+    XCTAssertEqual(stoppedOnce, 1)
+    sessionEnded("Pierwsze zdanie. dalsze słowa", to: state)
+    XCTAssertEqual(delivered, "typed\nPierwsze zdanie. dalsze słowa")
+    XCTAssertEqual(f.store.draft, delivered)
+    XCTAssertEqual(stopped, stoppedOnce)
+    XCTAssertFalse(f.store.ownsLiveDictation)
   }
 
   // MARK: Acceptance 1 — capture identity, atomically checked

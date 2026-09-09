@@ -18,6 +18,7 @@ use codescribe_core::pipeline::acoustic_ledger::{
     TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
@@ -64,6 +65,8 @@ pub struct TranscriptDocumentEntry {
     pub layer_decision_receipts: Vec<String>,
     pub seal_receipt: Option<String>,
     pub manual_edit_receipt: Option<String>,
+    /// Presentation provenance, distinct from acoustic and human-edit evidence.
+    pub presentation_receipt: Option<IncrementalShapingReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +130,86 @@ pub struct TranscriptRevision {
     pub rendered_text: String,
     pub seal_coverage: Option<SealCoverageReceipt>,
     pub comparison: Option<TranscriptComparisonReceipt>,
+    // In-process reducer capability, never deserialized or exported as acoustic
+    // evidence. Detects edits to any public snapshot field before publication.
+    publication_digest: [u8; 32],
+}
+
+impl TranscriptRevision {
+    fn digest(&self) -> [u8; 32] {
+        Sha256::digest(format!("{:?}", (
+            &self.schema, self.revision, &self.action, &self.entries,
+            &self.rendered_text, &self.seal_coverage, &self.comparison,
+        )).as_bytes()).into()
+    }
+
+    /// Validate the complete reducer-minted snapshot before any observer or
+    /// delivery side effect. The Bus calls this; it never reconstructs text.
+    pub(crate) fn authenticates_publication(&self, ledger: &AcousticLedger, session: &str) -> bool {
+        if self.publication_digest != self.digest()
+            || self.entries.is_empty()
+            || self.entries.windows(2).any(|pair| pair[0].occurrence >= pair[1].occurrence)
+        {
+            return false;
+        }
+        let mut left_context = String::new();
+        for entry in &self.entries {
+            if entry.occurrence.session != session
+                || ledger.serial_of(&entry.occurrence).is_none()
+                || ledger.text_of(&entry.occurrence) != Some(entry.label.as_str())
+                || entry.seal_receipt.as_ref().is_some_and(|id| {
+                    !ledger.authenticates_seal_reference(&entry.occurrence, id)
+                })
+            {
+                return false;
+            }
+            let presentation = if let Some(receipt) = &entry.presentation_receipt {
+                if receipt.occurrence != entry.occurrence
+                    || receipt.session_id != session
+                    || receipt.source_label != entry.label
+                    || receipt.revision > self.revision
+                    || receipt.source_revision.checked_add(1) != Some(receipt.revision)
+                    || receipt.left_context != left_context
+                    || receipt.left_context_sha256 != format!("{:x}", Sha256::digest(left_context.as_bytes()))
+                    || !ledger.incremental_shapings().contains(receipt)
+                    || ledger.seal_of(&entry.occurrence).is_none_or(|seal| {
+                        seal.receipt_id != receipt.source_seal_receipt
+                    })
+                {
+                    return false;
+                }
+                receipt.shaped_text.as_str()
+            } else {
+                entry.label.as_str()
+            };
+            append_exact_fragment(&mut left_context, presentation);
+        }
+        match &self.action {
+            ReducerAction::RecordLedgerSeal { occurrence, seal_receipt, terminal } => {
+                ledger.seal_receipt(seal_receipt).is_some_and(|seal| {
+                    seal.is_occurrence_seal() != *terminal
+                        && seal.sealed_occurrences.first() == Some(occurrence)
+                        && seal.sealed_occurrences.iter().all(|sealed| {
+                            self.entries.iter().any(|entry| &entry.occurrence == sealed)
+                        })
+                })
+            }
+            ReducerAction::ApplyIncrementalShaping { receipt } => self.entries.iter().any(|entry| {
+                entry.presentation_receipt.as_ref() == Some(receipt)
+                    && receipt.revision == self.revision
+            }),
+            ReducerAction::ApplyUserRevision { receipt } => {
+                ledger.manual_document_revisions().contains(receipt)
+                    && receipt.session_id == session
+                    && receipt.revision == self.revision
+                    && receipt.source_revision.checked_add(1) == Some(self.revision)
+                    && receipt.rendered_text == self.rendered_text
+                    && receipt.source_occurrences == self.entries.iter()
+                        .map(|entry| entry.occurrence.clone()).collect::<Vec<_>>()
+            }
+            _ => true,
+        }
+    }
 }
 
 /// A UI request to replace one exact terminal reducer revision.
@@ -270,12 +353,7 @@ impl std::error::Error for IncrementalShapingRefusal {}
 /// derived from. Keeping the source label is what makes a stale shape visible:
 /// when a later observer relabels the occurrence the shape no longer describes
 /// the committed words, and the reducer drops it instead of rendering a lie.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ShapedPresentation {
-    source_label: String,
-    text: String,
-    receipt_id: String,
-}
+type ShapedPresentation = IncrementalShapingReceipt;
 
 /// The one committed Rust document plus explicitly non-authoritative UI paint.
 /// Only `document_by_occurrence` can produce a committed revision. The preview
@@ -299,6 +377,19 @@ pub struct TranscriptReducer {
     manual_rendered_text: Option<String>,
     manual_document_revision_receipt: Option<String>,
     terminal: bool,
+    observed_seals: std::collections::BTreeSet<String>,
+    applied_observations: Vec<ObservationIdentity>,
+}
+
+/// Preserve fragment bytes; only an absent inter-occurrence separator is added.
+fn append_exact_fragment(rendered: &mut String, fragment: &str) {
+    if !rendered.is_empty() && !fragment.is_empty()
+        && !rendered.ends_with(char::is_whitespace)
+        && !fragment.starts_with(char::is_whitespace)
+    {
+        rendered.push(' ');
+    }
+    rendered.push_str(fragment);
 }
 
 /// Trim a fragment's outer edges. Interior whitespace and newlines survive —
@@ -342,13 +433,16 @@ impl TranscriptReducer {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        for entry in &mut entries {
+            entry.presentation_receipt = self.shaped_by_occurrence.get(&entry.occurrence).cloned();
+        }
         if let Some(receipt) = &self.manual_document_revision_receipt {
             for entry in &mut entries {
                 entry.manual_edit_receipt = Some(receipt.clone());
             }
         }
         let rendered_text = self.committed_rendered_text();
-        TranscriptRevision {
+        let mut snapshot = TranscriptRevision {
             schema: "codescribe.transcript-revision.v1".to_string(),
             revision: self.revision,
             action,
@@ -356,7 +450,10 @@ impl TranscriptReducer {
             rendered_text,
             seal_coverage: self.latest_seal_coverage.clone(),
             comparison: self.latest_comparison.clone(),
-        }
+            publication_digest: [0; 32],
+        };
+        snapshot.publication_digest = snapshot.digest();
+        snapshot
     }
 
     /// Apply only the mutation authority granted by the shared ledger. An
@@ -368,7 +465,18 @@ impl TranscriptReducer {
         observation: &ObservationIdentity,
         receipt: &MutationReceipt,
     ) -> Option<TranscriptRevision> {
-        if !receipt.grants_mutation() || !ledger.is_qualified(&observation.occurrence) {
+        if !receipt.grants_mutation() || !ledger.is_qualified(&observation.occurrence)
+            || self.document_by_occurrence.keys().next().is_some_and(|first| {
+                first.session != observation.occurrence.session
+            })
+        {
+            return None;
+        }
+        if self.applied_observations.contains(observation)
+            || !ledger.layer_trail_for(&observation.occurrence).any(|decision| {
+                decision.observation == *observation && decision.decision == *receipt
+            })
+        {
             return None;
         }
         let serial = ledger.serial_of(&observation.occurrence)?;
@@ -384,6 +492,7 @@ impl TranscriptReducer {
         self.manual_rendered_text = None;
         self.manual_document_revision_receipt = None;
         let entry = TranscriptDocumentEntry {
+            presentation_receipt: None,
             occurrence: observation.occurrence.clone(),
             label: ledger.text_of(&observation.occurrence)?.to_string(),
             observation_receipt: format!(
@@ -430,11 +539,13 @@ impl TranscriptReducer {
         }
         self.document_by_occurrence
             .insert(observation.occurrence.clone(), entry.clone());
+        self.invalidate_stale_shapes();
         let action = if observation.producer == ObservationProducer::ManualHuman {
             ReducerAction::ApplyManualEdit { entry }
         } else {
             ReducerAction::ApplyLedgerDecision { entry }
         };
+        self.applied_observations.push(observation.clone());
         Some(self.revision_for_action(action))
     }
 
@@ -449,12 +560,20 @@ impl TranscriptReducer {
         {
             return None;
         }
+        if self.observed_seals.contains(&receipt.receipt_id)
+            || receipt.sealed_occurrences.iter().any(|occurrence| {
+                !self.document_by_occurrence.contains_key(occurrence)
+            })
+        {
+            return None;
+        }
         for occurrence in &receipt.sealed_occurrences {
             if let Some(entry) = self.document_by_occurrence.get_mut(occurrence) {
                 entry.seal_receipt = Some(receipt.receipt_id.clone());
             }
         }
         let occurrence = receipt.sealed_occurrences.first()?.clone();
+        self.observed_seals.insert(receipt.receipt_id.clone());
         let terminal = !receipt.is_occurrence_seal();
         if terminal {
             self.terminal = true;
@@ -568,7 +687,9 @@ impl TranscriptReducer {
             .ok_or(IncrementalShapingRefusal::UnknownOccurrence)?
             .session
             .clone();
-        if occurrence.session != session_id {
+        if occurrence.session != session_id || self.document_by_occurrence.keys()
+            .any(|entry| entry.session != session_id)
+        {
             return Err(IncrementalShapingRefusal::ForeignSession);
         }
         if self
@@ -577,6 +698,13 @@ impl TranscriptReducer {
             .is_some_and(|shaped| shaped.source_label == source_label)
         {
             return Err(IncrementalShapingRefusal::AlreadyShaped);
+        }
+        // Do not shape against a known open predecessor: it can still change.
+        // On every closure the emitter revisits the complete sealed prefix.
+        if self.document_by_occurrence.keys().take_while(|key| *key < occurrence)
+            .any(|key| !ledger.is_sealed(key))
+        {
+            return Err(IncrementalShapingRefusal::LedgerRefusal("incremental_shaping_left_context_open"));
         }
         let left_context = self.rendered_occurrence_span(Some(occurrence));
         let shaped = codescribe_core::pipeline::light_plus::apply_with_left_context(
@@ -609,12 +737,9 @@ impl TranscriptReducer {
             .map_err(IncrementalShapingRefusal::LedgerRefusal)?;
         self.shaped_by_occurrence.insert(
             occurrence.clone(),
-            ShapedPresentation {
-                source_label,
-                text: shaped,
-                receipt_id: receipt.receipt_id.clone(),
-            },
+            receipt.clone(),
         );
+        self.invalidate_stale_shapes();
         Ok(self.revision_for_action(ReducerAction::ApplyIncrementalShaping { receipt }))
     }
 
@@ -689,10 +814,9 @@ impl TranscriptReducer {
         })
     }
 
-    /// Open terminal review only after the engine lifecycle has finished. This
-    /// carries no text and mints no reducer revision; it closes the one-
-    /// occurrence ambiguity where a whole-session seal has the same physical
-    /// coverage shape as its sole occurrence seal.
+    /// Mark terminal review lifecycle without text or a new reducer revision.
+    /// Ledger seal scope independently opens terminal CAS before this event;
+    /// cardinality has no finality meaning. Edit admission still checks seals.
     fn mark_terminal_lifecycle(&mut self) {
         self.terminal = true;
     }
@@ -820,16 +944,25 @@ impl TranscriptReducer {
             if until.is_some_and(|limit| occurrence == limit) {
                 break;
             }
-            let presentation = self.presentation_of(occurrence, entry).trim();
-            if presentation.is_empty() {
-                continue;
-            }
-            if !rendered.is_empty() {
-                rendered.push(' ');
-            }
-            rendered.push_str(presentation);
+            append_exact_fragment(&mut rendered, self.presentation_of(occurrence, entry));
         }
         rendered
+    }
+
+    /// Drop dependent shapes when insertion/relabel changes their exact left
+    /// context. Historical ledger receipts remain immutable and inspectable.
+    fn invalidate_stale_shapes(&mut self) {
+        let mut left = String::new();
+        for (occurrence, entry) in &self.document_by_occurrence {
+            if self.shaped_by_occurrence.get(occurrence).is_some_and(|shape| {
+                shape.source_label != entry.label || shape.left_context != left
+            }) {
+                self.shaped_by_occurrence.remove(occurrence);
+            }
+            let text = self.shaped_by_occurrence.get(occurrence)
+                .map(|shape| shape.shaped_text.as_str()).unwrap_or(&entry.label);
+            append_exact_fragment(&mut left, text);
+        }
     }
 
     /// The presentation bytes for one entry: its committed shape while that
@@ -840,7 +973,7 @@ impl TranscriptReducer {
         entry: &'entry TranscriptDocumentEntry,
     ) -> &'entry str {
         match self.shaped_by_occurrence.get(occurrence) {
-            Some(shaped) if shaped.source_label == entry.label => shaped.text.as_str(),
+            Some(shaped) if shaped.source_label == entry.label => shaped.shaped_text.as_str(),
             _ => entry.label.as_str(),
         }
     }
@@ -1041,17 +1174,34 @@ impl PresentationEmitter {
         }
     }
 
+    fn authenticates_revision(&self, revision: &TranscriptRevision, ledger: &AcousticLedger) -> bool {
+        let Some(first) = revision.entries.first() else {
+            return false;
+        };
+        let session = self.transcript_bus.as_ref().map(|bus| bus.session_id())
+            .unwrap_or(&first.occurrence.session);
+        revision.authenticates_publication(ledger, session)
+    }
+
     fn publish_revision(&self, revision: TranscriptRevision) {
         if let Some(ledger) = &self.acoustic_ledger {
             let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+            if !self.authenticates_revision(&revision, &ledger) {
+                return;
+            }
             if let Some(bus) = &self.transcript_bus {
                 let events = bus.publish_revision(&revision, &ledger);
+                if events.is_empty() {
+                    return;
+                }
                 if let Some(callback) = &self.projection_callback {
                     for event in &events {
                         callback(event);
                     }
                 }
             }
+        } else {
+            return;
         }
         self.send_cmd(EmitterCmd::PublishCommittedRevision(revision.rendered_text));
     }
@@ -1085,8 +1235,14 @@ impl PresentationEmitter {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .apply_user_revision(ledger, &intent)?;
+        if !self.authenticates_revision(&revision, ledger) {
+            return Err(UserRevisionRefusal::LedgerRefusal("publication_authentication_failed"));
+        }
         if let Some(bus) = &self.transcript_bus {
             let events = bus.publish_revision(&revision, ledger);
+            if events.is_empty() {
+                return Err(UserRevisionRefusal::LedgerRefusal("bus_publication_refused"));
+            }
             if let Some(callback) = &self.projection_callback {
                 for event in &events {
                     callback(event);
@@ -1154,12 +1310,17 @@ impl PresentationEmitter {
     fn mint_incremental_light_plus(
         &self,
         ledger: &mut AcousticLedger,
-        occurrences: &[OccurrenceIdentity],
+        _occurrences: &[OccurrenceIdentity],
     ) {
         if self.literal_delivery() {
             return;
         }
-        for occurrence in occurrences {
+        let occurrences = self.session_state.lock().unwrap_or_else(|error| error.into_inner())
+            .document_by_occurrence.keys().cloned().collect::<Vec<_>>();
+        for occurrence in &occurrences {
+            if !ledger.is_sealed(occurrence) {
+                break;
+            }
             let shaped = {
                 let mut reducer = self
                     .session_state
@@ -1169,8 +1330,14 @@ impl PresentationEmitter {
             };
             match shaped {
                 Ok(revision) => {
+                    if !self.authenticates_revision(&revision, ledger) {
+                        continue;
+                    }
                     if let Some(bus) = &self.transcript_bus {
                         let events = bus.publish_revision(&revision, ledger);
+                        if events.is_empty() {
+                            continue;
+                        }
                         if let Some(callback) = &self.projection_callback {
                             for event in &events {
                                 callback(event);
@@ -1277,8 +1444,14 @@ impl EventSink for PresentationEmitter {
                     .unwrap_or_else(|error| error.into_inner())
                     .apply_ledger_mutation(&ledger, observation, receipt);
                 if let Some(revision) = revision {
+                    if !self.authenticates_revision(&revision, &ledger) {
+                        return;
+                    }
                     if let Some(bus) = &self.transcript_bus {
                         let events = bus.publish_revision(&revision, &ledger);
+                        if events.is_empty() {
+                            return;
+                        }
                         if let Some(callback) = &self.projection_callback {
                             for event in &events {
                                 callback(event);
@@ -1303,6 +1476,9 @@ impl EventSink for PresentationEmitter {
                     return;
                 };
                 let mut ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+                if !ledger.authenticates_seal(receipt) {
+                    return;
+                }
                 let revision = self
                     .session_state
                     .lock()
@@ -1311,12 +1487,18 @@ impl EventSink for PresentationEmitter {
                 let Some(revision) = revision else {
                     return;
                 };
+                if !self.authenticates_revision(&revision, &ledger) {
+                    return;
+                }
                 let terminal = matches!(
                     revision.action,
                     ReducerAction::RecordLedgerSeal { terminal: true, .. }
                 );
                 if let Some(bus) = &self.transcript_bus {
                     let events = bus.publish_revision(&revision, &ledger);
+                    if events.is_empty() {
+                        return;
+                    }
                     if let Some(callback) = &self.projection_callback {
                         for event in &events {
                             callback(event);
@@ -1390,8 +1572,14 @@ impl EventSink for PresentationEmitter {
                             revision.map(|revision| (is_label_revision, revision))
                         })
                 {
+                    if !self.authenticates_revision(&revision, &ledger) {
+                        continue;
+                    }
                     if let Some(bus) = &self.transcript_bus {
                         let events = bus.publish_revision(&revision, &ledger);
+                        if events.is_empty() {
+                            continue;
+                        }
                         if let Some(callback) = &self.projection_callback {
                             for event in &events {
                                 callback(event);
@@ -1548,7 +1736,8 @@ mod tests {
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
-    use tokio::sync::Mutex;
+    use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingDeltaSink {
@@ -2122,10 +2311,8 @@ mod tests {
             )
             .unwrap(),
         );
-        // Two occurrences, so `seal_terminal` covers more than one range and is
-        // unambiguously terminal. A one-occurrence session produces a receipt
-        // whose coverage shape is identical to its sole occurrence seal — that
-        // ambiguity is the live-shaping path and has its own test below.
+        // Preserve the two-occurrence terminal beside the single-occurrence
+        // falsifier. Explicit scope, never cardinality, identifies both.
         let occurrence = OccurrenceIdentity::new("light-plus-session", 6, 0, 16_000);
         let tail_occurrence = OccurrenceIdentity::new("light-plus-session", 6, 16_000, 32_000);
         let ledger = Arc::new(StdMutex::new(AcousticLedger::new()));
@@ -2895,6 +3082,13 @@ mod tests {
             "shaped prefix preserved, open suffix byte-exact"
         );
 
+        let retained = take.projected.lock().unwrap().iter().rev()
+            .find(|event| event.reducer_revision == open_projection.reducer_revision && event.document_index == 0)
+            .unwrap().acoustic_receipts[0].presentation_receipt.clone().unwrap();
+        assert_eq!(retained.receipt_id, after_first[0].receipt_id);
+        assert_eq!(retained.source_revision, after_first[0].source_revision);
+        assert_eq!(retained.shaped_text, after_first[0].shaped_text);
+        assert!(open_projection.acoustic_receipts[0].presentation_receipt.is_none());
         take.seal(&second);
         take.emitter.finish().await;
 
@@ -2926,7 +3120,7 @@ mod tests {
         let mut take = live_take("open-suffix-session");
         let closed = OccurrenceIdentity::new("open-suffix-session", 13, 0, 16_000);
         let open = OccurrenceIdentity::new("open-suffix-session", 13, 16_000, 32_000);
-        let open_words = "jeszcze mowie i nie skonczylem";
+        let open_words = "  jeszcze mowie i nie skonczylem\n\t";
 
         take.admit(&closed, 1, "pierwsza czesc juz zamknieta");
         take.seal(&closed);
@@ -2977,7 +3171,10 @@ mod tests {
         assert_eq!(shapings[0].occurrence, first);
         assert_eq!(shapings[1].occurrence, second);
         assert_ne!(shapings[0].receipt_id, shapings[1].receipt_id);
-        assert_eq!(take.shaping_projections().len(), 2);
+        let rows = take.shaping_projections();
+        assert_eq!(rows.len(), 3, "one first-entry row, then two document-entry rows");
+        assert_eq!(rows.iter().map(|row| row.reducer_revision)
+            .collect::<std::collections::BTreeSet<_>>().len(), 2);
     }
 
     /// Acceptance: a duplicate seal observation mints no second revision and no
@@ -2989,11 +3186,17 @@ mod tests {
 
         take.admit(&occurrence, 1, "raz powiedziane zdanie");
         let seal_event = take.seal(&occurrence);
+        let revision_before = take.emitter.session_state.lock().unwrap().revision;
+        let callbacks_before = take.projected.lock().unwrap().len();
+        let bus_before = std::fs::read(&take.bus_path).unwrap();
 
         take.emitter.on_event(&seal_event);
         take.emitter.on_event(&seal_event);
         take.emitter.finish().await;
 
+        assert_eq!(take.emitter.session_state.lock().unwrap().revision, revision_before);
+        assert_eq!(take.projected.lock().unwrap().len(), callbacks_before);
+        assert_eq!(std::fs::read(&take.bus_path).unwrap(), bus_before);
         assert_eq!(take.shapings().len(), 1, "one occurrence, one shaping");
         assert_eq!(
             take.shaping_projections().len(),
@@ -3038,7 +3241,7 @@ mod tests {
     async fn literal_delivery_keeps_live_occurrences_byte_exact() {
         let mut take = live_take("literal-live-session");
         let occurrence = OccurrenceIdentity::new("literal-live-session", 17, 0, 16_000);
-        let spoken = "slowa literalne bez kropki";
+        let spoken = "  surowe  słowa\n\t";
 
         take.emitter.set_literal_delivery(true);
         take.admit(&occurrence, 1, spoken);
@@ -3097,7 +3300,7 @@ mod tests {
     }
 
     /// Recovery falsifier: a real terminal is not identified by cardinality.
-    /// UNRUN under W2; the inherited `is_occurrence_seal` misclassifies this case.
+    /// UNRUN under W2; both receipt scope and pre-lifecycle CAS are exercised.
     #[tokio::test]
     async fn a_single_occurrence_terminal_opens_the_current_shaped_cas_source() {
         let mut take = live_take("single-terminal");
@@ -3105,7 +3308,15 @@ mod tests {
         take.admit(&occurrence, 1, "jedno zdanie");
         take.seal(&occurrence);
         let seal = take.ledger.lock().unwrap().seal_terminal("single-terminal", 19).unwrap();
+        assert_ne!(seal.receipt_id, take.ledger.lock().unwrap().seal_of(&occurrence).unwrap().receipt_id);
+        take.emitter.on_event(&EngineEvent::LedgerSeal { receipt: seal.clone() });
+        let revision = take.emitter.session_state.lock().unwrap().revision;
+        assert_eq!(take.emitter.terminal_revision_source("single-terminal", revision),
+            Ok("Jedno zdanie.".to_string()), "genuine terminal CAS opens before lifecycle end");
+        let callbacks = take.projected.lock().unwrap().len();
         take.emitter.on_event(&EngineEvent::LedgerSeal { receipt: seal });
+        assert_eq!(take.emitter.session_state.lock().unwrap().revision, revision);
+        assert_eq!(take.projected.lock().unwrap().len(), callbacks);
         take.emitter.on_event(&EngineEvent::SessionFinalised {
             session_id: "single-terminal".to_string(),
             layer_summary: LayerSummary::default(),
@@ -3191,6 +3402,10 @@ mod tests {
                 .source_text,
             shaped
         );
+        assert!(take.bus.publish_ended(TranscriptSessionEndReason::Completed,
+            true, TranscriptDelivery::Unattempted).is_none());
+        take.emitter.finish().await;
+        assert_eq!(take.delivery.lock().await.as_str(), shaped);
         assert!(
             take.shaping_projections()
                 .iter()
@@ -3267,8 +3482,8 @@ mod tests {
     /// Acceptance: a terminal whole-document revision keeps ownership of the
     /// presentation, and an occurrence seal never opens the terminal corridor.
     ///
-    /// Two occurrences make the epoch seal unambiguously terminal, which is the
-    /// only door to a user edit. Once that edit lands, a live shape addressed
+    /// The explicitly terminal epoch seal is the only door to a user edit.
+    /// This two-occurrence case complements the single-occurrence falsifier. Once that edit lands, a live shape addressed
     /// at one of its source occurrences is refused rather than allowed to
     /// overwrite part of the human's document.
     #[test]
@@ -3376,9 +3591,17 @@ mod tests {
             else {
                 panic!("admitted_mutation must produce a ledger mutation");
             };
-            reducer
-                .apply_ledger_mutation(&ledger, observation, receipt)
-                .expect("qualified observation commits");
+            let admitted = reducer.apply_ledger_mutation(&ledger, observation, receipt);
+            if occurrence == &native {
+                assert!(admitted.is_some());
+            } else {
+                assert!(admitted.is_none(), "a qualified foreign entry is refused at reducer admission");
+                // Preserve the predecessor's contaminated-document falsifier
+                // explicitly, without weakening production session admission.
+                let mut foreign_reducer = TranscriptReducer::default();
+                let foreign_revision = foreign_reducer.apply_ledger_mutation(&ledger, observation, receipt).unwrap();
+                reducer.document_by_occurrence.insert(foreign.clone(), foreign_revision.entries[0].clone());
+            }
             ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
             assert!(ledger.note_frontier_return(occurrence, ObservationProducer::Apple));
             ledger.seal(occurrence).expect("closed occurrence seals");
@@ -3388,6 +3611,9 @@ mod tests {
             reducer.apply_incremental_shaping(&mut ledger, &foreign),
             Err(IncrementalShapingRefusal::ForeignSession)
         );
+        assert_eq!(reducer.apply_incremental_shaping(&mut ledger, &native),
+            Err(IncrementalShapingRefusal::ForeignSession), "the entire contaminated document refuses");
+        reducer.document_by_occurrence.remove(&foreign);
         assert!(
             reducer
                 .apply_incremental_shaping(&mut ledger, &native)
@@ -3398,4 +3624,109 @@ mod tests {
         assert_eq!(shapings.len(), 1);
         assert_eq!(shapings[0].occurrence, native);
     }
+    #[tokio::test]
+    async fn late_predecessor_closure_shapes_in_document_order_with_immutable_context() {
+        let mut take = live_take("closure-order");
+        let first = OccurrenceIdentity::new("closure-order", 1, 0, 16_000);
+        let second = OccurrenceIdentity::new("closure-order", 1, 16_000, 32_000);
+        take.admit(&first, 1, "pierwsze zdanie");
+        take.admit(&second, 2, "drugie zdanie");
+        take.seal(&second);
+        assert!(take.shapings().is_empty(), "known open left context cannot authorize casing");
+        take.seal(&first);
+        take.emitter.finish().await;
+        let receipts = take.shapings();
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].occurrence, first);
+        assert_eq!(receipts[1].occurrence, second);
+        assert_eq!(receipts[1].left_context, "Pierwsze zdanie.");
+        assert_eq!(receipts[1].left_context_sha256,
+            format!("{:x}", Sha256::digest(b"Pierwsze zdanie.")));
+        assert_eq!(take.delivery.lock().await.as_str(), "Pierwsze zdanie. Drugie zdanie.");
+    }
+
+    #[tokio::test]
+    async fn late_predecessor_insertion_invalidates_retained_shape_without_rewriting_receipt() {
+        let mut take = live_take("late-insert");
+        let first = OccurrenceIdentity::new("late-insert", 1, 0, 16_000);
+        let second = OccurrenceIdentity::new("late-insert", 1, 16_000, 32_000);
+        take.admit(&second, 2, "drugie zdanie");
+        take.seal(&second);
+        let original = take.shapings()[0].clone();
+        take.admit(&first, 1, "pierwsze zdanie");
+        let revision = take.projected.lock().unwrap().last().unwrap().clone();
+        assert_eq!(revision.rendered_text, "pierwsze zdanie drugie zdanie");
+        assert!(revision.acoustic_receipts[0].presentation_receipt.is_none());
+        take.seal(&first);
+        take.emitter.finish().await;
+        assert_eq!(take.shapings()[0], original, "historical provenance never changes");
+        let receipts = take.shapings();
+        let current = receipts.last().unwrap();
+        assert_eq!(current.occurrence, second);
+        assert_ne!(current.receipt_id, original.receipt_id);
+        assert_eq!(current.left_context, "Pierwsze zdanie.");
+        assert_eq!(take.delivery.lock().await.as_str(), "Pierwsze zdanie. Drugie zdanie.");
+    }
+
+    #[tokio::test]
+    async fn unchanged_shape_and_late_observer_do_not_mint_publication() {
+        let mut take = live_take("unchanged-observer");
+        let occurrence = OccurrenceIdentity::new("unchanged-observer", 1, 0, 16_000);
+        take.admit(&occurrence, 1, "Already shaped.");
+        let seal = take.seal(&occurrence);
+        let before = take.emitter.session_state.lock().unwrap().revision;
+        let rows = take.projected.lock().unwrap().len();
+        let bytes = std::fs::read(&take.bus_path).unwrap();
+        let (observation, receipt) = {
+            let mut ledger = take.ledger.lock().unwrap();
+            let observation = ObservationIdentity::new(ObservationProducer::Whisper, 99, 0, occurrence);
+            let receipt = ledger.admit(&observation, "late rewrite");
+            assert!(!receipt.grants_mutation());
+            (observation, receipt)
+        };
+        take.emitter.on_event(&EngineEvent::LedgerMutation {
+            observation, receipt, label: "late rewrite".to_string(),
+        });
+        take.emitter.on_event(&seal);
+        take.emitter.finish().await;
+        assert_eq!(take.emitter.session_state.lock().unwrap().revision, before);
+        assert_eq!(take.projected.lock().unwrap().len(), rows);
+        assert_eq!(std::fs::read(&take.bus_path).unwrap(), bytes);
+        assert!(take.shapings().is_empty());
+        assert_eq!(take.delivery.lock().await.as_str(), "Already shaped.");
+    }
+
+    #[tokio::test]
+    async fn forged_snapshot_never_reaches_the_actual_delivery_worker() {
+        let mut take = live_take("delivery-forgery");
+        let occurrence = OccurrenceIdentity::new("delivery-forgery", 1, 0, 16_000);
+        take.admit(&occurrence, 1, "real words");
+        take.seal(&occurrence);
+        let mut revision = take.emitter.session_state.lock().unwrap()
+            .record_context_marker(0, "context").unwrap();
+        revision.rendered_text = "forged delivery".to_string();
+        let rows = take.projected.lock().unwrap().len();
+        take.emitter.publish_revision(revision);
+        take.emitter.finish().await;
+        assert_eq!(take.projected.lock().unwrap().len(), rows);
+        assert_eq!(take.delivery.lock().await.as_str(), "Real words.");
+    }
+
+    #[tokio::test]
+    async fn bus_refusal_cannot_update_only_the_delivery_buffer() {
+        let mut take = live_take("ended-publication");
+        let occurrence = OccurrenceIdentity::new("ended-publication", 1, 0, 16_000);
+        take.admit(&occurrence, 1, "real words");
+        take.seal(&occurrence);
+        take.bus.publish_ended(TranscriptSessionEndReason::Completed,
+            false, TranscriptDelivery::Unattempted).unwrap();
+        let revision = take.emitter.session_state.lock().unwrap()
+            .record_context_marker(0, "late context").unwrap();
+        let callbacks = take.projected.lock().unwrap().len();
+        take.emitter.publish_revision(revision);
+        take.emitter.finish().await;
+        assert_eq!(take.projected.lock().unwrap().len(), callbacks);
+        assert_eq!(take.delivery.lock().await.as_str(), "Real words.");
+    }
+
 }

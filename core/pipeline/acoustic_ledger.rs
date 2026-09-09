@@ -417,6 +417,7 @@ pub struct AcousticLedger {
     evidence: BTreeMap<OccurrenceIdentity, AcousticSerial>,
     frontiers: BTreeMap<OccurrenceIdentity, ObservationFrontier>,
     seals: BTreeMap<OccurrenceIdentity, LedgerSealReceipt>,
+    terminal_seals: Vec<LedgerSealReceipt>,
     trail: Vec<LayerDecisionReceipt>,
     manual_edits: Vec<ManualEditReceipt>,
     manual_document_revisions: Vec<ManualDocumentRevisionReceipt>,
@@ -966,7 +967,8 @@ impl AcousticLedger {
             return Err(SealRefusal::ObservationsWithoutReceipts);
         }
         Ok(LedgerSealReceipt {
-            receipt_id: Self::seal_id(occurrence),
+            receipt_id: Self::seal_id(LedgerSealScope::Occurrence, occurrence),
+            scope: LedgerSealScope::Occurrence,
             coverage: occurrence.clone(),
             sealed_occurrences: vec![occurrence.clone()],
             serials: vec![serial.clone()],
@@ -1043,15 +1045,42 @@ impl AcousticLedger {
         // `seal` above. It is not independent evidence and must not be read as
         // any.
         let frontier = ObservationFrontier::scheduled(coverage.clone(), Vec::new());
-        Ok(LedgerSealReceipt {
-            receipt_id: Self::seal_id(&coverage),
+        let receipt = LedgerSealReceipt {
+            receipt_id: Self::seal_id(LedgerSealScope::Terminal, &coverage),
+            scope: LedgerSealScope::Terminal,
             coverage,
             sealed_occurrences: in_epoch,
             serials,
             vad_close_sample: vad_close,
             frontier,
             layer_trail_ordinals: ordinals,
-        })
+        };
+        if !self.terminal_seals.contains(&receipt) {
+            self.terminal_seals.push(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    /// Compare the entire carrier with ledger-owned finality, never just its ID.
+    pub fn authenticates_seal(&self, receipt: &LedgerSealReceipt) -> bool {
+        match receipt.scope {
+            LedgerSealScope::Occurrence => self.seal_of(&receipt.coverage) == Some(receipt),
+            LedgerSealScope::Terminal => self.terminal_seals.contains(receipt),
+        }
+    }
+
+    /// Read-only lookup of an already minted scope-bearing receipt.
+    pub fn seal_receipt(&self, id: &str) -> Option<&LedgerSealReceipt> {
+        self.seals.values().chain(self.terminal_seals.iter())
+            .find(|seal| seal.receipt_id == id)
+    }
+
+    /// A projected finality reference must cover this exact occurrence.
+    pub fn authenticates_seal_reference(&self, occurrence: &OccurrenceIdentity, id: &str) -> bool {
+        self.seal_of(occurrence).is_some_and(|seal| seal.receipt_id == id)
+            || self.terminal_seals.iter().any(|seal| {
+                seal.receipt_id == id && seal.sealed_occurrences.contains(occurrence)
+            })
     }
 
     /// The seal held for one occurrence, if it is sealed.
@@ -1065,10 +1094,10 @@ impl AcousticLedger {
     }
 
     /// Deterministic seal identifier for a coverage.
-    fn seal_id(coverage: &OccurrenceIdentity) -> String {
+    fn seal_id(scope: LedgerSealScope, coverage: &OccurrenceIdentity) -> String {
         format!(
-            "seal-{}-{}-{}-{}",
-            coverage.session, coverage.capture_epoch, coverage.sample_start, coverage.sample_end
+            "seal-{}-{}-{}-{}-{}",
+            scope.as_str(), coverage.session, coverage.capture_epoch, coverage.sample_start, coverage.sample_end
         )
     }
 
@@ -1228,10 +1257,18 @@ impl AcousticLedger {
             .seal_of(occurrence)
             .map(|seal| seal.receipt_id.clone())
             .ok_or("incremental_shaping_seal_missing")?;
-        if self.incremental_shapings.iter().any(|held| {
+        if source_label == shaped_text {
+            return Err("incremental_shaping_unchanged");
+        }
+        if super::light_plus::apply_with_left_context(left_context, source_label) != shaped_text {
+            return Err("incremental_shaping_not_deterministic");
+        }
+        if self.incremental_shapings.iter().rev().find(|held| {
             &held.occurrence == occurrence
-                && held.source_label == source_label
+        }).is_some_and(|held| {
+            held.source_label == source_label
                 && held.shaped_text == shaped_text
+                && held.left_context == left_context
         }) {
             return Err("incremental_shaping_unchanged");
         }
@@ -1251,6 +1288,7 @@ impl AcousticLedger {
             occurrence: occurrence.clone(),
             source_seal_receipt,
             source_label: source_label.to_string(),
+            left_context: left_context.to_string(),
             left_context_sha256: format!("{:x}", Sha256::digest(left_context.as_bytes())),
             shaped_text: shaped_text.to_string(),
         };
@@ -2104,6 +2142,8 @@ pub struct IncrementalShapingReceipt {
     /// Exact committed label the shape was derived from. A later relabel makes
     /// the shape stale and detectable rather than silently wrong.
     pub source_label: String,
+    /// Exact historical context; its digest must never silently change.
+    pub left_context: String,
     /// Digest of the committed left neighbourhood the casing decision saw.
     pub left_context_sha256: String,
     /// Presentation bytes for this occurrence.
@@ -2218,6 +2258,22 @@ impl SealRefusal {
     }
 }
 
+/// Finality scope minted by the ledger; independent of occurrence count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerSealScope {
+    Occurrence,
+    Terminal,
+}
+
+impl LedgerSealScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Occurrence => "occurrence",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
 /// An immutable ledger fact: this coverage is finished.
 ///
 /// * inputs: the qualified serial, the VAD closing boundary, the closed
@@ -2232,12 +2288,14 @@ impl SealRefusal {
 ///   deciding finality themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LedgerSealReceipt {
+    /// Ledger-minted scope. Cardinality never determines finality.
+    pub scope: LedgerSealScope,
     /// Stable identifier for cross-referencing from a projection.
     pub receipt_id: String,
     /// Coordinate the seal covers.
     pub coverage: OccurrenceIdentity,
-    /// Occurrences the seal makes final. One for an occurrence seal, many for a
-    /// terminal session seal.
+    /// Occurrences the seal makes final: one for occurrence scope, one or more
+    /// for terminal scope. The length does not determine the scope.
     pub sealed_occurrences: Vec<OccurrenceIdentity>,
     /// Serials of those occurrences, in the same order.
     pub serials: Vec<AcousticSerial>,
@@ -2321,9 +2379,9 @@ impl LedgerSealReceipt {
         "sealed"
     }
 
-    /// Whether the seal covers exactly one occurrence.
+    /// Whether the ledger minted occurrence finality, including single-entry terminals.
     pub fn is_occurrence_seal(&self) -> bool {
-        self.sealed_occurrences.len() == 1
+        self.scope == LedgerSealScope::Occurrence
     }
 }
 
@@ -3403,4 +3461,41 @@ mod tests {
         );
         assert!(ledger.incremental_shapings().is_empty());
     }
+    #[test]
+    fn occurrence_and_single_terminal_have_distinct_authenticated_scope() {
+        let (mut ledger, occurrence) = sealed_for_shaping();
+        let ordinary = ledger.seal_of(&occurrence).unwrap().clone();
+        let terminal = ledger.seal_terminal("s1", 1).unwrap();
+        assert!(ordinary.is_occurrence_seal());
+        assert!(!terminal.is_occurrence_seal());
+        assert_eq!(terminal.sealed_occurrences, vec![occurrence]);
+        assert_ne!(ordinary.receipt_id, terminal.receipt_id);
+        assert!(ledger.authenticates_seal(&ordinary));
+        assert!(ledger.authenticates_seal(&terminal));
+        assert_eq!(ledger.seal_terminal("s1", 1).unwrap(), terminal);
+        assert_eq!(ledger.terminal_seals.len(), 1);
+        let mut forged = ordinary;
+        forged.scope = LedgerSealScope::Terminal;
+        assert!(!ledger.authenticates_seal(&forged));
+    }
+
+    #[test]
+    fn qualified_committed_open_source_and_non_deterministic_shape_are_refused() {
+        let (mut ledger, occurrence) = whisper_only_qualified_ledger();
+        let observation = obs(ObservationProducer::Whisper, 0, occurrence.clone());
+        assert!(ledger.admit(&observation, "jakieś słowa").grants_mutation());
+        assert!(ledger.is_qualified(&occurrence));
+        assert!(ledger.text_of(&occurrence).is_some());
+        assert!(!ledger.is_sealed(&occurrence));
+        assert_eq!(ledger.record_incremental_shaping("s1", 4, 5, &occurrence,
+            "jakieś słowa", "", "Jakieś słowa."),
+            Err("incremental_shaping_occurrence_not_sealed"));
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
+        ledger.seal(&occurrence).unwrap();
+        assert_eq!(ledger.record_incremental_shaping("s1", 4, 5, &occurrence,
+            "jakieś słowa", "", "Unrelated bytes."),
+            Err("incremental_shaping_not_deterministic"));
+        assert!(ledger.incremental_shapings().is_empty());
+    }
+
 }

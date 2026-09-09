@@ -181,7 +181,8 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       wordEvidenceReceipts: ["hang-word-evidence-\(sequence)"],
       layerDecisionReceipts: ["hang-layer-decision-\(sequence)"],
       sealReceipt: nil,
-      manualEditReceipt: nil
+      manualEditReceipt: nil,
+      presentationReceipt: nil
     )
     return CsTranscriptProjectionEvent(
       schema: "codescribe.transcript_projection.v1",
