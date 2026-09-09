@@ -141,6 +141,58 @@ adds context without replacing the typed processing error. The owned Stop slot
 retains the error for duplicate callers; the existing terminal epilogue ends the
 failed take once, without resetting a successor or claiming delivery.
 
+#### Controller WAV filesystem boundary (W2 source checkpoint, tests UNRUN)
+
+The controller opens the source once, refuses a symlink leaf, and checks the
+opened descriptor is a regular file before invoking any archive callback.
+Nonblocking open lets it reject a FIFO without waiting for a writer. Both WAV
+copies read that held descriptor, including when the source pathname is replaced
+between admission and copying. This pins file identity, not immutable contents:
+a process already able to write that inode can still change the recording.
+
+The configured root's existing parent is trusted configuration. Its resolution
+is performed once (allowing platform aliases such as `/var`); the resolved
+absolute components are then opened one at a time with `openat`, directory-only
+and no-follow flags. The root leaf and `sessions` directory are created/opened
+relative to held descriptors and cannot be symlinks. Parent traversal is refused;
+ancestors must already exist. The source's existing parent is resolved and
+opened the same way. This is no hard-coded home/temp prefix whitelist and does
+not authenticate a hostile replacement of a trusted directory by another real
+directory before admission.
+
+Root and sessions handles are retained before the daily callback. Each copy
+writes a fresh, exclusively created mode-0600 temporary inode in its pinned
+directory, syncs the file, then atomically replaces the destination entry with
+`renameat`. A destination symlink is replaced, never followed; a hardlink or the
+source's own name is replaced without truncating its inode. Repeated retention
+and latest-alias refresh remain supported. Renaming an admitted directory cannot
+redirect writes through its replacement symlink, though the saved file may then
+be reachable under the directory's new name. Logs identify the requested path,
+not a promise that its current pathname still reaches that pinned directory.
+
+Each admitted destination is attempted independently, including after daily
+archive failure or refusal of the sessions directory. Copy errors leave existing
+destination entries intact and attempt temporary-entry cleanup; cleanup failure
+is reported. Source validation failure refuses all retention. The original typed
+capture error and visible failure warning remain the consumer's result.
+
+**Separate boundary:** `archive_session_take` still calls `save_audio`, which
+passes source/destination pathnames to `encode_wav_to_m4a` / `afconvert`; on encode
+failure it removes that output path and uses `fs::copy` for the WAV fallback.
+History also writes transcript artifacts through its existing pathname API.
+These operations do not borrow the controller's pinned descriptors. Their path
+races, destination symlinks, and source replacement remain outside this repair;
+controller-copy guarantees are not end-to-end archive safety. This cut changes
+neither that owner nor its fallback. Tests inject that callback and prove no
+codec/runtime behavior until executed later.
+
+The filesystem model does not defend against arbitrary mutation by a process
+with the same account's directory privileges. A crash/panic can leave a temporary
+entry, directory entries are not fsynced for crash durability, and the two WAV
+publications are not one transaction. The synchronous archive callback still has
+no bounded cancellation/settlement guarantee. These remain integration/runtime
+obligations, not properties established by the security scan.
+
 For this new processing-failure path, committed text is **unavailable**: the
 producer's shared string has no revision/occurrence authentication attached to
 it. It is neither archived as speech nor delivered. The controller does not
