@@ -176,22 +176,68 @@ destination entries intact and attempt temporary-entry cleanup; cleanup failure
 is reported. Source validation failure refuses all retention. The original typed
 capture error and visible failure warning remain the consumer's result.
 
-**Separate boundary:** `archive_session_take` still calls `save_audio`, which
-passes source/destination pathnames to `encode_wav_to_m4a` / `afconvert`; on encode
-failure it removes that output path and uses `fs::copy` for the WAV fallback.
-History also writes transcript artifacts through its existing pathname API.
-These operations do not borrow the controller's pinned descriptors. Their path
-races, destination symlinks, and source replacement remain outside this repair;
-controller-copy guarantees are not end-to-end archive safety. This cut changes
-neither that owner nor its fallback. Tests inject that callback and prove no
-codec/runtime behavior until executed later.
+#### Daily archive filesystem and encoder boundary (W2 source checkpoint, tests UNRUN)
 
-The filesystem model does not defend against arbitrary mutation by a process
-with the same account's directory privileges. A crash/panic can leave a temporary
-entry, directory entries are not fsynced for crash durability, and the two WAV
-publications are not one transaction. The synchronous archive callback still has
-no bounded cancellation/settlement guarantee. These remain integration/runtime
-obligations, not properties established by the security scan.
+The daily callback now receives the same held source `File` used by the session
+and latest-alias copies. Public pathname APIs admit a regular, non-symlink WAV
+once, then delegate to this owner. No converter or fallback reopens its old
+pathname. Identity is pinned; concurrent writes to the admitted inode remain
+outside the guarantee.
+
+The root supplied by `Config::config_dir()` is trusted configuration; that API
+already canonicalizes an existing `CODESCRIBE_DATA_DIR` override, including its
+leaf alias. This cut does not authenticate the original override pathname. The
+supplied root's existing parent is resolved once, then walked with no-follow
+directory descriptors. Supplied root, `transcriptions`, and day
+leaves use `mkdirat`/`openat`; symlink directories are refused. Directory renames
+cannot redirect subsequent writes into replacement links. Returned/logged paths
+are requested locations, not authenticated claims that those pathnames still
+reach the admitted directories.
+
+One exclusively created reservation selects a common stem across `.m4a`, `.wav`
+and `.txt`, including standalone text saves. Existing entries, including dangling
+links and hardlinks, occupy a stem. Exhaustion fails instead of overwriting a
+base name. Audio and transcript are staged in fresh mode-0600 files and published
+with directory-relative, no-replace `linkat`. A late hostile destination entry
+causes refusal; it is never opened or removed. Paired same-second takes retain
+separate history rows; legacy text-only save families still collapse.
+
+Committed speech produces a raw audio/text pair; no-speech produces a failed
+pair with an empty marker and the fixed `(no speech)` title. Unavailable output
+produces audio only and never persists its diagnostic. If text publication fails
+after audio publication, audio remains and the operation reports failure. The
+legacy standalone `HistoryEntry` return type still cannot represent a write
+error: its path is an intended path and callers must not treat it as a receipt.
+
+The converter receives only anonymous private staging files, via inherited
+regular-file stdin/stdout and `/dev/fd/0`, `/dev/fd/1` on macOS. It cannot truncate
+the admitted source or published artifacts. A 15-second archive conversion
+budget is an agent implementation choice within the existing 120-second Stop
+caller budget, not a Founder latency target. Polling owns the child until exit;
+timeout/error/unwind kills and waits for that child. There is no detached waiter,
+process-wide kill, diagnostic pipe, or unbounded stderr buffer. Stderr is discarded;
+exit status and timeout remain visible diagnostics. Failed, hanging, or empty
+successful conversion falls back to WAV read from the same admitted source.
+Only successful nonempty encoded bytes are published as m4a. This validates
+status and size, not codec decodability; real macOS decode remains mandatory.
+
+Unix directory operations cover macOS and Linux; Linux reports unsupported AAC
+conversion and retains WAV. Non-Unix daily writes refuse explicitly. The actual
+macOS `afconvert` descriptor-path behavior is UNRUN; refusal safely selects WAV.
+
+The threat model excludes arbitrary same-account mutation of owned staging or
+admitted directory entries. File data is synced before publication, but directories
+are not fsynced and the pair is not a crash-atomic transaction. Crash/panic or
+cleanup failure can leave a reservation/staging entry; later allocation skips it.
+Cleanup errors are logged. Audio already published is never rollback cleanup.
+A stalled filesystem operation, process spawn or kernel child reap still has no hard deadline;
+the 15-second child polling budget is not an end-to-end Stop settlement guarantee.
+
+Still-unbounded Stop owners include serialization/recorder locks, recorder drain
+and WAV finalization, transcription task join, presentation/ledger lock acquisition, final
+adjudication/formatting, delivery transport, archive filesystem I/O, and terminal
+reset/publication. This cut adds no cancellation authority to those owners.
+Security scans establish neither finite settlement nor installed recovery.
 
 For this new processing-failure path, committed text is **unavailable**: the
 producer's shared string has no revision/occurrence authentication attached to

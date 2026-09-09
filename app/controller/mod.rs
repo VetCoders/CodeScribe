@@ -276,7 +276,7 @@ fn retain_session_audio(
         path,
         transcript,
         &Config::config_dir(),
-        codescribe_core::state::archive_session_take,
+        codescribe_core::state::archive_session_take_from_file,
     ) {
         warn!("{error:#}");
     }
@@ -292,14 +292,14 @@ fn retain_session_audio_at(
     transcript: codescribe_core::state::SessionTranscriptArchive<'_>,
     root: &std::path::Path,
     archive: impl FnOnce(
-        &std::path::Path,
+        &mut std::fs::File,
         codescribe_core::state::SessionTranscriptArchive<'_>,
     ) -> Option<std::path::PathBuf>,
 ) -> Result<()> {
     let id = retainable_session_id(session_id)
         .ok_or_else(|| anyhow::anyhow!("audio retention refused: missing or unsafe session id"))?;
-    // Freeze the source object before invoking the separate pathname-based
-    // history owner. O_NONBLOCK prevents a FIFO from hanging before fstat.
+    // Freeze the source object before invoking the daily history owner.
+    // O_NONBLOCK prevents a FIFO from hanging before fstat.
     let (source_parent, source_name) = open_retention_parent(path)
         .with_context(|| format!("audio retention source {} refused", path.display()))?;
     let mut source = open_retention_entry(
@@ -318,7 +318,7 @@ fn retain_session_audio_at(
     let sessions_directory = root_directory.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))
         .and_then(|directory| retention_subdirectory(directory, c"sessions"));
     let mut failures = Vec::new();
-    if archive(path, transcript).is_none() {
+    if archive(&mut source, transcript).is_none() {
         failures.push("daily audio archive failed".to_string());
     }
     let session_path = session_audio_path(root, id)
@@ -539,7 +539,7 @@ async fn stop_recorder_for_terminal(
                                 "capture processing failed; committed text unavailable",
                             ),
                             &Config::config_dir(),
-                            codescribe_core::state::archive_session_take,
+                            codescribe_core::state::archive_session_take_from_file,
                         ),
                     ))
                 } else {
@@ -5466,10 +5466,13 @@ mod capture_failure_recovery_tests {
             (Some("capture-owner"), 7), |id, path| {
                 retain_session_audio_at(Some(id), path,
                     SessionTranscriptArchive::Unavailable("processing failed"), &root,
-                    |path, transcript| {
+                    |file, transcript| {
+                        use std::io::Read;
                         assert!(matches!(transcript, SessionTranscriptArchive::Unavailable(_)));
-                        assert_eq!(path, source);
-                        Some(path.to_path_buf())
+                        let mut archived = Vec::new();
+                        file.read_to_end(&mut archived).unwrap();
+                        assert_eq!(archived, bytes);
+                        Some(source.clone())
                     })
             },
         );
@@ -5548,7 +5551,7 @@ mod capture_failure_recovery_tests {
         retain_session_audio_at(
             Some("capture-owner"), source,
             SessionTranscriptArchive::Unavailable("filesystem fixture"), root,
-            |path, _| Some(path.to_path_buf()),
+            |_, _| Some(source.to_path_buf()),
         )
     }
 
@@ -5689,10 +5692,14 @@ mod capture_failure_recovery_tests {
         std::fs::write(&source, b"opened take").unwrap();
         retain_session_audio_at(
             Some("capture-owner"), &source, SessionTranscriptArchive::Unavailable("fixture"), &root,
-            |path, _| {
-                std::fs::rename(path, &original).unwrap();
-                std::fs::write(path, b"replacement must not be copied").unwrap();
-                Some(path.to_path_buf())
+            |file, _| {
+                use std::io::Read;
+                std::fs::rename(&source, &original).unwrap();
+                std::fs::write(&source, b"replacement must not be copied").unwrap();
+                let mut archived = Vec::new();
+                file.read_to_end(&mut archived).unwrap();
+                assert_eq!(archived, b"opened take");
+                Some(source.clone())
             },
         ).unwrap();
         assert_eq!(std::fs::read(original).unwrap(), b"opened take");
@@ -5716,14 +5723,14 @@ mod capture_failure_recovery_tests {
         std::fs::write(&unrelated, b"external bytes").unwrap();
         retain_session_audio_at(
             Some("capture-owner"), &source, SessionTranscriptArchive::Unavailable("fixture"), &root,
-            |path, _| {
+            |_, _| {
                 std::fs::rename(root.join("sessions"), root.join("pinned-sessions")).unwrap();
                 symlink(&external, root.join("sessions")).unwrap();
                 symlink(&unrelated, root.join("pinned-sessions/capture-owner.wav")).unwrap();
                 symlink(&source, root.join("last_session.wav")).unwrap();
                 std::fs::rename(&root, &moved).unwrap();
                 symlink(&external, &root).unwrap();
-                Some(path.to_path_buf())
+                Some(source.to_path_buf())
             },
         ).unwrap();
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"external bytes");
