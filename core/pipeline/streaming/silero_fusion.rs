@@ -207,10 +207,10 @@ impl UtteranceLedger {
 /// open across pauses shorter than the utterance gap, and closes on the capture
 /// cursor rather than on the last speech frame. That padding is correct for
 /// deciding *who owns which occurrence*, and wrong for asking *how much of this
-/// take was speech*: measured on take `e186c4db` (2026-09-09) the utterance set
-/// reported 2 974 s of "speech" for a 2 990 s recording whose offline Silero
-/// measurement was 454 s. The 31 minutes of dropout noise after the operator
-/// stopped talking were never speech; they were one padded window.
+/// take was speech*: measured on one archived take the utterance set reported
+/// 2 974 s of "speech" for a 2 990 s recording whose offline Silero measurement
+/// was 454 s. The 31 minutes of dropout noise that followed the last spoken
+/// word were never speech; they were one padded window.
 ///
 /// So the two live side by side and answer different questions. Ownership keeps
 /// its padded ranges; coverage asks this set.
@@ -1064,9 +1064,9 @@ mod tests {
 
     /// Two bursts of speech with real silence between them are two acoustic
     /// ranges, symmetrically padded by 64 ms — not one padded window that
-    /// swallows the pause. This is the whole point of the set: on take
-    /// `e186c4db` the utterance view called 99.5% of a 50-minute recording
-    /// speech, against an offline measurement of 454 s.
+    /// swallows the pause. This is the whole point of the set: on an archived
+    /// take the utterance view called 99.5% of a 50-minute recording speech,
+    /// against an offline measurement of 454 s.
     #[test]
     fn acoustic_speech_set_keeps_separate_bursts_separate() {
         let mut ingress = SileroIngress::new(16_000, "bursts", 7);
@@ -1314,5 +1314,224 @@ mod tests {
         assert_eq!(ingress.ledger().utterances().len(), 1);
         assert_eq!(ingress.ledger().utterances()[0].range.sample_start, 16_000);
         assert_eq!(ingress.ledger().utterances()[0].range.sample_end, 32_000);
+    }
+
+    /// Scoped process-env override that restores the prior value on drop, so a
+    /// context-mode test cannot leak its selector into the next one.
+    struct EnvGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        /// Set `key`, remembering whatever was there before.
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: context-mode tests that mutate process env are serialized
+            // by `CONTEXT_ENV` below.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        /// Unset `key`, remembering whatever was there before.
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: as above.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        /// Put the previous value back, or unset the key when it was absent —
+        /// restoring an empty string instead would not be the same state.
+        fn drop(&mut self) {
+            // SAFETY: restores the serialized test's prior process environment.
+            unsafe {
+                match self.previous.as_ref() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    /// Process env is one slot. Every context-mode test takes this first.
+    static CONTEXT_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Executable truth of the context selector, against the registry entry.
+    ///
+    /// The documented default used to read `utterance`. That token is not one
+    /// the parser knows: it falls through to the default arm, which is
+    /// [`FusionContextMode::SymmetricPad`], not `UtteranceOnly`. Anyone reading
+    /// the old entry and setting `utterance` to get exact-utterance audio got
+    /// 400 ms of symmetric context instead. The recognised token is
+    /// `utterance_only`; this test is what the registry entry now states.
+    #[test]
+    fn context_mode_from_env_is_symmetric_pad_by_default_and_names_its_own_tokens() {
+        let _env = CONTEXT_ENV.lock().unwrap_or_else(|e| e.into_inner());
+
+        {
+            let _guard = EnvGuard::remove(SILERO_FUSION_CONTEXT_ENV);
+            assert_eq!(FusionContextMode::from_env(), FusionContextMode::SymmetricPad);
+            assert_eq!(FusionContextMode::default(), FusionContextMode::SymmetricPad);
+        }
+
+        for token in ["utterance_only", "utterance-only", "exact", "  EXACT  "] {
+            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
+            assert_eq!(
+                FusionContextMode::from_env(),
+                FusionContextMode::UtteranceOnly,
+                "{token} selects utterance-only audio"
+            );
+        }
+        for token in ["left_pad", "left-pad", "pad", "Left_Pad"] {
+            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
+            assert_eq!(FusionContextMode::from_env(), FusionContextMode::LeftAudioPad);
+        }
+        for token in ["stable_prompt", "stable-text", "prompt"] {
+            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
+            assert_eq!(
+                FusionContextMode::from_env(),
+                FusionContextMode::StableTextPrompt
+            );
+        }
+
+        // Malformed, unknown, and the historically documented `utterance` all
+        // resolve to the default. Nothing here fails closed or panics, and none
+        // of them silently selects utterance-only.
+        for token in ["utterance", "", "   ", "symmetric", "left pad", "0"] {
+            let _guard = EnvGuard::set(SILERO_FUSION_CONTEXT_ENV, token);
+            assert_eq!(
+                FusionContextMode::from_env(),
+                FusionContextMode::SymmetricPad,
+                "{token:?} is not a recognised token and must fall back to the default"
+            );
+        }
+
+        assert_eq!(FusionContextMode::SymmetricPad.as_str(), "symmetric_pad");
+        assert_eq!(FusionContextMode::UtteranceOnly.as_str(), "utterance_only");
+        assert_eq!(FusionContextMode::LeftAudioPad.as_str(), "left_audio_pad");
+        assert_eq!(
+            FusionContextMode::StableTextPrompt.as_str(),
+            "stable_text_prompt"
+        );
+        assert!(
+            (DEFAULT_SYMMETRIC_PAD_SECS - 0.40).abs() < f32::EPSILON,
+            "the registry entry states 400 ms each side"
+        );
+    }
+
+    /// Two neighbouring utterances whose 400 ms pads would overlap.
+    ///
+    /// Overlapping decode context is allowed and often better: both decoders may
+    /// listen into the silence between the words. What neither may do is reach a
+    /// sample the other utterance owns. Ownership is minted from the unpadded
+    /// range and is untouched by any of this.
+    #[test]
+    fn overlapping_decode_context_stops_at_the_neighbour_and_never_moves_ownership() {
+        let rate = 16_000_f32;
+        let pad = (DEFAULT_SYMMETRIC_PAD_SECS * rate).round() as u64;
+        // 0.5 s apart: 6 400 samples of pad on each side of a 8 000-sample gap.
+        let first = range(0, 16_000);
+        let second = range(24_000, 40_000);
+
+        let first_context = bound_context_range(
+            &first,
+            FusionContextMode::SymmetricPad,
+            pad,
+            &ContextBounds {
+                long_silence_fence: 0,
+                capture_end: 40_000,
+                next_utterance_start: Some(second.sample_start),
+                previous_utterance_end: None,
+            },
+        );
+        let second_context = bound_context_range(
+            &second,
+            FusionContextMode::SymmetricPad,
+            pad,
+            &ContextBounds {
+                long_silence_fence: 0,
+                capture_end: 40_000,
+                next_utterance_start: None,
+                previous_utterance_end: Some(first.sample_end),
+            },
+        );
+
+        assert!(
+            first_context.sample_end <= second.sample_start,
+            "left neighbour's context reached into the right neighbour's owned PCM"
+        );
+        assert!(
+            second_context.sample_start >= first.sample_end,
+            "right neighbour's context reached into the left neighbour's owned PCM"
+        );
+        assert!(
+            first_context.sample_end > second_context.sample_start,
+            "this fixture must actually overlap, or it proves nothing"
+        );
+        assert_eq!(first_context.sample_start, 0, "clamped at the session start");
+        assert_eq!(second_context.sample_end, 40_000, "clamped at captured PCM");
+
+        // The owned ranges are separate values and were not touched.
+        assert_eq!((first.sample_start, first.sample_end), (0, 16_000));
+        assert_eq!((second.sample_start, second.sample_end), (24_000, 40_000));
+    }
+
+    /// No observed crossing means an empty acoustic set — at any capture cursor,
+    /// and whether the VAD never fired or never loaded.
+    ///
+    /// This set is evidence of speech, never evidence of silence: emptiness here
+    /// says only that this instrument produced nothing. Deciding what an empty
+    /// set means belongs to the coverage producer selection in
+    /// `apple_live_session`, which falls back rather than calling the take
+    /// trivially complete.
+    #[test]
+    fn an_unobserved_vad_produces_an_empty_acoustic_set_not_a_silent_one() {
+        let mut ingress = SileroIngress::new(16_000, "no-crossing", 3);
+
+        assert!(ingress.acoustic_speech_ranges(0).is_empty());
+        assert!(ingress.acoustic_speech_ranges(16_000).is_empty());
+        assert!(
+            ingress.acoustic_speech_ranges(48_000_000).is_empty(),
+            "a long take with no crossing still measures no speech, not all of it"
+        );
+
+        // An empty boundary batch is not an observation either.
+        assert!(ingress.observe_boundaries(&[]).is_empty());
+        assert!(ingress.acoustic_speech_ranges(16_000).is_empty());
+
+        // The utterance ledger is a different question and is also empty here:
+        // neither set invents a range for audio nobody measured.
+        assert!(ingress.ledger().utterances().is_empty());
+    }
+
+    /// A `SpeechEnd` at the exact capture cursor closes the range there, and the
+    /// right pad cannot claim a sample past what was captured.
+    #[test]
+    fn a_crossing_at_end_of_capture_is_padded_only_to_the_last_captured_sample() {
+        let mut ingress = SileroIngress::new(16_000, "eof", 0);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 8_000,
+                speech_probability: 0.91,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 16_000,
+                speech_probability: 0.12,
+            },
+        ]);
+
+        let ranges = ingress.acoustic_speech_ranges(16_000);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].sample_start, 8_000 - 1_024);
+        assert_eq!(
+            ranges[0].sample_end, 16_000,
+            "the 64 ms right pad is clamped at end of captured PCM"
+        );
+        assert_eq!(ranges[0].session, "eof");
     }
 }

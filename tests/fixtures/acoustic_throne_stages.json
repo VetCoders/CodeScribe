@@ -1331,12 +1331,23 @@
               "symbol": "repair_terminal_seal_coverage",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
-                "session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)",
+                "let speech_ranges = coverage_speech_ranges(state);",
                 "ledger.assess_seal_coverage(",
                 "InProcessTailProvider.transcribe(&request, &window.samples)",
                 "EngineEvent::SealCoverage {",
                 "EnergyAdmission::QualifyFinalPassGap",
                 "record_seal_coverage(final_receipt.clone())"
+              ]
+            },
+            {
+              "symbol": "coverage_speech_ranges_with_source",
+              "file": "core/pipeline/streaming/apple_live_session.rs",
+              "required_code": [
+                "let samples_seen = state.audio.session_sample_end();",
+                "session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)",
+                "let acoustic = fusion.acoustic_speech_ranges(samples_seen);",
+                "select_coverage_speech_source(!acoustic.is_empty(), !utterances.is_empty())",
+                "CoverageSpeechSource::CaptureEnergy"
               ]
             },
             {
@@ -1404,6 +1415,31 @@
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "apple_stream_worker",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "coverage_speech_ranges",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "repair_terminal_seal_coverage",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "coverage_speech_ranges_with_source",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "coverage_speech_ranges",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "coverage_speech_ranges_with_source",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "publish_terminal_coverage",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "session_active_speech_ranges",
+              "callee_file": "core/audio/capture_receipt.rs",
+              "caller": "coverage_speech_ranges_with_source",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 2
             },
             {
               "callee": "assess_seal_coverage",

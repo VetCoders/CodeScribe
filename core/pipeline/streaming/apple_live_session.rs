@@ -135,10 +135,10 @@ pub const LEDGER_TERMINAL_SEAL_REFUSED_WARNING_CODE: &str = "acoustic_ledger_ter
 /// happened to that job's payload.
 ///
 /// The two are separate facts and were being read as one. `verdict = "skipped"`
-/// reads like a rejection, and on 2026-09-09 three such lines were cited as
-/// three lost Whisper labels on take `e186c4db`; correlating PCM spans against
-/// Bus revisions showed all three had been admitted and had persisted to
-/// revision 85. The verdict never decided that. The one-throne path admits
+/// reads like a rejection, and three such lines on one archived take were read
+/// as three lost Whisper labels; correlating PCM spans against Bus revisions
+/// showed all three had been admitted and had persisted to a later published
+/// revision. The verdict never decided that. The one-throne path admits
 /// Whisper through `AcousticLedger` on occurrence identity, and `payload` is
 /// forwarded on every successful job regardless of what the char-diff said.
 ///
@@ -2439,7 +2439,7 @@ impl CoverageSpeechSource {
 }
 
 /// Padded fusion ownership windows, summed. Diagnostics only: this is the
-/// number that called 99.5% of take `e186c4db` speech.
+/// number that read a whole archived take as 99.5% speech.
 fn fusion_utterance_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
     state
         .fusion
@@ -7432,9 +7432,9 @@ mod rc_w1_live_ledger_tests {
     /// The regression this cut exists for. A padded ownership window spanning a
     /// whole take must not be counted as speech; the crossings inside it are.
     ///
-    /// Shape taken from take `e186c4db` (2026-09-09): one utterance window that
-    /// stayed open across 50 minutes reported 99.5% of the recording as speech,
-    /// against an offline Silero measurement of 454 s.
+    /// Shape taken from an archived 50-minute take: one utterance window that
+    /// stayed open for its whole length reported 99.5% of the recording as
+    /// speech, against an offline Silero measurement of 454 s.
     #[test]
     fn coverage_speech_set_measures_crossings_not_the_padded_ownership_window() {
         let mut state = AppleSealState::new_for_session(RATE, "rc-w1-coverage".into(), 0);
@@ -7526,34 +7526,7 @@ mod rc_w1_live_ledger_tests {
         assert_eq!(speech[0].sample_end, at(1.0) + 1_280 + 1_024);
     }
 
-    /// The terminal repair path and the published receipt must measure against
-    /// the same set, or repair chases gaps the receipt never claimed.
-    #[test]
-    fn repair_and_publish_read_one_speech_set() {
-        let mut state = AppleSealState::new_for_session(RATE, "rc-w1-one-set".into(), 0);
-        push_capture(&mut state, 6.0);
-
-        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
-        ingress.observe_boundaries(&[
-            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
-            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
-        ]);
-        ingress.observe(Some((0, at(6.0))), true, at(6.0));
-        state.fusion = Some(ingress);
-
-        // `repair_terminal_seal_coverage` and `publish_terminal_coverage` both
-        // resolve their speech set through this one function.
-        let first = coverage_speech_ranges(&state);
-        let second = coverage_speech_ranges(&state);
-        assert_eq!(first, second);
-        assert_eq!(
-            sum_range_samples(&first),
-            at(1.0) + 2 * 1_024,
-            "one burst, padded — not the six-second ownership window"
-        );
-    }
-
-    /// The disputed 2026-09-09 labels were admitted, not lost. A `skipped`
+    /// The disputed labels were admitted, not lost. A `skipped`
     /// char-diff verdict is diagnostics; the payload it "skipped" is forwarded
     /// to occurrence admission all the same, and the receipt says both.
     #[test]
@@ -7598,5 +7571,998 @@ mod rc_w1_live_ledger_tests {
         // A failed job is the one case with no payload, and it says so.
         let failed = legacy_char_diff_receipt(&TailPatchOutcome::NoChange, false);
         assert!(!failed.payload_forwarded);
+    }
+}
+
+/// W2 acoustic checkpoint: the terminal coverage entrypoints, the capture
+/// energy fallback, and ledger admission — exercised through the production
+/// functions rather than through a helper called twice.
+///
+/// These live in their own module because this file's main `mod tests` is
+/// parked behind `#[cfg(any())]`; see the disposition table in the cut report.
+/// Nothing here revives a retired production helper to satisfy an old test.
+#[cfg(test)]
+mod rc_w2_acoustic_tests {
+    use super::*;
+    use crate::audio::chunker::{VadBoundaryEvidence, VadBoundaryKind};
+    use crate::pipeline::acoustic_ledger::RefuseReason;
+
+    const RATE: u32 = 16_000;
+    /// `ACOUSTIC_SPEECH_PAD_SECS` (64 ms) at [`RATE`].
+    const PAD: u64 = 1_024;
+    /// `SEAL_COVERAGE_INCOMPLETE_MS` (250 ms) at [`RATE`].
+    const THRESHOLD: u64 = 4_000;
+
+    /// The capture energy ladder is one process-global slot. Every test that
+    /// writes or reads it takes this lock first, or two tests measuring
+    /// different takes would answer each other's questions.
+    static ENERGY_CLOCK: Mutex<()> = Mutex::new(());
+
+    fn at(secs: f32) -> u64 {
+        (secs * RATE as f32) as u64
+    }
+
+    fn state_for(session: &str, capture_secs: f32) -> AppleSealState {
+        let mut state = AppleSealState::new_for_session(RATE, session.into(), 0);
+        state.energy_calibration = Some(EnergyCalibration::new("synthetic", 1.0, 1));
+        if capture_secs > 0.0 {
+            state
+                .audio
+                .push(&vec![0.25f32; (capture_secs * RATE as f32) as usize]);
+        }
+        state
+    }
+
+    fn crossing(kind: VadBoundaryKind, sample: u64) -> VadBoundaryEvidence {
+        VadBoundaryEvidence {
+            kind,
+            sample,
+            speech_probability: match kind {
+                VadBoundaryKind::SpeechStart => 0.9,
+                VadBoundaryKind::SpeechEnd => 0.1,
+            },
+        }
+    }
+
+    /// One second of speech inside a ten-second take, plus the padded ownership
+    /// window the fusion ledger legitimately mints across the whole take.
+    ///
+    /// The two sets disagree by an order of magnitude on purpose: every
+    /// assertion below is only meaningful because a regression to the padded
+    /// set would change the answer.
+    fn one_burst_in_a_ten_second_take(session: &str) -> AppleSealState {
+        let mut state = state_for(session, 10.0);
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+        ]);
+        ingress.observe(Some((0, at(10.0))), true, at(10.0));
+        state.fusion = Some(ingress);
+        state
+    }
+
+    /// Commit the exact acoustic range as an occurrence, through the same
+    /// admission path the terminal gap repair uses.
+    fn commit_the_burst(
+        state: &mut AppleSealState,
+        ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    ) -> OccurrenceIdentity {
+        let occurrence = OccurrenceIdentity::new(
+            state.session_id.clone(),
+            state.capture_epoch,
+            at(1.0) - PAD,
+            at(2.0) + PAD,
+        );
+        let receipt = admit_ledger_label(
+            state,
+            ev_tx,
+            LabelAdmission {
+                observation: LedgerObservationIdentity::new(
+                    LedgerObservationProducer::Whisper,
+                    1,
+                    0,
+                    occurrence.clone(),
+                ),
+                label: "Iwo",
+                energy: EnergyAdmission::QualifyFinalPassGap,
+            },
+        );
+        assert!(
+            receipt.is_some_and(|receipt| receipt.grants_mutation()),
+            "the fixture must actually commit an occurrence, or coverage proves nothing"
+        );
+        occurrence
+    }
+
+    fn warning_codes(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<String> {
+        let mut codes = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::Warning { code, .. } = event {
+                codes.push(code);
+            }
+        }
+        codes
+    }
+
+    fn coverage_receipts(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<SealCoverageReceipt> {
+        let mut receipts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::SealCoverage { receipt, .. } = event {
+                receipts.push(receipt);
+            }
+        }
+        receipts
+    }
+
+    /// The actual repair entrypoint, on a take whose committed occurrence covers
+    /// the acoustic speech exactly.
+    ///
+    /// Negative control, and the reason this test is not a tautology: the same
+    /// ledger, asked about the padded ownership windows instead, answers
+    /// `Incomplete` with a 127 000-sample hole. If `repair_terminal_seal_coverage`
+    /// ever drifts back to that set, `Complete` below stops holding.
+    #[test]
+    fn repair_measures_the_acoustic_set_and_leaves_a_covered_take_alone() {
+        let mut state = one_burst_in_a_ten_second_take("rc-w2-repair-covered");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+        let _ = warning_codes(&mut rx);
+
+        let padded_answer = {
+            let ledger = state.acoustic_ledger.lock().unwrap();
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &fusion_utterance_ranges(&state),
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            padded_answer.status,
+            SealCoverageStatus::Incomplete,
+            "the padded ownership set must disagree, or this test proves nothing"
+        );
+        assert_eq!(padded_answer.speech_samples, at(10.0));
+
+        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+
+        assert_eq!(receipt.status, SealCoverageStatus::Complete);
+        assert!(receipt.uncovered_speech_ranges.is_empty());
+        assert_eq!(
+            receipt.speech_samples,
+            at(1.0) + 2 * PAD,
+            "coverage is measured against the crossings, not the ten-second window"
+        );
+        assert_eq!(receipt.incomplete_threshold_samples, THRESHOLD);
+        assert!(
+            warning_codes(&mut rx)
+                .iter()
+                .all(|code| !code.starts_with("seal_coverage_gap")),
+            "a covered take must not send Whisper after gaps that were never speech"
+        );
+    }
+
+    /// The actual publication entrypoint reports the acoustic set, records it on
+    /// the ledger, and emits it once. The padded sum stays a diagnostic.
+    #[test]
+    fn publish_reports_the_acoustic_set_and_records_it_on_the_ledger() {
+        let mut state = one_burst_in_a_ten_second_take("rc-w2-publish");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+        let _ = coverage_receipts(&mut rx);
+
+        let receipt = publish_terminal_coverage(&state, &tx);
+
+        assert_eq!(receipt.speech_samples, at(1.0) + 2 * PAD);
+        assert_eq!(receipt.status, SealCoverageStatus::Complete);
+        assert_eq!(
+            sum_range_samples(&fusion_utterance_ranges(&state)),
+            at(10.0),
+            "ownership keeps its padded window; only the coverage question narrowed"
+        );
+        assert_eq!(
+            coverage_receipts(&mut rx),
+            vec![receipt.clone()],
+            "one publication, carrying exactly the receipt that was returned"
+        );
+        assert_eq!(
+            state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .latest_seal_coverage()
+                .cloned(),
+            Some(receipt),
+            "terminal admission reads this receipt; it must be the recorded one"
+        );
+    }
+
+    /// Repair and publication are two different production functions. They must
+    /// answer with the same speech set on the same state, or repair chases gaps
+    /// the published receipt never claimed.
+    ///
+    /// This replaces the W1 test that called one helper twice: both named
+    /// entrypoints are invoked here, and each one's own receipt is compared.
+    #[test]
+    fn repair_and_publish_answer_with_one_speech_set() {
+        let mut state = one_burst_in_a_ten_second_take("rc-w2-one-set");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+        let _ = coverage_receipts(&mut rx);
+
+        let published_before = publish_terminal_coverage(&state, &tx);
+        let repaired = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+        let published_after = publish_terminal_coverage(&state, &tx);
+
+        for other in [&repaired, &published_after] {
+            assert_eq!(other.speech_samples, published_before.speech_samples);
+            assert_eq!(other.covered_samples, published_before.covered_samples);
+            assert_eq!(
+                other.incomplete_threshold_samples,
+                published_before.incomplete_threshold_samples
+            );
+            assert_eq!(other.status, published_before.status);
+            assert_eq!(
+                other.uncovered_speech_ranges,
+                published_before.uncovered_speech_ranges
+            );
+        }
+    }
+
+    /// Uncovered speech whose PCM cannot be resolved is reported, not decoded
+    /// and not quietly dropped. No witness is manufactured for audio the process
+    /// no longer holds.
+    #[test]
+    fn repair_reports_unresolvable_gap_pcm_instead_of_inventing_a_witness() {
+        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        begin_session_energy_clock();
+        let mut accumulator = CaptureLevelAccumulator::new();
+        accumulator.push_samples(&vec![0.25f32; at(3.0) as usize]);
+
+        // Capture energy measured three seconds of speech; the live buffer holds
+        // none of it, which is exactly the retention-loss case.
+        let mut state = state_for("rc-w2-unresolvable", 0.0);
+        assert!(state.fusion.is_none());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+
+        assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
+        assert_eq!(receipt.speech_samples, at(3.0));
+        assert_eq!(receipt.covered_samples, 0);
+        assert!(
+            warning_codes(&mut rx)
+                .contains(&"seal_coverage_gap_pcm_unavailable".to_string()),
+            "an unresolvable gap is a stated refusal, not a silent skip"
+        );
+        let ledger = state.acoustic_ledger.lock().unwrap();
+        assert!(
+            ledger.rendered_text().is_empty(),
+            "no text may enter the ledger from a range whose PCM was never read"
+        );
+        assert_eq!(ledger.qualified_occurrences().count(), 0);
+    }
+
+    /// The capture energy fallback measures the hops the capture path actually
+    /// recorded — not a flag, and not the whole take.
+    #[test]
+    fn capture_energy_fallback_measures_recorded_hops() {
+        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+        begin_session_energy_clock();
+        let mut accumulator = CaptureLevelAccumulator::new();
+        accumulator.push_samples(&vec![0.25f32; at(1.0) as usize]);
+        accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
+
+        let state = state_for("rc-w2-energy", 2.0);
+        assert!(state.fusion.is_none());
+
+        let (speech, source) = coverage_speech_ranges_with_source(&state);
+
+        assert_eq!(source, CoverageSpeechSource::CaptureEnergy);
+        assert_eq!(speech.len(), 1, "the silent second is not speech");
+        assert_eq!(speech[0].sample_start, 0);
+        assert_eq!(speech[0].sample_end, at(1.0));
+        assert_eq!(speech[0].session, "rc-w2-energy");
+        assert_eq!(speech[0].capture_epoch, state.capture_epoch);
+    }
+
+    /// Measured silence and an absent energy ladder produce the same empty
+    /// speech set today, and therefore the same trivially complete receipt.
+    ///
+    /// This is a recorded coverage gap, not a proof of silence: the seam carries
+    /// no "the ladder ran and heard nothing" fact, so a take whose capture path
+    /// never opened the clock is indistinguishable from a take that was silent.
+    /// The assertions below pin the honest half — neither input may invent
+    /// speech — and name the missing half for the runtime phases. The threshold
+    /// is not lowered and no fabricated distinction is introduced here.
+    #[test]
+    fn measured_silence_and_absent_evidence_are_both_empty_and_not_yet_distinguishable() {
+        let _clock = ENERGY_CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        begin_session_energy_clock();
+        let mut accumulator = CaptureLevelAccumulator::new();
+        accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        let silent_state = state_for("rc-w2-silent", 1.0);
+        let (silent_speech, silent_source) = coverage_speech_ranges_with_source(&silent_state);
+
+        begin_session_energy_clock();
+        let absent_state = state_for("rc-w2-absent", 1.0);
+        let (absent_speech, absent_source) = coverage_speech_ranges_with_source(&absent_state);
+
+        assert!(silent_speech.is_empty(), "silence is never speech");
+        assert!(absent_speech.is_empty(), "absence is never speech");
+        assert_eq!(silent_source, CoverageSpeechSource::CaptureEnergy);
+        assert_eq!(absent_source, CoverageSpeechSource::CaptureEnergy);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let silent = publish_terminal_coverage(&silent_state, &tx);
+        let absent = publish_terminal_coverage(&absent_state, &tx);
+        assert_eq!(silent.speech_samples, 0);
+        assert_eq!(absent.speech_samples, 0);
+        assert_eq!(
+            silent.status, absent.status,
+            "the recorded gap: this seam cannot yet tell measured silence from a \
+             ladder that never ran"
+        );
+    }
+
+    /// The terminal coverage threshold is 250 ms of the capture clock, and the
+    /// published receipt carries the exact figure it was judged against.
+    #[test]
+    fn terminal_coverage_threshold_stays_at_two_hundred_fifty_milliseconds() {
+        assert_eq!(SEAL_COVERAGE_INCOMPLETE_MS, 250);
+        assert_eq!(
+            u64::from(48_000_u32) * SEAL_COVERAGE_INCOMPLETE_MS / 1_000,
+            12_000,
+            "the immutable ledger threshold at 48 kHz"
+        );
+        assert_eq!(u64::from(RATE) * SEAL_COVERAGE_INCOMPLETE_MS / 1_000, THRESHOLD);
+
+        let mut state = one_burst_in_a_ten_second_take("rc-w2-threshold");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+        assert_eq!(
+            publish_terminal_coverage(&state, &tx).incomplete_threshold_samples,
+            THRESHOLD
+        );
+        assert_eq!(
+            repair_terminal_seal_coverage(&mut state, &tx, None).incomplete_threshold_samples,
+            THRESHOLD
+        );
+    }
+
+    /// A sealed occurrence is finished. A later machine observation of the same
+    /// PCM is refused as a replay, and the committed label does not move.
+    #[test]
+    fn a_sealed_occurrence_refuses_a_later_machine_observation() {
+        // Three seconds, so the committed burst's padded range is inside the
+        // retained PCM the qualification step has to read.
+        let mut state = state_for("rc-w2-post-seal", 3.0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let occurrence = commit_the_burst(&mut state, &tx);
+
+        assert!(
+            state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_of(&occurrence)
+                .is_some(),
+            "the fixture must reach a seal before the replay means anything"
+        );
+
+        let replay = admit_ledger_label(
+            &mut state,
+            &tx,
+            LabelAdmission {
+                observation: LedgerObservationIdentity::new(
+                    LedgerObservationProducer::Lexicon,
+                    2,
+                    0,
+                    occurrence.clone(),
+                ),
+                label: "Iwo poprawione",
+                energy: EnergyAdmission::RequireExistingQualification,
+            },
+        );
+
+        assert!(matches!(
+            replay,
+            Some(MutationReceipt::Refuse {
+                reason: RefuseReason::SealedReplay,
+                ..
+            })
+        ));
+        assert_eq!(
+            state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .text_of(&occurrence)
+                .map(str::to_owned),
+            Some("Iwo".to_string()),
+            "a refused replay may not rewrite sealed text"
+        );
+    }
+
+    /// The retired char-diff verdict is diagnostics. A `skipped` job still
+    /// forwards its payload, and that payload still reaches occurrence
+    /// admission — proven end to end, through the two production functions that
+    /// carry it, not through the receipt struct alone.
+    #[test]
+    fn a_legacy_skip_verdict_still_reaches_ledger_admission() {
+        let mut state = state_for("rc-w2-legacy-skip", 2.0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let occurrence = OccurrenceIdentity::new(
+            state.session_id.clone(),
+            state.capture_epoch,
+            0,
+            at(1.0),
+        );
+        let range = TailSampleRange {
+            session: state.session_id.clone(),
+            capture_epoch: state.capture_epoch,
+            sample_start: 0,
+            sample_end: at(1.0),
+        };
+        let identity = TailRequestIdentity {
+            request_id: 7,
+            range: range.clone(),
+        };
+
+        // Qualify the occurrence and open exactly the Whisper slot the job is
+        // about, without pre-admitting any label.
+        {
+            let calibration = state.energy_calibration.clone().unwrap();
+            let window = state.window_by_samples(0, at(1.0)).unwrap();
+            let energy_integral = window
+                .samples
+                .iter()
+                .map(|sample| f64::from(*sample) * f64::from(*sample))
+                .sum::<f64>();
+            let mut ledger = state.acoustic_ledger.lock().unwrap();
+            assert!(
+                ledger
+                    .qualify(
+                        &AcousticEvidence {
+                            occurrence: occurrence.clone(),
+                            duration_ms: 1_000.0,
+                            energy_integral,
+                            mean_rms_dbfs: -12.0,
+                            peak_dbfs: -12.0,
+                            vad_open_sample: Some(0),
+                            vad_close_sample: Some(at(1.0)),
+                            evidence_calibration_version: calibration.version.clone(),
+                        },
+                        &calibration,
+                    )
+                    .is_qualified()
+            );
+            ledger.schedule_frontier(
+                occurrence.clone(),
+                vec![LedgerObservationProducer::Whisper],
+            );
+        }
+        state.pending_events.insert(
+            9,
+            PendingAppleSeal {
+                occurrence: occurrence.clone(),
+                raw_text: "Iwo".into(),
+                layer1_baseline: "Iwo".into(),
+                start_ts: 0.0,
+                end_ts: 1.0,
+                segments: Vec::new(),
+            },
+        );
+        state.tail_patch_awaiting_completion = 1;
+
+        let payload = TailProviderPayload {
+            identity: identity.clone(),
+            text: "odzysk".into(),
+            segments: vec![TimedTailSegment {
+                text: "odzysk".into(),
+                range: range.clone(),
+            }],
+            avg_logprob: None,
+            compression_ratio: None,
+            provider_id: crate::stt::tail_provider::TailProviderId::Fake,
+            elapsed_ms: 0,
+            evidence: crate::stt::tail_provider::TailProviderEvidence {
+                source: crate::stt::tail_provider::TailEvidenceSource::Whisper,
+                revision: Some("rc-w2".into()),
+                stability: crate::stt::tail_provider::TailEvidenceStability::Final,
+                timing_quality: crate::stt::tail_provider::TailTimingQuality::Synthetic,
+                avg_logprob: None,
+            },
+        };
+
+        let mut lane = AppleTailPatchLane::new(
+            RATE,
+            None,
+            crate::stt::tail_provider::TailProviderId::Fake,
+        );
+        let completion = lane.finish_for_worker(
+            Some(TailPatchInFlight {
+                utterance_id: 9,
+                request_identity: identity,
+                member_occurrences: vec![(9, occurrence.clone())],
+            }),
+            Ok(TailPatchJobResult {
+                utterance_id: 9,
+                outcome: TailPatchOutcome::skipped(
+                    SkipReasonCode::ChangeRatio,
+                    "ratio 1.31 exceeds max 0.50",
+                ),
+                payload,
+            }),
+        );
+
+        assert!(
+            completion.payload.is_some(),
+            "a skipped verdict must not discard the provider payload"
+        );
+
+        state.complete_whisper_window(&tx, completion, 1.0);
+
+        assert_eq!(
+            state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .text_of(&occurrence)
+                .map(str::to_owned),
+            Some("odzysk".to_string()),
+            "the payload a legacy skip 'rejected' is the one the ledger admitted"
+        );
+        assert_eq!(state.tail_patch_jobs_applied, 1);
+        assert_eq!(state.tail_patch_jobs_skipped, 0);
+    }
+
+    /// Ported from the parked `mod tests`
+    /// (`apple_segments_map_to_captured_pcm_samples_at_ingestion`): Apple
+    /// segment seconds land on the session PCM clock at ingestion, and a
+    /// segment reaching past captured audio is clamped rather than inventing
+    /// samples. The current owner is `apple_segments_on_pcm_clock`.
+    #[test]
+    fn apple_segments_land_on_the_captured_pcm_clock() {
+        let state = state_for("rc-w2-segments", 2.0);
+        let mapped = apple_segments_on_pcm_clock(
+            &state,
+            &[
+                TranscriptSegment {
+                    text: "Iwo".into(),
+                    start_ts: 0.25,
+                    end_ts: 0.75,
+                },
+                TranscriptSegment {
+                    text: "poza".into(),
+                    start_ts: 1.5,
+                    end_ts: 9.0,
+                },
+            ],
+        );
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].range.sample_start, at(0.25));
+        assert_eq!(mapped[0].range.sample_end, at(0.75));
+        assert_eq!(mapped[0].range.session, "rc-w2-segments");
+        assert_eq!(mapped[1].range.sample_start, at(1.5));
+        assert_eq!(
+            mapped[1].range.sample_end,
+            at(2.0),
+            "a segment cannot claim audio the session never captured"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Ported from the parked `mod tests`: engine lifecycle over the single
+    // Silero. `EpochGate`, `EpochDecision`, `EPOCH_PREROLL_SECS` and every
+    // method used below are live production symbols with a live consumer
+    // (`apple_stream_worker`); only the parked module around them was dead, so
+    // these contracts move here unchanged rather than being retired.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Amplitude stand-in for the session Silero's `speech_live` bit, so the
+    /// epoch state machine can be driven on synthetic PCM without loading the
+    /// VAD model (a unit test must not depend on the model being present).
+    fn amplitude_edge(samples: &[f32], threshold: f32) -> bool {
+        samples.iter().any(|s| s.abs() >= threshold)
+    }
+
+    /// 200 Hz tone at `amplitude` — the "speech" side of the fixture.
+    fn tone(secs: f32, amplitude: f32) -> Vec<f32> {
+        let total = (secs * RATE as f32) as usize;
+        (0..total)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                amplitude * (2.0 * std::f32::consts::PI * 200.0 * t).sin()
+            })
+            .collect()
+    }
+
+    fn silence(secs: f32) -> Vec<f32> {
+        vec![0.0; (secs * RATE as f32) as usize]
+    }
+
+    /// Drive the gate the way the worker does — chunk by chunk — keeping each
+    /// decision next to the session cursor it was taken at. The last chunk of a
+    /// block is short, so cursors are carried, never reconstructed from indices.
+    fn drive(
+        gate: &mut EpochGate,
+        audio: &[f32],
+        samples_seen: &mut u64,
+    ) -> Vec<(u64, EpochDecision)> {
+        let mut out = Vec::new();
+        for chunk in audio.chunks(1024) {
+            *samples_seen += chunk.len() as u64;
+            out.push((
+                *samples_seen,
+                gate.feed_pcm(chunk, *samples_seen, amplitude_edge(chunk, 0.1)),
+            ));
+        }
+        out
+    }
+
+    /// Speech opens an epoch, silence past the product threshold closes it, and
+    /// the next speech edge wakes a new one whose base carries the pre-roll —
+    /// without reaching back into the epoch that already closed.
+    #[test]
+    fn epoch_gate_sleeps_after_threshold_silence_and_wakes_with_preroll() {
+        let mut gate = EpochGate::armed(RATE, 5.0);
+        let mut seen = 0u64;
+
+        let speech = drive(&mut gate, &tone(2.0, 0.5), &mut seen);
+        assert!(
+            matches!(
+                speech.first(),
+                Some((_, EpochDecision::Wake { preroll_from: 0 }))
+            ),
+            "first speech chunk must open epoch 0 (nothing was retained before it), got {:?}",
+            speech.first()
+        );
+        assert!(
+            speech[1..].iter().all(|(_, d)| *d == EpochDecision::Forward),
+            "speech after the wake must forward, got {:?}",
+            &speech[1..]
+        );
+
+        let quiet = drive(&mut gate, &silence(6.0), &mut seen);
+        let sleep_at = quiet
+            .iter()
+            .position(|(_, d)| matches!(d, EpochDecision::Sleep { .. }))
+            .expect("6 s of silence at a 5 s threshold must close the epoch");
+        let (sleep_cursor, EpochDecision::Sleep { silence_secs }) = quiet[sleep_at] else {
+            unreachable!("position() matched Sleep");
+        };
+        assert!(
+            (5.0..5.2).contains(&silence_secs),
+            "the epoch must close within one chunk of the 5 s threshold, closed at {silence_secs}s"
+        );
+        assert!(
+            quiet[sleep_at + 1..]
+                .iter()
+                .all(|(_, d)| *d == EpochDecision::Idle),
+            "after sleeping the engine rests until the next speech edge, got {:?}",
+            &quiet[sleep_at + 1..]
+        );
+
+        let resume_cursor = seen;
+        let woke = drive(&mut gate, &tone(1.0, 0.5), &mut seen);
+        let (_, EpochDecision::Wake { preroll_from }) = woke[0] else {
+            panic!("speech after rest must wake a new epoch, got {:?}", woke[0]);
+        };
+        let preroll = (EPOCH_PREROLL_SECS * RATE as f32) as u64;
+        assert_eq!(
+            preroll_from,
+            resume_cursor.saturating_sub(preroll),
+            "the new epoch is based one pre-roll ahead of the chunk that woke it"
+        );
+        assert!(
+            preroll_from >= sleep_cursor,
+            "pre-roll must not re-feed audio the closed epoch already carried \
+             ({preroll_from} < {sleep_cursor})"
+        );
+    }
+
+    /// `utterance_silence_sec: None` is the legacy contract: one stream for the
+    /// whole take, no epoch decisions at all.
+    #[test]
+    fn epoch_gate_disarmed_never_sleeps_or_wakes() {
+        let mut gate = EpochGate::disarmed();
+        assert!(!gate.is_armed());
+        let mut seen = 0u64;
+        let mut decisions = drive(&mut gate, &tone(1.0, 0.5), &mut seen);
+        decisions.extend(drive(&mut gate, &silence(30.0), &mut seen));
+        decisions.extend(drive(&mut gate, &tone(1.0, 0.5), &mut seen));
+        assert!(
+            decisions.iter().all(|(_, d)| *d == EpochDecision::Forward),
+            "disarmed gate must forward every chunk, got {:?}",
+            decisions
+                .iter()
+                .filter(|(_, d)| *d != EpochDecision::Forward)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// No Silero means no edges, and an armed gate with no edge source would
+    /// rest forever on a stream that never opened. The lifecycle fails open.
+    #[test]
+    fn epoch_gate_without_speech_edges_falls_back_to_one_stream() {
+        let mut gate = EpochGate::for_session(RATE, Some(5.0), false);
+        assert!(
+            !gate.is_armed(),
+            "an armed gate with no edge source would sleep the engine forever"
+        );
+        assert_eq!(
+            gate.feed_pcm(&[0.0; 1_024], 1_024, false),
+            EpochDecision::Forward,
+            "Silero absence must preserve continuous Apple PCM flow"
+        );
+        assert!(EpochGate::for_session(RATE, Some(5.0), true).is_armed());
+        assert!(
+            !EpochGate::for_session(RATE, None, true).is_armed(),
+            "no hands-free silence setting is still the legacy single stream"
+        );
+    }
+
+    /// Ported from the parked `mod tests`
+    /// (`epoch_shift_lifts_segment_times_onto_the_session_pcm_clock`): bridge
+    /// time restarts at zero for every epoch, so events leaving a non-zero
+    /// epoch must be lifted onto the session PCM clock before any seal maps
+    /// them to samples. Only the retired `AppleSealState::new` constructor kept
+    /// this test parked; the contract and both owners are live.
+    #[test]
+    fn epoch_shift_lifts_segment_times_onto_the_session_pcm_clock() {
+        let state = state_for("rc-w2-epoch-shift", 110.0);
+
+        let shifted = shift_events(
+            vec![LiveStreamEvent::PhraseFinal {
+                text: "Iwo".into(),
+                segments: vec![TranscriptSegment {
+                    text: "Iwo".into(),
+                    start_ts: 0.5,
+                    end_ts: 2.0,
+                }],
+            }],
+            100.0,
+        );
+        let LiveStreamEvent::PhraseFinal { segments, .. } = &shifted[0] else {
+            panic!("the shim must preserve the event kind, got {:?}", shifted[0]);
+        };
+        // Both sums are exact in binary32, so this is equality, not tolerance.
+        assert_eq!(segments[0].start_ts, 100.5);
+        assert_eq!(segments[0].end_ts, 102.0);
+
+        let on_pcm = apple_segments_on_pcm_clock(&state, segments);
+        assert_eq!(on_pcm[0].range.sample_start, at(100.5));
+        assert_eq!(on_pcm[0].range.sample_end, at(102.0));
+    }
+
+    /// Ported from the parked `mod tests`
+    /// (`epoch_shift_at_base_zero_is_identity`): the first epoch is based at 0,
+    /// so the shim is the identity there. This is what keeps a single-epoch
+    /// take bit-identical to the legacy one-stream lane.
+    #[test]
+    fn epoch_shift_at_base_zero_is_identity() {
+        let shifted = shift_events(
+            vec![
+                LiveStreamEvent::Partial {
+                    text: "Iwo".into(),
+                    segments: vec![TranscriptSegment {
+                        text: "Iwo".into(),
+                        start_ts: 0.5,
+                        end_ts: 2.0,
+                    }],
+                },
+                LiveStreamEvent::Summary {
+                    text: "Iwo wraca".into(),
+                    segments: vec![TranscriptSegment {
+                        text: "Iwo wraca".into(),
+                        start_ts: 0.5,
+                        end_ts: 4.0,
+                    }],
+                    ok: true,
+                    error: None,
+                },
+            ],
+            0.0,
+        );
+        let LiveStreamEvent::Partial { segments, .. } = &shifted[0] else {
+            panic!("the shim must preserve the event kind, got {:?}", shifted[0]);
+        };
+        assert_eq!((segments[0].start_ts, segments[0].end_ts), (0.5, 2.0));
+        let LiveStreamEvent::Summary { segments, .. } = &shifted[1] else {
+            panic!("the shim must preserve the event kind, got {:?}", shifted[1]);
+        };
+        assert_eq!((segments[0].start_ts, segments[0].end_ts), (0.5, 4.0));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Ported from the parked `mod tests`: phrase-restart adjudication.
+    // `phrase_restart_should_freeze_prior` is live production
+    // (`apple_live_session.rs:3639`) with a live consumer inside
+    // `emit_stream_events`, and every test of it was parked — so this rule
+    // currently ships unguarded. Nothing here revives a retired helper: the
+    // parked bodies only needed the current `AppleSealState` constructor.
+    // ══════════════════════════════════════════════════════════════════
+
+    fn segment(text: &str, start_ts: f32, end_ts: f32) -> TranscriptSegment {
+        TranscriptSegment {
+            text: text.into(),
+            start_ts,
+            end_ts,
+        }
+    }
+
+    /// Ported unchanged from the parked `mod tests`: the measured phrase-restart
+    /// vectors, including the 40→20 collapse the old rule missed. The table is
+    /// the falsifier — this test fails if any vector's verdict moves, and fails
+    /// if a vector is silently dropped from the fixture.
+    #[test]
+    fn fleet_red_retention_missed_collapse_40_to_20() {
+        let vectors = include_str!("../../../tests/fixtures/phrase_restart_vectors.tsv");
+        let required_ids = [
+            "measured_restart_47_to_12",
+            "measured_revision_95_to_79",
+            "missed_collapse_40_to_20",
+            "shared_opener_sentence_restart",
+            "shared_opener_spoken_variant",
+        ];
+        let mut seen_ids = std::collections::BTreeSet::new();
+
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let fields: Vec<_> = line.split('\t').collect();
+            assert_eq!(fields.len(), 4, "malformed phrase restart vector: {line}");
+            seen_ids.insert(fields[0]);
+            let expected = fields[1]
+                .parse::<bool>()
+                .expect("expected_freeze must be true or false");
+            let actual = phrase_restart_should_freeze_prior(fields[2], fields[3]);
+            if fields[0] == "missed_collapse_40_to_20" {
+                assert_eq!(fields[2].chars().count(), 40);
+                assert_eq!(fields[3].chars().count(), 20);
+            }
+            assert_eq!(
+                actual, expected,
+                "phrase restart vector {} diverged: prev_chars={} next_chars={}",
+                fields[0],
+                fields[2].chars().count(),
+                fields[3].chars().count()
+            );
+        }
+
+        for required_id in required_ids {
+            assert!(
+                seen_ids.contains(required_id),
+                "required phrase restart vector missing: {required_id}"
+            );
+        }
+    }
+
+    /// Ported from the parked `mod tests`: after a long open partial, SFSpeech
+    /// collapses onto the next sentence's shared opener. That collapse must
+    /// freeze the prior utterance — the old rule did not, and whole sentences
+    /// disappeared.
+    #[test]
+    fn utterance_drop_shared_opener_restart_freezes_prior_sentence() {
+        let s6 = "Zdanie szóste spokojnie po stresie wracam do normalnego tempa i mówię wyraźnie.";
+        assert!(
+            phrase_restart_should_freeze_prior(s6, "Zdanie"),
+            "collapse onto the next sentence's shared opener must freeze s6"
+        );
+        assert!(
+            phrase_restart_should_freeze_prior(s6, "Zdanie siódme"),
+            "collapse onto a non-prefix next-sentence head must freeze s6"
+        );
+        assert!(
+            phrase_restart_should_freeze_prior(s6, "Zadanie"),
+            "Zadanie opener (spoken variant) must freeze too"
+        );
+    }
+
+    /// Ported from the parked `mod tests`: revisions and rewinds retain the
+    /// prior text; only a forward extension containing the full prior
+    /// hypothesis may replace it.
+    #[test]
+    fn utterance_drop_revision_and_rewind_retain_prior() {
+        // 95 → 79 char mid-reword classifies as a revision, and still freezes,
+        // because otherwise its removed span has no retained copy anywhere.
+        let prev = format!("{}MIDDLE{}", "x".repeat(50), "y".repeat(39));
+        let next = format!("{}REVISE{}", "x".repeat(50), "y".repeat(23));
+        assert_eq!(prev.len(), 95);
+        assert_eq!(next.len(), 79);
+        assert!(
+            phrase_restart_should_freeze_prior(&prev, &next),
+            "revision must retain the prior hypothesis"
+        );
+        assert!(!phrase_restart_should_freeze_prior(
+            "Zdanie",
+            "Zdanie szóste spokojnie"
+        ));
+        let long = "Hello world this is a long phrase that continues for a while more text here";
+        let rewind: String = long.chars().take(40).collect();
+        assert!(
+            phrase_restart_should_freeze_prior(long, &rewind),
+            "substantial true-prefix rewind must retain its removed suffix"
+        );
+        assert!(phrase_restart_should_freeze_prior(long, ""));
+        assert!(!phrase_restart_should_freeze_prior("", "new phrase"));
+        assert!(!phrase_restart_should_freeze_prior(
+            "middle retained",
+            "new prefix middle retained and suffix"
+        ));
+    }
+
+    /// Ported from the parked `mod tests`: the same rule at the adjudication
+    /// layer, through the live `emit_stream_events` consumer — a partial
+    /// sequence that used to drop the post-stressor sentence now seals it as
+    /// `UtteranceFinal` before the restart partial lands as a preview.
+    #[test]
+    fn utterance_drop_emit_seals_prior_on_shared_opener_partial_restart() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = state_for("rc-w2-utterance-drop", 30.0);
+        let s5 = "Zdanie piąte, szybko bez pauz. Teraz mówię bardzo szybko, bez żadnej przerwy, \
+                  żeby sprawdzić czy silnik nadąża za tempem, którego normalnie unika w \
+                  codziennym dyktowaniu.";
+        let s6 = "Zdanie szóste spokojnie po stresie wracam do normalnego tempa i mówię wyraźnie.";
+        let s7 = "Zdanie siódme Overlap cztery angielskie terminy w polskim";
+        emit_stream_events(
+            vec![
+                LiveStreamEvent::Partial {
+                    text: s5.to_string(),
+                    segments: vec![segment(s5, 0.0, 5.0)],
+                },
+                // The stressor phrase seals cleanly.
+                LiveStreamEvent::PhraseFinal {
+                    text: s5.to_string(),
+                    segments: vec![segment(s5, 0.0, 5.0)],
+                },
+                // The post-stressor sentence builds as an open partial…
+                LiveStreamEvent::Partial {
+                    text: s6.to_string(),
+                    segments: vec![segment(s6, 5.0, 10.0)],
+                },
+                // …then SFSpeech restarts onto the next opener without isFinal.
+                LiveStreamEvent::Partial {
+                    text: "Zdanie".to_string(),
+                    segments: vec![segment("Zdanie", 10.0, 10.5)],
+                },
+                LiveStreamEvent::Partial {
+                    text: s7.to_string(),
+                    segments: vec![segment(s7, 10.0, 15.0)],
+                },
+                LiveStreamEvent::PhraseFinal {
+                    text: s7.to_string(),
+                    segments: vec![segment(s7, 10.0, 15.0)],
+                },
+            ],
+            &tx,
+            &mut state,
+            30.0,
+        );
+        drop(tx);
+        let mut finals = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::UtteranceFinal { text, .. } = event {
+                finals.push(text);
+            }
+        }
+        assert!(
+            finals
+                .iter()
+                .any(|t| t.contains("szóste") || t.contains("szost")),
+            "the post-stressor sentence must be committed, got finals: {finals:?}"
+        );
+        assert!(
+            finals
+                .iter()
+                .any(|t| t.contains("siódme") || t.contains("siodm") || t.contains("Overlap")),
+            "the restarting sentence must still seal, got finals: {finals:?}"
+        );
+        assert!(
+            state.sealed_count >= 3,
+            "s5 + frozen s6 + s7 → at least 3 seals, got {}",
+            state.sealed_count
+        );
     }
 }
