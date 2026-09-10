@@ -1921,19 +1921,28 @@ mod tests {
         destination.read_to_end(&mut encoded).expect("held result");
         assert!(encoded.len() > 12 && encoded.len() < original.len());
         assert_eq!(&encoded[4..8], b"ftyp", "M4A container, never WAV fallback");
-        let (decoded, rate) = crate::audio::load_audio_file(&moved_destination)
-            .expect("decode production M4A");
+        let (decoded, rate) =
+            crate::audio::load_audio_file(&moved_destination).expect("decode production M4A");
         assert!(rate > 0 && !decoded.is_empty());
         let seconds = decoded.len() as f32 / rate as f32;
         assert!((4.0..=6.0).contains(&seconds), "decoded duration {seconds}");
-        assert!(decoded.iter().any(|sample| sample.abs() > 0.01), "non-silent PCM");
+        assert!(
+            decoded.iter().any(|sample| sample.abs() > 0.01),
+            "non-silent PCM"
+        );
         source.rewind().expect("rewind source");
         let mut preserved = Vec::new();
         source.read_to_end(&mut preserved).expect("read source");
         assert_eq!(preserved, original);
         assert_eq!(fs::read(&moved_source).expect("held source"), original);
-        assert_eq!(fs::read(&source_path).expect("foreign source"), b"foreign source");
-        assert_eq!(fs::read(&destination_path).expect("foreign destination"), b"foreign destination");
+        assert_eq!(
+            fs::read(&source_path).expect("foreign source"),
+            b"foreign source"
+        );
+        assert_eq!(
+            fs::read(&destination_path).expect("foreign destination"),
+            b"foreign destination"
+        );
     }
 
     /// macOS: save_audio archives to smaller m4a that still decodes near source duration.

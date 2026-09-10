@@ -1,8 +1,8 @@
 //! Bounded archive-only conversion. The child owns only private staging paths.
 
-use anyhow::Result;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use anyhow::Context;
+use anyhow::Result;
 use std::fs::File;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 use std::io::{Seek, SeekFrom};
@@ -48,13 +48,22 @@ fn run_encoder(
 
     let input_meta = input.metadata()?;
     let output_meta = output.metadata()?;
-    anyhow::ensure!(input_meta.is_file(), "archive encoder input must be regular");
-    anyhow::ensure!(output_meta.is_file(), "archive encoder destination must be regular");
+    anyhow::ensure!(
+        input_meta.is_file(),
+        "archive encoder input must be regular"
+    );
+    anyhow::ensure!(
+        output_meta.is_file(),
+        "archive encoder destination must be regular"
+    );
     anyhow::ensure!(
         (input_meta.dev(), input_meta.ino()) != (output_meta.dev(), output_meta.ino()),
         "archive encoder input aliases destination"
     );
-    let staging = tempfile::Builder::new().prefix("codescribe-encoder-").tempdir()?;
+    let staging = tempfile::Builder::new()
+        .prefix("codescribe-encoder-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -109,7 +118,10 @@ fn admit_encoder_output(dir: &File) -> Result<File> {
     let encoded = unsafe { File::from_raw_fd(fd) };
     let metadata = encoded.metadata()?;
     anyhow::ensure!(metadata.is_file(), "archive encoder output must be regular");
-    anyhow::ensure!(metadata.nlink() == 1, "archive encoder output must not be hardlinked");
+    anyhow::ensure!(
+        metadata.nlink() == 1,
+        "archive encoder output must not be hardlinked"
+    );
     anyhow::ensure!(metadata.len() > 0, "archive encoder returned empty success");
     Ok(encoded)
 }
@@ -233,16 +245,30 @@ mod tests {
     fn assert_reaped(pid: libc::pid_t) {
         let mut status = 0;
         // SAFETY: check only the recorded child; the status pointer is valid.
-        assert_eq!(unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) }, -1);
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
     fn success_failure_and_deadline_return_only_after_child_is_reaped() {
         for (script, timeout, expected) in [
             ("exit 0", Duration::from_secs(2), None),
-            ("exit 9", Duration::from_secs(2), Some("archive encoder failed")),
-            ("while :; do :; done", Duration::ZERO, Some("deadline exceeded")),
+            (
+                "exit 9",
+                Duration::from_secs(2),
+                Some("archive encoder failed"),
+            ),
+            (
+                "while :; do :; done",
+                Duration::ZERO,
+                Some("deadline exceeded"),
+            ),
         ] {
             let child = Command::new("/bin/sh")
                 .args(["-c", script])
@@ -254,7 +280,9 @@ mod tests {
             let pid = child.id() as libc::pid_t;
             let result = supervise(child, timeout);
             match expected {
-                Some(message) => assert!(result.expect_err("refused").to_string().contains(message)),
+                Some(message) => {
+                    assert!(result.expect_err("refused").to_string().contains(message))
+                }
                 None => result.expect("success"),
             }
             assert_reaped(pid);
@@ -274,6 +302,44 @@ mod tests {
         });
         assert!(result.is_err());
         assert_reaped(pid);
+    }
+
+    #[test]
+    fn child_observes_private_directory_and_input_before_encoder_work() {
+        let mut input = tempfile::tempfile().expect("input");
+        input.write_all(b"admitted audio").expect("fixture");
+        let mut output = tempfile::tempfile().expect("output");
+        output.write_all(b"held destination").expect("sentinel");
+        // Observe modes in the actual encoder child, before creating output.
+        // The returned bytes are a transport receipt, not an M4A codec claim.
+        let stat_args = if cfg!(target_os = "macos") {
+            "-f %Lp"
+        } else {
+            "-c %a"
+        };
+        run_encoder(
+            Command::new("/bin/sh").args([
+                "-c",
+                r#"set -eu
+directory_mode=$(/usr/bin/stat $1 .)
+input_mode=$(/usr/bin/stat $1 input.wav)
+test "$directory_mode" = 700
+test "$input_mode" = 600
+test ! -e output.m4a
+test "$(cat input.wav)" = 'admitted audio'
+printf '%s/%s\n' "$directory_mode" "$input_mode" > output.m4a
+cat input.wav >> output.m4a
+"#,
+                "mode-witness",
+                stat_args,
+            ]),
+            &mut input,
+            &mut output,
+            Duration::from_secs(2),
+        )
+        .expect("child verifies private staging before encoder work");
+        assert_eq!(bytes(&mut output), b"700/600\nadmitted audio");
+        assert_eq!(bytes(&mut input), b"admitted audio");
     }
 
     #[test]
@@ -313,7 +379,10 @@ mod tests {
         symlink(stage.join("output.m4a"), moved.join("output.m4a")).expect("replace leaf");
         assert!(admit_encoder_output(&dir).is_err());
         assert_eq!(bytes(&mut admitted), b"admitted result");
-        assert_eq!(std::fs::read(stage.join("output.m4a")).expect("foreign"), b"foreign result");
+        assert_eq!(
+            std::fs::read(stage.join("output.m4a")).expect("foreign"),
+            b"foreign result"
+        );
     }
 
     #[test]
