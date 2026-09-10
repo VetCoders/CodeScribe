@@ -918,51 +918,10 @@ SWIFT_TEST_CODESIGN_IDENTITY ?= -
 SWIFT_TEST_MAX_SECONDS ?= 30
 .PHONY: test-swift
 test-swift: $(ENGINE_BRIDGE)
-	@set -o pipefail; \
-	$(TEST_DATA_DIR_SETUP); \
-	echo "=== Apple phrase-restart Rust/Swift lockstep self-test ==="; \
-	$(ENGINE_BRIDGE) --phrase-restart-self-test || exit $$?; \
-	if [ ! -f target/$(PROFILE)/libcodescribe_ffi.dylib ]; then \
-	  echo "test-swift: target/$(PROFILE)/libcodescribe_ffi.dylib is missing." >&2; \
-	  echo "test-swift: run 'make app-bindings' (or 'make app') first." >&2; \
-	  exit 2; \
-	fi; \
-	if ! command -v xcodegen >/dev/null 2>&1; then \
-	  echo "test-swift: xcodegen is required because the Xcode project is generated, not committed." >&2; \
-	  exit 2; \
-	fi; \
-	echo "=== Regenerating Xcode project from project.yml ==="; \
-	( cd macos && xcodegen generate ) || exit $$?; \
-	echo "=== Swift front-end tests (CodescribeTests) ==="; \
-	cd macos && xcodebuild test \
-	  -scheme Codescribe \
-	  -destination 'platform=macOS,arch=arm64' \
-	  CODE_SIGN_IDENTITY="$(SWIFT_TEST_CODESIGN_IDENTITY)" \
-	  $(SWIFT_TEST_ARGS) 2>&1 | tee $(SWIFT_TEST_LOG) | \
-	  grep -E "^Test Case .* (failed|error)|Executed [0-9]+ tests|^\*\* TEST|error:"; \
-	rc=$${PIPESTATUS[0]}; \
-	executed=$$(grep -oE 'Executed [0-9]+ test' $(SWIFT_TEST_LOG) | tail -1 | grep -oE '[0-9]+'); \
-	if [ "$$rc" -eq 0 ] && [ "$${executed:-0}" -eq 0 ]; then \
-	  echo "test-swift: xcodebuild said TEST SUCCEEDED but executed 0 tests." >&2; \
-	  echo "test-swift: a -only-testing filter that matches nothing exits 0 — that is a" >&2; \
-	  echo "test-swift: silent pass, not a green gate. Check SWIFT_TEST_ARGS." >&2; \
-	  rc=3; \
-	fi; \
-	secs=$$(sed -nE 's/^.*Executed [0-9]+ tests?,.* in ([0-9.]+) \([0-9.]+\) seconds.*$$/\1/p' $(SWIFT_TEST_LOG) | tail -1); \
-	slowest=$$(sed -nE "s/^.*CodescribeTests\.([A-Za-z0-9_]+) ([A-Za-z0-9_]+)\]' passed \(([0-9.]+) seconds\)\..*$$/\3 \1.\2/p" $(SWIFT_TEST_LOG) | sort -rn | head -1); \
-	echo "test-swift: full log $(SWIFT_TEST_LOG) (rc=$$rc, executed=$${executed:-0}, seconds=$${secs:-unknown})"; \
-	if [ -n "$$slowest" ]; then echo "test-swift: slowest test $$slowest"; fi; \
-	if [ "$$rc" -eq 0 ] && [ -n "$$secs" ] && \
-	   awk -v s="$$secs" -v m="$(SWIFT_TEST_MAX_SECONDS)" 'BEGIN{exit !(s>m)}'; then \
-	  echo "test-swift: suite took $$secs s, over the $(SWIFT_TEST_MAX_SECONDS) s budget." >&2; \
-	  echo "test-swift: green-but-slow is the shape this gate exists to catch — a 10x swing" >&2; \
-	  echo "test-swift: here has meant the core is doing real (blocking) work for a test run," >&2; \
-	  echo "test-swift: not that the machine is busy. Check the slowest test above, then" >&2; \
-	  echo "test-swift: core/config/keychain.rs::in_xctest_host and macos/CodescribeTests/README.md." >&2; \
-	  echo "test-swift: if the host really is loaded: make test-swift SWIFT_TEST_MAX_SECONDS=90" >&2; \
-	  rc=4; \
-	fi; \
-	exit $$rc
+	@$(TEST_DATA_DIR_SETUP); \
+	$(SHELL) scripts/test-swift.sh "$(PROFILE)" "$(ENGINE_BRIDGE)" \
+	  "$(SWIFT_TEST_CODESIGN_IDENTITY)" "$(SWIFT_TEST_MAX_SECONDS)" \
+	  "$(SWIFT_TEST_LOG)" $(SWIFT_TEST_ARGS)
 
 # Apple live engine proof.
 #
