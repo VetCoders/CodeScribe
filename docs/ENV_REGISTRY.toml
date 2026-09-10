@@ -281,16 +281,17 @@ description = "OpenAI vendor key account (Settings › Providers / Keychain bund
 [vars.LLM_XAI_API_KEY]
 default = ""
 type = "secret"
+secret = true
 reload = "hot"
 category = "llm"
-description = "xAI vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+description = "xAI vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL. xAI (Grok) API key for the assistive/agent lane when LLM_ASSISTIVE_PROVIDER=xai-responses. Stored in the Codescribe Keychain bundle under its own account, so it coexists with the OpenAI and Anthropic keys"
 
 [vars.LLM_ANTHROPIC_API_KEY]
 default = ""
 type = "secret"
 reload = "hot"
 category = "llm"
-description = "Anthropic vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL"
+description = "Anthropic vendor key account (Settings › Providers / Keychain bundle); env is a fallback, never the URL. Anthropic Messages API key account shared by Anthropic formatting and assistive lanes"
 
 [vars.LLM_API_KEY]
 default = ""
@@ -354,13 +355,6 @@ type = "secret"
 reload = "hot"
 category = "llm"
 description = "RETIRED alias of LLM_OPENAI_API_KEY (warned, removed after 2026-10-15); lanes select a provider, keys live per provider"
-
-[vars.LLM_ANTHROPIC_API_KEY]
-default = ""
-type = "secret"
-reload = "hot"
-category = "llm"
-description = "Anthropic Messages API key account shared by Anthropic formatting and assistive lanes"
 
 [vars.LLM_TEMPERATURE]
 default = ""
@@ -525,13 +519,6 @@ type = "string"
 reload = "restart"
 category = "stt"
 description = "Directory containing all models; a leading ~/ expands to the user home directory"
-
-[vars.CODESCRIBE_EMBED_MODEL]
-default = ""
-type = "string"
-reload = "rebuild"
-category = "stt"
-description = "Whisper model name embedded at build time (core/build.rs fat SKU path)"
 
 [vars.CODESCRIBE_STT_ENGINE]
 default = "auto"
@@ -933,14 +920,6 @@ type = "string"
 reload = "restart"
 category = "llm"
 description = "Override the Anthropic OAuth issuer base URL used for account login (proxies and staging only)"
-
-[vars.LLM_XAI_API_KEY]
-default = ""
-type = "string"
-reload = "hot"
-category = "llm"
-secret = true
-description = "xAI (Grok) API key for the assistive/agent lane when LLM_ASSISTIVE_PROVIDER=xai-responses. Stored in the Codescribe Keychain bundle under its own account, so it coexists with the OpenAI and Anthropic keys"
 
 [vars.LLM_XAI_ENDPOINT]
 default = "https://api.x.ai/v1/responses"
@@ -1378,7 +1357,7 @@ default = ""
 type = "string"
 reload = "rebuild"
 category = "build"
-description = "Whisper model to embed (HF repo or local path)"
+description = "Whisper model selected at build time by core/build.rs for the opt-in fat SKU: model name, HF repo ID (owner/repo), or local directory (absolute, ~/, or relative to core/; a bare name falls back to core/models/). Empty uses the compiled default model name. A complete CODESCRIBE_MODEL_PATH override wins, then composed models directories, then a complete HF cache snapshot, then the local path"
 
 [vars.CODESCRIBE_NO_EMBED]
 default = "0"
