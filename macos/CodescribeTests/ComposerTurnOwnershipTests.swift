@@ -257,7 +257,7 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     XCTAssertFalse(stopRequested(f.surface.calls))
   }
 
-  func testStopFailureRevokesStopPermissionButPreservesTerminalDestination() async {
+  func testStopFailureRevokesLivePermissionButAllowsAddressedRetry() async {
     let f = makeFixture(recording: [false, true, true])
     f.dictation.toggle()
     await settle(f)
@@ -274,7 +274,9 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.store.setDictationPhase(.recording) // A later foreign phase cannot grant another stop.
     f.dictation.toggle()
     await settle(f)
-    XCTAssertEqual(stopCount(f.surface.calls), 1)
+    XCTAssertEqual(stopCount(f.surface.calls), 2)
+    XCTAssertTrue(f.store.composerStopRetryAvailable)
+    XCTAssertEqual(f.surface.calls.filter { $0 == .startComposerTurn }.count, 1)
     f.store.endDictationSession()
     XCTAssertNil(f.store.dictationThreadID)
     XCTAssertFalse(f.store.hasComposerCaptureRequest)
@@ -482,6 +484,92 @@ final class ComposerTurnOwnershipTests: XCTestCase {
     f.dictation.toggle()
     await settle(f)
     XCTAssertEqual(stopCount(f.surface.calls), 1)
+  }
+
+  // W2 contracts, UNRUN: transport recovery addresses the original request.
+  func testTransportRetryKeepsCaptureRequestThreadAndDraftUntilAddressedDelivery() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    let request = f.store.currentComposerCaptureRequestID
+    f.surface.stopFails = true
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertTrue(f.store.composerStopRetryAvailable)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    f.store.select(f.threadB)
+    f.store.draft = "B's unsent draft"
+    f.surface.stopFails = false
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, [.isRecording, .startComposerTurn, .stop("capture-1"), .stop("capture-1")])
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertEqual(f.store.draft, "B's unsent draft")
+    XCTAssertFalse(f.store.composerStopRetryAvailable)
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal, "Stopped is not delivery acknowledgement")
+    XCTAssertEqual(f.store.receiveDictationTranscript("A's recovered words", captureID: "capture-1"), .parked(threadID: f.threadA))
+    XCTAssertTrue(f.store.finishDictationCapture(sessionID: "capture-1"))
+    XCTAssertEqual(f.store.draft, "B's unsent draft")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "A's recovered words")
+  }
+
+  func testRetryFailureStaysActionableAfterBannerExpiryWithoutInferringIdle() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    let expiry = Gate(expectation(description: "failure banner clock entered"))
+    f.store.waitForDictationFailureExpiry = { await expiry.wait() }
+    f.surface.stopFails = true
+    f.dictation.toggle()
+    await settle(f)
+    await fulfillment(of: [expiry.entered], timeout: 1)
+    expiry.release()
+    await f.store.dictationFailureTask?.value
+    guard case .failed = f.store.dictationPhase else {
+      return XCTFail("preparing would disable the real composer mic retry")
+    }
+    XCTAssertTrue(f.store.composerStopRetryAvailable)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    f.surface.stopFails = false
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, [.isRecording, .startComposerTurn, .stop("capture-1"), .stop("capture-1")])
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+  }
+
+  func testDelayedRetryReplyCannotChangeAReplacementRequest() async {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    f.surface.stopFails = true
+    f.dictation.toggle()
+    await settle(f)
+    guard let oldRequest = f.store.currentComposerCaptureRequestID else {
+      return XCTFail("the failed transport must retain its request")
+    }
+    let gate = Gate(expectation(description: "retry is suspended"))
+    f.surface.stopFails = false
+    f.surface.stopOutcome = .foreignCapture
+    f.surface.onStop = { await gate.wait() }
+    f.dictation.toggle()
+    await fulfillment(of: [gate.entered], timeout: 1)
+    f.store.endDictationSession()
+    f.store.select(f.threadB)
+    let replacement = f.store.beginComposerCaptureRequest(threadID: f.threadB)
+    f.store.completeComposerCaptureStart(replacement, live: true, handle: CsCaptureHandle(captureId: "capture-2"))
+    gate.release()
+    await settle(f)
+    XCTAssertNotEqual(oldRequest, replacement)
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, replacement)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-2")
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+    f.store.reportComposerStopFailure("late failure", requestID: oldRequest, handle: CsCaptureHandle(captureId: "capture-1"))
+    XCTAssertFalse(f.store.composerStopRetryAvailable)
+    XCTAssertTrue(f.store.ownsLiveDictation)
   }
 
 }

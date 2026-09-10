@@ -153,7 +153,9 @@ pub struct CsCaptureHandle {
 }
 
 /// Typed outcome of a conditional stop. Every variant is a state the caller can
-/// act on; none of them is an error string to match.
+/// act on; none of them is an error string to match. A failed transport may
+/// retry the same handle to join/retrieve the retained controller operation.
+/// Stopped acknowledges processing, not consumption of addressed delivery.
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CsConditionalStop {
     /// The identity matched the live capture and the stop path ran.

@@ -117,6 +117,88 @@ Named toggle captures use the existing toggle terminal processor even in
 Assistive mode, so it reads the recorder's `CaptureTurnIntent` and preserves the
 one-turn formatter/delivery route. No hands-free configuration is changed.
 
+### Shared Stop convergence (rc-w2-stop-convergence, W2 source only)
+
+Hold release, RAW toggle during hold, toggle Stop, external overlay/tray Stop,
+and composer Stop now register or join the same controller settlement slot.
+Hotkey Stop admission precedes mode-flag writes. Current capture selection uses
+non-waiting registration/serialization/state/identity locks: contention refuses
+admission rather than queuing an unaddressed gesture behind a replacement.
+The registered task rechecks its named identity under `serial_lock` and retains
+that lock through terminal processing. An idle Stop invalidates a not-yet-admitted
+delayed hold generation. A foreign named Stop cannot invalidate that generation.
+
+Routing now depends on the admitted take, not on its stopping surface:
+SingleTurn toggle takes use the toggle terminal body, including Assistive;
+HandsFree takes use the existing external-surface final-pass policy. Thus
+Assistive HandsFree and explicitly disabled final-pass toggle gestures now use
+the same generic processor as their external Stop. The existing one-turn
+formatter, audio retention, typed processing errors and delivery claim remain.
+
+The old hold/toggle watchdogs cancelled their processing futures, called
+`recover_from_stuck_stop` and forced Idle even with a held recorder. They are
+removed. The replacement contract is a bounded caller wait and an uncancelled,
+tracked operation. Legacy void bridge Stop reports unresolved outcomes as errors;
+it never maps Pending/AlreadyStopping/admission refusal to successful Stop.
+Original May 13/14 hang evidence remains beside the phase timing logs. The old
+forced-Idle serving-status test is replaced by barrier tests requiring Busy and
+no terminal while held, followed by exact terminal settlement after release.
+Actual completed failures retain the TranscriptionFailed lifecycle assertions.
+
+After an addressed transport error, the store grants one explicit retry using
+its original request ID and capture handle. Retry joins/retrieves the same
+operation, makes no isRecording query and starts no take. This permission is
+separate from recording presentation; lifecycle paint and banner expiry cannot
+create it. An addressed transport-failure banner stays visible until retry or
+terminal receipt: the real composer's preparing mic is disabled, whereas its
+failure mic remains actionable on the owning thread. Retry success still does
+not acknowledge delivery. Original thread,
+draft and capture receipts remain until the addressed consumer delivers or
+reconciles the capture. Late results/failures cannot mutate a replacement request.
+A lost delivery event after a successful Stop reply still needs the outside-fence
+projection/transport recovery owner; this cut adds no replayed document API.
+
+Shutdown closes capture admission permanently for that controller, including
+delayed hold tasks and conversation starts. The bridge also closes lazy
+construction admission and retains the closed shared root until runtime teardown.
+It requires a terminal Stop outcome plus quiescence checked under serialization:
+no active task without a result, Idle, no session identity, inactive recorder,
+and no running conversation task. Busy/Pending, lock contention, processing error
+or missing receipt refuses shutdown without clearing capture ownership. A later
+shutdown attempt can join the same owner. No application is stopped to verify this
+source checkpoint. Runtime restart within the same process is not restored by
+this shutdown contract.
+
+**BOUNDARY — finite Stop is still open.** `StreamingRecorder::stop` awaits
+`Recorder::stop`; that owner's `stop_tx.send`, stream destruction,
+`SpillSink::finalize` thread join, buffer locks and WAV writes have no end-to-end
+bound. `StreamingRecorder::complete_stop` awaits the transcription task, takes
+transcript-buffer locks during drain, and locks the ledger. Its three-second drain
+clock cannot bound lock acquisition. Controller routing/recorder/mode locks,
+terminal formatter, delivery and terminal reset/publication also remain owned
+potentially indefinite waits. Filesystem copies, archive publication and process
+reap can block despite the inherited encoder budget. Safe finite recovery needs
+the resource owner to return authenticated failure/audio receipts after it has
+actually released or quarantined the resource; a timer in this controller cannot
+authorize reuse or fabricate a seal. Pending alone fails full RC acceptance.
+
+Conversation key-up still calls `stop_conversation_mode`, with its separate
+Moshi loop/recorder/player cleanup. It has no capture-addressed settlement
+identity and drops its timed-out JoinHandle. External Stop and shutdown now
+refuse that unsupported state rather than run generic dictation cleanup on it.
+This remains an explicit convergence boundary; the conversation engine/audio
+owners are outside this fence. OS hotkey events queued before reaching controller
+admission also carry no capture identity; this cut's successor guarantee starts
+at controller admission, not at the physical key timestamp.
+
+Tests added here exercise actual controller routes and barriers, bridge shutdown
+receipt handling, and RealComposerDictation/AgentChatStore recovery with a fake
+FFI transport. Hold processing still uses the inherited `cfg!(test)` short path;
+this is not a microphone/archive end-to-end test. All tests are **UNRUN**.
+BUILD/TEST/RUNTIME=NOT_ASSESSED. Astra must reconcile overlay recovery and generated
+bindings, restore the relevant Rust and Swift gates at seam closure, and verify
+installed behavior. This source checkpoint is not W2 structural closure.
+
 ### Producer failure recovery (W2 source checkpoint, tests UNRUN)
 
 `StreamingRecorder::stop` now passes every archive outcome through the same

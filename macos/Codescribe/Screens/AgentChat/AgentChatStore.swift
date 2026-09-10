@@ -642,6 +642,7 @@ final class AgentChatStore: ObservableObject {
   /// Lifecycle paint may select a delivery thread but cannot create this receipt.
   private var composerCaptureRequestID: UUID?
   private var composerCaptureStartCompleted = false
+  private(set) var composerStopRetryAvailable = false
   /// The controller's own identity for the take this gesture opened. Unlike the
   /// booleans above, this is not a local belief: the controller minted it, and
   /// handing it back is what lets a stop be refused when the microphone changed
@@ -703,6 +704,7 @@ final class AgentChatStore: ObservableObject {
     composerCaptureRequestID = requestID
     composerCaptureStartCompleted = false
     composerCaptureAwaitingTerminal = false
+    composerStopRetryAvailable = false
     dictationThreadID = threadID
     let destination = threads.first { $0.id == threadID }
       ?? threadsBeforeSearch?.first { $0.id == threadID }
@@ -746,6 +748,7 @@ final class AgentChatStore: ObservableObject {
 
   /// Consume local stop permission once; terminal delivery still owns the latch.
   func awaitComposerCaptureTerminal() {
+    composerStopRetryAvailable = false
     composerCaptureStartCompleted = false
     composerCaptureAwaitingTerminal = true
     dictationPhase = .preparing
@@ -762,6 +765,7 @@ final class AgentChatStore: ObservableObject {
     case .admissionUnavailable:
       composerCaptureStartCompleted = true
       composerCaptureAwaitingTerminal = false
+      composerStopRetryAvailable = false
       dictationPhase = .recording
     case .foreignCapture, .noLiveCapture:
       reconcileComposerCaptureLost()
@@ -772,6 +776,8 @@ final class AgentChatStore: ObservableObject {
     guard isCurrentComposerCaptureRequest(requestID),
       composerCaptureHandle?.captureId == handle.captureId else { return }
     reportDictationFailure(message, preservingDelivery: true)
+    // Only an addressed failure grants retry. Global lifecycle paint cannot.
+    composerStopRetryAvailable = true
   }
 
   /// Release a request whose take the controller says no longer exists.
@@ -784,6 +790,7 @@ final class AgentChatStore: ObservableObject {
     composerCaptureRequestID = nil
     composerCaptureStartCompleted = false
     composerCaptureAwaitingTerminal = false
+    composerStopRetryAvailable = false
     composerCaptureHandle = nil
     dictationBlocked = false
     let hadSession = dictationThreadID != nil
@@ -835,6 +842,7 @@ final class AgentChatStore: ObservableObject {
       composerCaptureRequestID = nil
       composerCaptureStartCompleted = false
       composerCaptureAwaitingTerminal = false
+      composerStopRetryAvailable = false
       composerCaptureHandle = nil
       let hadSession = dictationThreadID != nil
       dictationThreadID = nil
@@ -1002,6 +1010,7 @@ final class AgentChatStore: ObservableObject {
     composerCaptureRequestID = nil
     composerCaptureStartCompleted = false
     composerCaptureAwaitingTerminal = false
+    composerStopRetryAvailable = false
     composerCaptureHandle = nil
     dictationBlocked = false
     if case .failed = dictationPhase {
@@ -1013,8 +1022,7 @@ final class AgentChatStore: ObservableObject {
   }
 
   /// Surface a recoverable dictation failure with a self-clearing inline message
-  /// (auto-returns to `.idle` after a few seconds so the composer doesn't keep a
-  /// stale error banner).
+  /// (expiry clears the banner; a pending request stays preparing).
   func reportDictationFailure(_ message: String, preservingDelivery: Bool = false) {
     if preservingDelivery {
       composerCaptureStartCompleted = false
@@ -1033,6 +1041,9 @@ final class AgentChatStore: ObservableObject {
       guard let self, !Task.isCancelled, dictationFailureToken == token,
         (composerCaptureRequestID == requestID || composerCaptureRequestID == nil),
         case .failed = dictationPhase else { return }
+      // Preparing disables the real mic button. An addressed transport failure
+      // stays actionable on the owning thread until retry or terminal receipt.
+      guard !composerStopRetryAvailable else { return }
       // Banner expiry is display cleanup, not a terminal delivery receipt.
       dictationPhase = hasComposerCaptureRequest ? .preparing : .idle
     }
