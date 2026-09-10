@@ -736,12 +736,20 @@
               "symbol": "seal_utterance_final",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
-                "state.fusion_seal_armed && seal_sliced_by_silero(state, ev_tx, &disjoint)",
+                "if state.fusion_seal_armed {",
+                "if segments.is_empty() {",
+                "return false;",
+                "seal_sliced_by_silero(state, ev_tx, &segments);",
+                "return true;",
+                "let mut cursor = state.last_apple_segment_end;",
+                "for mut segment in segments {",
                 "let apple_range = TailSampleRange {",
                 "session: state.session_id.clone()",
                 "capture_epoch: state.capture_epoch",
                 "sample_start: span_sample_start",
                 "sample_end: span_sample_end",
+                "let ledger_occurrence = OccurrenceIdentity::from(&span_range)",
+                "let apple_admitted = admit_ledger_label(",
                 "EnergyAdmission::QualifyFromOwnedPcm"
               ]
             },
@@ -749,33 +757,95 @@
               "symbol": "seal_sliced_by_silero",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
-                "let occurrence = OccurrenceIdentity::from(&silero.range)",
-                "let apple_admitted = admit_ledger_label(",
-                "LedgerObservationProducer::Apple",
-                "occurrence.clone()",
-                "energy: EnergyAdmission::QualifyFromOwnedPcm"
+                "let Some(fusion) = state.fusion.as_ref() else {",
+                "return false;",
+                "let utterances = fusion.ledger().utterances();",
+                "if disjoint.is_empty()",
+                "&& state.silero_slice_revision.as_ref().is_some_and(|(len, last)| {",
+                "*len == utterances.len() && last.as_ref() == utterances.last()",
+                "return true;",
+                "state.silero_slice_revision = Some((utterances.len(), utterances.last().cloned()));",
+                "let ledger = fusion.ledger().clone();",
+                "reconcile_silero_ledger(state, ev_tx, &ledger, disjoint)"
+              ]
+            },
+            {
+              "symbol": "reconcile_silero_ledger",
+              "file": "core/pipeline/streaming/apple_live_session.rs",
+              "required_code": [
+                "if ledger.utterances().iter().any(|utterance| {",
+                "utterance.range.session != state.session_id",
+                "|| utterance.range.capture_epoch != state.capture_epoch",
+                "code: RefinementFailure::InvalidIdentity.code().into()",
+                "return false;",
+                "let apple_words = apple_segments_on_pcm_clock(state, disjoint);",
+                "let (sliced, leftover) = slice_apple_words(ledger, &fusion_words);",
+                "for silero in ledger",
+                ".filter(|utterance| utterance.closed)",
+                "let has_apple_label = !text.trim().is_empty();",
+                "let occurrence = OccurrenceIdentity::from(&silero.range);",
+                "if !qualify_owned_occurrence(state, &occurrence) {",
+                "RefinementFailure::PcmUnavailable",
+                "RefinementFailure::QualificationRefused",
+                "state.fail_refinement(ev_tx, utterance_id, &occurrence, reason);",
+                "state.reconciled_silero.insert(utterance_id);",
+                "continue;",
+                "let apple_admitted = if has_apple_label {",
+                "admit_ledger_label(",
+                "energy: EnergyAdmission::RequireExistingQualification,",
+                "let request_range = bound_context_range(&silero.range, context, pad_samples, &bounds);",
+                "state.window_by_samples(request_range.sample_start, request_range.sample_end)"
+              ]
+            },
+            {
+              "symbol": "qualify_owned_occurrence",
+              "file": "core/pipeline/streaming/apple_live_session.rs",
+              "required_code": [
+                "if occurrence.session != state.session_id || occurrence.capture_epoch != state.capture_epoch {",
+                "return false;",
+                "let Some(calibration) = state.energy_calibration.as_ref() else {",
+                "return false;",
+                "if ledger.is_qualified(occurrence) {",
+                "return true;",
+                "let Some(window) = state.window_by_samples(occurrence.sample_start, occurrence.sample_end)",
+                "return false;",
+                "if window.samples.is_empty() {",
+                "return false;",
+                "let energy_integral = window",
+                "let mean_rms = (energy_integral / window.samples.len() as f64).sqrt();",
+                "let peak = window",
+                ".fold(0.0_f64, f64::max);",
+                "let evidence = AcousticEvidence {",
+                "occurrence: occurrence.clone(),",
+                "duration_ms: occurrence.sample_len() as f64 * 1_000.0 / state.sample_rate.max(1) as f64,",
+                "mean_rms_dbfs: dbfs(mean_rms),",
+                "peak_dbfs: dbfs(peak),",
+                "vad_open_sample: Some(occurrence.sample_start),",
+                "vad_close_sample: Some(occurrence.sample_end),",
+                "evidence_calibration_version: calibration.version.clone(),",
+                "if !ledger.qualify(&evidence, calibration).is_qualified() {",
+                "return false;"
               ]
             },
             {
               "symbol": "admit_ledger_label",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
-                "let occurrence = observation.occurrence.clone()",
-                "window_by_samples(occurrence.sample_start, occurrence.sample_end)?",
-                "if window.samples.is_empty()",
-                "let energy_integral = window.samples.iter()",
-                "let mean_rms = (energy_integral / window.samples.len() as f64).sqrt()",
-                "let peak = window.samples.iter()",
-                "let evidence = AcousticEvidence {",
-                "occurrence: occurrence.clone()",
-                "duration_ms: occurrence.sample_len() as f64 * 1_000.0 / state.sample_rate.max(1) as f64",
-                "energy_integral",
-                "mean_rms_dbfs: dbfs(mean_rms)",
-                "peak_dbfs: dbfs(peak)",
-                "vad_open_sample: Some(occurrence.sample_start)",
-                "vad_close_sample: Some(occurrence.sample_end)",
-                "evidence_calibration_version: calibration.version.clone()",
-                "ledger.qualify(&evidence, calibration)"
+                "let LabelAdmission {",
+                "let occurrence = observation.occurrence.clone();",
+                "let producer = observation.producer;",
+                "if occurrence.session != state.session_id || occurrence.capture_epoch != state.capture_epoch {",
+                "return None;",
+                "EnergyAdmission::QualifyFromOwnedPcm | EnergyAdmission::QualifyFinalPassGap",
+                ") && !qualify_owned_occurrence(state, &occurrence)",
+                "return None;",
+                "if !ledger.is_qualified(&occurrence) {",
+                "return None;",
+                "let receipt = ledger.admit(&observation, label);",
+                "EngineEvent::LedgerMutation {",
+                "let closed = ledger.note_frontier_return(&occurrence, producer);",
+                "EngineEvent::LedgerSeal { receipt: seal }",
+                "Some(receipt)"
               ]
             },
             {
@@ -814,84 +884,146 @@
               "callee_file": "core/audio/streaming_recorder.rs",
               "caller": "schedule_hold_start",
               "caller_file": "app/controller/mod.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "start_event_session",
               "callee_file": "core/audio/streaming_recorder.rs",
               "caller": "schedule_hold_start",
               "caller_file": "app/controller/mod.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "transcription_session",
               "callee_file": "core/pipeline/streaming/session.rs",
               "caller": "start_event_session",
               "caller_file": "core/audio/streaming_recorder.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "apple_stream_transcription_session",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "transcription_session",
               "caller_file": "core/pipeline/streaming/session.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "apple_stream_worker",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "apple_stream_transcription_session",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "emit_stream_events",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "apple_stream_worker",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "seal_utterance_final",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "emit_stream_events",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
-              "min_calls": 1
+              "minimum_count": 1
+            },
+            {
+              "callee": "seal_sliced_by_silero",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "apple_stream_worker",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 2
+            },
+            {
+              "callee": "reconcile_silero_ledger",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "seal_sliced_by_silero",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 1
+            },
+            {
+              "callee": "qualify_owned_occurrence",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "reconcile_silero_ledger",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 1
             },
             {
               "callee": "admit_ledger_label",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
-              "caller": "seal_sliced_by_silero",
+              "caller": "reconcile_silero_ledger",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
-              "min_calls": 1
+              "minimum_count": 2
+            },
+            {
+              "callee": "qualify_owned_occurrence",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "admit_ledger_label",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 1
             },
             {
               "callee": "qualify",
               "callee_file": "core/pipeline/acoustic_ledger.rs",
-              "caller": "admit_ledger_label",
+              "caller": "qualify_owned_occurrence",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "mint",
               "callee_file": "core/pipeline/acoustic_ledger.rs",
               "caller": "qualify",
               "caller_file": "core/pipeline/acoustic_ledger.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "bind_session_authority",
               "callee_file": "core/audio/streaming_recorder.rs",
               "caller": "start_toggle_recording",
               "caller_file": "app/controller/mod.rs",
-              "min_calls": 1
+              "minimum_count": 1
             },
             {
               "callee": "start_event_session",
               "callee_file": "core/audio/streaming_recorder.rs",
               "caller": "start_toggle_recording",
               "caller_file": "app/controller/mod.rs",
-              "min_calls": 1
+              "minimum_count": 1
+            }
+          ],
+          "ordering": [
+            {
+              "caller": "reconcile_silero_ledger",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "before": {
+                "corridor": "capture_to_ledger",
+                "callee": "qualify_owned_occurrence"
+              },
+              "after": {
+                "corridor": "capture_to_ledger",
+                "callee": "admit_ledger_label"
+              },
+              "barrier": {
+                "required_code": "state.fail_refinement(ev_tx, utterance_id, &occurrence, reason);",
+                "selection": "last_before_after"
+              }
+            },
+            {
+              "caller": "reconcile_silero_ledger",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "before": {
+                "corridor": "capture_to_ledger",
+                "callee": "qualify_owned_occurrence"
+              },
+              "after": {
+                "corridor": "capture_to_ledger",
+                "callee": "admit_ledger_label"
+              },
+              "barrier": {
+                "required_code": "if ledger.is_sealed(&occurrence) {",
+                "selection": "last_before_after"
+              }
             }
           ]
         },
