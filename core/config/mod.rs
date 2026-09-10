@@ -52,7 +52,10 @@ pub mod stt_migration;
 /// Config enums and the main `Config` struct definitions.
 mod types;
 
-pub use loader::{CapturedLaneCredential, CapturedRuntimeInputs, StartupAcquisitionProbe, note_startup_acquisition};
+pub use loader::{
+    CapturedLaneCredential, CapturedRuntimeInputs, StartupAcquisitionProbe,
+    note_startup_acquisition,
+};
 pub use prompts::{CapturedPrompt, CapturedRuntimePrompts};
 
 // Re-export types

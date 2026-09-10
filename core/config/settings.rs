@@ -1089,10 +1089,13 @@ impl RuntimeSettingsSnapshot {
         error: SettingsSnapshotValidationError,
         settings_path: PathBuf,
     ) -> Self {
-        parts.repair_receipt.unrepairable.push(super::repair::ConfigUnrepairable {
-            path: settings_path,
-            reason: error.to_string(),
-        });
+        parts
+            .repair_receipt
+            .unrepairable
+            .push(super::repair::ConfigUnrepairable {
+                path: settings_path,
+                reason: error.to_string(),
+            });
         parts.seal_lane_armed = false;
         let RuntimeSnapshotParts {
             repair_receipt,
@@ -4093,7 +4096,10 @@ mod captured_sealer_tests {
     fn sole_sealer_keeps_nonempty_digest_check_and_explicit_refusal_path() {
         let probe = StartupAcquisitionProbe::forbid();
         let root = PathBuf::from("/fixture/sealer");
-        let snapshot = Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(root.clone(), 42));
+        let snapshot = Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(
+            root.clone(),
+            42,
+        ));
         let parts = RuntimeSnapshotParts {
             repair_receipt: snapshot.repair_receipt,
             values: snapshot.values,
@@ -4109,11 +4115,21 @@ mod captured_sealer_tests {
             tail_provider: snapshot.tail_provider,
         };
         let error = RuntimeSettingsSnapshot::seal_loaded(parts.clone()).unwrap_err();
-        assert!(matches!(&error, SettingsSnapshotValidationError::InvalidField { field: "digest", .. }));
-        let refused = RuntimeSettingsSnapshot::refused_startup(parts, error, root.join("settings.json"));
+        assert!(matches!(
+            &error,
+            SettingsSnapshotValidationError::InvalidField {
+                field: "digest",
+                ..
+            }
+        ));
+        let refused =
+            RuntimeSettingsSnapshot::refused_startup(parts, error, root.join("settings.json"));
         assert!(!refused.seal_lane_armed());
         assert_eq!(refused.repair_receipt().unrepairable.len(), 1);
-        assert_eq!(refused.repair_receipt().unrepairable[0].path, root.join("settings.json"));
+        assert_eq!(
+            refused.repair_receipt().unrepairable[0].path,
+            root.join("settings.json")
+        );
         assert!(probe.attempts().is_empty());
     }
 }
