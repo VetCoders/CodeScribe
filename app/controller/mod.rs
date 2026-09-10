@@ -5814,13 +5814,44 @@ mod hold_start_terminal_lifecycle_falsifiers {
     /// the audited interleaving. Virtual time only; no wall-clock sleeps.
     #[tokio::test(start_paused = true)]
     async fn keyup_between_bus_start_and_rec_hold_ends_the_session_exactly_once() {
-        let temp = tempfile::tempdir().expect("temp bus dir");
-        let bus_path = temp.path().join("transcript-events.jsonl");
-        // SAFETY: current-thread test runtime; the variable is read only by the
-        // `TranscriptBus::open` inside this test's own hold start.
-        unsafe { std::env::set_var(TRANSCRIPT_BUS_PATH_ENV, &bus_path) };
+        const CHILD: &str = "CODESCRIBE_HOLD_START_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Follow tests/logging_isolation.rs: change only the child's env.
+            // The parent's prior Bus path survives even if the fixture panics;
+            // current-thread Tokio and serial_test alone cannot isolate env.
+            let temp = tempfile::tempdir().expect("temp bus dir");
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("resolve controller test binary"),
+            )
+            .args([
+                "--exact",
+                "controller::hold_start_terminal_lifecycle_falsifiers::keyup_between_bus_start_and_rec_hold_ends_the_session_exactly_once",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(
+                TRANSCRIPT_BUS_PATH_ENV,
+                temp.path().join("transcript-events.jsonl"),
+            )
+            .output()
+            .expect("launch isolated controller fixture");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "controller fixture failed: {stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored"),
+                "the exact controller fixture must execute: {stdout}\n{stderr}"
+            );
+            return;
+        }
+        let bus_path = std::path::PathBuf::from(
+            std::env::var_os(TRANSCRIPT_BUS_PATH_ENV).expect("isolated child Bus path"),
+        );
 
-        let controller = RecordingController::new_without_keychain();
+        let controller = Arc::new(RecordingController::new_without_keychain());
         let recorder_gate = controller.recorder.lock().await;
         assert!(
             recorder_gate.is_some(),
@@ -5898,8 +5929,6 @@ mod hold_start_terminal_lifecycle_falsifiers {
                 .recorder
                 .is_active()
         );
-
-        unsafe { std::env::remove_var(TRANSCRIPT_BUS_PATH_ENV) };
     }
 
     /// Structural falsifier: exactly one controller call site writes the
