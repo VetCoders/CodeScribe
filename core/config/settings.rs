@@ -1032,6 +1032,7 @@ pub struct RuntimeSettingsSnapshot {
 /// as a unit so no part can be sealed from a different pass.
 #[derive(Clone)]
 pub(crate) struct RuntimeSnapshotParts {
+    pub(crate) repair_receipt: super::repair::RepairReceipt,
     pub(crate) values: Config,
     pub(crate) user_settings: UserSettings,
     pub(crate) llm_lanes: RuntimeLlmLanes,
@@ -1052,6 +1053,7 @@ impl RuntimeSettingsSnapshot {
         parts: RuntimeSnapshotParts,
     ) -> Result<Self, SettingsSnapshotValidationError> {
         let RuntimeSnapshotParts {
+            repair_receipt,
             values,
             user_settings,
             llm_lanes,
@@ -1066,7 +1068,7 @@ impl RuntimeSettingsSnapshot {
         } = parts;
         SettingsSnapshotValidation::admit(&values, &provenance, &digest)?;
         Ok(Self {
-            repair_receipt: super::repair::launch_receipt(),
+            repair_receipt,
             values,
             user_settings,
             llm_lanes,
@@ -1085,16 +1087,15 @@ impl RuntimeSettingsSnapshot {
     pub(crate) fn refused_startup(
         mut parts: RuntimeSnapshotParts,
         error: SettingsSnapshotValidationError,
+        settings_path: PathBuf,
     ) -> Self {
-        super::repair::record(super::repair::RepairReceipt {
-            unrepairable: vec![super::repair::ConfigUnrepairable {
-                path: UserSettings::settings_path(),
-                reason: error.to_string(),
-            }],
-            ..Default::default()
+        parts.repair_receipt.unrepairable.push(super::repair::ConfigUnrepairable {
+            path: settings_path,
+            reason: error.to_string(),
         });
         parts.seal_lane_armed = false;
         let RuntimeSnapshotParts {
+            repair_receipt,
             values,
             user_settings,
             llm_lanes,
@@ -1108,7 +1109,7 @@ impl RuntimeSettingsSnapshot {
             tail_provider,
         } = parts;
         Self {
-            repair_receipt: super::repair::launch_receipt(),
+            repair_receipt,
             values,
             user_settings,
             llm_lanes,
@@ -1123,7 +1124,7 @@ impl RuntimeSettingsSnapshot {
         }
     }
 
-    /// Repairs observed in this process before this snapshot was sealed.
+    /// Repair facts captured for this generation, independent of later process state.
     pub fn repair_receipt(&self) -> &super::repair::RepairReceipt {
         &self.repair_receipt
     }
@@ -2125,11 +2126,13 @@ impl UserSettings {
 
     /// Returns the path to `settings.json`.
     pub fn settings_path() -> PathBuf {
+        super::loader::note_startup_acquisition("settings path/repair registry");
         Self::settings_dir().join("settings.json")
     }
 
     /// Loads settings from disk. Returns `Default` on any error.
     pub fn load() -> Self {
+        super::loader::note_startup_acquisition("user settings file");
         let _data_io = match super::storage_reset::begin_app_data_io() {
             Ok(guard) => guard,
             Err(error) => {
@@ -4078,5 +4081,39 @@ mod tests {
         let resolved = cloud_no_consent.resolved_asr_mode();
         assert_eq!(resolved.mode, AsrProductMode::AppleOnly);
         assert_eq!(resolved.derivation, ModeDerivation::ConsentMissingFallback);
+    }
+}
+
+#[cfg(test)]
+mod captured_sealer_tests {
+    use super::*;
+    use crate::config::{CapturedRuntimeInputs, StartupAcquisitionProbe};
+
+    #[test]
+    fn sole_sealer_keeps_nonempty_digest_check_and_explicit_refusal_path() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let root = PathBuf::from("/fixture/sealer");
+        let snapshot = Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(root.clone(), 42));
+        let parts = RuntimeSnapshotParts {
+            repair_receipt: snapshot.repair_receipt,
+            values: snapshot.values,
+            user_settings: snapshot.user_settings,
+            llm_lanes: snapshot.llm_lanes,
+            formatting_policy: snapshot.formatting_policy,
+            ai_execution: snapshot.ai_execution,
+            provenance: snapshot.provenance,
+            digest: SettingsSnapshotDigest::from_hex(String::new()),
+            energy_calibration: snapshot.energy_calibration,
+            seal_lane_armed: true,
+            local_tail_patch: snapshot.local_tail_patch,
+            tail_provider: snapshot.tail_provider,
+        };
+        let error = RuntimeSettingsSnapshot::seal_loaded(parts.clone()).unwrap_err();
+        assert!(matches!(&error, SettingsSnapshotValidationError::InvalidField { field: "digest", .. }));
+        let refused = RuntimeSettingsSnapshot::refused_startup(parts, error, root.join("settings.json"));
+        assert!(!refused.seal_lane_armed());
+        assert_eq!(refused.repair_receipt().unrepairable.len(), 1);
+        assert_eq!(refused.repair_receipt().unrepairable[0].path, root.join("settings.json"));
+        assert!(probe.attempts().is_empty());
     }
 }

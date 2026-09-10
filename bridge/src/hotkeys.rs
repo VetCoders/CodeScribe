@@ -1422,6 +1422,29 @@ async fn dispatch_recording_hotkey_event(
     Ok(())
 }
 
+/// Dependency-mode fixture: app/core are normal dependencies, so cfg(test) in
+/// those crates cannot protect this path. Keep the real controller and Stop state.
+#[cfg(test)]
+fn fixture_controller() -> Arc<RecordingController> {
+    use codescribe::controller::ControllerStartupResources;
+    use codescribe_core::config::{CapturedRuntimeInputs, Config, StartupAcquisitionProbe};
+    let root = tempfile::tempdir().expect("isolated fixture root");
+    let probe = StartupAcquisitionProbe::forbid();
+    let snapshot = Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(
+        root.path().to_path_buf(),
+        1_700_000_000_000,
+    ));
+    let controller = RecordingController::from_startup_inputs(
+        snapshot,
+        ControllerStartupResources::inert(),
+        root.path(),
+    );
+    assert!(probe.attempts().is_empty(), "fixture acquired host startup inputs");
+    // Context storage is lazy. These lifecycle fixtures never write context;
+    // the controller retains this explicit path after the scratch directory closes.
+    Arc::new(controller)
+}
+
 #[cfg(test)]
 mod application_shutdown_tests {
     use super::*;
@@ -1462,7 +1485,7 @@ mod application_shutdown_tests {
 
     #[tokio::test]
     async fn idle_shutdown_helper_closes_same_controller_without_removing_it() {
-        let controller = Arc::new(RecordingController::new_without_keychain());
+        let controller = fixture_controller();
         let store = Arc::new(Mutex::new(Some(Arc::clone(&controller))));
         settle_controller_for_shutdown(&controller).await.unwrap();
         assert!(Arc::ptr_eq(
@@ -1501,7 +1524,7 @@ mod dispatch_tests {
     async fn blocked_double_tap_does_not_publish_tray_conflict() {
         tray_status::update_tray_status(TrayStatus::Idle);
 
-        let controller = Arc::new(RecordingController::new_without_keychain());
+        let controller = fixture_controller();
         dispatch_recording_hotkey_event(
             HotkeyEvent::DoubleTapBlocked {
                 gesture: DoubleTapGesture::LeftOption,
@@ -2021,7 +2044,7 @@ mod composer_stop_bridge_tests {
             .unwrap(),
             CsConditionalStop::NoLiveCapture
         );
-        let controller = Arc::new(RecordingController::new_without_keychain());
+        let controller = fixture_controller();
         *store.lock().unwrap() = Some(Arc::clone(&controller));
         for _ in 0..2 {
             assert_eq!(
@@ -2693,7 +2716,7 @@ mod preparing_compensation_tests {
         let listener = Arc::new(RecordingLifecycleListener::default());
         *shared_listener().write().unwrap_or_else(|e| e.into_inner()) =
             Some(Arc::clone(&listener) as Arc<dyn CsTranscriptionListener>);
-        let controller = Arc::new(RecordingController::new_without_keychain());
+        let controller = fixture_controller();
         *shared_controller()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&controller));

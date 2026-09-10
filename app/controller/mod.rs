@@ -915,6 +915,18 @@ struct ConversationLoopHandles {
     event_broadcast: broadcast::Sender<IpcEvent>,
 }
 
+/// Resources acquired before state assembly. Inert inputs carry no recorder,
+/// model discovery or prewarm; they still use the actual controller lifecycle.
+pub struct ControllerStartupResources {
+    recorder: Option<StreamingRecorder>,
+}
+
+impl ControllerStartupResources {
+    pub fn inert() -> Self {
+        Self { recorder: None }
+    }
+}
+
 impl RecordingController {
     /// One phrasing for "there is no recorder", logged and returned together so
     /// a caller cannot report the failure in a way the log does not corroborate.
@@ -927,6 +939,7 @@ impl RecordingController {
     /// device disables voice capture but must not prevent the app from starting,
     /// so the failure degrades to `None` plus a warning.
     fn init_streaming_recorder(context: &str) -> Option<StreamingRecorder> {
+        crate::config::note_startup_acquisition("streaming recorder");
         match StreamingRecorder::new() {
             Ok(recorder) => Some(recorder),
             Err(error) => {
@@ -982,15 +995,16 @@ impl RecordingController {
         runtime_settings: RuntimeSettingsSnapshot,
         recorder_context: &str,
     ) -> Self {
-        let config = runtime_settings.values().clone();
-        info!(
-            "Initializing RecordingController (hold_delay={}ms, beep={}, language={:?})",
-            config.hold_start_delay_ms, config.beep_on_start, config.whisper_language
-        );
+        let resources = Self::acquire_startup_resources(recorder_context);
+        Self::from_startup_inputs(runtime_settings, resources, Config::config_dir())
+    }
 
+    fn acquire_startup_resources(recorder_context: &str) -> ControllerStartupResources {
+        crate::config::note_startup_acquisition("controller startup resources");
         let recorder = Self::init_streaming_recorder(recorder_context);
 
         if !cfg!(test) {
+            crate::config::note_startup_acquisition("model discovery");
             match ModelManager::new() {
                 Ok(model_manager) => {
                     if let Ok(models) = model_manager.list_models()
@@ -1019,6 +1033,7 @@ impl RecordingController {
                 // inference, so the first dictation pays neither model-load nor
                 // Metal kernel-compilation latency — matching the old always-instant
                 // behaviour where the long-lived daemon was warm before first use.
+                crate::config::note_startup_acquisition("STT prewarm thread");
                 std::thread::Builder::new()
                     .name("stt-prewarm".into())
                     .spawn(|| {
@@ -1033,6 +1048,22 @@ impl RecordingController {
             }
         }
 
+        ControllerStartupResources { recorder }
+    }
+
+    /// One real state/lifecycle assembly, with an explicit context root.
+    /// Callers that already acquired resources never fall back to host acquisition.
+    pub fn from_startup_inputs(
+        runtime_settings: RuntimeSettingsSnapshot,
+        resources: ControllerStartupResources,
+        data_root: impl AsRef<std::path::Path>,
+    ) -> Self {
+        let config = runtime_settings.values();
+        info!(
+            "Initializing RecordingController (hold_delay={}ms, beep={}, language={:?})",
+            config.hold_start_delay_ms, config.beep_on_start, config.whisper_language
+        );
+        let ControllerStartupResources { recorder } = resources;
         let runtime_settings = RwLock::new(Arc::new(runtime_settings));
         if recorder.is_none() {
             warn!("Recorder unavailable at controller init; voice capture is disabled");
@@ -1066,7 +1097,7 @@ impl RecordingController {
             assistive_context: Arc::new(RwLock::new(None)),
             pending_assistive_context: Arc::new(RwLock::new(None)),
             context_bucket: Arc::new(Mutex::new(ContextBucket::for_codescribe_data_dir(
-                Config::config_dir(),
+                data_root,
             ))),
             pre_overlay_frontmost_app: Arc::new(RwLock::new(None)),
             delivered_take: Arc::new(Mutex::new(None)),
@@ -6921,5 +6952,55 @@ mod capture_failure_recovery_tests {
             Some(TranscriptSessionEndReason::TranscriptionFailed)
         );
         assert_eq!(controller.current_state().await, State::Idle);
+    }
+}
+
+#[cfg(test)]
+mod explicit_startup_tests {
+    use super::*;
+    use crate::config::{CapturedRuntimeInputs, StartupAcquisitionProbe};
+
+    fn snapshot(root: &std::path::Path) -> RuntimeSettingsSnapshot {
+        Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(
+            root.to_path_buf(), 1_700_000_000_000,
+        ))
+    }
+
+    #[tokio::test]
+    async fn explicit_assembly_keeps_real_idle_lifecycle_and_passed_context_root() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = StartupAcquisitionProbe::forbid();
+        let controller = RecordingController::from_startup_inputs(
+            snapshot(root.path()), ControllerStartupResources::inert(), root.path(),
+        );
+        assert_eq!(controller.current_state().await, State::Idle);
+        assert!(controller.recorder.lock().await.is_none());
+        assert!(!controller.shutdown_requested.load(Ordering::SeqCst));
+        let bucket = controller.context_bucket.lock().await;
+        let expected = ContextBucket::for_codescribe_data_dir(root.path());
+        assert_eq!(format!("{bucket:?}"), format!("{expected:?}"));
+        assert!(!root.path().join("context").exists(), "assembly must not create context storage");
+        assert!(probe.attempts().is_empty());
+    }
+
+    #[test]
+    fn normal_constructor_shared_path_still_invokes_resource_acquisition() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let result = std::panic::catch_unwind(|| {
+            RecordingController::with_runtime_settings(
+                snapshot(std::path::Path::new("/fixture/normal")), "fixture adapter witness",
+            )
+        });
+        assert!(result.is_err());
+        assert_eq!(probe.attempts(), ["controller startup resources"]);
+    }
+
+    #[test]
+    fn both_normal_constructors_still_invoke_core_host_capture() {
+        for constructor in [RecordingController::new, RecordingController::new_without_keychain] {
+            let probe = StartupAcquisitionProbe::forbid();
+            assert!(std::panic::catch_unwind(constructor).is_err());
+            assert_eq!(probe.attempts(), ["settings capture"]);
+        }
     }
 }

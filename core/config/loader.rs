@@ -25,7 +25,7 @@ use super::settings::{
     DEFAULT_AGENT_WORKSPACE_ROOT, DEFAULT_SEAL_LANE_ARMED, FormattingPolicy, RuntimeAiExecution,
     RuntimeAiRequestTiming, RuntimeFormatterExecution, RuntimeLlmCredential, RuntimeLlmLane,
     RuntimeLlmLaneKind, RuntimeLlmLanes, RuntimeSettingsSnapshot, RuntimeSnapshotParts,
-    SILERO_FUSION_ENV, SettingsLoaderInput, SettingsSnapshotDigest, SettingsSnapshotProvenance,
+    SILERO_FUSION_ENV, SettingsSnapshotDigest, SettingsSnapshotProvenance,
     SettingsSnapshotValidationError, UserSettings, normalize_agent_workspace_roots,
     normalize_stt_engine, parse_agent_workspace_roots,
 };
@@ -90,6 +90,111 @@ fn config_persistence_guard() -> std::sync::MutexGuard<'static, ()> {
 /// without a restart. Only a genuinely external env var keeps its priority.
 static CONFIG_SEEDED_ENV_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
+/// Source facts for the sole snapshot resolver. Values are captured after the
+/// existing Config loader precedence; no digest or resolved lane is caller-owned.
+/// Deliberately not Debug: credentials and prompt content must not enter logs.
+#[derive(Clone)]
+pub struct CapturedRuntimeInputs {
+    pub values: Config,
+    pub user_settings: UserSettings,
+    pub settings_path: PathBuf,
+    pub settings_bytes: Option<Vec<u8>>,
+    pub env_overlay_keys: Vec<String>,
+    pub loaded_at_unix_ms: u64,
+    pub energy_calibration_path: PathBuf,
+    pub energy_calibration: SealedEnergyCalibration,
+    /// Only explicit runtime overrides; absent and non-Unicode remain distinct.
+    pub overrides: HashMap<String, Result<String, VarError>>,
+    /// Captured key/account availability, keyed by provider key account.
+    pub credentials: HashMap<String, CapturedLaneCredential>,
+    pub prompts: super::prompts::CapturedRuntimePrompts,
+    pub repair_receipt: super::repair::RepairReceipt,
+}
+
+/// Captured credential facts. Secret values deliberately have no Debug impl.
+#[derive(Clone, Default)]
+pub struct CapturedLaneCredential {
+    pub api_key: Option<String>,
+    pub signed_in: bool,
+}
+
+impl CapturedRuntimeInputs {
+    /// Explicit no-host inputs: compiled defaults and missing measured evidence.
+    /// The caller supplies both the root and time; neither HOME nor a clock is read.
+    pub fn defaults_at(data_root: PathBuf, loaded_at_unix_ms: u64) -> Self {
+        let energy_calibration_path = data_root.join(super::energy_calibration::ENERGY_CALIBRATION_FILE_NAME);
+        Self {
+            values: Config::default(),
+            user_settings: UserSettings::default(),
+            settings_path: data_root.join("settings.json"),
+            settings_bytes: None,
+            env_overlay_keys: Vec::new(),
+            loaded_at_unix_ms,
+            energy_calibration: SealedEnergyCalibration::from_captured(&energy_calibration_path, Ok(None)),
+            energy_calibration_path,
+            overrides: HashMap::new(),
+            credentials: HashMap::new(),
+            prompts: super::prompts::CapturedRuntimePrompts::default(),
+            repair_receipt: super::repair::RepairReceipt::default(),
+        }
+    }
+
+    fn env(&self, key: &str) -> Result<String, VarError> {
+        self.overrides.get(key).cloned().unwrap_or(Err(VarError::NotPresent))
+    }
+
+    fn non_empty(&self, key: &str) -> Option<String> {
+        self.env(key).ok().and_then(Config::non_empty_string)
+    }
+}
+
+type StartupAcquisitionAttempts = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
+
+thread_local! {
+    static STARTUP_ACQUISITION_PROBE: std::cell::RefCell<Option<StartupAcquisitionAttempts>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Synchronous, thread-bound acquisition tripwire for dependency-mode witnesses.
+/// Every observed entry panics BEFORE host access, never silently suppresses it.
+/// No environment changes and no cross-thread/process test configuration.
+#[doc(hidden)]
+pub struct StartupAcquisitionProbe {
+    attempts: StartupAcquisitionAttempts,
+}
+
+impl StartupAcquisitionProbe {
+    pub fn forbid() -> Self {
+        let attempts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        STARTUP_ACQUISITION_PROBE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "startup acquisition probe already installed");
+            *slot = Some(attempts.clone());
+        });
+        Self { attempts }
+    }
+
+    pub fn attempts(&self) -> Vec<&'static str> {
+        self.attempts.borrow().clone()
+    }
+}
+
+impl Drop for StartupAcquisitionProbe {
+    fn drop(&mut self) {
+        STARTUP_ACQUISITION_PROBE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+/// Instrument acquisition adapters, including the app crate's startup adapter.
+#[doc(hidden)]
+pub fn note_startup_acquisition(source: &'static str) {
+    STARTUP_ACQUISITION_PROBE.with(|slot| {
+        if let Some(attempts) = slot.borrow().as_ref() {
+            attempts.borrow_mut().push(source);
+            panic!("forbidden startup acquisition: {source}");
+        }
+    });
+}
+
 impl Config {
     /// Load configuration from disk or environment.
     ///
@@ -137,52 +242,116 @@ impl Config {
     fn load_runtime_snapshot_with_keychain_population(
         populate_keychain: bool,
     ) -> RuntimeSettingsSnapshot {
-        let input = SettingsLoaderInput {
-            settings_path: UserSettings::settings_path(),
-            allow_env_file: true,
-            allow_process_env_overrides: true,
-        };
+        let input = Self::capture_runtime_inputs(populate_keychain);
+        let prior_repairs = input.repair_receipt.clone();
+        let snapshot = Self::resolve_runtime_snapshot_with_capture(|| input);
+        // Recording/logging are host concerns, never part of resolution/sealing.
+        let receipt = snapshot.repair_receipt();
+        super::repair::record(super::repair::RepairReceipt {
+            actions: receipt.actions.iter().filter(|r| !prior_repairs.actions.contains(r)).cloned().collect(),
+            backups: receipt.backups.iter().filter(|r| !prior_repairs.backups.contains(r)).cloned().collect(),
+            unrepairable: receipt.unrepairable.iter().filter(|r| !prior_repairs.unrepairable.contains(r)).cloned().collect(),
+        });
+        super::repair::log_launch_once();
+        snapshot
+    }
+
+    /// Shared capture-to-resolution handoff. A replay adapter can supply the
+    /// exact captured facts without running any host acquisition in a witness.
+    fn resolve_runtime_snapshot_with_capture(
+        capture: impl FnOnce() -> CapturedRuntimeInputs,
+    ) -> RuntimeSettingsSnapshot {
+        Self::runtime_snapshot_from_captured(capture())
+    }
+
+    /// Production acquisition adapter. The shared resolver below sees values only.
+    fn capture_runtime_inputs(populate_keychain: bool) -> CapturedRuntimeInputs {
+        note_startup_acquisition("settings capture");
         let values = Self::load_with_keychain_population(populate_keychain);
         let user_settings = UserSettings::load();
-        let (seal_lane_armed, seal_lane_env_override) =
-            Self::resolve_seal_lane_armed(&user_settings);
-        let settings_bytes = fs::read(&input.settings_path).ok();
-        let settings_json_sha256 = settings_bytes.as_deref().map(sha256_hex);
-        let mut env_overlay_keys = Self::seeded_env_keys()
+        let settings_path = UserSettings::settings_path();
+        let settings_bytes = fs::read(&settings_path).ok();
+        let env_overlay_keys = Self::seeded_env_keys()
             .lock()
             .map(|keys| keys.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
-        if seal_lane_env_override {
-            env_overlay_keys.push(SILERO_FUSION_ENV.to_string());
-        }
-        env_overlay_keys.sort_unstable();
-        env_overlay_keys.dedup();
         let loaded_at_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or_default();
-        // Same loader pass, same data dir: the measured acoustic calibration is
-        // read once here and frozen with the snapshot. Absence/refusal seal as
-        // explicit states — the admission gate names them, nothing repairs them.
         let energy_calibration_path = energy_calibration_path();
         let energy_calibration = SealedEnergyCalibration::load(&energy_calibration_path);
-        let provenance = SettingsSnapshotProvenance {
-            settings_json_path: settings_bytes.as_ref().map(|_| input.settings_path.clone()),
-            settings_json_sha256,
-            env_overlay_keys,
-            defaults_applied: true,
-            loaded_at_unix_ms,
-            energy_calibration_path,
-            energy_calibration_sha256: energy_calibration.sha256().map(str::to_owned),
+        let mut overrides = HashMap::new();
+        for key in [
+            "CODESCRIBE_LAYERED_TRANSCRIPTION", "FORMATTING_LEVEL",
+            crate::stt::tail_provider::STT_TAIL_PROVIDER_ENV,
+            AI_MAX_RETRIES_ENV, AI_RETRY_DELAY_MS_ENV,
+            AI_ATTEMPT_TIMEOUT_MS_ENV, AI_INTER_CHUNK_TIMEOUT_MS_ENV,
+            LlmMode::Formatting.provider_env_key(), LlmMode::Formatting.model_env_key(),
+            LlmMode::Assistive.provider_env_key(), LlmMode::Assistive.model_env_key(),
+        ] {
+            overrides.insert(key.to_string(), Self::config_runtime_env_var(key));
+        }
+        // This single documented key also honors the seeded .env value.
+        overrides.insert(SILERO_FUSION_ENV.to_string(), std::env::var(SILERO_FUSION_ENV));
+        let mut input = CapturedRuntimeInputs {
+            values, user_settings, settings_path, settings_bytes, env_overlay_keys,
+            loaded_at_unix_ms, energy_calibration_path, energy_calibration, overrides,
+            credentials: HashMap::new(),
+            prompts: super::prompts::CapturedRuntimePrompts::default(),
+            repair_receipt: super::repair::launch_receipt(),
         };
-        let phase_override = Self::config_runtime_env_var("CODESCRIBE_LAYERED_TRANSCRIPTION").ok();
+        Self::warn_legacy_llm_endpoint_env();
+        let registry = ProviderRegistry::from_settings(&input.user_settings);
+        for lane in [RuntimeLlmLaneKind::Formatting, RuntimeLlmLaneKind::Assistive] {
+            let reference = Self::runtime_provider_reference(lane, &input);
+            let provider = registry.resolve(&reference)
+                .or_else(|| registry.resolve(&ProviderRef::default()))
+                .expect("the default vendor is always registered");
+            let api_key = Self::runtime_lane_api_key(&provider.key_account);
+            let signed_in = lane == RuntimeLlmLaneKind::Assistive
+                && provider.wire == WireFamily::OpenAiResponses
+                && provider.oauth_vendor.is_some_and(|vendor| {
+                    account_auth::provider_oauth_config(vendor)
+                        .is_ok_and(|row| Self::signed_in_provider_account(row.tokens_account))
+                });
+            input.credentials.insert(provider.key_account, CapturedLaneCredential { api_key, signed_in });
+        }
+        let policy = FormattingPolicy::resolve(
+            input.env("FORMATTING_LEVEL").ok().as_deref(),
+            input.user_settings.formatting_level.as_deref(),
+        ).unwrap_or(FormattingPolicy::Off);
+        input.prompts = super::prompts::CapturedRuntimePrompts::capture(policy);
+        input
+    }
+
+    /// Resolve and seal captured facts through the same core path as production.
+    /// This entry does no host acquisition and accepts no caller-made digest.
+    pub fn runtime_snapshot_from_captured(mut input: CapturedRuntimeInputs) -> RuntimeSettingsSnapshot {
+        let (seal_lane_armed, seal_lane_env_override) = Self::resolve_seal_lane_armed(&input);
+        if seal_lane_env_override {
+            input.env_overlay_keys.push(SILERO_FUSION_ENV.to_string());
+        }
+        input.env_overlay_keys.sort_unstable();
+        input.env_overlay_keys.dedup();
+        let provenance = SettingsSnapshotProvenance {
+            settings_json_path: input.settings_bytes.as_ref().map(|_| input.settings_path.clone()),
+            settings_json_sha256: input.settings_bytes.as_deref().map(sha256_hex),
+            env_overlay_keys: input.env_overlay_keys.clone(),
+            defaults_applied: true,
+            loaded_at_unix_ms: input.loaded_at_unix_ms,
+            energy_calibration_path: input.energy_calibration_path.clone(),
+            energy_calibration_sha256: input.energy_calibration.sha256().map(str::to_owned),
+        };
+        let user_settings = &input.user_settings;
+        let phase_override = input.env("CODESCRIBE_LAYERED_TRANSCRIPTION").ok();
         let mut local_tail_patch = resolve_local_tail_patch(
             phase_override
                 .as_deref()
                 .or(user_settings.layered_transcription.as_deref()),
         );
         let tail_provider =
-            match Self::config_runtime_env_var(crate::stt::tail_provider::STT_TAIL_PROVIDER_ENV) {
+            match input.env(crate::stt::tail_provider::STT_TAIL_PROVIDER_ENV) {
                 Ok(value) => crate::stt::tail_provider::TailProviderId::parse(&value).ok(),
                 Err(VarError::NotPresent) => {
                     Some(crate::stt::tail_provider::TailProviderId::InProcess)
@@ -193,19 +362,19 @@ impl Config {
             local_tail_patch =
                 crate::asr_session::recorder::LocalTailPatchDisposition::DegradedInvalidOverride;
         }
-        let runtime_formatting_policy = Self::config_runtime_env_var("FORMATTING_LEVEL").ok();
+        let runtime_formatting_policy = input.env("FORMATTING_LEVEL").ok();
         let formatting_policy = FormattingPolicy::resolve(
             runtime_formatting_policy.as_deref(),
             user_settings.formatting_level.as_deref(),
         )
         .unwrap_or_else(|_| {
-            super::repair::record(super::repair::RepairReceipt {
-                unrepairable: vec![super::repair::ConfigUnrepairable {
-                    path: input.settings_path.clone(),
-                    reason: "invalid FORMATTING_LEVEL override; formatting disabled for this launch; fix the override".into(),
-                }],
-                ..Default::default()
-            });
+            let refusal = super::repair::ConfigUnrepairable {
+                path: input.settings_path.clone(),
+                reason: "invalid FORMATTING_LEVEL override; formatting disabled for this launch; fix the override".into(),
+            };
+            if !input.repair_receipt.unrepairable.contains(&refusal) {
+                input.repair_receipt.unrepairable.push(refusal);
+            }
             FormattingPolicy::Off
         });
         if let (Some(runtime), Some(persisted)) = (
@@ -216,48 +385,51 @@ impl Config {
             FormattingPolicy::parse(persisted),
         ) && runtime != persisted
         {
-            super::repair::record(super::repair::RepairReceipt {
-                actions: vec![super::repair::RepairAction::PrecedenceNote {
-                    key: "FORMATTING_LEVEL".into(),
-                }],
-                ..Default::default()
-            });
+            let note = super::repair::RepairAction::PrecedenceNote { key: "FORMATTING_LEVEL".into() };
+            if !input.repair_receipt.actions.contains(&note) {
+                input.repair_receipt.actions.push(note);
+            }
         }
         let seal_lane_armed =
-            seal_lane_armed && super::repair::launch_receipt().unrepairable.is_empty();
-        let llm_lanes = Self::resolve_runtime_llm_lanes(&user_settings);
-        let ai_execution = Self::resolve_runtime_ai_execution(formatting_policy);
-        let mut digest_values = values.clone();
+            seal_lane_armed && input.repair_receipt.unrepairable.is_empty();
+        let llm_lanes = Self::resolve_runtime_llm_lanes(&input);
+        let ai_execution = Self::resolve_runtime_ai_execution(formatting_policy, &input);
+        let mut digest_values = input.values.clone();
         for key in [
             &mut digest_values.stt_file_api_key,
             &mut digest_values.stt_live_api_key,
         ] {
             *key = key.as_ref().map(|_| "<redacted:present>".to_string());
         }
+        let repair_sha256 = sha256_hex(
+            serde_json::to_string(&input.repair_receipt)
+                .expect("repair receipt serializes").as_bytes(),
+        );
         let digest_material = format!(
-            "{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\nlocal_tail_patch={local_tail_patch:?}\ntail_provider={tail_provider:?}\n{}\n{}\n{}",
+            "repair_sha256={repair_sha256}\n{digest_values:?}\n{user_settings:?}\n{provenance:?}\nformatting_policy={}\nseal_lane_armed={seal_lane_armed}\nlocal_tail_patch={local_tail_patch:?}\ntail_provider={tail_provider:?}\n{}\n{}\n{}",
             formatting_policy.as_str(),
             llm_lanes.digest_material(),
             ai_execution.digest_material(),
-            energy_calibration.digest_material(),
+            input.energy_calibration.digest_material(),
         );
         let digest = SettingsSnapshotDigest::from_hex(sha256_hex(digest_material.as_bytes()));
-        super::repair::log_launch_once();
         let parts = RuntimeSnapshotParts {
-            values,
-            user_settings,
+            repair_receipt: input.repair_receipt,
+            values: input.values,
+            user_settings: input.user_settings,
             llm_lanes,
             formatting_policy,
             ai_execution,
             provenance,
             digest,
-            energy_calibration,
+            energy_calibration: input.energy_calibration,
             seal_lane_armed,
             local_tail_patch,
             tail_provider,
         };
         let recovery = parts.clone();
         match RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {
+            repair_receipt: parts.repair_receipt,
             values: parts.values,
             user_settings: parts.user_settings,
             llm_lanes: parts.llm_lanes,
@@ -271,7 +443,7 @@ impl Config {
             tail_provider: parts.tail_provider,
         }) {
             Ok(snapshot) => snapshot,
-            Err(error) => RuntimeSettingsSnapshot::refused_startup(recovery, error),
+            Err(error) => RuntimeSettingsSnapshot::refused_startup(recovery, error, input.settings_path),
         }
     }
 
@@ -279,9 +451,9 @@ impl Config {
     /// generation. The process value may be either an explicit shell override
     /// or the optional `.env` value injected during bootstrap; for this one
     /// documented power-user key both forms deliberately outrank Settings.
-    fn resolve_seal_lane_armed(settings: &UserSettings) -> (bool, bool) {
-        let configured = settings.seal_lane_armed.unwrap_or(DEFAULT_SEAL_LANE_ARMED);
-        match std::env::var(SILERO_FUSION_ENV) {
+    fn resolve_seal_lane_armed(input: &CapturedRuntimeInputs) -> (bool, bool) {
+        let configured = input.user_settings.seal_lane_armed.unwrap_or(DEFAULT_SEAL_LANE_ARMED);
+        match input.env(SILERO_FUSION_ENV) {
             Ok(raw) => (
                 matches!(
                     raw.trim().to_ascii_lowercase().as_str(),
@@ -295,15 +467,16 @@ impl Config {
 
     /// Resolve prompt, retry, and shared Agent/formatter timing once for the
     /// selected runtime generation. No consumer may reconstruct these facts.
-    fn resolve_runtime_ai_execution(formatting_policy: FormattingPolicy) -> RuntimeAiExecution {
+    fn resolve_runtime_ai_execution(formatting_policy: FormattingPolicy, input: &CapturedRuntimeInputs) -> RuntimeAiExecution {
         let (formatting_prompt, assistive_prompt) =
-            super::prompts::seal_runtime_prompts(formatting_policy);
-        let max_retries = Self::runtime_env_or_default(AI_MAX_RETRIES_ENV, DEFAULT_AI_MAX_RETRIES);
+            input.prompts.seal(formatting_policy);
+        let max_retries = Self::runtime_env_or_default(input, AI_MAX_RETRIES_ENV, DEFAULT_AI_MAX_RETRIES);
         let retry_delay_ms =
-            Self::runtime_env_or_default(AI_RETRY_DELAY_MS_ENV, DEFAULT_AI_RETRY_DELAY_MS);
+            Self::runtime_env_or_default(input, AI_RETRY_DELAY_MS_ENV, DEFAULT_AI_RETRY_DELAY_MS);
         let attempt_timeout_ms =
-            Self::runtime_env_or_default(AI_ATTEMPT_TIMEOUT_MS_ENV, DEFAULT_AI_ATTEMPT_TIMEOUT_MS);
+            Self::runtime_env_or_default(input, AI_ATTEMPT_TIMEOUT_MS_ENV, DEFAULT_AI_ATTEMPT_TIMEOUT_MS);
         let inter_chunk_timeout_ms = Self::runtime_env_or_default(
+            input,
             AI_INTER_CHUNK_TIMEOUT_MS_ENV,
             DEFAULT_AI_INTER_CHUNK_TIMEOUT_MS,
         );
@@ -322,11 +495,11 @@ impl Config {
         )
     }
 
-    fn runtime_env_or_default<T>(key: &str, default: T) -> T
+    fn runtime_env_or_default<T>(input: &CapturedRuntimeInputs, key: &str, default: T) -> T
     where
         T: FromStr,
     {
-        Self::config_runtime_env_var(key)
+        input.env(key)
             .ok()
             .and_then(|value| {
                 let value = value.trim();
@@ -339,12 +512,11 @@ impl Config {
 
     /// Resolve both LLM lanes during the one settings-loader pass. Consumers
     /// only receive the sealed result; none may repeat this work.
-    fn resolve_runtime_llm_lanes(settings: &UserSettings) -> RuntimeLlmLanes {
-        Self::warn_legacy_llm_endpoint_env();
-        let registry = ProviderRegistry::from_settings(settings);
+    fn resolve_runtime_llm_lanes(input: &CapturedRuntimeInputs) -> RuntimeLlmLanes {
+        let registry = ProviderRegistry::from_settings(&input.user_settings);
         RuntimeLlmLanes::seal(
-            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Formatting, &registry, settings),
-            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Assistive, &registry, settings),
+            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Formatting, &registry, input),
+            Self::resolve_runtime_llm_lane(RuntimeLlmLaneKind::Assistive, &registry, input),
         )
     }
 
@@ -357,25 +529,20 @@ impl Config {
     fn resolve_runtime_llm_lane(
         lane: RuntimeLlmLaneKind,
         registry: &ProviderRegistry,
-        settings: &UserSettings,
+        input: &CapturedRuntimeInputs,
     ) -> RuntimeLlmLane {
-        let (mode, persisted_provider, persisted_model) = match lane {
+        let settings = &input.user_settings;
+        let (mode, persisted_model) = match lane {
             RuntimeLlmLaneKind::Formatting => (
                 LlmMode::Formatting,
-                settings.llm_formatting_provider.as_deref(),
                 settings.llm_formatting_model.as_deref(),
             ),
             RuntimeLlmLaneKind::Assistive => (
                 LlmMode::Assistive,
-                settings.llm_assistive_provider.as_deref(),
                 settings.llm_assistive_model.as_deref(),
             ),
         };
-        let reference = Self::runtime_env_non_empty(mode.provider_env_key())
-            .as_deref()
-            .and_then(ProviderRef::parse)
-            .or_else(|| persisted_provider.and_then(ProviderRef::parse))
-            .unwrap_or_default();
+        let reference = Self::runtime_provider_reference(lane, input);
         let (provider, mut unavailable_reason) = match registry.resolve(&reference) {
             Some(provider) => (provider, None),
             None => (
@@ -388,7 +555,7 @@ impl Config {
                 )),
             ),
         };
-        let model = Self::runtime_env_non_empty(mode.model_env_key())
+        let model = input.non_empty(mode.model_env_key())
             .or_else(|| {
                 persisted_model
                     .map(str::to_string)
@@ -407,13 +574,12 @@ impl Config {
                 provider.display_name
             ));
         }
-        let api_key = Self::runtime_lane_api_key(&provider.key_account);
+        let captured = input.credentials.get(&provider.key_account).cloned().unwrap_or_default();
+        let api_key = captured.api_key;
         let account_auth = lane == RuntimeLlmLaneKind::Assistive
             && provider.wire == WireFamily::OpenAiResponses
-            && provider.oauth_vendor.is_some_and(|vendor| {
-                account_auth::provider_oauth_config(vendor)
-                    .is_ok_and(|row| Self::signed_in_provider_account(row.tokens_account))
-            });
+            && provider.oauth_vendor.is_some()
+            && captured.signed_in;
         let credentialed = api_key.is_some() || account_auth || !provider.key_required;
         if !credentialed && unavailable_reason.is_none() {
             unavailable_reason = Some(format!(
@@ -437,12 +603,22 @@ impl Config {
         )
     }
 
+    fn runtime_provider_reference(lane: RuntimeLlmLaneKind, input: &CapturedRuntimeInputs) -> ProviderRef {
+        let (mode, persisted) = match lane {
+            RuntimeLlmLaneKind::Formatting => (LlmMode::Formatting, input.user_settings.llm_formatting_provider.as_deref()),
+            RuntimeLlmLaneKind::Assistive => (LlmMode::Assistive, input.user_settings.llm_assistive_provider.as_deref()),
+        };
+        input.non_empty(mode.provider_env_key()).as_deref().and_then(ProviderRef::parse)
+            .or_else(|| persisted.and_then(ProviderRef::parse)).unwrap_or_default()
+    }
+
     /// The API key for a provider account through the Keychain corridor.
     ///
     /// Env alias, REMOVE AFTER 2026-10-15: the retired `LLM_API_KEY` /
     /// `LLM_FORMATTING_API_KEY` / `LLM_ASSISTIVE_API_KEY` process-env names
     /// still feed the OpenAI account (and only that one), with a single warn.
     fn runtime_lane_api_key(account: &str) -> Option<String> {
+        note_startup_acquisition("credential cache");
         let key = super::keychain::cached_runtime_key(account);
         if key.is_some() || account != ProviderKind::OpenAiResponses.api_key_account() {
             return key;
@@ -482,12 +658,6 @@ impl Config {
         }
     }
 
-    fn runtime_env_non_empty(key: &str) -> Option<String> {
-        Self::config_runtime_env_var(key)
-            .ok()
-            .and_then(Self::non_empty_string)
-    }
-
     /// Seal-time truth of "a provider account is signed in": the serialized
     /// token record under `tokens_account`, read exactly where sign-in put it —
     /// the Keychain bundle, through the process cache (no Keychain I/O at seal
@@ -495,7 +665,7 @@ impl Config {
     /// still wins, as for every other secret. The record must parse: a corrupt
     /// blob seals as "not signed in" instead of a lane that fails at first use.
     ///
-    /// Deliberately not [`Self::runtime_env_non_empty`]: token accounts are
+    /// Deliberately not [`Self::config_runtime_env_var`]: token accounts are
     /// kept out of `KEYCHAIN_ACCOUNTS` so OAuth tokens are never mirrored into
     /// the process environment (child processes inherit it). That helper could
     /// therefore only see env, which the app never seeds with tokens — from
@@ -503,6 +673,7 @@ impl Config {
     /// Settings showed "signed in as …" while every sealed lane carried
     /// `account_auth=false`, and removing the API key refused the lane.
     fn signed_in_provider_account(tokens_account: &str) -> bool {
+        note_startup_acquisition("account cache");
         super::keychain::cached_runtime_key(tokens_account)
             .is_some_and(|raw| serde_json::from_str::<account_auth::AccountTokens>(&raw).is_ok())
     }
@@ -520,6 +691,7 @@ impl Config {
     /// a stale `~/.codescribe/.env` cannot shadow a choice made in the UI.
     /// Only after that are defaults, settings, and finally explicit env applied.
     fn load_with_keychain_population(populate_keychain: bool) -> Self {
+        note_startup_acquisition("config files/env/keychain");
         let _data_io = match super::storage_reset::begin_app_data_io() {
             Ok(guard) => guard,
             Err(error) => {
@@ -678,6 +850,7 @@ impl Config {
     /// bootstrap reads as absent afterwards — so persisted settings win over
     /// config's own startup copy.
     fn config_runtime_env_var(key: &str) -> Result<String, VarError> {
+        note_startup_acquisition("runtime env/cache");
         if super::keychain::is_known_account(key) {
             return super::keychain::cached_runtime_key(key).ok_or(VarError::NotPresent);
         }
@@ -3372,5 +3545,145 @@ mod local_tail_decision_tests {
             resolve_local_tail_patch(Some("phase2")),
             D::DegradedInvalidOverride
         );
+    }
+}
+
+#[cfg(test)]
+mod captured_startup_tests {
+    use super::*;
+    use super::super::repair::{ConfigUnrepairable, RepairAction};
+
+    fn inputs() -> CapturedRuntimeInputs {
+        let mut input = CapturedRuntimeInputs::defaults_at(PathBuf::from("/fixture/one"), 1_700_000_000_000);
+        input.user_settings.formatting_level = Some("correction".into());
+        input.settings_bytes = Some(br#"{"formatting_level":"correction"}"#.to_vec());
+        input.overrides.insert("FORMATTING_LEVEL".into(), Ok("smart".into()));
+        input.overrides.insert(SILERO_FUSION_ENV.into(), Ok("true".into()));
+        input.overrides.insert(AI_MAX_RETRIES_ENV.into(), Ok("7".into()));
+        input.env_overlay_keys = vec!["BEEP_ON_START".into(), "BEEP_ON_START".into()];
+        input.prompts.smart.content = "fixture system prompt".into();
+        input.prompts.smart.tuning = Some("  fixture tuning  ".into());
+        input.credentials.insert(ProviderKind::OpenAiResponses.api_key_account().into(), CapturedLaneCredential {
+            api_key: Some("fixture-credential-a".into()),
+            signed_in: true,
+        });
+        input
+    }
+
+    #[test]
+    fn captured_adapter_and_explicit_path_seal_identical_generation_without_acquisition() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let input = inputs();
+        let captures = std::cell::Cell::new(0);
+        // Replay the facts at the production capture handoff. This is synthetic
+        // source evidence, not a live-host capture or semantic-validation claim.
+        let replay = Config::resolve_runtime_snapshot_with_capture(|| {
+            captures.set(captures.get() + 1);
+            input.clone()
+        });
+        let explicit = Config::runtime_snapshot_from_captured(input);
+        assert_eq!(captures.get(), 1);
+        assert_eq!(replay.digest(), explicit.digest());
+        assert_eq!(replay.provenance(), explicit.provenance());
+        assert_eq!(replay.provenance().loaded_at_unix_ms, 1_700_000_000_000);
+        assert_eq!(replay.user_settings(), explicit.user_settings());
+        assert_eq!(replay.llm_lanes().digest_material(), explicit.llm_lanes().digest_material());
+        assert_eq!(replay.ai_execution().digest_material(), explicit.ai_execution().digest_material());
+        assert_eq!(replay.energy_calibration_status(), explicit.energy_calibration_status());
+        assert_eq!(replay.repair_receipt(), explicit.repair_receipt());
+        assert_eq!(explicit.formatting_policy(), FormattingPolicy::Smart);
+        assert_eq!(explicit.ai_execution().formatter().max_retries(), 7);
+        assert_eq!(explicit.ai_execution().formatter().formatting_prompt().unwrap().composed_content(), "fixture system prompt\n\nfixture tuning");
+        assert!(explicit.repair_receipt().actions.contains(&RepairAction::PrecedenceNote { key: "FORMATTING_LEVEL".into() }));
+        assert!(probe.attempts().is_empty());
+    }
+
+    #[test]
+    fn captured_prompts_and_repairs_do_not_contaminate_next_generation() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let original = inputs();
+        let first = Config::runtime_snapshot_from_captured(original.clone());
+        let mut changed = original.clone();
+        changed.prompts.smart.content = "another fixture".into();
+        let prompt_changed = Config::runtime_snapshot_from_captured(changed);
+        assert_ne!(first.digest(), prompt_changed.digest());
+        let mut refused = original.clone();
+        refused.repair_receipt.unrepairable.push(ConfigUnrepairable {
+            path: PathBuf::from("/fixture/refused/settings.json"),
+            reason: "fixture refusal".into(),
+        });
+        let refused = Config::runtime_snapshot_from_captured(refused);
+        assert!(!refused.seal_lane_armed());
+        assert_ne!(first.digest(), refused.digest());
+        let again = Config::runtime_snapshot_from_captured(original);
+        assert_eq!(first.digest(), again.digest());
+        assert!(again.repair_receipt().unrepairable.is_empty());
+        assert!(probe.attempts().is_empty());
+    }
+
+    #[test]
+    fn captured_secret_bytes_are_redacted_from_generation_digest() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let mut first = inputs();
+        first.values.stt_file_api_key = Some("fixture-stt-a".into());
+        let mut second = first.clone();
+        second.values.stt_file_api_key = Some("fixture-stt-b".into());
+        second.credentials.get_mut(ProviderKind::OpenAiResponses.api_key_account()).unwrap().api_key = Some("fixture-credential-b".into());
+        let first = Config::runtime_snapshot_from_captured(first);
+        let second = Config::runtime_snapshot_from_captured(second);
+        assert_eq!(first.digest(), second.digest());
+        let diagnostic = format!("{:?} {:?}", first.llm_lanes(), first.ai_execution());
+        assert!(!diagnostic.contains("fixture-credential-a"));
+        assert!(!diagnostic.contains("fixture system prompt"));
+        assert!(probe.attempts().is_empty());
+    }
+
+    #[test]
+    fn explicit_invalid_overrides_keep_fail_closed_semantics() {
+        let probe = StartupAcquisitionProbe::forbid();
+        let mut invalid = inputs();
+        invalid.overrides.insert("FORMATTING_LEVEL".into(), Ok("not-a-policy".into()));
+        invalid.overrides.insert(crate::stt::tail_provider::STT_TAIL_PROVIDER_ENV.into(), Ok("not-a-provider".into()));
+        let snapshot = Config::runtime_snapshot_from_captured(invalid.clone());
+        invalid.repair_receipt = snapshot.repair_receipt().clone();
+        let repeated = Config::runtime_snapshot_from_captured(invalid);
+        assert_eq!(snapshot.digest(), repeated.digest());
+        assert_eq!(snapshot.repair_receipt(), repeated.repair_receipt());
+        assert_eq!(snapshot.formatting_policy(), FormattingPolicy::Off);
+        assert!(snapshot.ai_execution().formatter().formatting_prompt().is_none());
+        assert!(!snapshot.seal_lane_armed());
+        assert!(snapshot.tail_provider().is_none());
+        assert_eq!(snapshot.repair_receipt().unrepairable[0].path, PathBuf::from("/fixture/one/settings.json"));
+        assert!(matches!(snapshot.energy_calibration_status(), super::super::energy_calibration::EnergyCalibrationStatus::Missing { .. }));
+        assert!(probe.attempts().is_empty());
+    }
+
+    #[test]
+    fn normal_startup_reaches_acquisition_adapter_before_any_host_access() {
+        for populate in [false, true] {
+            let probe = StartupAcquisitionProbe::forbid();
+            let result = std::panic::catch_unwind(|| Config::load_startup_runtime_snapshot(populate));
+            assert!(result.is_err());
+            assert_eq!(probe.attempts(), ["settings capture"]);
+        }
+    }
+
+    #[test]
+    fn acquisition_tripwires_cover_lower_level_sources() {
+        let sources: [(&str, fn()); 8] = [
+            ("config files/env/keychain", || { let _ = Config::load_without_keychain(); }),
+            ("runtime env/cache", || { let _ = Config::config_runtime_env_var("FORMATTING_LEVEL"); }),
+            ("credential cache", || { let _ = Config::runtime_lane_api_key("LLM_OPENAI_API_KEY"); }),
+            ("account cache", || { let _ = Config::signed_in_provider_account("fixture"); }),
+            ("user settings file", || { let _ = UserSettings::load(); }),
+            ("settings path/repair registry", || { let _ = UserSettings::settings_path(); }),
+            ("prompt file", || { let _ = super::super::prompts::prompt_snapshot(super::super::prompts::PromptKind::Assistive); }),
+            ("calibration file", || { let _ = SealedEnergyCalibration::load(Path::new("/fixture/calibration.json")); }),
+        ];
+        for (expected, acquire) in sources {
+            let probe = StartupAcquisitionProbe::forbid();
+            assert!(std::panic::catch_unwind(acquire).is_err());
+            assert_eq!(probe.attempts(), [expected]);
+        }
     }
 }
