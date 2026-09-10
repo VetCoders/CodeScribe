@@ -246,7 +246,7 @@ final class OverlayStateTests: XCTestCase {
       evidenceCalibrationVersion: "test-v1",
       wordEvidenceReceipts: includesWordEvidence ? ["test-word-evidence-\(sequence)"] : [],
       layerDecisionReceipts: ["test-layer-decision-\(sequence)"],
-      sealReceipt: terminal ? "test-seal-\(sequence)" : nil,
+      sealReceipt: terminal && projectedPhase != "coverage_refused" ? "test-seal-\(sequence)" : nil,
       manualEditReceipt: manualEditReceipt,
       presentationReceipt: nil
     )
@@ -260,7 +260,7 @@ final class OverlayStateTests: XCTestCase {
         reducerRevision: reducerRevision ?? sequence,
         reducerAction: reducerAction
           ?? (terminal
-            ? "record_ledger_terminal_seal"
+            ? (projectedPhase == "coverage_refused" ? "session_ended" : "record_ledger_terminal_seal")
             : "record_ledger_projection"),
         occurrenceSessionId: sessionId,
         captureEpoch: 1,
@@ -2898,6 +2898,142 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertFalse(realPanel.isMainWindow)
     realPanel.orderOut(nil)
     withExtendedLifetime([offController, agentController, visibleController]) {}
+  }
+
+  // MARK: Refusal visibility (rc-w2-refusal-visibility) — UNRUN under W2
+
+  func testRefusedCoverageNeverArmsAutoHideAfterProjectionOrInteraction() {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    var successes = 0
+    state.onClose = { closes += 1 }
+    state.onSuccessfulDictation = { successes += 1 }
+    let words = "Zażółć — bez pieczęci.\nPowtórz. Powtórz."
+
+    projectText(
+      words, to: state, phase: "coverage_refused", canInsert: true, canCopy: true,
+      canRetranscribe: true, terminal: true)
+    XCTAssertNil(state.autoHideDeadline, "refusal must not arm a countdown")
+
+    state.setPointerHovering(true)
+    state.setPointerHovering(false)
+    state.userDraggedOverlay()
+    state.userResizedOverlay()
+    XCTAssertNil(state.autoHideDeadline, "interaction must not rearm refused recovery")
+    clock.now += OverlayState.autoHideDelaySeconds * 3
+    state.fireAutoHideNowForTests()
+
+    XCTAssertEqual(closes, 0)
+    XCTAssertEqual(successes, 0)
+    XCTAssertEqual(state.mode, .coverageRefused)
+    XCTAssertEqual(Array(state.canvasText.utf8), Array(words.utf8))
+    XCTAssertNotNil(state.coverageRefusalNotice)
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.insertPaste, .copy, .retranscribe, .close])
+  }
+
+  func testWakeArmedBeforeRefusalCannotCloseRecoveryAtItsDeadline() throws {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+    projectText("earlier verdict", to: state, terminal: true)
+    let generation = state.captureGeneration
+    let armedDeadline = try XCTUnwrap(state.autoHideDeadline)
+
+    clock.now += 1
+    projectText("kept words", to: state, phase: "coverage_refused", terminal: true)
+    XCTAssertEqual(state.captureGeneration, generation)
+    XCTAssertNil(state.autoHideDeadline, "refusal cancels the earlier countdown")
+
+    // Restore the saved deadline only at the existing test seam. Without the
+    // execution guard this closes the panel, even if scheduling is protected.
+    clock.now = armedDeadline
+    state.fireAutoHideNowForTests(armedDeadline: armedDeadline)
+    XCTAssertEqual(closes, 0)
+    XCTAssertNil(state.autoHideDeadline)
+    XCTAssertEqual(state.activeText, "kept words")
+    XCTAssertNotNil(state.coverageRefusalNotice)
+  }
+
+  func testEarlyWakeArmedBeforeRefusalCannotLeaveARecoveryDeadline() throws {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+    projectText("earlier verdict", to: state, terminal: true)
+    let armedDeadline = try XCTUnwrap(state.autoHideDeadline)
+    projectText("kept words", to: state, phase: "coverage_refused", terminal: true)
+
+    clock.now = armedDeadline - 1
+    state.fireAutoHideNowForTests(armedDeadline: armedDeadline)
+    XCTAssertNil(state.autoHideDeadline, "an early refused wake must retire its deadline")
+    clock.now = armedDeadline + 1
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 0)
+  }
+
+  func testExplicitCloseStillDismissesRefusedRecoveryWithoutDiscardingWords() {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+    state.onComposerTranscript = { text, _ in .retained(text) }
+    projectText(
+      "recover these words", to: state, phase: "coverage_refused", canCopy: true,
+      terminal: true, delivery: .composerPending, sessionId: "explicit-close-refused")
+
+    XCTAssertTrue(OverlayIntentRail.projectedIntents(for: state).contains(.close))
+    state.relayIntent(.close)
+
+    XCTAssertEqual(closes, 1, "the human Close intent must reach the actual close callback")
+    XCTAssertEqual(state.mode, .coverageRefused)
+    XCTAssertEqual(state.activeText, "recover these words")
+    XCTAssertEqual(state.retainedComposerDelivery, "recover these words")
+    XCTAssertNil(state.autoHideDeadline)
+    clock.now += OverlayState.autoHideDelaySeconds * 2
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 1)
+  }
+
+  func testRefusalSuccessorKeepsItsOwnSuccessfulCountdownDespitePredecessorWake() throws {
+    let clock = OverlayStateTestClock()
+    let state = OverlayState(nowProvider: { clock.now })
+    var closes = 0
+    state.onClose = { closes += 1 }
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectText("earlier verdict", to: state, terminal: true, sessionId: "predecessor")
+    let staleGeneration = state.captureGeneration
+    XCTAssertNotNil(state.autoHideDeadline)
+    projectText(
+      "refused predecessor", to: state, phase: "coverage_refused", terminal: true,
+      sessionId: "predecessor")
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    projectText("successor live", to: state, sessionId: "successor")
+    XCTAssertGreaterThan(state.captureGeneration, staleGeneration)
+    state.fireAutoHideForTests(generation: staleGeneration)
+    XCTAssertEqual(closes, 0)
+    XCTAssertEqual(state.activeText, "successor live")
+    XCTAssertNil(state.coverageRefusalNotice)
+
+    projectText("successor complete", to: state, terminal: true, sessionId: "successor")
+    let successorDeadline = try XCTUnwrap(state.autoHideDeadline)
+    clock.now = successorDeadline - 0.1
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 0, "ordinary success still waits the full interval")
+    clock.now = successorDeadline
+    state.fireAutoHideForTests(generation: staleGeneration)
+    XCTAssertEqual(closes, 0, "even an expired successor deadline is not the predecessor's")
+    XCTAssertEqual(state.autoHideDeadline, successorDeadline)
+    state.fireAutoHideNowForTests()
+    XCTAssertEqual(closes, 1, "the successor's successful countdown still works")
+    XCTAssertEqual(state.mode, .formatted)
+    XCTAssertEqual(state.activeText, "successor complete")
   }
 
   // MARK: Refusal recovery (rc-w2-refusal-ui) — UNRUN under W2

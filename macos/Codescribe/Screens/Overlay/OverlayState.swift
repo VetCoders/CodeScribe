@@ -506,7 +506,7 @@ final class OverlayState {
 
   // MARK: Activity-anchored auto-hide for terminal outcomes
   private var autoHideTask: Task<Void, Never>?
-  private var autoHideDeadline: TimeInterval?
+  private(set) var autoHideDeadline: TimeInterval?
   private var isPointerHovering = false
   private let nowProvider: () -> TimeInterval
   /// Single source of truth for the Founder-dictated terminal lifetime.
@@ -1418,6 +1418,12 @@ final class OverlayState {
   }
 
   private func restartAutoHideCountdown() {
+    // Refused coverage still needs reachable recovery controls. A timer is
+    // not human dismissal, even when the document is retained in memory.
+    guard mode != .coverageRefused else {
+      cancelAutoHide()
+      return
+    }
     // A take under review (caret in the canvas, or an uncommitted draft) is
     // never auto-hidden out from under the user.
     guard isTerminalMode, !isPointerHovering, !isEditingTranscript, !isRevisionDraftDirty
@@ -1446,6 +1452,12 @@ final class OverlayState {
   private func evaluateAutoHideDeadline(rescheduleIfEarly: Bool, generation: UInt64) {
     guard generation == captureGeneration else { return }
     autoHideTask = nil
+    // Recheck the current verdict: this wake may have been armed before the
+    // refusal arrived. It may neither close recovery nor reach Agent delivery.
+    guard mode != .coverageRefused else {
+      cancelAutoHide()
+      return
+    }
     guard isTerminalMode, !isPointerHovering, let deadline = autoHideDeadline else { return }
     let remaining = deadline - nowProvider()
     if remaining > 0 {
@@ -1466,13 +1478,17 @@ final class OverlayState {
 
   /// Deterministic XCTest seam: tests inject a monotonic clock, advance it,
   /// and evaluate the same deadline logic without wall-clock sleeps.
-  func fireAutoHideNowForTests() {
+  /// Supplying a previously armed deadline models a pending wake independently
+  /// of scheduling cancellation, so the deadline's refusal guard is falsifiable.
+  func fireAutoHideNowForTests(armedDeadline: TimeInterval? = nil) {
+    if let armedDeadline { autoHideDeadline = armedDeadline }
     fireAutoHideForTests(generation: captureGeneration)
   }
 
   /// Deterministic negative seam: replay a wake that was armed by an EARLIER
   /// capture (pass its generation) and prove it cannot close the successor.
   func fireAutoHideForTests(generation: UInt64) {
+    guard generation == captureGeneration else { return }
     autoHideTask?.cancel()
     autoHideTask = nil
     evaluateAutoHideDeadline(rescheduleIfEarly: false, generation: generation)
