@@ -301,6 +301,9 @@ final class OverlayResizeHitTests: XCTestCase {
           XCTFail("DictationOverlayWindow.make did not return FloatingOverlayPanel")
           return NSPanel()
         }
+        // Override restored geometry before the controller installs its resize
+        // ownership callback. This fixture never writes the real defaults.
+        panel.setContentSize(NSSize(width: 470, height: 260))
         builtPanel = panel
         return panel
       },
@@ -314,6 +317,8 @@ final class OverlayResizeHitTests: XCTestCase {
       panel.invalidatePresence()
     }
     let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
+    XCTAssertEqual(panel.frame.width, 470, accuracy: 0.5)
+    XCTAssertEqual(panel.frame.height, 260, accuracy: 0.5)
     let before = panel.frame.height
     let manyLines = (1...80).map { "projected line \($0)" }.joined(separator: "\n")
 
@@ -321,6 +326,7 @@ final class OverlayResizeHitTests: XCTestCase {
     RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     let grown = panel.frame.height
     let maximum = floor(screen.visibleFrame.height * OverlayContentSizePolicy.maximumScreenFraction)
+    XCTAssertEqual(OverlayContentSizePolicy.maximumScreenFraction, 0.60)
     print("W5_T16_BREATH before=\(before) grown=\(grown) maximum=\(maximum)")
     XCTAssertGreaterThan(grown, before)
     XCTAssertLessThanOrEqual(grown, maximum + 0.5)
@@ -337,6 +343,25 @@ final class OverlayResizeHitTests: XCTestCase {
     )
     project(manyLines + "\nmore projected content", sequence: 2, to: state)
     XCTAssertEqual(panel.frame.height, manualHeight, accuracy: 0.5)
+
+    // The automatic cap must not become a ceiling on an explicit user size.
+    let oversized = NSSize(width: panel.frame.width + 40, height: maximum + 80)
+    panel.setFrame(
+      NSRect(
+        x: panel.frame.minX,
+        y: panel.frame.maxY - oversized.height,
+        width: oversized.width,
+        height: oversized.height
+      ),
+      display: true
+    )
+    XCTAssertGreaterThan(panel.frame.height, maximum)
+    project("short projected content", sequence: 3, to: state)
+    XCTAssertEqual(panel.frame.width, oversized.width, accuracy: 0.5)
+    XCTAssertEqual(panel.frame.height, oversized.height, accuracy: 0.5)
+    project(manyLines + "\neven more projected content", sequence: 4, to: state)
+    XCTAssertEqual(panel.frame.width, oversized.width, accuracy: 0.5)
+    XCTAssertEqual(panel.frame.height, oversized.height, accuracy: 0.5)
   }
 
   @MainActor
