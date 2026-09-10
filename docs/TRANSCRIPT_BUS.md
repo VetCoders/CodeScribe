@@ -249,14 +249,42 @@ Availability semantics, as the producers report them:
   chunk skipped ahead or because the extent stopped short of what the take
   produced.
 
-**Native projection limitation.** These fields exist on the Bus wire and in
-`ProjectedSealCoverageReceipt` only. `bridge/src/recording.rs` `from_bus_event`
-still omits seal coverage, and `OverlayState.statusText` /
-`defaultCoverageRefusalNotice` still hardcode incomplete coverage. A refused
-take therefore reaches the user as the existing generic `coverage_refused`
-notice regardless of reason. Carrying the typed reason into the native
-projection is a separate joined cut; no user-visible distinction is claimed
-here.
+**Native coverage projection (rc-w3-native-coverage-reason).**
+`CsTranscriptProjectionEvent.seal_coverage` copies the existing receipt through
+`from_bus_event`, including sample counts/ranges, observer diagnostics and absent
+ratio. Status and unavailable reason are Swift-visible enums. Missing legacy
+coverage stays absent; unfamiliar wire tokens become `Unknown`, never Complete.
+The native bridge decodes protocol tokens, not logs or display strings, and
+creates no new evidence or transcript authority.
+
+`OverlayState` derives both status and standing refusal copy from the admitted
+projection. Incomplete measured speech and unavailable measurement have distinct
+copy; each known unavailable reason explains why measurement could not certify
+this take without asserting that words were lost. Missing coverage is unverified.
+Text bytes, phase and capability bits still come from the same projection.
+An empty Error projection gains neither words nor actions from the diagnostic.
+
+Admission compares sequence, reducer revision and capture epoch **within the
+same session**. Sequence must increase; revision and epoch cannot regress.
+Multiple entry rows and the lifecycle clone may share a revision, so equal
+revision with later sequence remains admissible. Each revision republishes its
+ordered occurrence entries with the same full render; when a document spans
+epochs, early rows below the admitted epoch do not paint, while the final row at
+the current epoch carries that same document. This is presentation admission,
+not a new occurrence reducer. The Bus still owns publication order and refuses
+old/equal revisions at its writer boundary; lifecycle publication increments
+sequence and clones the last document revision/epoch once.
+
+Retired sessions are excluded from paint before ordering admission. Their
+identity-addressed `ComposerPending` terminal still reaches its original receiver,
+even when a newer document revision arrived before that late lifecycle. Delivery
+uses the existing receiver admission receipt; retirement cannot cancel the debt. Exact sequence replay cannot repaint or release capture. A repeated
+lifecycle cannot repaint or release capture twice; a matching repeated terminal
+or a later fresh offer may retry a handover the receiver has not acknowledged. A new session starts its own order, clears its
+notice, and preserves existing identity-owned recovery. Later document revisions
+of the current session remain admissible and carry their own notice verdict.
+No refusal arms auto-send, a success callback, auto-hide or microphone capture.
+Installed/live acceptance remains a separate integrator obligation.
 
 ### Presentation provenance and serialization
 

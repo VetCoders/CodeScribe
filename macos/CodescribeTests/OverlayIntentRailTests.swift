@@ -555,7 +555,7 @@ final class OverlayIntentRailTests: XCTestCase {
     state.engine = engine
 
     XCTAssertEqual(state.mode, .coverageRefused)
-    XCTAssertEqual(state.statusText, "incomplete coverage")
+    XCTAssertEqual(state.statusText, "unverified coverage")
     XCTAssertEqual(
       OverlayIntentRail.projectedIntents(for: state), [.copy, .retranscribe, .close])
 
@@ -573,7 +573,7 @@ final class OverlayIntentRailTests: XCTestCase {
 
     XCTAssertEqual(engine.copiedTaggedText, "usable but unsealed")
     XCTAssertEqual(state.mode, .coverageRefused, "recovery must not relabel the phase")
-    XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: state.statusText), "incomplete coverage")
+    XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: state.statusText), "unverified coverage")
   }
 
   func testErrorRecoveryCopyUsesProductionRouteWithoutFormatting() async {
@@ -650,7 +650,8 @@ final class OverlayIntentRailTests: XCTestCase {
         terminal: true,
         lifecycleTerminal: true,
         delivery: .unattempted,
-        acousticReceipts: []
+        acousticReceipts: [],
+        sealCoverage: nil
       )
     )
 
@@ -696,7 +697,8 @@ final class OverlayIntentRailTests: XCTestCase {
         terminal: terminal,
         lifecycleTerminal: terminal,
         delivery: .unattempted,
-        acousticReceipts: []
+        acousticReceipts: [],
+        sealCoverage: nil
       )
     )
     return state

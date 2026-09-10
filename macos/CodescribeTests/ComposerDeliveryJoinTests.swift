@@ -264,7 +264,8 @@ final class ComposerDeliveryJoinTests: XCTestCase {
         terminal: terminal,
         lifecycleTerminal: lifecycleTerminal,
         delivery: delivery,
-        acousticReceipts: [receipt]
+        acousticReceipts: [receipt],
+        sealCoverage: nil
       )
     )
   }
@@ -1595,4 +1596,84 @@ final class ComposerDeliveryJoinTests: XCTestCase {
       f.store.threads.allSatisfy { $0.messages.isEmpty },
       "a parked refusal must never be submitted on the user's behalf")
   }
+  func testEqualRevisionLaterSequenceDeliversRefusedWordsToOriginalComposer() throws {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "join-session")
+    listening("tak tak", to: state)
+    var terminal = try XCTUnwrap(state.latestTranscriptProjection)
+    terminal.sequence += 1
+    terminal.terminal = true
+    terminal.lifecycleTerminal = true
+    terminal.delivery = .composerPending
+    terminal.phase = "coverage_refused"
+    terminal.reducerAction = "session_ended"
+    terminal.sealCoverage = CsProjectedSealCoverageReceipt(
+      status: .unavailable, unavailableReason: .partialObservation, speechSamples: 0,
+      coveredSamples: 0, uncoveredSpeechRanges: [], maxUncoveredSamples: 0,
+      incompleteThresholdSamples: 4_000, speechProducer: "capture_energy",
+      availability: "discontinuous", observedSamples: nil, coverageRatio: nil)
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    state.applyTranscriptProjection(terminal)
+    state.applyTranscriptProjection(terminal)
+    XCTAssertEqual(f.store.draft, "B typed")
+    XCTAssertEqual(state.statusText, "measurement unavailable")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "tak tak")
+    XCTAssertTrue(f.store.threads.allSatisfy { $0.messages.isEmpty })
+  }
+
+  func testRetiredEqualRevisionPendingDeliveryUsesSessionLocalOrder() throws {
+    try assertRetiredPendingDelivery(newerOldDocument: false)
+  }
+
+  func testRetiredPendingDeliverySurvivesANewerDocumentBeforeItsLateLifecycle() throws {
+    try assertRetiredPendingDelivery(newerOldDocument: true)
+  }
+
+  private func assertRetiredPendingDelivery(newerOldDocument: Bool) throws {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "old-session")
+    listening("old words", to: state, sessionId: "old-session")
+    var old = try XCTUnwrap(state.latestTranscriptProjection)
+    old.sequence = 100
+    old.reducerRevision = 100
+    state.applyTranscriptProjection(old)
+    if newerOldDocument {
+      var revision = old
+      revision.sequence += 2
+      revision.reducerRevision += 1
+      state.applyTranscriptProjection(revision)
+    }
+    state.finishControllerRecording()
+    if let request = f.store.currentComposerCaptureRequestID, let handle = f.store.composerCaptureHandle {
+      f.store.applyComposerStopOutcome(.noLiveCapture, requestID: request, handle: handle)
+    }
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    admitCapture(f.store, threadID: f.threadB, id: "new-session")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    listening("new words", to: state, sessionId: "new-session")
+    let current = state.latestTranscriptProjection
+    old.sequence += 1
+    old.terminal = true
+    old.lifecycleTerminal = true
+    old.phase = "coverage_refused"
+    old.delivery = .composerPending
+    state.applyTranscriptProjection(old)
+    state.applyTranscriptProjection(old)
+    XCTAssertEqual(state.latestTranscriptProjection, current)
+    XCTAssertEqual(state.activeText, "new words")
+    XCTAssertNil(state.coverageRefusalNotice)
+    XCTAssertEqual(f.store.draft, "B typed")
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "new-session")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "old words")
+  }
+
 }

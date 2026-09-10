@@ -428,12 +428,40 @@ final class OverlayState {
   @ObservationIgnored private var eventTask: Task<Void, Never>?
 
   static let defaultNoSpeechNotice = "No speech detected"
-  /// The sentence a refused take shows instead of a seal. It states the two
-  /// facts that are true at once — the words are here, the coverage is not
-  /// complete — because dropping either half is how this outcome gets
-  /// mistaken for success or for loss.
+  /// Missing legacy coverage is unverified, never proof of missing words.
   static let defaultCoverageRefusalNotice =
-    "Incomplete coverage — these words were kept, not sealed"
+    "Coverage could not be verified — these words were kept, not sealed"
+
+  /// Display copy comes only from the admitted coverage projection. Absence is
+  /// unknown, not incomplete speech and not a successful measurement.
+  private var coverageRefusalCopy: (status: String, notice: String) {
+    guard let coverage = latestTranscriptProjection?.sealCoverage else {
+      return ("unverified coverage", Self.defaultCoverageRefusalNotice)
+    }
+    switch coverage.status {
+    case .incomplete:
+      return ("incomplete coverage", "Incomplete coverage — these words were kept, not sealed")
+    case .unavailable:
+      let explanation: String
+      switch coverage.unavailableReason {
+      case .notObserved: explanation = "No acoustic measurement was available for this take"
+      case .identityMismatch: explanation = "The acoustic measurement did not match this take"
+      case .invalidMeasurement: explanation = "The acoustic measurement could not be used"
+      case .partialObservation: explanation = "The acoustic measurement covered only part of this take"
+      case .unknown, nil: explanation = "The acoustic measurement was unavailable"
+      }
+      return ("measurement unavailable", "\(explanation) — these words were kept, not sealed")
+    case .unknown, .complete:
+      // A conflicting complete diagnostic cannot override a refused phase.
+      return ("unverified coverage", Self.defaultCoverageRefusalNotice)
+    }
+  }
+
+  /// Admission metadata only; no transcript or acoustic adjudication is stored.
+  /// Keep each session's fence when its paint retires so delayed delivery still
+  /// addresses that session without comparing its sequence to a successor's.
+  private var projectionOrder: [String: (sequence: UInt64, revision: UInt64, epoch: UInt64)] = [:]
+  private var endedProjectionSessions: Set<String> = []
 
   private var recording = false
   /// Reason from `on_no_speech`, captured before the terminal stop.
@@ -557,7 +585,7 @@ final class OverlayState {
     // Never "formatted": the pill is the first thing a user reads, and the
     // one word it must not say about a refused take is the word that means
     // sealed.
-    case .coverageRefused: return "incomplete coverage"
+    case .coverageRefused: return coverageRefusalCopy.status
     case .noSpeech: return "no speech"
     case .error: return "error"
     }
@@ -1726,7 +1754,6 @@ final class OverlayState {
   /// Paint the engine document directly. An unfamiliar chrome phase must not
   /// prevent text delivery; retain the current chrome until a known phase arrives.
   func applyTranscriptProjection(_ projection: CsTranscriptProjectionEvent) {
-    defer { onTranscriptPresentationChanged?() }
     // Retired projections may still carry undelivered words, but cannot paint
     // or finalize the newer capture. Retry the identity-addressed receiver only.
     let foreignComposerTerminal = projection.terminal && projection.lifecycleTerminal
@@ -1734,14 +1761,50 @@ final class OverlayState {
     if retiredProjectionSessions.contains(projection.sessionId)
       || foreignComposerTerminal
     {
+      defer { onTranscriptPresentationChanged?() }
       if projection.terminal && projection.lifecycleTerminal {
         if projection.delivery == .composerPending {
           admitComposerDelivery(projection, affectsCurrentCapture: false)
         }
-        onCaptureEnded?(projection.sessionId)
+        if endedProjectionSessions.insert(projection.sessionId).inserted {
+          onCaptureEnded?(projection.sessionId)
+        }
       }
       return
     }
+    if let accepted = projectionOrder[projection.sessionId] {
+      guard projection.sequence > accepted.sequence,
+        projection.reducerRevision >= accepted.revision,
+        projection.captureEpoch >= accepted.epoch
+      else {
+        // Re-observing the same authenticated terminal may retry a handover
+        // the receiver refused. Only its existing admission receipt consumes
+        // delivery; this must not repaint or release capture again.
+        if projection.sequence == accepted.sequence,
+          projection.reducerRevision == accepted.revision,
+          projection.captureEpoch == accepted.epoch,
+          projection.terminal, projection.lifecycleTerminal,
+          projection.delivery == .composerPending,
+          endedProjectionSessions.contains(projection.sessionId)
+        {
+          admitComposerDelivery(projection, affectsCurrentCapture: false)
+        }
+        return
+      }
+    }
+    projectionOrder[projection.sessionId] = (
+      projection.sequence, projection.reducerRevision, projection.captureEpoch)
+    // Replayed lifecycle cannot repaint or release capture twice. A later
+    // addressed offer can still retry an unacknowledged composer handover.
+    let lifecycleTerminal = projection.terminal && projection.lifecycleTerminal
+    if lifecycleTerminal && endedProjectionSessions.contains(projection.sessionId) {
+      if projection.delivery == .composerPending {
+        admitComposerDelivery(projection, affectsCurrentCapture: false)
+      }
+      return
+    }
+    if lifecycleTerminal { endedProjectionSessions.insert(projection.sessionId) }
+    defer { onTranscriptPresentationChanged?() }
     let priorProjection = latestTranscriptProjection
     let isNewSession = priorProjection?.sessionId != projection.sessionId
     let draftWasDirty = isRevisionDraftDirty
@@ -1815,6 +1878,11 @@ final class OverlayState {
       abortRecordingSession()
     }
     latestTranscriptProjection = projection
+    // Mirror this accepted projection; a successor or a later document verdict
+    // cannot inherit a notice belonging to its predecessor.
+    coverageRefusalNotice =
+      projection.terminal && projection.phase == OverlayMode.coverageRefused.rawValue
+      ? coverageRefusalCopy.notice : nil
     if !projection.terminal {
       markTranscriptActivity()
     }
@@ -1863,14 +1931,6 @@ final class OverlayState {
       if projection.phase == OverlayMode.noSpeech.rawValue {
         noSpeechNotice = pendingNoSpeechMessage ?? OverlayState.defaultNoSpeechNotice
       }
-      // Mirrors the producer's phase rather than latching: a later terminal
-      // revision of the same session carries its own verdict, and a notice
-      // that outlived it would be this layer asserting a refusal the reducer
-      // has stopped stating.
-      coverageRefusalNotice =
-        projection.phase == OverlayMode.coverageRefused.rawValue
-        ? OverlayState.defaultCoverageRefusalNotice
-        : nil
       restartAutoHideCountdown()
       if revisionReceipt != nil {
         captureQualityIfEdited(action: "revision")
@@ -2344,7 +2404,7 @@ final class OverlayState {
       renderedText: renderedText, phase: phase.rawValue, canPaste: isFormatted, canInsert: isFormatted,
       canCopy: !renderedText.isEmpty, canRetranscribe: phase == .noSpeech || isFormatted,
       canFormat: isFormatted,
-      terminal: terminal, lifecycleTerminal: terminal, delivery: .unattempted, acousticReceipts: [])
+      terminal: terminal, lifecycleTerminal: terminal, delivery: .unattempted, acousticReceipts: [], sealCoverage: nil)
   }
 }
 
