@@ -142,17 +142,14 @@ PROFILE="${1:-debug}"
 case "$PROFILE" in
   debug)
     CONFIG="Debug"
-    TARGET_DIR="target/debug"
     CARGO_PROFILE_ARGS=()
     ;;
   local-release)
     CONFIG="Release"
-    TARGET_DIR="target/local-release"
     CARGO_PROFILE_ARGS=(--profile local-release)
     ;;
   release)
     CONFIG="Release"
-    TARGET_DIR="target/release"
     CARGO_PROFILE_ARGS=(--release)
     ;;
   *) echo "usage: $0 [debug|local-release|release]" >&2; exit 2 ;;
@@ -163,12 +160,27 @@ esac
 require() {
   command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found — $2" >&2; exit 1; }
 }
+require python3 "install Python 3 for Cargo metadata and binding normalization"
 require cargo    "install the Rust toolchain: https://rustup.rs"
 require xcodegen "the app's .xcodeproj is generated, not committed: brew install xcodegen"
 if [ "${SKIP_XCODEBUILD:-0}" != "1" ]; then
   require xcodebuild "install Xcode (App Store), then: sudo xcodebuild -runFirstLaunch"
   require swiftc "install Xcode command line tools: xcode-select --install"
 fi
+
+# Ask Cargo itself: environment, ancestor/repo config and Cargo home all share
+# the same authority as the builds below. Never fall back to a local target.
+if ! TARGET_ROOT="$(cargo metadata --no-deps --format-version 1 | python3 -c '
+import json, sys
+value = json.load(sys.stdin)["target_directory"]
+if not isinstance(value, str) or not value.startswith("/") or any(c in value for c in "\\\"\n\r"):
+    raise SystemExit("invalid Cargo target_directory (expected an absolute path)")
+print(value)
+')"; then
+  echo "error: cannot resolve Cargo artifact root via cargo metadata" >&2
+  exit 1
+fi
+TARGET_DIR="$TARGET_ROOT/$PROFILE"
 
 resolve_embedder_source() {
   local explicit="${CODESCRIBE_EMBEDDER_BUNDLE_SOURCE:-${CODESCRIBE_EMBEDDER_PATH:-}}"
@@ -246,15 +258,48 @@ STAMP_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "==> stamp (pre-build): v${STAMP_VERSION} build ${STAMP_BUILD_NUM} commit ${STAMP_COMMIT} built ${STAMP_BUILT_AT}"
 
 echo "==> [1/7] Building codescribe-ffi ($PROFILE)"
-if [ "$PROFILE" = "local-release" ]; then
-  CODESCRIBE_LOCAL_INSTALL=1 cargo build -p codescribe-ffi "${CARGO_PROFILE_ARGS[@]}"
-  CODESCRIBE_LOCAL_INSTALL=1 cargo build -p codescribe-core --bin codescribe-stt-sidecar "${CARGO_PROFILE_ARGS[@]}"
-else
-  env -u CODESCRIBE_LOCAL_INSTALL \
-    cargo build -p codescribe-ffi "${CARGO_PROFILE_ARGS[@]}"
-  env -u CODESCRIBE_LOCAL_INSTALL \
-    cargo build -p codescribe-core --bin codescribe-stt-sidecar "${CARGO_PROFILE_ARGS[@]}"
-fi
+# Verify emitted artifact receipts before any consumer can touch stale files.
+# A configured build.target puts artifacts in a triple subdirectory. This app
+# pipeline is host-only: reject that layout, including an explicit host triple,
+# rather than executing a cross-built bindgen or linking an unrelated host dylib.
+build_cargo_artifacts() {
+  local package="$1" receipts
+  shift
+  if [ "$PROFILE" = "local-release" ]; then
+    receipts="$(CODESCRIBE_LOCAL_INSTALL=1 cargo build -p "$package" "$@" ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} --message-format=json-render-diagnostics)" || return $?
+  else
+    receipts="$(env -u CODESCRIBE_LOCAL_INSTALL cargo build -p "$package" "$@" ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} --message-format=json-render-diagnostics)" || return $?
+  fi
+  printf '%s\n' "$receipts" | python3 -c '
+import json, sys
+from pathlib import Path
+root, package = Path(sys.argv[1]), sys.argv[2]
+expected = ({"codescribe_ffi": "libcodescribe_ffi.dylib", "uniffi-bindgen": "uniffi-bindgen"}
+            if package == "codescribe-ffi" else {"codescribe-stt-sidecar": "codescribe-stt-sidecar"})
+seen = set()
+finished = False
+for line in sys.stdin:
+    if not line.startswith("{"):
+        continue
+    message = json.loads(line)
+    if message.get("reason") == "build-finished":
+        finished = message.get("success") is True
+    if message.get("reason") != "compiler-artifact":
+        continue
+    name = message.get("target", {}).get("name")
+    if name not in expected:
+        continue
+    path = root / expected[name]
+    emitted = message.get("filenames", []) if name == "codescribe_ffi" else [message.get("executable")]
+    if str(path) not in emitted or not path.is_file():
+        raise SystemExit(f"error: Cargo artifact for {name} is not {path}; explicit build.target/cross-compilation is unsupported by build-app; remove that configuration for a host build")
+    seen.add(name)
+if not finished or seen != set(expected):
+    raise SystemExit(f"error: incomplete Cargo artifact receipts for {package}; refusing stale local artifacts")
+' "$TARGET_DIR" "$package"
+}
+build_cargo_artifacts codescribe-ffi
+build_cargo_artifacts codescribe-core --bin codescribe-stt-sidecar
 
 echo "==> [2/7] Rewriting dylib install_name to @rpath (relocatable bundle)"
 install_name_tool -id @rpath/libcodescribe_ffi.dylib "$DYLIB"
@@ -309,7 +354,7 @@ run_app_xcodebuild() {
     -scheme "$SCHEME" -configuration "$CONFIG" \
     -derivedDataPath "$DERIVED" \
     ONLY_ACTIVE_ARCH=YES \
-    LIBRARY_SEARCH_PATHS="$REPO_ROOT/$TARGET_DIR" \
+    LIBRARY_SEARCH_PATHS="\"$TARGET_DIR\"" \
     CODE_SIGNING_ALLOWED="${CODE_SIGNING_ALLOWED:-NO}" \
     MARKETING_VERSION="$STAMP_VERSION" \
     CURRENT_PROJECT_VERSION="$STAMP_BUILD_NUM" \
