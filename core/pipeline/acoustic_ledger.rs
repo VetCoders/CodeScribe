@@ -542,7 +542,9 @@ impl AcousticLedger {
         let Some(observed_samples) = speech.availability().observed_samples() else {
             return refuse(match speech.availability() {
                 AcousticAvailability::IdentityMismatch => AcousticEvidenceGap::IdentityMismatch,
-                AcousticAvailability::InvalidMeasurement => AcousticEvidenceGap::InvalidMeasurement,
+                AcousticAvailability::InvalidMeasurement { .. } => {
+                    AcousticEvidenceGap::InvalidMeasurement
+                }
                 AcousticAvailability::Discontinuous { .. } => {
                     AcousticEvidenceGap::PartialObservation
                 }
@@ -2446,10 +2448,13 @@ pub enum AcousticEvidenceGap {
     NotObserved,
     /// A measurement exists but names another session or capture epoch.
     IdentityMismatch,
-    /// PCM reached the observer and none of it was finite.
+    /// PCM reached the observer and some of it was not finite, so nothing it
+    /// measured for this take can be trusted — an unmeasurable region reads as
+    /// silence and there is no way to tell the two apart after the fact.
     InvalidMeasurement,
-    /// The observer measured only part of the capture, and committed speech or
-    /// a measured span reaches past that extent.
+    /// The observer measured only part of the capture: committed speech or a
+    /// measured span reaches past its extent, or that extent stops short of the
+    /// PCM the take actually produced.
     PartialObservation,
 }
 
@@ -3571,7 +3576,10 @@ mod tests {
 
         for availability in [
             AcousticAvailability::NotObserved,
-            AcousticAvailability::InvalidMeasurement,
+            AcousticAvailability::InvalidMeasurement { valid_samples: 0 },
+            AcousticAvailability::InvalidMeasurement {
+                valid_samples: 8_000,
+            },
             AcousticAvailability::Discontinuous {
                 observed_samples: 8_000,
             },

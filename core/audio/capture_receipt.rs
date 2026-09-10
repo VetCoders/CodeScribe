@@ -52,9 +52,17 @@ struct SessionEnergyClock {
     /// PCM this owner actually ingested. Zero means nothing was ever measured,
     /// which is a different fact from "measured, and it was silent".
     observed_samples: u64,
-    /// Samples that arrived non-finite. `push_samples` maps them to zero before
-    /// measurement, so an invalid-only buffer must not read as measured silence.
-    nonfinite_samples: u64,
+    /// Start of the earliest hop that carried non-finite PCM, if any.
+    ///
+    /// Validity is **positional**, not a total. `push_samples` substitutes zero
+    /// for every non-finite sample before measuring, so a contaminated hop
+    /// reports a depressed RMS and reads as silence. Counting those samples and
+    /// comparing the total against the whole observed extent — the shape this
+    /// field replaces — hid exactly that: one invalid second inside a
+    /// two-second take never reached the threshold, so the unmeasurable second
+    /// was certified silent. What the reader needs is where the measurement
+    /// stopped being trustworthy, which is this.
+    first_invalid_sample: Option<u64>,
 }
 
 /// Producer token for the capture energy ladder.
@@ -101,10 +109,21 @@ pub enum AcousticAvailability {
     NotObserved,
     /// A measurement exists, but it names a different session or epoch.
     IdentityMismatch,
-    /// PCM arrived and every sample of it was non-finite: nothing was measured.
-    InvalidMeasurement,
+    /// PCM arrived and some of it was non-finite, so this observer's
+    /// measurement cannot be trusted for the take.
+    ///
+    /// Non-finite input is substituted with zero before measurement, which
+    /// makes an unmeasurable region indistinguishable from a silent one. The
+    /// observer therefore refuses the whole take rather than certifying the
+    /// part it could still read: an invalid region is not silence whether it
+    /// arrives first, last, or between two valid ones. `valid_samples` is the
+    /// contiguous extent measured before the first invalid sample — diagnostic
+    /// only, never a coverage extent.
+    InvalidMeasurement { valid_samples: u64 },
     /// PCM arrived with a hole — some captured audio never reached this
-    /// observer, so the unobserved part cannot be certified either way.
+    /// observer, either because a chunk skipped ahead or because the extent
+    /// stops short of the capture the take produced. The unobserved part cannot
+    /// be certified either way.
     Discontinuous { observed_samples: u64 },
 }
 
@@ -115,7 +134,7 @@ impl AcousticAvailability {
             Self::Observed { observed_samples } => Some(observed_samples),
             Self::NotObserved
             | Self::IdentityMismatch
-            | Self::InvalidMeasurement
+            | Self::InvalidMeasurement { .. }
             | Self::Discontinuous { .. } => None,
         }
     }
@@ -126,7 +145,7 @@ impl AcousticAvailability {
             Self::Observed { .. } => "observed",
             Self::NotObserved => "not_observed",
             Self::IdentityMismatch => "identity_mismatch",
-            Self::InvalidMeasurement => "invalid_measurement",
+            Self::InvalidMeasurement { .. } => "invalid_measurement",
             Self::Discontinuous { .. } => "discontinuous",
         }
     }
@@ -242,7 +261,13 @@ impl CaptureEnergyOwner {
     fn record_hop(&self, sample_start: u64, sample_end: u64, rms: f32, nonfinite: u64) {
         let mut clock = self.clock.lock().unwrap_or_else(|e| e.into_inner());
         clock.observed_samples = clock.observed_samples.max(sample_end);
-        clock.nonfinite_samples = clock.nonfinite_samples.saturating_add(nonfinite);
+        if nonfinite > 0 {
+            // The hop is contaminated wherever the invalid samples sat inside
+            // it, so the trustworthy prefix ends where the hop begins. Hops
+            // arrive in capture order but `min` keeps this true regardless.
+            let first = clock.first_invalid_sample.get_or_insert(sample_start);
+            *first = (*first).min(sample_start);
+        }
         if sample_end <= sample_start || !rms.is_finite() || rms < 0.0 {
             return;
         }
@@ -311,11 +336,17 @@ impl CaptureEnergyOwner {
                 AcousticAvailability::NotObserved,
             );
         }
-        if clock.nonfinite_samples >= clock.observed_samples {
+        if let Some(first_invalid) = clock.first_invalid_sample {
+            // One invalid region is enough. Publishing the valid prefix as a
+            // measurement would hand the ledger an extent that stops short of
+            // the capture without saying so, which is the same certified-silence
+            // lie one step further down.
             return AcousticSpeechEvidence::unavailable(
                 identity,
                 CAPTURE_ENERGY_PRODUCER,
-                AcousticAvailability::InvalidMeasurement,
+                AcousticAvailability::InvalidMeasurement {
+                    valid_samples: first_invalid,
+                },
             );
         }
         let mut ranges: Vec<(u64, u64)> = Vec::new();
@@ -920,9 +951,15 @@ mod tests {
     }
 
     /// A buffer of NaN/inf is mapped to zero for measurement, so it must not be
-    /// allowed to read as measured silence.
+    /// allowed to read as measured silence — in any position.
+    ///
+    /// Position is the whole point. The previous shape compared the non-finite
+    /// total against the whole observed extent, so an invalid region vanished
+    /// from the verdict as soon as enough valid PCM arrived on either side of
+    /// it; the ladder then published a zero-RMS hop and the take sealed as
+    /// silent audio nobody had actually measured.
     #[test]
-    fn invalid_only_buffers_cannot_certify_measured_silence() {
+    fn invalid_samples_cannot_certify_measured_silence_in_any_position() {
         let owner = CaptureEnergyOwner::bind("invalid", 1);
         let mut writer = CaptureLevelAccumulator::bound_to(&owner);
         writer.push_samples(&vec![f32::NAN; 320]);
@@ -931,20 +968,70 @@ mod tests {
             owner
                 .session_active_speech_ranges("invalid", 1, 16_000)
                 .availability(),
-            AcousticAvailability::InvalidMeasurement
+            AcousticAvailability::InvalidMeasurement { valid_samples: 0 },
+            "NaN and infinities are equally unmeasurable, and nothing valid \
+             preceded them"
         );
 
-        // One finite buffer restores a real measurement; the invalid samples
-        // stay counted but no longer describe the whole take.
+        // A finite buffer afterwards measures its own extent, but it cannot
+        // retro-validate what came before it.
         writer.push_samples(&vec![0.0; 320]);
         assert_eq!(
             owner
                 .session_active_speech_ranges("invalid", 1, 16_000)
                 .availability(),
-            AcousticAvailability::Observed {
-                observed_samples: 960
-            }
+            AcousticAvailability::InvalidMeasurement { valid_samples: 0 },
+            "valid PCM after an invalid region does not make that region silent"
         );
+
+        // Valid first, then invalid: the trustworthy prefix is reported as a
+        // diagnostic and the take is still refused.
+        let mixed = CaptureEnergyOwner::bind("mixed", 1);
+        let mut mixed_writer = CaptureLevelAccumulator::bound_to(&mixed);
+        mixed_writer.push_samples(&vec![0.25; 320]);
+        mixed_writer.push_samples(&vec![f32::NEG_INFINITY; 320]);
+        let evidence = mixed.session_active_speech_ranges("mixed", 1, 16_000);
+        assert_eq!(
+            evidence.availability(),
+            AcousticAvailability::InvalidMeasurement { valid_samples: 320 },
+            "the first 320 samples were measurable; the take is not"
+        );
+        assert!(
+            evidence.ranges().is_empty(),
+            "refused evidence publishes no speech, not even the valid prefix's"
+        );
+        assert!(!evidence.is_observed());
+
+        // One invalid sample inside an otherwise valid hop is enough: zero
+        // substitution has already depressed that hop's RMS, so its silence
+        // and its speech are equally unreliable.
+        let one_bad = CaptureEnergyOwner::bind("one-bad", 1);
+        let mut one_bad_writer = CaptureLevelAccumulator::bound_to(&one_bad);
+        one_bad_writer.push_samples(&vec![0.25; 320]);
+        let mut contaminated = vec![0.25f32; 320];
+        contaminated[17] = f32::NAN;
+        one_bad_writer.push_samples(&contaminated);
+        assert_eq!(
+            one_bad
+                .session_active_speech_ranges("one-bad", 1, 16_000)
+                .availability(),
+            AcousticAvailability::InvalidMeasurement { valid_samples: 320 },
+        );
+
+        // Valid silence keeps its measurement and keeps succeeding.
+        let quiet = CaptureEnergyOwner::bind("quiet", 1);
+        let mut quiet_writer = CaptureLevelAccumulator::bound_to(&quiet);
+        quiet_writer.push_samples(&vec![0.0; 640]);
+        let quiet_evidence = quiet.session_active_speech_ranges("quiet", 1, 16_000);
+        assert_eq!(
+            quiet_evidence.availability(),
+            AcousticAvailability::Observed {
+                observed_samples: 640
+            },
+            "measured silence is a measurement; only invalid input is not"
+        );
+        assert!(quiet_evidence.is_observed());
+        assert!(quiet_evidence.ranges().is_empty());
     }
 
     /// The reader supplies the identity it expects; the owner refuses to answer

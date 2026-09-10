@@ -48,8 +48,8 @@ use crate::asr_session::recorder::{
 };
 use crate::asr_session::{SessionId as Layer1SessionId, SessionInput as Layer1SessionInput};
 use crate::audio::capture_receipt::{
-    AcousticSpeechEvidence, CaptureEnergyOwner, CaptureLevelAccumulator, CapturePathMeta,
-    emit_capture_level_receipt,
+    AcousticAvailability, AcousticSpeechEvidence, CaptureEnergyOwner, CaptureLevelAccumulator,
+    CapturePathMeta, emit_capture_level_receipt,
 };
 use crate::audio::streaming_recorder::CaptureTurnIntent;
 use crate::config::{FormattingPolicy, RuntimeSettingsSnapshot};
@@ -2868,16 +2868,58 @@ fn fusion_utterance_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
 /// capture owner itself reports. Absence keeps its own name here instead of
 /// arriving at the ledger as an empty set.
 fn coverage_speech_evidence(state: &AppleSealState) -> AcousticSpeechEvidence {
-    if let Some(fusion) = state.fusion.as_ref() {
-        let acoustic = fusion.acoustic_speech_evidence();
-        if acoustic.observed_speech() {
-            return acoustic;
-        }
-    }
-    state.capture_energy.session_active_speech_ranges(
+    let captured_samples = state.audio.session_sample_end();
+    let capture_energy = state.capture_energy.session_active_speech_ranges(
         &state.session_id,
         state.capture_epoch,
         state.sample_rate,
+    );
+    // The capture writer adjudicates the PCM it wrote. When it measured samples
+    // it could not read, no later observer over the same buffer may certify
+    // them: a downstream reader sees the identical NaN as a probability that
+    // fails every threshold, which is indistinguishable from silence.
+    if matches!(
+        capture_energy.availability(),
+        AcousticAvailability::InvalidMeasurement { .. }
+    ) {
+        return capture_energy;
+    }
+    if let Some(fusion) = state.fusion.as_ref() {
+        let acoustic = fusion.acoustic_speech_evidence();
+        if acoustic.observed_speech() {
+            return within_capture(acoustic, captured_samples);
+        }
+    }
+    within_capture(capture_energy, captured_samples)
+}
+
+/// Hold an observer's measured extent against the capture the take produced.
+///
+/// An observer reports how much PCM reached *it*. Nothing in the pipeline
+/// guarantees that equals what the microphone produced — a chunk lane that
+/// stops forwarding leaves no hole to detect, because the extent simply ends
+/// early. The ledger compares committed and measured spans against the extent
+/// the observer claims, so without this the unheard remainder was certified
+/// covered whenever no word happened to be committed inside it.
+///
+/// `state.audio` is the capture owner's own count of samples seen this
+/// session — retained or evicted — so this compares two authenticated facts.
+/// It only ever downgrades: a short observer becomes unavailable, and no
+/// evidence is promoted.
+fn within_capture(
+    evidence: AcousticSpeechEvidence,
+    captured_samples: u64,
+) -> AcousticSpeechEvidence {
+    let Some(observed_samples) = evidence.availability().observed_samples() else {
+        return evidence;
+    };
+    if observed_samples >= captured_samples {
+        return evidence;
+    }
+    AcousticSpeechEvidence::unavailable(
+        evidence.identity().clone(),
+        evidence.producer(),
+        AcousticAvailability::Discontinuous { observed_samples },
     )
 }
 
@@ -7675,6 +7717,114 @@ mod rc_w2_acoustic_tests {
         );
     }
 
+    /// rc-w3-acoustic-validity: three capture qualities, three honest outcomes,
+    /// all through `publish_terminal_coverage` and the ledger's own finality.
+    ///
+    /// Valid silence still succeeds — that is the outcome the validity repair
+    /// must not cost. An all-invalid capture and a mixed valid/invalid capture
+    /// both refuse, and both name invalid measurement rather than a gap or an
+    /// absent observer.
+    #[test]
+    fn valid_silence_all_invalid_and_mixed_capture_reach_distinct_outcomes() {
+        let silent_state = state_for("rc-w3-quality-silent", 1.0);
+        let mut silent_writer = CaptureLevelAccumulator::bound_to(&silent_state.capture_energy);
+        silent_writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+
+        let invalid_state = state_for("rc-w3-quality-invalid", 1.0);
+        let mut invalid_writer = CaptureLevelAccumulator::bound_to(&invalid_state.capture_energy);
+        invalid_writer.push_samples(&vec![f32::NAN; at(1.0) as usize]);
+
+        let mixed_state = state_for("rc-w3-quality-mixed", 2.0);
+        let mut mixed_writer = CaptureLevelAccumulator::bound_to(&mixed_state.capture_energy);
+        mixed_writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        mixed_writer.push_samples(&vec![f32::INFINITY; at(1.0) as usize]);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let silent = publish_terminal_coverage(&silent_state, &tx);
+        let invalid = publish_terminal_coverage(&invalid_state, &tx);
+        let mixed = publish_terminal_coverage(&mixed_state, &tx);
+
+        assert_eq!(
+            silent.status,
+            SealCoverageStatus::Complete,
+            "a ladder that ran over finite silence covered everything there was"
+        );
+        assert_eq!(silent.coverage_ratio(), Some(1.0));
+        assert_eq!(silent.observed_samples, Some(at(1.0)));
+
+        for (label, receipt) in [("all invalid", &invalid), ("mixed", &mixed)] {
+            assert_eq!(
+                receipt.status,
+                SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement),
+                "{label} capture measured nothing it can stand behind"
+            );
+            assert_eq!(receipt.coverage_ratio(), None, "{label} has no ratio");
+            assert_eq!(receipt.observed_samples, None, "{label} has no extent");
+            assert_eq!(receipt.availability, "invalid_measurement");
+            assert_eq!(receipt.speech_producer, CAPTURE_ENERGY_PRODUCER);
+        }
+
+        // The three receipts are genuinely different documents, not one status
+        // rendered three ways.
+        assert_ne!(silent.status, invalid.status);
+        assert_eq!(
+            invalid.status, mixed.status,
+            "both invalid captures name the same reason; only the diagnostic \
+             prefix differs, and that never reaches the receipt"
+        );
+
+        // Finality agrees with the receipts.
+        assert_eq!(
+            invalid_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w3-quality-invalid", 0),
+            Err(SealRefusal::CoverageIncomplete),
+            "invalid measurement refuses the terminal seal"
+        );
+        assert_eq!(
+            mixed_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w3-quality-mixed", 0),
+            Err(SealRefusal::CoverageIncomplete),
+            "a valid second in front of an invalid one does not rescue the seal"
+        );
+    }
+
+    /// rc-w3-acoustic-validity: the extent guard is not Silero-specific.
+    ///
+    /// The capture energy ladder sits upstream of the retained buffer, so in
+    /// production it cannot fall behind it. This pins the guard's second arm
+    /// anyway: whichever observer answers, an extent shorter than the capture
+    /// is reported as an unobserved remainder rather than covered silence.
+    #[test]
+    fn a_short_capture_energy_extent_cannot_certify_the_unheard_remainder() {
+        let state = state_for("rc-w3-validity-short-ladder", 10.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.0f32; at(4.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            evidence.availability(),
+            AcousticAvailability::Discontinuous {
+                observed_samples: at(4.0)
+            },
+            "four measured seconds of a ten-second capture leave six unheard"
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let receipt = publish_terminal_coverage(&state, &tx);
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
+    }
+
     /// The terminal coverage threshold is 250 ms of the capture clock, and the
     /// published receipt carries the exact figure it was judged against.
     #[test]
@@ -8369,6 +8519,190 @@ mod rc_w2_acoustic_tests {
             "s5 + frozen s6 + s7 → at least 3 seals, got {}",
             state.sealed_count
         );
+    }
+
+    /// rc-w3-acoustic-validity: invalid PCM *after* valid PCM, through the real
+    /// writer -> owner -> ledger chain.
+    ///
+    /// One second of finite zeros, then one second of NaN, on one bound
+    /// accumulator. The reader used to refuse only when the non-finite count
+    /// reached the whole observed extent (`16_000 >= 32_000` is false), so the
+    /// NaN second was measured as silence, the hop was published with a zero
+    /// RMS, and an empty ledger certified the take Complete.
+    #[test]
+    fn invalid_pcm_after_valid_pcm_is_not_certified_as_silence() {
+        let state = state_for("rc-w3-validity-after", 2.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        writer.push_samples(&vec![f32::NAN; at(1.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            evidence.availability().as_str(),
+            "invalid_measurement",
+            "a NaN second measured nothing, and a valid second in front of it \
+             does not turn it into silence"
+        );
+        assert!(!evidence.is_observed());
+        assert!(evidence.ranges().is_empty());
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement),
+            "an unmeasurable region may not reach a successful seal"
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
+        assert_eq!(receipt.observed_samples, None);
+    }
+
+    /// rc-w3-acoustic-validity: invalid PCM *before* valid PCM.
+    ///
+    /// The mirror case, with infinities rather than NaN — `is_finite` rejects
+    /// both, and both are substituted with zero before measurement. The valid
+    /// tail's speech may not be published on evidence whose head was never
+    /// measurable.
+    #[test]
+    fn invalid_pcm_before_valid_pcm_is_not_certified_as_silence() {
+        let state = state_for("rc-w3-validity-before", 2.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![f32::NEG_INFINITY; at(1.0) as usize]);
+        writer.push_samples(&vec![0.25f32; at(1.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(
+            evidence.availability().as_str(),
+            "invalid_measurement",
+            "an infinite head is as unmeasurable as a NaN one"
+        );
+        assert!(
+            evidence.ranges().is_empty(),
+            "unavailable evidence publishes no speech, not even the valid tail's"
+        );
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement)
+        );
+    }
+
+    /// rc-w3-acoustic-validity: a measuring observer cannot overrule the
+    /// capture owner's invalid verdict on the same PCM.
+    ///
+    /// Silero reports a crossing over a take whose capture writer measured
+    /// nothing but NaN. Selection preferred any observer that "measured
+    /// speech", so the downstream observer won and the invalid capture never
+    /// reached the ledger.
+    #[test]
+    fn a_measuring_observer_cannot_overrule_an_invalid_capture() {
+        let state = one_burst_in_a_ten_second_take("rc-w3-validity-bypass");
+        assert!(
+            coverage_speech_evidence(&state).observed_speech(),
+            "the fixture must start with a downstream observer that measured speech"
+        );
+
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![f32::NAN; at(10.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(
+            evidence.producer(),
+            CAPTURE_ENERGY_PRODUCER,
+            "the capture owner adjudicates the PCM it wrote; no later observer \
+             may certify audio the writer measured as invalid"
+        );
+        assert_eq!(evidence.availability().as_str(), "invalid_measurement");
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement)
+        );
+    }
+
+    /// rc-w3-acoustic-validity: a partly observed capture cannot certify its
+    /// unobserved tail, even when no word was committed inside that tail.
+    ///
+    /// Forwarding stops after four seconds of a ten-second take. No chunk ever
+    /// skips, so nothing is discontinuous — the observer's extent simply ends
+    /// early. Its one measured burst is committed, so the coverage arithmetic
+    /// is perfect and the six unheard seconds were the whole lie: the ledger
+    /// compared committed and measured spans against the observer's extent and
+    /// never against the capture the take actually produced.
+    #[test]
+    fn a_partly_observed_capture_cannot_certify_its_unobserved_tail() {
+        let mut state = state_for("rc-w3-validity-tail", 10.0);
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.note_observed_pcm(at(4.0), at(4.0));
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+        ]);
+        ingress.observe(Some((0, at(4.0))), true, at(4.0));
+        state.fusion = Some(ingress);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+
+        let evidence = coverage_speech_evidence(&state);
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_ne!(
+            receipt.status,
+            SealCoverageStatus::Complete,
+            "six seconds of this capture never reached any observer; covering \
+             the measured burst does not certify them silent"
+        );
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
     }
 }
 

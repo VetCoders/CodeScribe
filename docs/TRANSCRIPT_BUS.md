@@ -157,7 +157,8 @@ contains:
   coordinates, occurrence seal ID, source label, exact left context, its SHA-256,
   and shaped bytes. No field claims word-level timing for the shaped text.
 - optional additive `seal_coverage` evidence: measured speech/covered sample
-  counts, uncovered PCM ranges, ratio, threshold, and `complete|incomplete`;
+  counts, uncovered PCM ranges, the 250 ms threshold, and the availability
+  contract below;
 - optional additive `comparison`: SHA-256, character count, and rendered text
   for the pre-repair Apple-lane document and the whole-session local Whisper
   pass (historical/diagnostic; absent on the current normal stop path).
@@ -174,17 +175,17 @@ contains:
 
 The projection contract is one snapshot, not a bag of Swift inputs:
 
-| Field                               | Source of truth                                                                                                                                                                                                                                         |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reducer_revision`, `rendered_text` | Exact committed reducer revision                                                                                                                                                                                                                        |
+| Field                               | Source of truth                                                                                                                                                                                                                                                             |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `reducer_revision`, `rendered_text` | Exact committed reducer revision                                                                                                                                                                                                                                            |
 | `phase`                             | `listening` for open book revisions, `finalizing` after a terminal ledger seal, then `formatted`, `coverage_refused` or `no_speech` from `session_ended` plus the last committed render; a terminal user revision remains `formatted`; failed/superseded starts are `error` |
-| `can_paste`                         | The delivery throne selects `ClipboardPaste`, a latched target exists, and the take has ended                                                                                                                                                           |
-| `can_insert`                        | The delivery throne selects `ClipboardPaste` or `DeferredInsert`, and the take has ended                                                                                                                                                                |
-| `can_copy`                          | The committed render is non-empty                                                                                                                                                                                                                       |
-| `can_retranscribe`                  | The session WAV exists and the take has ended                                                                                                                                                                                                           |
-| `can_format`                        | The take has ended and the committed render is non-empty                                                                                                                                                                                                |
-| `terminal`                          | A terminal document revision or the controller's unique `session_ended` transition; a user/formatter revision can precede lifecycle end |
-| `lifecycle_terminal`                | Only the controller's unique `session_ended` projection; document revisions never release capture ownership or consume the delivery obligation |
+| `can_paste`                         | The delivery throne selects `ClipboardPaste`, a latched target exists, and the take has ended                                                                                                                                                                               |
+| `can_insert`                        | The delivery throne selects `ClipboardPaste` or `DeferredInsert`, and the take has ended                                                                                                                                                                                    |
+| `can_copy`                          | The committed render is non-empty                                                                                                                                                                                                                                           |
+| `can_retranscribe`                  | The session WAV exists and the take has ended                                                                                                                                                                                                                               |
+| `can_format`                        | The take has ended and the committed render is non-empty                                                                                                                                                                                                                    |
+| `terminal`                          | A terminal document revision or the controller's unique `session_ended` transition; a user/formatter revision can precede lifecycle end                                                                                                                                     |
+| `lifecycle_terminal`                | Only the controller's unique `session_ended` projection; document revisions never release capture ownership or consume the delivery obligation                                                                                                                              |
 
 `resolve_delivery_route(OverlayInsert, ...)` remains the only destination
 decision. The projection layer queries its result; it does not create another
@@ -202,7 +203,60 @@ An older/equal reducer revision cannot republish rows. The Bus does not admit an
 occurrence, choose a label, infer identity, perform text-tail matching, mint a
 seal or render another document. `seal_coverage` is emitted before terminal finality. A terminal
 `LedgerSeal` reducer action marks the writer sealed only when the latest
-coverage is not incomplete. No arbitrary string can close committed Bus truth.
+coverage is **complete**. No arbitrary string can close committed Bus truth.
+
+### Seal coverage availability contract
+
+`seal_coverage.status` is one of `complete`, `incomplete`, `unavailable`.
+Only `complete` may certify terminal truth; `incomplete` and every
+`unavailable` reason block the seal in `AcousticLedger::seal_terminal` and in
+`TranscriptReducer::apply_ledger_seal` alike.
+
+| Field                | Values                                                                                      | Absent when                  |
+| -------------------- | ------------------------------------------------------------------------------------------- | ---------------------------- |
+| `status`             | `complete` · `incomplete` · `unavailable`                                                   | never                        |
+| `unavailable_reason` | `not_observed` · `identity_mismatch` · `invalid_measurement` · `partial_observation`        | `status != "unavailable"`    |
+| `speech_producer`    | `capture_energy` · `silero_boundaries`                                                      | never (empty on old records) |
+| `availability`       | `observed` · `not_observed` · `identity_mismatch` · `invalid_measurement` · `discontinuous` | never (empty on old records) |
+| `observed_samples`   | contiguous PCM extent the observer measured                                                 | `status == "unavailable"`    |
+| `coverage_ratio`     | covered fraction of measured speech; a real `1.0` for measured silence                      | `status == "unavailable"`    |
+
+The absent-ratio rule is the load-bearing one: a take nobody measured has no
+covered fraction. `coverage_ratio` is never `NaN` and never a synthetic `1.0`,
+because rendering one made absence of evidence look like a perfect take. When
+the status is `unavailable`, `speech_samples`, `covered_samples` and
+`max_uncovered_samples` are all `0` and carry no meaning.
+
+A reader branches on `status` and, for `unavailable`, on `unavailable_reason`.
+Never on the ratio, never on display copy. `availability` is the observer's
+own state and is diagnostic: it explains _which_ observer failed and how, while
+`unavailable_reason` is the ledger's verdict. They can differ — a
+`discontinuous` observer produces a `partial_observation` verdict.
+
+Availability semantics, as the producers report them:
+
+- `observed` — the observer ingested a contiguous extent and every sample of it
+  was finite. An empty range set here is **measured silence**, and it seals.
+- `not_observed` — no PCM reached that observer for the bound identity.
+- `identity_mismatch` — a measurement exists but names another session or
+  capture epoch; nothing is relabelled onto the caller's identity.
+- `invalid_measurement` — PCM arrived and some of it was non-finite. Non-finite
+  input is substituted with zero before measurement, which makes an unmeasurable
+  region indistinguishable from a silent one, so the observer refuses the whole
+  take rather than certifying the part it could still read. Position does not
+  matter: invalid audio before, after or between valid audio refuses alike.
+- `discontinuous` — captured audio never reached the observer, either because a
+  chunk skipped ahead or because the extent stopped short of what the take
+  produced.
+
+**Native projection limitation.** These fields exist on the Bus wire and in
+`ProjectedSealCoverageReceipt` only. `bridge/src/recording.rs` `from_bus_event`
+still omits seal coverage, and `OverlayState.statusText` /
+`defaultCoverageRefusalNotice` still hardcode incomplete coverage. A refused
+take therefore reaches the user as the existing generic `coverage_refused`
+notice regardless of reason. Carrying the typed reason into the native
+projection is a separate joined cut; no user-visible distinction is claimed
+here.
 
 ### Presentation provenance and serialization
 

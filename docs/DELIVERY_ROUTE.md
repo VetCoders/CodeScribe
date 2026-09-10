@@ -349,7 +349,7 @@ W4 obligations.
 Both `process_recording` (hold/generic) and `stop_toggle_and_adjudicate_inner`
 consume `process_terminal_stop_error` after the existing recorder terminal tail
 and audio retention. A string mentioning "seal refused" is still an ordinary
-failure. Only `TerminalSealRefused` with incomplete coverage for the current
+failure. Only `TerminalSealRefused` with non-complete coverage for the current
 capture can reach degraded handoff. Nonempty text must exactly match the
 already published unsealed Bus document, capture epoch and coverage diagnostics.
 The emitter accepts `SealCoverage` only when it matches the ledger's current
@@ -363,7 +363,36 @@ Three facts remain separate:
   `Stopped` does not acknowledge a receiver or certify a ledger seal.
 - Usable refused words end with `end_reason=coverage_refused` and
   `phase=coverage_refused`. The Bus clones the authenticated projection and
-  retains the incomplete coverage receipt; its `sealed` latch remains false.
+  retains the non-complete coverage receipt; its `sealed` latch remains false.
+
+### Which refusals reach this path
+
+`SealCoverageStatus` has three outcomes and only `complete` certifies terminal
+truth. Both non-success outcomes route here identically:
+
+| Coverage verdict                   | Meaning                                                                                     | Delivery                       |
+| ---------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------ |
+| `complete`                         | committed words cover the measured speech (measured silence included)                       | terminal seal, normal delivery |
+| `incomplete`                       | authenticated measured speech is uncovered beyond 250 ms                                    | degraded handoff               |
+| `unavailable(not_observed)`        | no acoustic observer measured this take                                                     | degraded handoff               |
+| `unavailable(identity_mismatch)`   | the measurement names another session or capture epoch                                      | degraded handoff               |
+| `unavailable(invalid_measurement)` | some PCM reaching the observer was non-finite, so nothing it measured can be trusted        | degraded handoff               |
+| `unavailable(partial_observation)` | the observer's extent stops short of the capture, or committed/measured spans reach past it | degraded handoff               |
+
+The distinction matters for honesty, not for routing: an unavailable verdict is
+**not** a claim that words were lost. Committed occurrences and the session WAV
+are preserved exactly as for `incomplete`, `TerminalSealRefused` carries the
+same authenticated payload, and recovery keeps the words. What changes is that
+the take is no longer allowed to _certify_ itself, and a quiet take with a real
+measurement behind it still seals normally.
+
+The user-visible copy does not yet distinguish these reasons. The typed reason
+travels on the Bus (`docs/TRANSCRIPT_BUS.md`), but `bridge/src/recording.rs`
+`from_bus_event` omits seal coverage and `OverlayState` hardcodes the incomplete
+wording, so every refusal renders as the existing generic `coverage_refused`
+notice with its existing recovery controls. Carrying the reason into the native
+projection is a separate joined cut.
+
 - Delivery remains `ComposerPending`, `SinkAccepted`, `Retained` or
   `Unattempted`. ComposerPending requires the original capture/thread receiver
   to acknowledge it. Retained can mean an intentional archive/canvas route;

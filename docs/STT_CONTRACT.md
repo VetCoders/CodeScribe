@@ -20,8 +20,10 @@
 > `FINAL_PASS_MODE` no longer owns any normal-stop inference.
 > C11 makes `publish_revision` the sole committed Bus writer: raw final,
 > correction, replacement, annotation, and preview events cannot write product
-> text. A terminal ledger seal closes Bus truth only after measured speech-span
-> coverage is complete within the 250 ms edge tolerance.
+> text. A terminal ledger seal closes Bus truth only after an **authenticated**
+> acoustic observation reports measured speech-span coverage complete within the
+> 250 ms edge tolerance; measured silence qualifies, missing, foreign, invalid
+> or partial measurement does not (§3.z).
 > Planning report: internal plan `stt-apple-must-have` (operator artifact store, 2026-07-24).
 
 ---
@@ -275,12 +277,73 @@ frozen in the recording snapshot; explicit file actions remain separate.
 
 **Stop** settles live observers, admits qualified source-mapped gap occurrences
 from the owned archive, drains formatter slots they created, then recomputes
-occurrence-union coverage. A gap over 250 ms blocks terminal truth. Only after a
+occurrence-union coverage. A gap over 250 ms blocks terminal truth, and so does
+coverage the acoustic observers cannot authenticate (§3.z). Only after a
 terminal ledger seal may the projection and delivery owners publish the **final**
 transcript, and only there may a paid formatter or a user edit rewrite the whole
 document. The deterministic Light+ presentation floor is not gated that way — it
 runs per occurrence seal during capture (§3.y). The WAV is never uploaded for
 this decision.
+
+### 3.z Acoustic evidence availability
+
+Coverage is measured against an **authenticated acoustic observation**, never
+against an empty range set. Two observers may supply one, both bound to the
+take's session and capture epoch:
+
+- the **capture energy ladder** (`CaptureEnergyOwner`, producer
+  `capture_energy`) — written by the capture arm's `CaptureLevelAccumulator`
+  and read by the Apple worker thread through the same shared handle;
+- the **Silero ingress** (`SileroIngress`, producer `silero_boundaries`) —
+  threshold crossings padded by 64 ms, over the extent it actually ingested.
+
+`assess_seal_coverage` yields `complete`, `incomplete`, or `unavailable(reason)`
+with reason `not_observed`, `identity_mismatch`, `invalid_measurement` or
+`partial_observation`. Only `complete` may certify a terminal seal; the ledger,
+the emitter, the recorder and controller recovery all branch on `is_complete()`,
+so no non-success outcome falls through a guard that knew one refusal.
+
+Three rules decide what an observer may say:
+
+1. **Measured silence is a measurement.** An observer that ingested a
+   contiguous, finite extent and found no speech reports `observed` with an
+   empty range set, gets a real `coverage_ratio` of `1.0`, and seals. Nothing
+   in the validity rules below costs a quiet take its seal.
+2. **Invalid PCM is not silence.** Non-finite samples (NaN and both infinities)
+   are substituted with zero before measurement, which makes an unmeasurable
+   region indistinguishable from a silent one. An observer that saw any
+   non-finite sample therefore reports `invalid_measurement` for the whole take
+   rather than certifying the part it could still read — whether the invalid
+   region arrives before, after, or between valid regions, and whether it is a
+   whole buffer or one sample inside an otherwise valid hop (zero substitution
+   has already depressed that hop's RMS). The contiguous extent measured before
+   the first invalid sample is carried as a diagnostic, never as a coverage
+   extent.
+3. **A partial observation cannot certify the rest.** An observer reports how
+   much PCM reached _it_, which is not necessarily what the microphone
+   produced: a chunk lane that stops forwarding leaves no hole to detect,
+   because the extent simply ends early. Coverage selection holds each
+   observer's extent against `LiveAudioBuffer::session_sample_end()` — the
+   capture owner's own count of samples seen this session, retained or
+   evicted — and an extent shorter than the capture becomes `discontinuous`,
+   which the ledger adjudicates as `partial_observation`. The ledger separately
+   refuses when committed or measured spans reach past the observed extent.
+
+Selection order: the capture writer adjudicates the PCM it wrote, so an
+`invalid_measurement` from the capture energy ladder wins outright — no later
+observer over the same buffer may certify samples the writer could not read.
+Otherwise a Silero observation that measured speech is preferred as the
+narrowest honest answer, and the capture energy ladder is the fallback. Padded
+fusion ownership windows are never a candidate: they stay open across pauses and
+close on the capture cursor, so they measure ownership, not speech.
+
+Calibration keeps its own unbound `CaptureLevelAccumulator`, which produces the
+full statistical receipt without writing to any take's ladder.
+
+Every non-complete outcome still releases lifecycle ownership and preserves the
+authenticated committed words and the session WAV; refusing a seal is a quality
+verdict, not a total failure. See `docs/DELIVERY_ROUTE.md` for the delivery
+consequences and `docs/TRANSCRIPT_BUS.md` for the projected wire contract.
 
 ### 3.2 Settings UI → config
 
@@ -447,11 +510,11 @@ A closed utterance must become readable text while the take is still running,
 not at Stop. The Light+ floor therefore has two gates, and they state different
 things:
 
-| Gate                                                | Scope                   | Receipt                              | Lifecycle |
-| --------------------------------------------------- | ----------------------- | ------------------------------------ | --------- |
-| Occurrence seal (`LedgerSeal`, `is_occurrence_seal`) | exactly those words     | `IncrementalShapingReceipt`          | stays open |
-| Terminal ledger seal                               | the sealed document     | explicit terminal seal; optional document Light+ receipt | finalizing |
-| Controller `session_ended`                          | capture lifecycle       | no new shaping or acoustic authority | ended |
+| Gate                                                 | Scope               | Receipt                                                  | Lifecycle  |
+| ---------------------------------------------------- | ------------------- | -------------------------------------------------------- | ---------- |
+| Occurrence seal (`LedgerSeal`, `is_occurrence_seal`) | exactly those words | `IncrementalShapingReceipt`                              | stays open |
+| Terminal ledger seal                                 | the sealed document | explicit terminal seal; optional document Light+ receipt | finalizing |
+| Controller `session_ended`                           | capture lifecycle   | no new shaping or acoustic authority                     | ended      |
 
 The live gate is `TranscriptReducer::apply_incremental_shaping`, driven by
 `PresentationEmitter::mint_incremental_light_plus`:

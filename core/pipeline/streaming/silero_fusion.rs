@@ -360,6 +360,13 @@ pub struct SileroIngress {
     /// so some captured audio never reached this observer. The hole cannot be
     /// certified as speech or as silence.
     discontinuous: bool,
+    /// Session sample index of the first non-finite sample fed to this ingress.
+    ///
+    /// The VAD reads whatever arrives; NaN and infinities produce a probability
+    /// that fails every threshold comparison, so invalid PCM leaves no crossing
+    /// and would be reported as measured silence. Recording where validity
+    /// ended keeps that region unmeasured instead.
+    first_invalid_sample: Option<u64>,
 }
 
 impl SileroIngress {
@@ -376,6 +383,7 @@ impl SileroIngress {
             speech: AcousticSpeechSet::default(),
             observed_samples: 0,
             discontinuous: false,
+            first_invalid_sample: None,
         }
     }
 
@@ -404,6 +412,24 @@ impl SileroIngress {
             self.discontinuous = true;
         }
         self.observed_samples = self.observed_samples.max(samples_seen);
+    }
+
+    /// Record whether the PCM in this chunk was measurable at all.
+    ///
+    /// Separated from the VAD read for the same reason [`Self::observe`] is:
+    /// "the samples were finite" is a capture fact a fixture can state without
+    /// a model, and a chunk of NaN must reach the same verdict whether the
+    /// embedded model happens to be loaded or not. [`Self::ingest`] calls this
+    /// on every chunk, immediately after [`Self::note_observed_pcm`] and before
+    /// anything reads the audio.
+    pub fn note_pcm_validity(&mut self, samples: &[f32], samples_seen: u64) {
+        let chunk_start = samples_seen.saturating_sub(samples.len() as u64);
+        let Some(offset) = samples.iter().position(|sample| !sample.is_finite()) else {
+            return;
+        };
+        let first = chunk_start.saturating_add(offset as u64);
+        let recorded = self.first_invalid_sample.get_or_insert(first);
+        *recorded = (*recorded).min(first);
     }
 
     pub fn ledger(&self) -> &UtteranceLedger {
@@ -438,6 +464,16 @@ impl SileroIngress {
                 identity,
                 SILERO_BOUNDARIES_PRODUCER,
                 AcousticAvailability::NotObserved,
+            );
+        }
+        // Validity before continuity: a hole is audio this observer never got,
+        // while invalid PCM is audio it got and could not read. Both refuse,
+        // and the reason names which one actually happened.
+        if let Some(valid_samples) = self.first_invalid_sample {
+            return AcousticSpeechEvidence::unavailable(
+                identity,
+                SILERO_BOUNDARIES_PRODUCER,
+                AcousticAvailability::InvalidMeasurement { valid_samples },
             );
         }
         if self.discontinuous {
@@ -498,9 +534,10 @@ impl SileroIngress {
             // not advance the extent this ingress claims to have heard.
             return SileroIngest::default();
         }
-        // Record the observed extent from the supplied PCM and cursor, before
-        // any speech decision.
+        // Record the observed extent and the validity of the supplied PCM,
+        // before any speech decision reads it.
         self.note_observed_pcm(samples.len() as u64, samples_seen);
+        self.note_pcm_validity(samples, samples_seen);
         let events = self.vad.feed(samples, 0);
         let boundaries = self.vad.take_vad_boundaries();
         let closed_here = events
@@ -1669,6 +1706,83 @@ mod tests {
         assert!(
             ingress.acoustic_speech_evidence().ranges().is_empty(),
             "unavailable evidence reports no ranges"
+        );
+    }
+
+    /// rc-w3-acoustic-validity: invalid PCM reaching the VAD is unmeasured, not
+    /// silent, and it outranks the continuity verdict.
+    ///
+    /// The model returns a probability for whatever it is handed. NaN and
+    /// infinities fail every threshold comparison, so they leave no crossing at
+    /// all — the exact shape of a silent stretch. This ingress therefore has to
+    /// record validity at ingest, the same way it records the extent.
+    #[test]
+    fn invalid_pcm_is_unmeasured_not_silent() {
+        let mut ingress = SileroIngress::new(16_000, "validity", 5);
+        ingress.note_observed_pcm(8_000, 8_000);
+        ingress.observe_boundaries(&[
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechStart,
+                sample: 2_000,
+                speech_probability: 0.9,
+            },
+            VadBoundaryEvidence {
+                kind: VadBoundaryKind::SpeechEnd,
+                sample: 4_000,
+                speech_probability: 0.1,
+            },
+        ]);
+        assert!(
+            ingress.acoustic_speech_evidence().observed_speech(),
+            "the fixture starts from a valid observation with a crossing in it"
+        );
+
+        // The next chunk continues the extent and carries NaN.
+        ingress.note_observed_pcm(8_000, 16_000);
+        ingress.note_pcm_validity(&vec![f32::NAN; 8_000], 16_000);
+        let evidence = ingress.acoustic_speech_evidence();
+        assert_eq!(
+            evidence.availability(),
+            AcousticAvailability::InvalidMeasurement {
+                valid_samples: 8_000
+            },
+            "the invalid chunk starts where the valid extent ended"
+        );
+        assert!(
+            evidence.ranges().is_empty(),
+            "an earlier real crossing is not published on refused evidence"
+        );
+        assert!(!evidence.observed_speech());
+
+        // Validity outranks continuity: a later hole does not rename the fault.
+        ingress.note_observed_pcm(4_000, 32_000);
+        assert_eq!(
+            ingress.acoustic_speech_evidence().availability(),
+            AcousticAvailability::InvalidMeasurement {
+                valid_samples: 8_000
+            },
+            "audio that arrived unreadable is a different fact from audio that \
+             never arrived, and the first one happened first"
+        );
+
+        // `ingest` records validity itself, before the model reads the chunk.
+        let mut fed = SileroIngress::new(16_000, "validity-ingest", 5);
+        fed.ingest(&vec![f32::NEG_INFINITY; 1_600], 1_600);
+        assert_eq!(fed.observed_samples(), 1_600);
+        assert_eq!(
+            fed.acoustic_speech_evidence().availability(),
+            AcousticAvailability::InvalidMeasurement { valid_samples: 0 }
+        );
+
+        // A finite chunk is not marked, so valid captures are untouched.
+        let mut clean = SileroIngress::new(16_000, "validity-clean", 5);
+        clean.ingest(&vec![0.0f32; 1_600], 1_600);
+        assert_eq!(
+            clean.acoustic_speech_evidence().availability(),
+            AcousticAvailability::Observed {
+                observed_samples: 1_600
+            },
+            "finite silence stays a measurement"
         );
     }
 }
