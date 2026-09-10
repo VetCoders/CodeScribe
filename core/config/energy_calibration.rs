@@ -1223,13 +1223,21 @@ mod captured_calibration_tests {
         let probe = crate::config::StartupAcquisitionProbe::forbid();
         let path = Path::new("/fixture/calibration.json");
         let missing = SealedEnergyCalibration::from_captured(path, Ok(None));
-        assert!(matches!(missing.status(), EnergyCalibrationStatus::Missing { path: p } if p == path));
+        assert!(
+            matches!(missing.status(), EnergyCalibrationStatus::Missing { path: p } if p == path)
+        );
         assert!(missing.artifact().is_none());
         assert!(missing.sha256().is_none());
-        let refused = SealedEnergyCalibration::from_captured(path, Err(EnergyCalibrationRefusal::Malformed {
-            path: path.to_path_buf(), reason: "captured corrupt bytes".into(),
-        }));
-        assert!(matches!(refused.status(), EnergyCalibrationStatus::Refused { path: p, .. } if p == path));
+        let refused = SealedEnergyCalibration::from_captured(
+            path,
+            Err(EnergyCalibrationRefusal::Malformed {
+                path: path.to_path_buf(),
+                reason: "captured corrupt bytes".into(),
+            }),
+        );
+        assert!(
+            matches!(refused.status(), EnergyCalibrationStatus::Refused { path: p, .. } if p == path)
+        );
         assert!(refused.artifact().is_none());
         assert!(refused.sha256().is_none());
         assert!(probe.attempts().is_empty());

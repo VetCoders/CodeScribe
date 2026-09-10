@@ -323,7 +323,11 @@ impl CapturedPrompt {
 
     fn seal(&self) -> RuntimeSealedPrompt {
         let base_sha256 = sha256_hex(self.content.as_bytes());
-        let tuning = self.tuning.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let tuning = self
+            .tuning
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let tuning_sha256 = tuning.map(str::as_bytes).map(sha256_hex);
         let mut composed_content = self.content.clone();
         if let Some(tuning) = tuning {
@@ -1022,8 +1026,14 @@ mod captured_prompt_tests {
         let sealed = captured.seal();
         assert_eq!(sealed.composed_content(), "base bytes\n\n\ntuning bytes");
         assert_eq!(sealed.base_sha256(), sha256_hex(b"base bytes\n"));
-        assert_eq!(sealed.tuning_sha256(), Some(sha256_hex(b"tuning bytes").as_str()));
-        assert_eq!(sealed.composed_sha256(), sha256_hex(sealed.composed_content().as_bytes()));
+        assert_eq!(
+            sealed.tuning_sha256(),
+            Some(sha256_hex(b"tuning bytes").as_str())
+        );
+        assert_eq!(
+            sealed.composed_sha256(),
+            sha256_hex(sealed.composed_content().as_bytes())
+        );
         assert_eq!(sealed.source(), PromptSource::ReadError);
         assert!(probe.attempts().is_empty());
     }

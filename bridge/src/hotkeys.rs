@@ -1439,7 +1439,10 @@ fn fixture_controller() -> Arc<RecordingController> {
         ControllerStartupResources::inert(),
         root.path(),
     );
-    assert!(probe.attempts().is_empty(), "fixture acquired host startup inputs");
+    assert!(
+        probe.attempts().is_empty(),
+        "fixture acquired host startup inputs"
+    );
     // Context storage is lazy. These lifecycle fixtures never write context;
     // the controller retains this explicit path after the scratch directory closes.
     Arc::new(controller)

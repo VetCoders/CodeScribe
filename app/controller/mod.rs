@@ -6962,7 +6962,8 @@ mod explicit_startup_tests {
 
     fn snapshot(root: &std::path::Path) -> RuntimeSettingsSnapshot {
         Config::runtime_snapshot_from_captured(CapturedRuntimeInputs::defaults_at(
-            root.to_path_buf(), 1_700_000_000_000,
+            root.to_path_buf(),
+            1_700_000_000_000,
         ))
     }
 
@@ -6971,7 +6972,9 @@ mod explicit_startup_tests {
         let root = tempfile::tempdir().unwrap();
         let probe = StartupAcquisitionProbe::forbid();
         let controller = RecordingController::from_startup_inputs(
-            snapshot(root.path()), ControllerStartupResources::inert(), root.path(),
+            snapshot(root.path()),
+            ControllerStartupResources::inert(),
+            root.path(),
         );
         assert_eq!(controller.current_state().await, State::Idle);
         assert!(controller.recorder.lock().await.is_none());
@@ -6979,7 +6982,10 @@ mod explicit_startup_tests {
         let bucket = controller.context_bucket.lock().await;
         let expected = ContextBucket::for_codescribe_data_dir(root.path());
         assert_eq!(format!("{bucket:?}"), format!("{expected:?}"));
-        assert!(!root.path().join("context").exists(), "assembly must not create context storage");
+        assert!(
+            !root.path().join("context").exists(),
+            "assembly must not create context storage"
+        );
         assert!(probe.attempts().is_empty());
     }
 
@@ -6988,7 +6994,8 @@ mod explicit_startup_tests {
         let probe = StartupAcquisitionProbe::forbid();
         let result = std::panic::catch_unwind(|| {
             RecordingController::with_runtime_settings(
-                snapshot(std::path::Path::new("/fixture/normal")), "fixture adapter witness",
+                snapshot(std::path::Path::new("/fixture/normal")),
+                "fixture adapter witness",
             )
         });
         assert!(result.is_err());
@@ -6997,7 +7004,10 @@ mod explicit_startup_tests {
 
     #[test]
     fn both_normal_constructors_still_invoke_core_host_capture() {
-        for constructor in [RecordingController::new, RecordingController::new_without_keychain] {
+        for constructor in [
+            RecordingController::new,
+            RecordingController::new_without_keychain,
+        ] {
             let probe = StartupAcquisitionProbe::forbid();
             assert!(std::panic::catch_unwind(constructor).is_err());
             assert_eq!(probe.attempts(), ["settings capture"]);
