@@ -78,8 +78,23 @@ final class OverlayController: ObservableObject {
   /// Runs the agent-handoff fade and calls back when it finishes. Injected so a
   /// test can fire the completion at an exact moment in the lifecycle instead of
   /// racing a wall-clock animation; the default keeps the real 0.18 s fade.
+  ///
+  /// The completion is `@escaping` because that is the lifetime BOTH consumers
+  /// actually take, not a precaution:
+  ///
+  /// - the default implementation below hands it to
+  ///   `NSAnimationContext.runAnimationGroup`'s `completionHandler`, which AppKit
+  ///   stores and calls after this call has returned;
+  /// - the delayed-completion test stores it in a local `pendingFade` and fires
+  ///   it after a successor capture has opened.
+  ///
+  /// A closure parameter of a function type is non-escaping by default exactly
+  /// as it is in a function declaration, so without this attribute neither
+  /// consumer may keep the callback past the call — which is the whole point of
+  /// a fade completion. `@MainActor @Sendable` stays: the completion runs on the
+  /// main actor and its captures are main-actor isolated.
   private let runHandoffFade:
-    @MainActor (NSPanel, @MainActor @Sendable () -> Void) -> Void
+    @MainActor (NSPanel, @escaping @MainActor @Sendable () -> Void) -> Void
   /// A direct edge resize is the user's size decision for the current session.
   /// The next recording may breathe again from that persisted starting point.
   private var automaticContentSizingEnabled = true
@@ -104,7 +119,7 @@ final class OverlayController: ObservableObject {
     orderPanelFront: (@MainActor (NSPanel) -> Void)? = nil,
     orderPanelOut: (@MainActor (NSPanel) -> Void)? = nil,
     runHandoffFade: (
-      @MainActor (NSPanel, @MainActor @Sendable () -> Void) -> Void
+      @MainActor (NSPanel, @escaping @MainActor @Sendable () -> Void) -> Void
     )? = nil
   ) {
     let state = state ?? OverlayState()

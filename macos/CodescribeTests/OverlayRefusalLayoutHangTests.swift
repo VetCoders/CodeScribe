@@ -280,6 +280,12 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       panel.invalidatePresence()
     }
 
+    // Storing the completion here is not just test convenience: it is the
+    // witness for the injected seam's escaping lifetime. `OverlayController`
+    // declares that completion `@escaping` precisely because both consumers keep
+    // it past the call — AppKit's real `completionHandler` does, and so does
+    // this fake. If that attribute were dropped, this line is the one that
+    // could no longer hold the callback.
     var pendingFade: (@MainActor @Sendable () -> Void)?
     var outs = 0
     let controller = OverlayController(
@@ -295,6 +301,8 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       },
       // Mimic the real fade's visible effect so the alpha assertions below
       // describe a window that was actually dimmed, not one that never moved.
+      // Deliberately NOT synchronous: calling `completed()` here would delete
+      // the delay the successor assertions depend on.
       runHandoffFade: { faded, completed in
         faded.alphaValue = 0
         pendingFade = completed
