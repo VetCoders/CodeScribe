@@ -4236,9 +4236,7 @@ impl RecordingController {
         let Ok(conversation) = self.conversation_task.try_lock() else {
             return false;
         };
-        !conversation
-            .as_ref()
-            .is_some_and(|task| !task.is_finished())
+        conversation.as_ref().is_none_or(|task| task.is_finished())
     }
 
     /// Stop-current is admitted without queuing behind a start or a terminal
@@ -6965,6 +6963,64 @@ mod explicit_startup_tests {
             root.to_path_buf(),
             1_700_000_000_000,
         ))
+    }
+
+    #[tokio::test]
+    async fn capture_shutdown_settled_requires_conversation_task_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let probe = StartupAcquisitionProbe::forbid();
+        let controller = RecordingController::from_startup_inputs(
+            snapshot(root.path()),
+            ControllerStartupResources::inert(),
+            root.path(),
+        );
+        assert!(!controller.capture_shutdown_settled());
+        controller.request_capture_shutdown();
+        assert!(controller.conversation_task.lock().await.is_none());
+        assert!(controller.capture_shutdown_settled(), "no task is settled");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+        });
+        let task_id = task.id();
+        *controller.conversation_task.lock().await = Some(task);
+        started_rx.await.unwrap();
+        assert!(
+            !controller.capture_shutdown_settled(),
+            "a running task must block shutdown settlement"
+        );
+
+        finish_tx.send(()).unwrap();
+        let mut conversation = controller.conversation_task.lock().await;
+        let task = conversation.as_mut().unwrap();
+        // Await by reference so the completed handle remains in the owner slot.
+        (&mut *task).await.unwrap();
+        assert!(task.is_finished());
+        assert_eq!(task.id(), task_id);
+        assert!(
+            !controller.capture_shutdown_settled(),
+            "even a finished task cannot bypass the conversation lock"
+        );
+        drop(conversation);
+        assert!(
+            controller.capture_shutdown_settled(),
+            "a finished retained task is settled"
+        );
+        assert_eq!(
+            controller
+                .conversation_task
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .id(),
+            task_id,
+            "settlement must not remove the finished handle"
+        );
+        assert!(probe.attempts().is_empty());
     }
 
     #[tokio::test]
