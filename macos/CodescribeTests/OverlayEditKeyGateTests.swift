@@ -141,7 +141,8 @@ final class OverlayEditKeyGateTests: XCTestCase {
         terminal: terminal,
         lifecycleTerminal: terminal,
         delivery: .unattempted,
-        acousticReceipts: []
+        acousticReceipts: [],
+        sealCoverage: nil
       )
     )
   }

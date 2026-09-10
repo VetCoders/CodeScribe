@@ -501,7 +501,8 @@ final class OverlayResizeHitTests: XCTestCase {
         terminal: false,
         lifecycleTerminal: false,
         delivery: .unattempted,
-        acousticReceipts: []
+        acousticReceipts: [],
+        sealCoverage: nil
       )
     )
   }

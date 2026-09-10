@@ -386,12 +386,25 @@ same authenticated payload, and recovery keeps the words. What changes is that
 the take is no longer allowed to _certify_ itself, and a quiet take with a real
 measurement behind it still seals normally.
 
-The user-visible copy does not yet distinguish these reasons. The typed reason
-travels on the Bus (`docs/TRANSCRIPT_BUS.md`), but `bridge/src/recording.rs`
-`from_bus_event` omits seal coverage and `OverlayState` hardcodes the incomplete
-wording, so every refusal renders as the existing generic `coverage_refused`
-notice with its existing recovery controls. Carrying the reason into the native
-projection is a separate joined cut.
+The native projection now carries typed coverage status and unavailable reason
+through `CsTranscriptProjectionEvent.seal_coverage`, including an absent ratio
+when measurement is unavailable. Both `statusText` and the standing refusal
+notice derive from the admitted projection: incomplete speech coverage differs
+from unavailable measurement, and missing legacy evidence stays unverified.
+Unavailable measurement does not assert lost words. The existing recovery slot
+and capability-driven controls keep the exact committed bytes.
+
+Admission is session-local: strictly later sequence, non-regressing revision
+and epoch. A lifecycle terminal with the same document revision and a later
+sequence remains valid and delivers before releasing the original capture.
+Stale/replayed projections cannot replace current refusal paint or redeliver
+acknowledged words. Retiring overlay paint does not retire the original
+identity-addressed `ComposerPending` obligation; even a terminal older than the last retired document revision still
+reaches the existing receiver. Repeated lifecycle cannot repaint or release twice, while
+a matching repeated terminal or fresh offer may retry an unacknowledged
+handover. Intentional equal words stay
+intact. No automatic sending, microphone acquisition or refusal auto-hide is
+introduced. Empty refusal retains Error phase and only its projected capabilities.
 
 - Delivery remains `ComposerPending`, `SinkAccepted`, `Retained` or
   `Unattempted`. ComposerPending requires the original capture/thread receiver
@@ -420,20 +433,14 @@ their generic hold test shortcut is not proof of an actual refused recorder
 Stop. Refusal-bearing Stop through the full recorder/shared-task chain and real
 receiver acknowledgment remain unverified. All tests are **UNRUN**.
 
-**BOUNDARY — receiver presentation and acceptance.**
-`bridge/src/recording.rs::CsTranscriptProjectionEvent::from_bus_event` forwards
-phase as a string and delivery as the existing enum; no FFI shape is changed.
-`bridge/src/hotkeys.rs` and the recording event forwarder use
-`core/pipeline/contracts.rs::warning_is_user_terminal`, which recognizes only
-`transcription_failed`: the new usable-refusal warning is currently log-only.
-`macos/Codescribe/Screens/Overlay/OverlayState.swift::applyTranscriptProjection`
-does not recognize `coverage_refused` in `OverlayMode`, so its old phase may
-remain on screen. Its success callback and Agent final-text hint currently
-require `formatted`. The separately admitted overlay donor and
-`macos/Codescribe/Core/ComposerDictation.swift` / `AgentChatStore.swift` must
-reconcile that phase, a visible recovery notice, and receiver-owned acceptance
-without changing auto-send policy or treating Stopped as delivery. No complete
-user-visible recovery is claimed here.
+**Native receiver boundary (rc-w3-native-coverage-reason).**
+`from_bus_event` carries phase, typed delivery and typed coverage together.
+`OverlayMode.coverageRefused` renders retained words with the existing recovery
+notice. `terminal_coverage_refused` remains quality telemetry: the warning
+allowlist is unchanged and only `transcription_failed` reaches `on_error`.
+The success callback and Agent final-text hint remain gated on `formatted`.
+Receiver admission still belongs to `ComposerDictation` / `AgentChatStore`;
+`Stopped`, visible copy and a source test do not certify installed delivery.
 
 Rust `transcript_projection.rs` carries the typed phase from lifecycle rows;
 `cli_transcript_lane.rs` only produces Completed/TranscriptionFailed today.

@@ -8,8 +8,8 @@ use codescribe::presentation::status_projection::{
     PresentationStatusKind, PresentationStatusProjection,
 };
 use codescribe::presentation::transcript_bus::{
-    ProjectedAcousticReceipt, ProjectedPresentationReceipt, TranscriptBusEvidenceEvent,
-    TranscriptDelivery,
+    ProjectedAcousticReceipt, ProjectedPresentationReceipt, ProjectedSealCoverageReceipt,
+    TranscriptBusEvidenceEvent, TranscriptDelivery,
 };
 use codescribe_core::pipeline::contracts::{AnnotationKind, LayerSource, LayerSummary};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -88,6 +88,85 @@ impl CsProjectedPresentationReceipt {
     }
 }
 
+/// Typed projection of the existing Bus coverage tokens. Unknown/legacy data
+/// never becomes complete. This bridge does not assess acoustic evidence.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsSealCoverageStatus {
+    Unknown,
+    Complete,
+    Incomplete,
+    Unavailable,
+}
+
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsCoverageUnavailableReason {
+    Unknown,
+    NotObserved,
+    IdentityMismatch,
+    InvalidMeasurement,
+    PartialObservation,
+}
+
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CsProjectedSealCoverageRange {
+    pub sample_start: u64,
+    pub sample_end: u64,
+}
+
+#[derive(uniffi::Record, Debug, Clone, PartialEq)]
+pub struct CsProjectedSealCoverageReceipt {
+    pub status: CsSealCoverageStatus,
+    pub unavailable_reason: Option<CsCoverageUnavailableReason>,
+    pub speech_samples: u64,
+    pub covered_samples: u64,
+    pub uncovered_speech_ranges: Vec<CsProjectedSealCoverageRange>,
+    pub max_uncovered_samples: u64,
+    pub incomplete_threshold_samples: u64,
+    pub speech_producer: String,
+    pub availability: String,
+    pub observed_samples: Option<u64>,
+    pub coverage_ratio: Option<f64>,
+}
+
+impl CsProjectedSealCoverageReceipt {
+    fn from_bus_receipt(receipt: &ProjectedSealCoverageReceipt) -> Self {
+        Self {
+            status: match receipt.status.as_str() {
+                "complete" => CsSealCoverageStatus::Complete,
+                "incomplete" => CsSealCoverageStatus::Incomplete,
+                "unavailable" => CsSealCoverageStatus::Unavailable,
+                _ => CsSealCoverageStatus::Unknown,
+            },
+            unavailable_reason: receipt
+                .unavailable_reason
+                .as_deref()
+                .map(|reason| match reason {
+                    "not_observed" => CsCoverageUnavailableReason::NotObserved,
+                    "identity_mismatch" => CsCoverageUnavailableReason::IdentityMismatch,
+                    "invalid_measurement" => CsCoverageUnavailableReason::InvalidMeasurement,
+                    "partial_observation" => CsCoverageUnavailableReason::PartialObservation,
+                    _ => CsCoverageUnavailableReason::Unknown,
+                }),
+            speech_samples: receipt.speech_samples,
+            covered_samples: receipt.covered_samples,
+            uncovered_speech_ranges: receipt
+                .uncovered_speech_ranges
+                .iter()
+                .map(|range| CsProjectedSealCoverageRange {
+                    sample_start: range.sample_start,
+                    sample_end: range.sample_end,
+                })
+                .collect(),
+            max_uncovered_samples: receipt.max_uncovered_samples,
+            incomplete_threshold_samples: receipt.incomplete_threshold_samples,
+            speech_producer: receipt.speech_producer.clone(),
+            availability: receipt.availability.clone(),
+            observed_samples: receipt.observed_samples,
+            coverage_ratio: receipt.coverage_ratio,
+        }
+    }
+}
+
 /// Bridge event schema for the one reducer-owned transcript projection. It
 /// carries the full render, phase, availability, terminal state, and evidence,
 /// but exposes no document mutation method.
@@ -126,6 +205,7 @@ pub struct CsTranscriptProjectionEvent {
     /// never carries control meaning.
     pub delivery: CsTranscriptDelivery,
     pub acoustic_receipts: Vec<CsProjectedAcousticReceipt>,
+    pub seal_coverage: Option<CsProjectedSealCoverageReceipt>,
 }
 
 /// Swift-visible mirror of [`TranscriptDelivery`]. One variant per controller
@@ -258,6 +338,10 @@ impl CsTranscriptProjectionEvent {
             terminal: event.terminal,
             lifecycle_terminal: event.lifecycle_terminal,
             delivery: CsTranscriptDelivery::from_bus_delivery(event.delivery),
+            seal_coverage: event
+                .seal_coverage
+                .as_ref()
+                .map(CsProjectedSealCoverageReceipt::from_bus_receipt),
             acoustic_receipts: event
                 .acoustic_receipts
                 .iter()
@@ -928,6 +1012,7 @@ mod tests {
                 terminal: true,
                 lifecycle_terminal: true,
                 delivery: CsTranscriptDelivery::ComposerPending,
+                seal_coverage: None,
                 acoustic_receipts: vec![CsProjectedAcousticReceipt {
                     acoustic_serial_version: 2,
                     acoustic_serial: "sha256:acoustic".to_string(),
@@ -1031,6 +1116,191 @@ mod tests {
         assert_eq!(projected.phase, "listening");
         assert!(!projected.terminal && !projected.lifecycle_terminal);
         assert_eq!(projected.delivery, CsTranscriptDelivery::Unattempted);
+    }
+
+    fn coverage_bus_fixture(
+        availability: codescribe_core::audio::capture_receipt::AcousticAvailability,
+    ) -> (TranscriptBusEvidenceEvent, TranscriptBusEvidenceEvent) {
+        use codescribe::presentation::emitter::TranscriptReducer;
+        use codescribe::presentation::transcript_bus::{TranscriptBus, TranscriptSession};
+        use codescribe_core::pipeline::acoustic_ledger::{
+            AcousticEvidence, AcousticLedger, EnergyCalibration, ObservationIdentity,
+            ObservationProducer, OccurrenceIdentity,
+        };
+        let mut ledger = AcousticLedger::new();
+        let mut reducer = TranscriptReducer::default();
+        let occurrence = OccurrenceIdentity::new("bridge-shaping", 3, 32_000, 48_000);
+        let calibration = EnergyCalibration::new("bridge-fixture", 1.0, 1);
+        let evidence = AcousticEvidence {
+            occurrence: occurrence.clone(),
+            duration_ms: 1_000.0,
+            energy_integral: 10.0,
+            mean_rms_dbfs: -12.0,
+            peak_dbfs: -3.0,
+            vad_open_sample: Some(32_000),
+            vad_close_sample: Some(48_000),
+            evidence_calibration_version: calibration.version.clone(),
+        };
+        assert!(ledger.qualify(&evidence, &calibration).is_qualified());
+        let observation =
+            ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence.clone());
+        let mutation = ledger.admit(&observation, "zażółć gęślą");
+        reducer
+            .apply_ledger_mutation(&ledger, &observation, &mutation)
+            .unwrap();
+        ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
+        assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
+        let seal = ledger.seal(&occurrence).unwrap().clone();
+        reducer.apply_ledger_seal(&seal).unwrap();
+        reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "bridge-shaping".to_string(),
+                mode: TranscriptMode::Agent,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            temp.path().join("bus"),
+            None,
+        )
+        .unwrap();
+
+        use codescribe_core::audio::capture_receipt::{
+            AcousticSpeechEvidence, CaptureEvidenceIdentity,
+        };
+        use codescribe_core::stt::tail_provider::TailSampleRange;
+        let speech = AcousticSpeechEvidence::measured(
+            CaptureEvidenceIdentity::new("bridge-shaping", 3),
+            "capture_energy",
+            availability,
+            vec![TailSampleRange {
+                session: "bridge-shaping".into(),
+                capture_epoch: 3,
+                sample_start: 32_000,
+                sample_end: 64_000,
+            }],
+        );
+        let coverage = ledger.assess_seal_coverage("bridge-shaping", 3, &speech, 4_000);
+        assert!(ledger.record_seal_coverage(coverage.clone()));
+        let revision = reducer.apply_seal_coverage(&coverage, None);
+        bus.publish_started();
+        let events = bus.publish_revision(&revision, &ledger);
+        assert_eq!(events.len(), 1);
+        let terminal = bus.publish_ended(
+            codescribe::presentation::transcript_bus::TranscriptSessionEndReason::CoverageRefused,
+            true, TranscriptDelivery::ComposerPending,
+        ).unwrap();
+        assert!(bus.publish_ended(
+            codescribe::presentation::transcript_bus::TranscriptSessionEndReason::CoverageRefused,
+            true, TranscriptDelivery::ComposerPending,
+        ).is_none(), "the producer emits one lifecycle terminal");
+        (events[0].clone(), terminal)
+    }
+
+    #[test]
+    fn incomplete_coverage_crosses_real_bus_and_bridge_with_lifecycle_order() {
+        use codescribe_core::audio::capture_receipt::AcousticAvailability;
+        let (document, terminal) = coverage_bus_fixture(AcousticAvailability::Observed {
+            observed_samples: 64_000,
+        });
+        assert_eq!(terminal.reducer_revision, document.reducer_revision);
+        assert_eq!(terminal.capture_epoch, document.capture_epoch);
+        assert!(terminal.sequence > document.sequence);
+        let projected = CsTranscriptProjectionEvent::from_bus_event(&terminal);
+        let coverage = projected.seal_coverage.unwrap();
+        assert_eq!(coverage.status, CsSealCoverageStatus::Incomplete);
+        assert_eq!(coverage.unavailable_reason, None);
+        assert_eq!(coverage.coverage_ratio, Some(0.5));
+        assert_eq!(coverage.speech_samples, 32_000);
+        assert_eq!(coverage.covered_samples, 16_000);
+        assert_eq!(
+            coverage.uncovered_speech_ranges,
+            vec![CsProjectedSealCoverageRange {
+                sample_start: 48_000,
+                sample_end: 64_000
+            }]
+        );
+        assert_eq!(coverage.max_uncovered_samples, 16_000);
+        assert_eq!(coverage.incomplete_threshold_samples, 4_000);
+        assert_eq!(coverage.observed_samples, Some(64_000));
+        assert_eq!(coverage.speech_producer, "capture_energy");
+        assert_eq!(coverage.availability, "observed");
+        assert_eq!(projected.rendered_text, document.rendered_text);
+        assert_eq!(projected.phase, "coverage_refused");
+        assert!(projected.lifecycle_terminal);
+        assert_eq!(projected.delivery, CsTranscriptDelivery::ComposerPending);
+    }
+
+    #[test]
+    fn every_unavailable_coverage_reason_crosses_real_bus_and_bridge_without_ratio() {
+        use codescribe_core::audio::capture_receipt::AcousticAvailability;
+        for (availability, expected) in [
+            (
+                AcousticAvailability::NotObserved,
+                CsCoverageUnavailableReason::NotObserved,
+            ),
+            (
+                AcousticAvailability::IdentityMismatch,
+                CsCoverageUnavailableReason::IdentityMismatch,
+            ),
+            (
+                AcousticAvailability::InvalidMeasurement {
+                    valid_samples: 32_000,
+                },
+                CsCoverageUnavailableReason::InvalidMeasurement,
+            ),
+            (
+                AcousticAvailability::Discontinuous {
+                    observed_samples: 32_000,
+                },
+                CsCoverageUnavailableReason::PartialObservation,
+            ),
+        ] {
+            let (document, terminal) = coverage_bus_fixture(availability);
+            let projected = CsTranscriptProjectionEvent::from_bus_event(&terminal);
+            let coverage = projected.seal_coverage.unwrap();
+            assert_eq!(coverage.status, CsSealCoverageStatus::Unavailable);
+            assert_eq!(coverage.unavailable_reason, Some(expected));
+            assert_eq!(coverage.coverage_ratio, None);
+            assert_eq!(coverage.observed_samples, None);
+            assert_eq!(coverage.speech_samples, 0);
+            assert_eq!(coverage.covered_samples, 0);
+            assert!(coverage.uncovered_speech_ranges.is_empty());
+            assert_eq!(coverage.max_uncovered_samples, 0);
+            assert_eq!(coverage.incomplete_threshold_samples, 4_000);
+            assert_eq!(coverage.speech_producer, "capture_energy");
+            assert_eq!(coverage.availability, availability.as_str());
+            assert_eq!(projected.rendered_text, document.rendered_text);
+            assert_eq!(projected.phase, "coverage_refused");
+            assert_eq!(projected.delivery, CsTranscriptDelivery::ComposerPending);
+        }
+    }
+
+    #[test]
+    fn legacy_and_unknown_coverage_never_become_complete() {
+        use codescribe_core::audio::capture_receipt::AcousticAvailability;
+        let (_, mut event) = coverage_bus_fixture(AcousticAvailability::NotObserved);
+        event.seal_coverage = None;
+        assert!(
+            CsTranscriptProjectionEvent::from_bus_event(&event)
+                .seal_coverage
+                .is_none()
+        );
+        let (_, mut event) = coverage_bus_fixture(AcousticAvailability::NotObserved);
+        event.seal_coverage.as_mut().unwrap().status = "future_status".into();
+        event.seal_coverage.as_mut().unwrap().unavailable_reason = Some("future_reason".into());
+        let coverage = CsTranscriptProjectionEvent::from_bus_event(&event)
+            .seal_coverage
+            .unwrap();
+        assert_eq!(coverage.status, CsSealCoverageStatus::Unknown);
+        assert_eq!(
+            coverage.unavailable_reason,
+            Some(CsCoverageUnavailableReason::Unknown)
+        );
+        assert_eq!(coverage.coverage_ratio, None);
     }
 
     #[test]

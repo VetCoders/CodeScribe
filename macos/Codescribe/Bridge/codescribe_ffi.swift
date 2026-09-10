@@ -2372,10 +2372,27 @@ public protocol CodescribeHotkeysProtocol: AnyObject, Sendable {
     func start() async throws
 
     /**
-     * Start the same toggle flow in the assistive lane. Overlay owns this
-     * route — the Agent composer mic is a separate, UI-initiated capture.
+     * Start the same toggle flow in the assistive lane.
+     *
+     * This is the hands-free assistive route: the overlay and the right-Option
+     * double tap. It keeps utterance silence epochs. The Agent composer mic is
+     * a separate, UI-initiated capture — see
+     * [`Self::start_composer_turn_recording`].
      */
     func startAssistiveRecording() async throws
+
+    /**
+     * Start one explicit Agent-composer take: one gesture, one turn.
+     *
+     * Deliberately not a `HotkeyEvent`: no OS gesture produces this, the
+     * composer button does. It reaches the same shared `RecordingController`,
+     * the same capture-ownership gate and the same optimistic overlay as the
+     * assistive toggle, and differs only in the per-take capture intent it
+     * carries — the take stays open through silence until an explicit stop.
+     * Returns the controller-admitted identity of the take this press opened.
+     * Swift keeps it and hands it back to stop exactly that capture.
+     */
+    func startComposerTurnRecording() async throws  -> CsCaptureHandle
 
     /**
      * Start the same toggle recording flow used by the default hotkey.
@@ -2386,6 +2403,17 @@ public protocol CodescribeHotkeysProtocol: AnyObject, Sendable {
      * Stop the global hotkey listener if it is active.
      */
     func stop()
+
+    /**
+     * Stop one named capture, and refuse if a different take now owns the mic.
+     *
+     * This is the composer's only stop entry. `stop_recording` above stays the
+     * unconditional surface for the hotkey and tray, which legitimately stop
+     * whatever is live; a UI gesture may not, because between the moment the
+     * user pressed and the moment this call lands the microphone can have
+     * changed hands.
+     */
+    func stopComposerTurnRecording(handle: CsCaptureHandle) async throws  -> CsConditionalStop
 
     /**
      * Stop the active legacy-controller recording flow, if one is live.
@@ -2935,8 +2963,12 @@ open func start()async throws   {
 }
 
     /**
-     * Start the same toggle flow in the assistive lane. Overlay owns this
-     * route — the Agent composer mic is a separate, UI-initiated capture.
+     * Start the same toggle flow in the assistive lane.
+     *
+     * This is the hands-free assistive route: the overlay and the right-Option
+     * double tap. It keeps utterance silence epochs. The Agent composer mic is
+     * a separate, UI-initiated capture — see
+     * [`Self::start_composer_turn_recording`].
      */
 open func startAssistiveRecording()async throws   {
     return
@@ -2951,6 +2983,34 @@ open func startAssistiveRecording()async throws   {
             completeFunc: ffi_codescribe_ffi_rust_future_complete_void,
             freeFunc: ffi_codescribe_ffi_rust_future_free_void,
             liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCsError_lift
+        )
+}
+
+    /**
+     * Start one explicit Agent-composer take: one gesture, one turn.
+     *
+     * Deliberately not a `HotkeyEvent`: no OS gesture produces this, the
+     * composer button does. It reaches the same shared `RecordingController`,
+     * the same capture-ownership gate and the same optimistic overlay as the
+     * assistive toggle, and differs only in the per-take capture intent it
+     * carries — the take stays open through silence until an explicit stop.
+     * Returns the controller-admitted identity of the take this press opened.
+     * Swift keeps it and hands it back to stop exactly that capture.
+     */
+open func startComposerTurnRecording()async throws  -> CsCaptureHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribehotkeys_start_composer_turn_recording(
+                    self.uniffiCloneHandle()
+
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCsCaptureHandle_lift,
             errorHandler: FfiConverterTypeCsError_lift
         )
 }
@@ -2983,6 +3043,32 @@ open func stop()  {try! rustCall() {
             self.uniffiCloneHandle(),$0
     )
 }
+}
+
+    /**
+     * Stop one named capture, and refuse if a different take now owns the mic.
+     *
+     * This is the composer's only stop entry. `stop_recording` above stays the
+     * unconditional surface for the hotkey and tray, which legitimately stop
+     * whatever is live; a UI gesture may not, because between the moment the
+     * user pressed and the moment this call lands the microphone can have
+     * changed hands.
+     */
+open func stopComposerTurnRecording(handle: CsCaptureHandle)async throws  -> CsConditionalStop  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_codescribe_ffi_fn_method_codescribehotkeys_stop_composer_turn_recording(
+                    self.uniffiCloneHandle(),
+                    FfiConverterTypeCsCaptureHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_codescribe_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_codescribe_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_codescribe_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCsConditionalStop_lift,
+            errorHandler: FfiConverterTypeCsError_lift
+        )
 }
 
     /**
@@ -7319,6 +7405,61 @@ public func FfiConverterTypeCsCapabilityRow_lower(_ value: CsCapabilityRow) -> R
 
 
 /**
+ * The controller-admitted identity of one capture.
+ *
+ * Issued by `start_composer_turn_recording` and required by the conditional
+ * stop. Swift holds it as opaque evidence: it proves *which* take a gesture
+ * opened, so a stop can be refused when a different take now owns the mic.
+ */
+public struct CsCaptureHandle: Equatable, Hashable {
+    public var captureId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(captureId: String) {
+        self.captureId = captureId
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsCaptureHandle: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsCaptureHandle: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsCaptureHandle {
+        return
+            try CsCaptureHandle(
+                captureId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsCaptureHandle, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.captureId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCaptureHandle_lift(_ buf: RustBuffer) throws -> CsCaptureHandle {
+    return try FfiConverterTypeCsCaptureHandle.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCaptureHandle_lower(_ value: CsCaptureHandle) -> RustBuffer {
+    return FfiConverterTypeCsCaptureHandle.lower(value)
+}
+
+
+/**
  * One config key/value pair for `update_config_many` batch writes. `key` is a
  * router env key (e.g. `"WHISPER_LANGUAGE"`, `"USE_LOCAL_STT"`); `value` is the
  * string form the core parses (bool `"1"`/`"0"`, f32 `"1.00"`, etc.).
@@ -9106,10 +9247,11 @@ public struct CsProjectedAcousticReceipt: Equatable, Hashable {
     public var layerDecisionReceipts: [String]
     public var sealReceipt: String?
     public var manualEditReceipt: String?
+    public var presentationReceipt: CsProjectedPresentationReceipt?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(acousticSerialVersion: UInt16, acousticSerial: String, sessionId: String, captureEpoch: UInt64, sampleStart: UInt64, sampleEnd: UInt64, durationMs: UInt64, energyIntegral: Double, meanRmsDbfs: Float, peakDbfs: Float, vadOpenSample: UInt64, vadCloseSample: UInt64, evidenceCalibrationVersion: String, wordEvidenceReceipts: [String], layerDecisionReceipts: [String], sealReceipt: String?, manualEditReceipt: String?) {
+    public init(acousticSerialVersion: UInt16, acousticSerial: String, sessionId: String, captureEpoch: UInt64, sampleStart: UInt64, sampleEnd: UInt64, durationMs: UInt64, energyIntegral: Double, meanRmsDbfs: Float, peakDbfs: Float, vadOpenSample: UInt64, vadCloseSample: UInt64, evidenceCalibrationVersion: String, wordEvidenceReceipts: [String], layerDecisionReceipts: [String], sealReceipt: String?, manualEditReceipt: String?, presentationReceipt: CsProjectedPresentationReceipt?) {
         self.acousticSerialVersion = acousticSerialVersion
         self.acousticSerial = acousticSerial
         self.sessionId = sessionId
@@ -9127,6 +9269,7 @@ public struct CsProjectedAcousticReceipt: Equatable, Hashable {
         self.layerDecisionReceipts = layerDecisionReceipts
         self.sealReceipt = sealReceipt
         self.manualEditReceipt = manualEditReceipt
+        self.presentationReceipt = presentationReceipt
     }
 
 
@@ -9159,7 +9302,8 @@ public struct FfiConverterTypeCsProjectedAcousticReceipt: FfiConverterRustBuffer
                 wordEvidenceReceipts: FfiConverterSequenceString.read(from: &buf),
                 layerDecisionReceipts: FfiConverterSequenceString.read(from: &buf),
                 sealReceipt: FfiConverterOptionString.read(from: &buf),
-                manualEditReceipt: FfiConverterOptionString.read(from: &buf)
+                manualEditReceipt: FfiConverterOptionString.read(from: &buf),
+                presentationReceipt: FfiConverterOptionTypeCsProjectedPresentationReceipt.read(from: &buf)
         )
     }
 
@@ -9181,6 +9325,7 @@ public struct FfiConverterTypeCsProjectedAcousticReceipt: FfiConverterRustBuffer
         FfiConverterSequenceString.write(value.layerDecisionReceipts, into: &buf)
         FfiConverterOptionString.write(value.sealReceipt, into: &buf)
         FfiConverterOptionString.write(value.manualEditReceipt, into: &buf)
+        FfiConverterOptionTypeCsProjectedPresentationReceipt.write(value.presentationReceipt, into: &buf)
     }
 }
 
@@ -9197,6 +9342,245 @@ public func FfiConverterTypeCsProjectedAcousticReceipt_lift(_ buf: RustBuffer) t
 #endif
 public func FfiConverterTypeCsProjectedAcousticReceipt_lower(_ value: CsProjectedAcousticReceipt) -> RustBuffer {
     return FfiConverterTypeCsProjectedAcousticReceipt.lower(value)
+}
+
+
+/**
+ * Presentation proof remains separate from acoustic evidence and human edits.
+ */
+public struct CsProjectedPresentationReceipt: Equatable, Hashable {
+    public var receiptId: String
+    public var provenance: String
+    public var sessionId: String
+    public var sourceRevision: UInt64
+    public var revision: UInt64
+    public var captureEpoch: UInt64
+    public var sampleStart: UInt64
+    public var sampleEnd: UInt64
+    public var sourceSealReceipt: String
+    public var sourceLabel: String
+    public var leftContext: String
+    public var leftContextSha256: String
+    public var shapedText: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(receiptId: String, provenance: String, sessionId: String, sourceRevision: UInt64, revision: UInt64, captureEpoch: UInt64, sampleStart: UInt64, sampleEnd: UInt64, sourceSealReceipt: String, sourceLabel: String, leftContext: String, leftContextSha256: String, shapedText: String) {
+        self.receiptId = receiptId
+        self.provenance = provenance
+        self.sessionId = sessionId
+        self.sourceRevision = sourceRevision
+        self.revision = revision
+        self.captureEpoch = captureEpoch
+        self.sampleStart = sampleStart
+        self.sampleEnd = sampleEnd
+        self.sourceSealReceipt = sourceSealReceipt
+        self.sourceLabel = sourceLabel
+        self.leftContext = leftContext
+        self.leftContextSha256 = leftContextSha256
+        self.shapedText = shapedText
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsProjectedPresentationReceipt: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsProjectedPresentationReceipt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsProjectedPresentationReceipt {
+        return
+            try CsProjectedPresentationReceipt(
+                receiptId: FfiConverterString.read(from: &buf),
+                provenance: FfiConverterString.read(from: &buf),
+                sessionId: FfiConverterString.read(from: &buf),
+                sourceRevision: FfiConverterUInt64.read(from: &buf),
+                revision: FfiConverterUInt64.read(from: &buf),
+                captureEpoch: FfiConverterUInt64.read(from: &buf),
+                sampleStart: FfiConverterUInt64.read(from: &buf),
+                sampleEnd: FfiConverterUInt64.read(from: &buf),
+                sourceSealReceipt: FfiConverterString.read(from: &buf),
+                sourceLabel: FfiConverterString.read(from: &buf),
+                leftContext: FfiConverterString.read(from: &buf),
+                leftContextSha256: FfiConverterString.read(from: &buf),
+                shapedText: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsProjectedPresentationReceipt, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.receiptId, into: &buf)
+        FfiConverterString.write(value.provenance, into: &buf)
+        FfiConverterString.write(value.sessionId, into: &buf)
+        FfiConverterUInt64.write(value.sourceRevision, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+        FfiConverterUInt64.write(value.captureEpoch, into: &buf)
+        FfiConverterUInt64.write(value.sampleStart, into: &buf)
+        FfiConverterUInt64.write(value.sampleEnd, into: &buf)
+        FfiConverterString.write(value.sourceSealReceipt, into: &buf)
+        FfiConverterString.write(value.sourceLabel, into: &buf)
+        FfiConverterString.write(value.leftContext, into: &buf)
+        FfiConverterString.write(value.leftContextSha256, into: &buf)
+        FfiConverterString.write(value.shapedText, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedPresentationReceipt_lift(_ buf: RustBuffer) throws -> CsProjectedPresentationReceipt {
+    return try FfiConverterTypeCsProjectedPresentationReceipt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedPresentationReceipt_lower(_ value: CsProjectedPresentationReceipt) -> RustBuffer {
+    return FfiConverterTypeCsProjectedPresentationReceipt.lower(value)
+}
+
+
+public struct CsProjectedSealCoverageRange: Equatable, Hashable {
+    public var sampleStart: UInt64
+    public var sampleEnd: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sampleStart: UInt64, sampleEnd: UInt64) {
+        self.sampleStart = sampleStart
+        self.sampleEnd = sampleEnd
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsProjectedSealCoverageRange: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsProjectedSealCoverageRange: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsProjectedSealCoverageRange {
+        return
+            try CsProjectedSealCoverageRange(
+                sampleStart: FfiConverterUInt64.read(from: &buf),
+                sampleEnd: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsProjectedSealCoverageRange, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.sampleStart, into: &buf)
+        FfiConverterUInt64.write(value.sampleEnd, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedSealCoverageRange_lift(_ buf: RustBuffer) throws -> CsProjectedSealCoverageRange {
+    return try FfiConverterTypeCsProjectedSealCoverageRange.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedSealCoverageRange_lower(_ value: CsProjectedSealCoverageRange) -> RustBuffer {
+    return FfiConverterTypeCsProjectedSealCoverageRange.lower(value)
+}
+
+
+public struct CsProjectedSealCoverageReceipt: Equatable, Hashable {
+    public var status: CsSealCoverageStatus
+    public var unavailableReason: CsCoverageUnavailableReason?
+    public var speechSamples: UInt64
+    public var coveredSamples: UInt64
+    public var uncoveredSpeechRanges: [CsProjectedSealCoverageRange]
+    public var maxUncoveredSamples: UInt64
+    public var incompleteThresholdSamples: UInt64
+    public var speechProducer: String
+    public var availability: String
+    public var observedSamples: UInt64?
+    public var coverageRatio: Double?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: CsSealCoverageStatus, unavailableReason: CsCoverageUnavailableReason?, speechSamples: UInt64, coveredSamples: UInt64, uncoveredSpeechRanges: [CsProjectedSealCoverageRange], maxUncoveredSamples: UInt64, incompleteThresholdSamples: UInt64, speechProducer: String, availability: String, observedSamples: UInt64?, coverageRatio: Double?) {
+        self.status = status
+        self.unavailableReason = unavailableReason
+        self.speechSamples = speechSamples
+        self.coveredSamples = coveredSamples
+        self.uncoveredSpeechRanges = uncoveredSpeechRanges
+        self.maxUncoveredSamples = maxUncoveredSamples
+        self.incompleteThresholdSamples = incompleteThresholdSamples
+        self.speechProducer = speechProducer
+        self.availability = availability
+        self.observedSamples = observedSamples
+        self.coverageRatio = coverageRatio
+    }
+
+
+}
+
+#if compiler(>=6)
+extension CsProjectedSealCoverageReceipt: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsProjectedSealCoverageReceipt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsProjectedSealCoverageReceipt {
+        return
+            try CsProjectedSealCoverageReceipt(
+                status: FfiConverterTypeCsSealCoverageStatus.read(from: &buf),
+                unavailableReason: FfiConverterOptionTypeCsCoverageUnavailableReason.read(from: &buf),
+                speechSamples: FfiConverterUInt64.read(from: &buf),
+                coveredSamples: FfiConverterUInt64.read(from: &buf),
+                uncoveredSpeechRanges: FfiConverterSequenceTypeCsProjectedSealCoverageRange.read(from: &buf),
+                maxUncoveredSamples: FfiConverterUInt64.read(from: &buf),
+                incompleteThresholdSamples: FfiConverterUInt64.read(from: &buf),
+                speechProducer: FfiConverterString.read(from: &buf),
+                availability: FfiConverterString.read(from: &buf),
+                observedSamples: FfiConverterOptionUInt64.read(from: &buf),
+                coverageRatio: FfiConverterOptionDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CsProjectedSealCoverageReceipt, into buf: inout [UInt8]) {
+        FfiConverterTypeCsSealCoverageStatus.write(value.status, into: &buf)
+        FfiConverterOptionTypeCsCoverageUnavailableReason.write(value.unavailableReason, into: &buf)
+        FfiConverterUInt64.write(value.speechSamples, into: &buf)
+        FfiConverterUInt64.write(value.coveredSamples, into: &buf)
+        FfiConverterSequenceTypeCsProjectedSealCoverageRange.write(value.uncoveredSpeechRanges, into: &buf)
+        FfiConverterUInt64.write(value.maxUncoveredSamples, into: &buf)
+        FfiConverterUInt64.write(value.incompleteThresholdSamples, into: &buf)
+        FfiConverterString.write(value.speechProducer, into: &buf)
+        FfiConverterString.write(value.availability, into: &buf)
+        FfiConverterOptionUInt64.write(value.observedSamples, into: &buf)
+        FfiConverterOptionDouble.write(value.coverageRatio, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedSealCoverageReceipt_lift(_ buf: RustBuffer) throws -> CsProjectedSealCoverageReceipt {
+    return try FfiConverterTypeCsProjectedSealCoverageReceipt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsProjectedSealCoverageReceipt_lower(_ value: CsProjectedSealCoverageReceipt) -> RustBuffer {
+    return FfiConverterTypeCsProjectedSealCoverageReceipt.lower(value)
 }
 
 
@@ -11077,11 +11461,34 @@ public struct CsTranscriptProjectionEvent: Equatable, Hashable {
     public var canRetranscribe: Bool
     public var canFormat: Bool
     public var terminal: Bool
+    /**
+     * True only for the session's lifecycle terminal. A terminal *revision* of
+     * the document is not the end of the capture, and only this flag tells the
+     * two apart without reading an action string.
+     */
+    public var lifecycleTerminal: Bool
+    /**
+     * Controller-owned delivery disposition, forwarded verbatim. Swift branches
+     * on this typed state; the human-facing `label` above stays presentation and
+     * never carries control meaning.
+     */
+    public var delivery: CsTranscriptDelivery
     public var acousticReceipts: [CsProjectedAcousticReceipt]
+    public var sealCoverage: CsProjectedSealCoverageReceipt?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(schema: String, sequence: UInt64, emittedAt: String, sessionId: String, mode: String, reducerRevision: UInt64, reducerAction: String, occurrenceSessionId: String, captureEpoch: UInt64, sampleStart: UInt64, sampleEnd: UInt64, documentIndex: UInt64, label: String, renderedText: String, phase: String, canPaste: Bool, canInsert: Bool, canCopy: Bool, canRetranscribe: Bool, canFormat: Bool, terminal: Bool, acousticReceipts: [CsProjectedAcousticReceipt]) {
+    public init(schema: String, sequence: UInt64, emittedAt: String, sessionId: String, mode: String, reducerRevision: UInt64, reducerAction: String, occurrenceSessionId: String, captureEpoch: UInt64, sampleStart: UInt64, sampleEnd: UInt64, documentIndex: UInt64, label: String, renderedText: String, phase: String, canPaste: Bool, canInsert: Bool, canCopy: Bool, canRetranscribe: Bool, canFormat: Bool, terminal: Bool,
+        /**
+         * True only for the session's lifecycle terminal. A terminal *revision* of
+         * the document is not the end of the capture, and only this flag tells the
+         * two apart without reading an action string.
+         */lifecycleTerminal: Bool,
+        /**
+         * Controller-owned delivery disposition, forwarded verbatim. Swift branches
+         * on this typed state; the human-facing `label` above stays presentation and
+         * never carries control meaning.
+         */delivery: CsTranscriptDelivery, acousticReceipts: [CsProjectedAcousticReceipt], sealCoverage: CsProjectedSealCoverageReceipt?) {
         self.schema = schema
         self.sequence = sequence
         self.emittedAt = emittedAt
@@ -11103,7 +11510,10 @@ public struct CsTranscriptProjectionEvent: Equatable, Hashable {
         self.canRetranscribe = canRetranscribe
         self.canFormat = canFormat
         self.terminal = terminal
+        self.lifecycleTerminal = lifecycleTerminal
+        self.delivery = delivery
         self.acousticReceipts = acousticReceipts
+        self.sealCoverage = sealCoverage
     }
 
 
@@ -11141,7 +11551,10 @@ public struct FfiConverterTypeCsTranscriptProjectionEvent: FfiConverterRustBuffe
                 canRetranscribe: FfiConverterBool.read(from: &buf),
                 canFormat: FfiConverterBool.read(from: &buf),
                 terminal: FfiConverterBool.read(from: &buf),
-                acousticReceipts: FfiConverterSequenceTypeCsProjectedAcousticReceipt.read(from: &buf)
+                lifecycleTerminal: FfiConverterBool.read(from: &buf),
+                delivery: FfiConverterTypeCsTranscriptDelivery.read(from: &buf),
+                acousticReceipts: FfiConverterSequenceTypeCsProjectedAcousticReceipt.read(from: &buf),
+                sealCoverage: FfiConverterOptionTypeCsProjectedSealCoverageReceipt.read(from: &buf)
         )
     }
 
@@ -11167,7 +11580,10 @@ public struct FfiConverterTypeCsTranscriptProjectionEvent: FfiConverterRustBuffe
         FfiConverterBool.write(value.canRetranscribe, into: &buf)
         FfiConverterBool.write(value.canFormat, into: &buf)
         FfiConverterBool.write(value.terminal, into: &buf)
+        FfiConverterBool.write(value.lifecycleTerminal, into: &buf)
+        FfiConverterTypeCsTranscriptDelivery.write(value.delivery, into: &buf)
         FfiConverterSequenceTypeCsProjectedAcousticReceipt.write(value.acousticReceipts, into: &buf)
+        FfiConverterOptionTypeCsProjectedSealCoverageReceipt.write(value.sealCoverage, into: &buf)
     }
 }
 
@@ -11775,6 +12191,209 @@ public func FfiConverterTypeCsApiKeyProbeStatus_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeCsApiKeyProbeStatus_lower(_ value: CsApiKeyProbeStatus) -> RustBuffer {
     return FfiConverterTypeCsApiKeyProbeStatus.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Typed outcome of a conditional stop. Every variant is a state the caller can
+ * act on; none of them is an error string to match. A failed transport may
+ * retry the same handle to join/retrieve the retained controller operation.
+ * Stopped acknowledges processing, not consumption of addressed delivery.
+ */
+
+public enum CsConditionalStop: Equatable, Hashable {
+
+    /**
+     * The identity matched the live capture and the stop path ran.
+     */
+    case stopped
+    /**
+     * A different capture owns the microphone. It was left running.
+     */
+    case foreignCapture
+    /**
+     * Nothing is capturing. Nothing was stopped and nothing was started.
+     */
+    case noLiveCapture
+    /**
+     * This capture is already inside its own stop path. Not stopped twice.
+     */
+    case alreadyStopping
+    /**
+     * A tracked controller task still owes settlement. Keep capture ownership.
+     */
+    case pending
+    /**
+     * No task was admitted. Keep the handle; an explicit retry is safe.
+     */
+    case admissionUnavailable
+
+
+
+}
+
+#if compiler(>=6)
+extension CsConditionalStop: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsConditionalStop: FfiConverterRustBuffer {
+    typealias SwiftType = CsConditionalStop
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsConditionalStop {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .stopped
+
+        case 2: return .foreignCapture
+
+        case 3: return .noLiveCapture
+
+        case 4: return .alreadyStopping
+
+        case 5: return .pending
+
+        case 6: return .admissionUnavailable
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CsConditionalStop, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .stopped:
+            writeInt(&buf, Int32(1))
+
+
+        case .foreignCapture:
+            writeInt(&buf, Int32(2))
+
+
+        case .noLiveCapture:
+            writeInt(&buf, Int32(3))
+
+
+        case .alreadyStopping:
+            writeInt(&buf, Int32(4))
+
+
+        case .pending:
+            writeInt(&buf, Int32(5))
+
+
+        case .admissionUnavailable:
+            writeInt(&buf, Int32(6))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsConditionalStop_lift(_ buf: RustBuffer) throws -> CsConditionalStop {
+    return try FfiConverterTypeCsConditionalStop.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsConditionalStop_lower(_ value: CsConditionalStop) -> RustBuffer {
+    return FfiConverterTypeCsConditionalStop.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum CsCoverageUnavailableReason: Equatable, Hashable {
+
+    case unknown
+    case notObserved
+    case identityMismatch
+    case invalidMeasurement
+    case partialObservation
+
+
+
+}
+
+#if compiler(>=6)
+extension CsCoverageUnavailableReason: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsCoverageUnavailableReason: FfiConverterRustBuffer {
+    typealias SwiftType = CsCoverageUnavailableReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsCoverageUnavailableReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .unknown
+
+        case 2: return .notObserved
+
+        case 3: return .identityMismatch
+
+        case 4: return .invalidMeasurement
+
+        case 5: return .partialObservation
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CsCoverageUnavailableReason, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .unknown:
+            writeInt(&buf, Int32(1))
+
+
+        case .notObserved:
+            writeInt(&buf, Int32(2))
+
+
+        case .identityMismatch:
+            writeInt(&buf, Int32(3))
+
+
+        case .invalidMeasurement:
+            writeInt(&buf, Int32(4))
+
+
+        case .partialObservation:
+            writeInt(&buf, Int32(5))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCoverageUnavailableReason_lift(_ buf: RustBuffer) throws -> CsCoverageUnavailableReason {
+    return try FfiConverterTypeCsCoverageUnavailableReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsCoverageUnavailableReason_lower(_ value: CsCoverageUnavailableReason) -> RustBuffer {
+    return FfiConverterTypeCsCoverageUnavailableReason.lower(value)
 }
 
 
@@ -12573,6 +13192,89 @@ public func FfiConverterTypeCsPasteOutcome_lower(_ value: CsPasteOutcome) -> Rus
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Typed projection of the existing Bus coverage tokens. Unknown/legacy data
+ * never becomes complete. This bridge does not assess acoustic evidence.
+ */
+
+public enum CsSealCoverageStatus: Equatable, Hashable {
+
+    case unknown
+    case complete
+    case incomplete
+    case unavailable
+
+
+
+}
+
+#if compiler(>=6)
+extension CsSealCoverageStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsSealCoverageStatus: FfiConverterRustBuffer {
+    typealias SwiftType = CsSealCoverageStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsSealCoverageStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .unknown
+
+        case 2: return .complete
+
+        case 3: return .incomplete
+
+        case 4: return .unavailable
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CsSealCoverageStatus, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .unknown:
+            writeInt(&buf, Int32(1))
+
+
+        case .complete:
+            writeInt(&buf, Int32(2))
+
+
+        case .incomplete:
+            writeInt(&buf, Int32(3))
+
+
+        case .unavailable:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSealCoverageStatus_lift(_ buf: RustBuffer) throws -> CsSealCoverageStatus {
+    return try FfiConverterTypeCsSealCoverageStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsSealCoverageStatus_lower(_ value: CsSealCoverageStatus) -> RustBuffer {
+    return FfiConverterTypeCsSealCoverageStatus.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A normalized gesture a work mode can bind to, mirrored from
  * `codescribe_core::config::ShortcutBinding`. This is a CLOSED set — the Settings
  * picker offers exactly these, matching `docs/HOTKEYS_CONTRACT.md`.
@@ -12686,6 +13388,102 @@ public func FfiConverterTypeCsShortcutBinding_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCsShortcutBinding_lower(_ value: CsShortcutBinding) -> RustBuffer {
     return FfiConverterTypeCsShortcutBinding.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Swift-visible mirror of [`TranscriptDelivery`]. One variant per controller
+ * disposition, so no consumer has to parse a label to learn a destination.
+ */
+
+public enum CsTranscriptDelivery: Equatable, Hashable {
+
+    /**
+     * No stop-path delivery ran for this take.
+     */
+    case unattempted
+    /**
+     * Destined for the Agent composer draft of the capturing thread, and not
+     * yet admitted by it. This is an obligation, never a success claim.
+     */
+    case composerPending
+    /**
+     * A system sink accepted the text at the OS boundary.
+     */
+    case sinkAccepted
+    /**
+     * No sink took the text; it stays recoverable.
+     */
+    case retained
+
+
+
+}
+
+#if compiler(>=6)
+extension CsTranscriptDelivery: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCsTranscriptDelivery: FfiConverterRustBuffer {
+    typealias SwiftType = CsTranscriptDelivery
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CsTranscriptDelivery {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .unattempted
+
+        case 2: return .composerPending
+
+        case 3: return .sinkAccepted
+
+        case 4: return .retained
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CsTranscriptDelivery, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .unattempted:
+            writeInt(&buf, Int32(1))
+
+
+        case .composerPending:
+            writeInt(&buf, Int32(2))
+
+
+        case .sinkAccepted:
+            writeInt(&buf, Int32(3))
+
+
+        case .retained:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsTranscriptDelivery_lift(_ buf: RustBuffer) throws -> CsTranscriptDelivery {
+    return try FfiConverterTypeCsTranscriptDelivery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCsTranscriptDelivery_lower(_ value: CsTranscriptDelivery) -> RustBuffer {
+    return FfiConverterTypeCsTranscriptDelivery.lower(value)
 }
 
 
@@ -13303,6 +14101,54 @@ fileprivate struct FfiConverterOptionTypeCsLastServingVerdict: FfiConverterRustB
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCsProjectedPresentationReceipt: FfiConverterRustBuffer {
+    typealias SwiftType = CsProjectedPresentationReceipt?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCsProjectedPresentationReceipt.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCsProjectedPresentationReceipt.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCsProjectedSealCoverageReceipt: FfiConverterRustBuffer {
+    typealias SwiftType = CsProjectedSealCoverageReceipt?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCsProjectedSealCoverageReceipt.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCsProjectedSealCoverageReceipt.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCsThreadFilter: FfiConverterRustBuffer {
     typealias SwiftType = CsThreadFilter?
 
@@ -13343,6 +14189,30 @@ fileprivate struct FfiConverterOptionTypeCsTokenUsage: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCsTokenUsage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCsCoverageUnavailableReason: FfiConverterRustBuffer {
+    typealias SwiftType = CsCoverageUnavailableReason?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCsCoverageUnavailableReason.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCsCoverageUnavailableReason.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -13668,6 +14538,31 @@ fileprivate struct FfiConverterSequenceTypeCsProjectedAcousticReceipt: FfiConver
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCsProjectedAcousticReceipt.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCsProjectedSealCoverageRange: FfiConverterRustBuffer {
+    typealias SwiftType = [CsProjectedSealCoverageRange]
+
+    public static func write(_ value: [CsProjectedSealCoverageRange], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCsProjectedSealCoverageRange.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CsProjectedSealCoverageRange] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CsProjectedSealCoverageRange]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCsProjectedSealCoverageRange.read(from: &buf))
         }
         return seq
     }
@@ -14569,13 +15464,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_start() != 63389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_start_assistive_recording() != 39512) {
+    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_start_assistive_recording() != 1112) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_start_composer_turn_recording() != 48894) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_start_recording() != 17686) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_stop() != 44257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_stop_composer_turn_recording() != 58826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_codescribe_ffi_checksum_method_codescribehotkeys_stop_recording() != 38552) {
