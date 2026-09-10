@@ -1773,6 +1773,213 @@ class CorridorBodyRecoveryTests(unittest.TestCase):
             self.assertIn("--fresh", call.args)
 
 
+class NeutralAstTests(unittest.TestCase):
+    """Actual neutral executable on fresh Loctree data; never import product code."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repo = SCRIPT.parents[1]
+        cls.live = VERIFIER.StructuralVerifier(cls.repo)
+        cls.live.context()
+        cls.payload = {"schema": "codescribe.structural-ast-input.v1", "bodies": []}
+        for symbol, file in VERIFIER.AST_BODIES.items():
+            rows = VERIFIER.corridor_body_rows(cls.live.body(symbol, file),
+                symbol=symbol, file=file, signature_contains=None)
+            if len(rows) != 1:
+                raise AssertionError(f"real positive body unavailable: {symbol}")
+            cls.payload["bodies"].append(rows[0])
+
+    def run_payload(self, payload):
+        return VERIFIER.run_ast_json(self.repo, list(VERIFIER.AST_COMMAND), payload)
+
+    def mutate(self, symbol, old, new):
+        payload = copy.deepcopy(self.payload)
+        body = next(row for row in payload["bodies"] if row["symbol"] == symbol)
+        self.assertIn(old, body["source"], symbol)
+        body["source"] = body["source"].replace(old, new, 1)
+        body["total_lines"] = len(body["source"].splitlines())
+        body["end_line"] = body["start_line"] + body["total_lines"] - 1
+        body["line_cap"] = max(body["line_cap"], body["total_lines"])
+        return payload
+
+    def test_real_positive_and_comment_only_change(self):
+        evidence = self.run_payload(self.payload)
+        self.assertTrue(evidence["accepted"], evidence)
+        payload = self.mutate("complete_stop", "self.lifecycle_handle = None;",
+            "/* return Ok(fake); unknown!(); */ self.lifecycle_handle = None;")
+        self.assertTrue(self.run_payload(payload)["accepted"])
+
+    def test_all_eleven_previous_mutants_rejected(self):
+        mutations = [
+            ("paste_before_guard", "execute_clipboard_paste", "let focus_confirmed = target_app", "clipboard::paste_and_restore(&paste_text)?; let focus_confirmed = target_app"),
+            ("focus_removed", "execute_clipboard_paste", "if focus_confirmed && preflight.can_post_events()", "if preflight.can_post_events()"),
+            ("preflight_removed", "execute_clipboard_paste", "if focus_confirmed && preflight.can_post_events()", "if focus_confirmed"),
+            ("wrong_paste_helper", "paste_text_from_overlay", "self.execute_clipboard_paste(", "self.wrong_helper("),
+            ("coverage_removed", "complete_stop", ".latest_seal_coverage()", ".wrong_coverage()"),
+            ("incomplete_success_decoy", "complete_stop", "if let Some(receipt) = incomplete_coverage {", "if let Some(receipt) = incomplete_coverage { if bypass { return Ok((String::new(), audio_path)); }"),
+            ("audio_receipt_removed", "complete_stop", "TerminalSealRefused {\n                receipt,\n                audio_path,", "TerminalSealRefused {\n                receipt,"),
+            ("committed_receipt_removed", "complete_stop", "                committed_text,", ""),
+            ("shutdown_bypass", "complete_stop", "if let Some(sender)", "if bypass { return Ok((String::new(), None)); } if let Some(sender)"),
+            ("shutdown_order", "complete_stop", "self.transcription_handle = None;", ""),
+            ("stop_bypass", "stop", "let stopped =", "if bypass { return Ok((String::new(), None)); } let stopped ="),
+        ]
+        for name, symbol, old, new in mutations:
+            with self.subTest(mutation=name):
+                evidence = self.run_payload(self.mutate(symbol, old, new))
+                self.assertFalse(evidence["accepted"], name)
+                self.assertTrue(any(not row["accepted"] for row in evidence["contracts"]))
+
+    def test_control_scope_and_unknown_syntax_counterexamples(self):
+        cases = [
+            ("else_effect", "execute_clipboard_paste", "self.arm_or_copy_deferred_payload(", "clipboard::paste_and_restore(&paste_text)?; self.arm_or_copy_deferred_payload("),
+            ("duplicate_guarded_effect", "execute_clipboard_paste", "OverlayPasteDelivery::Pasted", "clipboard::paste_and_restore(&paste_text)?; OverlayPasteDelivery::Pasted"),
+            ("nested_false", "execute_clipboard_paste", "clipboard::paste_and_restore(&paste_text)", "if false { clipboard::paste_and_restore(&paste_text)?; } Ok::<(), Error>(())"),
+            ("closure_effect", "execute_clipboard_paste", "clipboard::paste_and_restore(&paste_text)", "(|| clipboard::paste_and_restore(&paste_text))()"),
+            ("closure_refusal", "complete_stop", "return Err(anyhow::Error::new(TerminalSealRefused {", "let later = || return Err(anyhow::Error::new(TerminalSealRefused {"),
+            ("unreachable_shutdown", "complete_stop", "self.lifecycle_handle = None;", "return Err(anyhow::anyhow!(\"early\")); self.lifecycle_handle = None;"),
+            ("question_mark_stop", "stop", "self.recorder.stop().await;", "self.recorder.stop().await?;"),
+            ("unknown_macro", "complete_stop", "self.lifecycle_handle = None;", "unreviewed!(); self.lifecycle_handle = None;"),
+            ("macro_argument_return", "stop", 'info!("Stopping streaming recorder...");', 'info!("{}", { return Ok((String::new(), None)); });'),
+            ("unknown_callee", "complete_stop", "self.lifecycle_handle = None;", "unreviewed(); self.lifecycle_handle = None;"),
+            ("unknown_loop", "stop", "let stopped =", "while condition { return Err(error); } let stopped ="),
+            ("shadow_guard", "execute_clipboard_paste", "let preflight =", "let focus_confirmed = true; let preflight ="),
+            ("false_receipt", "complete_stop", "                committed_text,", "                committed_text: String::new(),"),
+            ("else_success", "complete_stop", "if let Some(receipt) = incomplete_coverage {", "if let None = incomplete_coverage { return Ok((String::new(), audio_path)); } else {"),
+            ("attribute", "stop", "pub async fn stop", "#[cfg(any())] pub async fn stop"),
+        ]
+        for name, symbol, old, new in cases:
+            with self.subTest(mutation=name):
+                self.assertFalse(self.run_payload(self.mutate(symbol, old, new))["accepted"], name)
+
+    def test_complete_body_and_json_contract_fail_closed(self):
+        for patch in ({"truncated": True}, {"extent": "window"}, {"total_lines": 9999},
+                      {"source": "fn {"}, {"language": "swift"}):
+            payload = copy.deepcopy(self.payload)
+            payload["bodies"][0].update(patch)
+            with self.subTest(patch=patch):
+                self.assertFalse(self.run_payload(payload)["accepted"])
+        for payload in ({}, {"schema": "x", "bodies": [], "command": "sh"}):
+            with self.assertRaises(RuntimeError):
+                self.run_payload(payload)
+
+    def test_missing_and_ambiguous_body_cannot_borrow_other_proof(self):
+        for bodies in (self.payload["bodies"][:-1], self.payload["bodies"] + self.payload["bodies"][:1]):
+            # Tool emits explicit cardinality refusal; Python also refuses malformed result counts.
+            with self.assertRaises(RuntimeError):
+                self.run_payload({"schema": self.payload["schema"], "bodies": bodies})
+
+    def test_helper_presence_alone_never_discharges_guards_or_stop(self):
+        for symbol in VERIFIER.AST_BODIES:
+            payload = copy.deepcopy(self.payload)
+            body = next(row for row in payload["bodies"] if row["symbol"] == symbol)
+            body.update(source=f"async fn {symbol}() {{ helper().await }}", total_lines=1,
+                        end_line=body["start_line"])
+            with self.subTest(symbol=symbol):
+                self.assertFalse(self.run_payload(payload)["accepted"])
+
+    def test_exact_command_policy_rejects_injection_before_subprocess(self):
+        from unittest.mock import patch
+        commands = [["cargo", "test"], ["sh", "-c", "true"], [],
+            [*VERIFIER.AST_COMMAND, "--manifest-path", "/tmp/Cargo.toml"],
+            [*VERIFIER.AST_COMMAND, "--", "anything"],
+            [arg.replace("codescribe-structural-ast", "codescribe-core") for arg in VERIFIER.AST_COMMAND],
+            [arg for arg in VERIFIER.AST_COMMAND if arg != "--locked"],
+            ["/tmp/cargo", *VERIFIER.AST_COMMAND[1:]]]
+        with patch.object(VERIFIER.subprocess, "run") as run:
+            for command in commands:
+                with self.subTest(command=command), self.assertRaises(RuntimeError):
+                    VERIFIER.run_ast_json(self.repo, command, self.payload)
+            run.assert_not_called()
+
+    def test_failed_missing_stale_or_forged_parser_never_certifies(self):
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        for result in (CompletedProcess([], 1, "", "compile failed"),
+                       CompletedProcess([], 0, "not JSON", ""),
+                       CompletedProcess([], 0, '{"accepted": true}', "")):
+            with patch.object(VERIFIER.subprocess, "run", return_value=result), self.assertRaises(RuntimeError):
+                self.run_payload(self.payload)
+        with patch.object(VERIFIER.subprocess, "run", side_effect=FileNotFoundError("cargo")), self.assertRaises(RuntimeError):
+            self.run_payload(self.payload)
+        with patch.object(VERIFIER, "ast_tool_digest", side_effect=["before", "after"]), \
+             patch.object(VERIFIER.subprocess, "run", return_value=CompletedProcess([], 0, "{}", "")), \
+             self.assertRaisesRegex(RuntimeError, "changed during"):
+            self.run_payload(self.payload)
+
+    def test_package_contract_rejects_product_dependency_and_build_script(self):
+        import shutil
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            shutil.copytree(self.repo / "tools/structural-ast", repo / "tools/structural-ast")
+            for name in ("Cargo.toml", "Cargo.lock"):
+                shutil.copyfile(self.repo / name, repo / name)
+            VERIFIER.ast_tool_digest(repo)
+            manifest = repo / "tools/structural-ast/Cargo.toml"
+            original = manifest.read_text()
+            manifest.write_text(original + '\ncodescribe = { path = "../.." }\n')
+            with self.assertRaisesRegex(RuntimeError, "dependency/build"):
+                VERIFIER.ast_tool_digest(repo)
+            manifest.write_text(original)
+            (repo / "tools/structural-ast/build.rs").write_text("fn main() {}")
+            with self.assertRaisesRegex(RuntimeError, "dependency/build"):
+                VERIFIER.ast_tool_digest(repo)
+
+    def test_compiler_overrides_are_removed_and_receipt_policy_is_exact(self):
+        from unittest.mock import patch
+        from subprocess import CompletedProcess
+        evidence = self.run_payload(self.payload)
+        with patch.dict(VERIFIER.os.environ, {"RUSTC_WRAPPER": "/tmp/evil", "RUSTFLAGS": "injected", "CARGO_TARGET_DIR": "/tmp/private"}), \
+             patch.object(VERIFIER.subprocess, "run", return_value=CompletedProcess([], 0, json.dumps(evidence), "")) as run:
+            self.run_payload(self.payload)
+            env = run.call_args.kwargs["env"]
+            self.assertNotIn("RUSTC_WRAPPER", env)
+            self.assertNotIn("RUSTFLAGS", env)
+            self.assertEqual(env["CARGO_TARGET_DIR"], VERIFIER.AST_TARGET)
+            self.assertEqual(env["CARGO_BUILD_JOBS"], "4")
+            self.assertFalse(run.call_args.kwargs.get("shell", False))
+        verifier = StubVerifier(Path("/repo"))
+        receipt, _ = VERIFIER.verify_stage(verifier, wired_manifest(), "wired", None, None)
+        receipt["command_inventory"].append(" ".join(VERIFIER.AST_COMMAND))
+        with self.assertRaisesRegex(RuntimeError, "authenticated tool receipt"):
+            VERIFIER.validate_receipt_shape(receipt)
+
+    def test_neutral_grammar_residue_exception_is_not_a_product_allowlist(self):
+        for file, ident, expected in (
+            ("tools/structural-ast/src/productions.rs", "OverlayPasteResult", "verifier_self_literal"),
+            ("tools/structural-ast/src/productions.rs", "overlay_paste_evil", "unclassified_requires_review"),
+            ("core/evil.rs", "OverlayPasteResult", "unclassified_requires_review"),
+        ):
+            row = occurrence(ident, file=file)
+            self.assertEqual(VERIFIER.classify_substring_residue(row, "overlay_paste")[0], expected)
+
+    def test_real_chain_requires_callsite_receipts_as_well_as_ast(self):
+        manifest = json.loads((self.repo / VERIFIER.DEFAULT_MANIFEST).read_text())
+        contracts = []
+        for corridor in manifest["stages"]["wired"]["required_corridors"]:
+            hops = [row for row in corridor["hops"] if row.get("ast_contract")]
+            if not hops:
+                continue
+            contracts.append({"name": corridor["name"], "hops": hops,
+                "required_invocations": [row for row in corridor["required_invocations"]
+                    if row["caller"] in VERIFIER.AST_BODIES and row["callee"] in
+                    {"execute_clipboard_paste", "paste_and_restore", "complete_stop", "latest_seal_coverage"}]})
+        live = VERIFIER.StructuralVerifier(self.repo)
+        observed, failures = VERIFIER.verify_code_corridors(live, contracts)
+        self.assertFalse(failures, failures)
+        self.assertEqual(sum(len(row["invocations"]) for row in observed.values()), 4)
+        for symbol in ("execute_clipboard_paste", "paste_and_restore", "complete_stop", "latest_seal_coverage"):
+            original = live.occurrences(symbol)
+            missing = copy.deepcopy(original)
+            missing["occurrences"] = [row for row in missing["occurrences"] if row.get("match_role") != "reference"]
+            live._occurrences[symbol] = missing
+            try:
+                _, failures = VERIFIER.verify_code_corridors(live, contracts)
+                self.assertTrue(failures, symbol)
+            finally:
+                live._occurrences[symbol] = original
+
+
 class RustModuleResolutionTests(unittest.TestCase):
     def test_reports_missing_module_and_accepts_standard_module_file(self) -> None:
         module_payload = regex_payload(

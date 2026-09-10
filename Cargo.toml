@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [".", "core", "bridge"]
+members = [".", "core", "bridge", "tools/structural-ast"]
 
 [workspace.package]
 version = "0.15.0"

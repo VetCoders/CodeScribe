@@ -765,6 +765,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codescribe-structural-ast"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "syn",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
