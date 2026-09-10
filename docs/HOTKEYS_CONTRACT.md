@@ -55,7 +55,7 @@ one `RecordingController`, one recorder, one `AcousticLedger`, one
 - **Epochs.** `CaptureTurnIntent::SingleTurn` asks the recorder for
   `utterance_silence_sec: None` — the pipeline's legacy contract of one
   continuous stream for the whole take. Silence never ends the take; only an
-  explicit stop does. This rests the *engine lifecycle*, not the VAD: Silero
+  explicit stop does. This rests the _engine lifecycle_, not the VAD: Silero
   segmentation, ledger qualification and Layer 1 tail repair run unchanged.
 - **Formatting.** The live per-occurrence formatter lane is never armed for a
   one-turn take (`live_formatter_lane_is_armed`), so no silence-delimited

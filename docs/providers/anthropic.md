@@ -16,20 +16,20 @@ docs disagree, the docs win.
 
 ## Constants
 
-| Constant | Value | Source |
-|---|---|---|
-| `CANONICAL` | `anthropic-messages` | Codescribe registry spelling (settings.json, env) |
-| `ALIASES` | `anthropic`, `anthropic_messages` | Codescribe registry spelling |
-| `DISPLAY_NAME` | `Anthropic (Messages)` | Codescribe picker label |
-| `DOCS_URL` | https://platform.claude.com/docs/en/api/messages | — |
-| `ENDPOINT` | `https://api.anthropic.com/v1/messages` | https://platform.claude.com/docs/en/api/messages — "POST https://api.anthropic.com/v1/messages" |
-| `MODELS_ENDPOINT` | `https://api.anthropic.com/v1/models` | https://platform.claude.com/docs/en/api/models-list — "GET /v1/models" |
-| `API_KEY_ACCOUNT` | `LLM_ANTHROPIC_API_KEY` | Codescribe Keychain bundle account |
-| `AUTH_HEADER` | `x-api-key` | https://platform.claude.com/docs/en/api/messages — Headers: `x-api-key` (required) |
-| `AUTH_VALUE_PREFIX` | `` (empty) | same page: the raw key is the header value |
-| `EXTRA_HEADERS` | `anthropic-version: 2023-06-01` | https://platform.claude.com/docs/en/api/versioning — "current version: 2023-06-01" |
-| `DEFAULT_FORMATTING_MODEL` | `claude-sonnet-5` | https://platform.claude.com/docs/en/about-claude/models/overview — current lineup on 2026-09-07 |
-| `DEFAULT_ASSISTIVE_MODEL` | `claude-opus-5` | same page |
+| Constant                   | Value                                            | Source                                                                                          |
+| -------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `CANONICAL`                | `anthropic-messages`                             | Codescribe registry spelling (settings.json, env)                                               |
+| `ALIASES`                  | `anthropic`, `anthropic_messages`                | Codescribe registry spelling                                                                    |
+| `DISPLAY_NAME`             | `Anthropic (Messages)`                           | Codescribe picker label                                                                         |
+| `DOCS_URL`                 | https://platform.claude.com/docs/en/api/messages | —                                                                                               |
+| `ENDPOINT`                 | `https://api.anthropic.com/v1/messages`          | https://platform.claude.com/docs/en/api/messages — "POST https://api.anthropic.com/v1/messages" |
+| `MODELS_ENDPOINT`          | `https://api.anthropic.com/v1/models`            | https://platform.claude.com/docs/en/api/models-list — "GET /v1/models"                          |
+| `API_KEY_ACCOUNT`          | `LLM_ANTHROPIC_API_KEY`                          | Codescribe Keychain bundle account                                                              |
+| `AUTH_HEADER`              | `x-api-key`                                      | https://platform.claude.com/docs/en/api/messages — Headers: `x-api-key` (required)              |
+| `AUTH_VALUE_PREFIX`        | `` (empty)                                       | same page: the raw key is the header value                                                      |
+| `EXTRA_HEADERS`            | `anthropic-version: 2023-06-01`                  | https://platform.claude.com/docs/en/api/versioning — "current version: 2023-06-01"              |
+| `DEFAULT_FORMATTING_MODEL` | `claude-sonnet-5`                                | https://platform.claude.com/docs/en/about-claude/models/overview — current lineup on 2026-09-07 |
+| `DEFAULT_ASSISTIVE_MODEL`  | `claude-opus-5`                                  | same page                                                                                       |
 
 The endpoint is pinned in code. There is no env or settings override for a
 vendor endpoint; a different host is a Custom provider on the `messages` wire.

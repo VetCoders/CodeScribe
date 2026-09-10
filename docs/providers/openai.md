@@ -21,8 +21,7 @@ This file documents a vendor specification, not installed runtime behavior.
 
 All retrieved 2026-09-07, before code, through official OpenAI developer-docs MCP.
 Read skill: `/Users/maciejgad/.claude/skills/openai-docs/SKILL.md`.
-No callable OpenAI MCP tool was initially exposed. `codex mcp add
-openaiDeveloperDocs --url https://developers.openai.com/mcp` succeeded.
+No callable OpenAI MCP tool was initially exposed. `codex mcp add openaiDeveloperDocs --url https://developers.openai.com/mcp` succeeded.
 Direct HTTP MCP `tools/list`, `search_openai_docs`, `fetch_openai_doc` and
 `get_openapi_spec` succeeded without restarting this headless worker.
 
@@ -50,21 +49,20 @@ URLs below establish the associated wire, not those Codescribe-specific strings.
 Model choices retain baseline seeds because both remain documented; this is not
 an allowlist or a claim about this user's live model entitlements.
 
-| Constant | Value | Source / provenance |
-|---|---|---|
-| `CANONICAL` | `"openai-responses"` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy |
-| `ALIASES` | `&["openai", "openai_responses"]` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy |
-| `DISPLAY_NAME` | `"OpenAI (Responses)"` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy |
-| `DOCS_URL` | `"https://developers.openai.com/api/reference/resources/responses/methods/create"` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); vendor wire / documented seed |
-| `ENDPOINT` | `"https://api.openai.com/v1/responses"` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); vendor wire / documented seed |
-| `MODELS_ENDPOINT` | `"https://api.openai.com/v1/models"` | [Docs](https://developers.openai.com/api/reference/resources/models/methods/list); vendor wire / documented seed |
-| `API_KEY_ACCOUNT` | `"LLM_OPENAI_API_KEY"` | [Docs](https://developers.openai.com/api/reference/overview#authentication); Codescribe policy |
-| `AUTH_HEADER` | `"authorization"` | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed |
-| `AUTH_VALUE_PREFIX` | `"Bearer "` | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed |
-| `EXTRA_HEADERS` | `&[]` | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed |
-| `DEFAULT_FORMATTING_MODEL` | `"gpt-4.1"` | [Docs](https://developers.openai.com/api/docs/models/gpt-4.1); vendor wire / documented seed |
-| `DEFAULT_ASSISTIVE_MODEL` | `"gpt-5.5"` | [Docs](https://developers.openai.com/api/docs/models/gpt-5.5); vendor wire / documented seed |
-
+| Constant                   | Value                                                                              | Source / provenance                                                                                                   |
+| -------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `CANONICAL`                | `"openai-responses"`                                                               | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy             |
+| `ALIASES`                  | `&["openai", "openai_responses"]`                                                  | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy             |
+| `DISPLAY_NAME`             | `"OpenAI (Responses)"`                                                             | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); Codescribe policy             |
+| `DOCS_URL`                 | `"https://developers.openai.com/api/reference/resources/responses/methods/create"` | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); vendor wire / documented seed |
+| `ENDPOINT`                 | `"https://api.openai.com/v1/responses"`                                            | [Docs](https://developers.openai.com/api/reference/resources/responses/methods/create); vendor wire / documented seed |
+| `MODELS_ENDPOINT`          | `"https://api.openai.com/v1/models"`                                               | [Docs](https://developers.openai.com/api/reference/resources/models/methods/list); vendor wire / documented seed      |
+| `API_KEY_ACCOUNT`          | `"LLM_OPENAI_API_KEY"`                                                             | [Docs](https://developers.openai.com/api/reference/overview#authentication); Codescribe policy                        |
+| `AUTH_HEADER`              | `"authorization"`                                                                  | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed            |
+| `AUTH_VALUE_PREFIX`        | `"Bearer "`                                                                        | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed            |
+| `EXTRA_HEADERS`            | `&[]`                                                                              | [Docs](https://developers.openai.com/api/reference/overview#authentication); vendor wire / documented seed            |
+| `DEFAULT_FORMATTING_MODEL` | `"gpt-4.1"`                                                                        | [Docs](https://developers.openai.com/api/docs/models/gpt-4.1); vendor wire / documented seed                          |
+| `DEFAULT_ASSISTIVE_MODEL`  | `"gpt-5.5"`                                                                        | [Docs](https://developers.openai.com/api/docs/models/gpt-5.5); vendor wire / documented seed                          |
 
 ## Models response shape
 
