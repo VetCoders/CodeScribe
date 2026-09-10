@@ -1099,14 +1099,30 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
   /// Two takes finish for A while B is on screen. Selecting A shows each
   /// document exactly once, and selecting A again does not repeat them.
-  func testRepeatedSelectionSurfacesEachDeliveredDocumentExactlyOnce() {
+  func testRepeatedSelectionSurfacesEachDeliveredDocumentExactlyOnce() throws {
     let f = makeFixture(recording: [false, true])
     admitCapture(f.store, threadID: f.threadA)
+    let predecessor = try XCTUnwrap(f.store.currentComposerCaptureRequestID)
     f.store.select(f.threadB)
 
     XCTAssertEqual(f.store.receiveDictationTranscript("first take", captureID: "join-session"), .parked(threadID: f.threadA))
+    // Receiving the document does not release the admitted capture request.
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, predecessor)
+    XCTAssertTrue(f.store.finishDictationCapture(sessionID: "join-session"))
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertFalse(f.store.ownsLiveDictation)
     admitCapture(f.store, threadID: f.threadA, id: "second-session")
+    let successor = try XCTUnwrap(f.store.currentComposerCaptureRequestID)
+    XCTAssertNotEqual(successor, predecessor)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "second-session")
     XCTAssertEqual(f.store.receiveDictationTranscript("second take", captureID: "second-session"), .parked(threadID: f.threadA))
+
+    XCTAssertTrue(f.store.finishDictationCapture(sessionID: "second-session"))
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertNil(f.store.composerCaptureHandle)
+    XCTAssertFalse(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.selectedThreadID, f.threadB)
 
     f.store.select(f.threadA)
     XCTAssertEqual(f.store.draft, "first take\nsecond take")
