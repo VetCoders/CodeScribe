@@ -429,18 +429,26 @@ pub fn save_entry_with_timestamp_and_slug(
     let text = text.trim();
     let now = timestamp.unwrap_or_else(Local::now);
 
-    let base = build_base_name(&now.format("%H%M%S").to_string(),
-        &make_slug(slug_hint.unwrap_or(text), 3), kind);
-    let intended = transcriptions_base_dir().join(now.format("%Y-%m-%d").to_string())
+    let base = build_base_name(
+        &now.format("%H%M%S").to_string(),
+        &make_slug(slug_hint.unwrap_or(text), 3),
+        kind,
+    );
+    let intended = transcriptions_base_dir()
+        .join(now.format("%Y-%m-%d").to_string())
         .join(format!("{base}.txt"));
-    let path = match daily_archive::save_text(&crate::config::Config::config_dir(), &now, &base, text) {
-        Ok(path) => path,
-        Err(error) => {
-            error!("Failed to save transcript {}: {error:#}", intended.display());
-            // Legacy return type cannot express failure; no file is invented.
-            intended
-        }
-    };
+    let path =
+        match daily_archive::save_text(&crate::config::Config::config_dir(), &now, &base, text) {
+            Ok(path) => path,
+            Err(error) => {
+                error!(
+                    "Failed to save transcript {}: {error:#}",
+                    intended.display()
+                );
+                // Legacy return type cannot express failure; no file is invented.
+                intended
+            }
+        };
 
     let preview = history_preview(kind, text);
 
@@ -797,10 +805,21 @@ pub fn save_audio(
 ) -> Option<PathBuf> {
     let result = (|| -> Result<PathBuf> {
         let mut source = daily_archive::admit_source(src_path)?;
-        let base = build_base_name(&timestamp.format("%H%M%S").to_string(),
-            &transcript_text.map(|text| make_slug(text, 3)).unwrap_or_default(), kind);
-        daily_archive::save(&crate::config::Config::config_dir(), &mut source,
-            &timestamp, &base, None, crate::audio::archive::encode_wav_to_m4a)
+        let base = build_base_name(
+            &timestamp.format("%H%M%S").to_string(),
+            &transcript_text
+                .map(|text| make_slug(text, 3))
+                .unwrap_or_default(),
+            kind,
+        );
+        daily_archive::save(
+            &crate::config::Config::config_dir(),
+            &mut source,
+            &timestamp,
+            &base,
+            None,
+            crate::audio::archive::encode_wav_to_m4a,
+        )
     })();
     archive_result(result)
 }
@@ -862,11 +881,19 @@ pub fn archive_session_take_from_file(
     let now = Local::now();
     let (slug, kind, text) = archive_classification(transcript);
     let base = build_base_name(&now.format("%H%M%S").to_string(), &make_slug(slug, 3), kind);
-    archive_result(daily_archive::save(&crate::config::Config::config_dir(), source,
-        &now, &base, text, crate::audio::archive::encode_wav_to_m4a))
+    archive_result(daily_archive::save(
+        &crate::config::Config::config_dir(),
+        source,
+        &now,
+        &base,
+        text,
+        crate::audio::archive::encode_wav_to_m4a,
+    ))
 }
 
-fn archive_classification(transcript: SessionTranscriptArchive<'_>) -> (&str, TranscriptKind, Option<&str>) {
+fn archive_classification(
+    transcript: SessionTranscriptArchive<'_>,
+) -> (&str, TranscriptKind, Option<&str>) {
     match transcript {
         SessionTranscriptArchive::Committed(text) if !text.trim().is_empty() => {
             (text, TranscriptKind::Raw, Some(text.trim()))
@@ -893,14 +920,23 @@ mod daily_archive {
     static NEXT_STAGE: AtomicU64 = AtomicU64::new(0);
 
     fn open_at(dir: &File, name: &CStr, flags: libc::c_int) -> std::io::Result<File> {
-        if name.to_bytes().is_empty() || name.to_bytes().contains(&b'/')
+        if name.to_bytes().is_empty()
+            || name.to_bytes().contains(&b'/')
             || matches!(name.to_bytes(), b"." | b"..")
         {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe archive component"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe archive component",
+            ));
         }
         // SAFETY: live directory descriptor and single NUL-terminated component.
         let fd = unsafe {
-            libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600)
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o600,
+            )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -910,16 +946,26 @@ mod daily_archive {
     }
 
     fn parent(path: &Path) -> Result<(File, CString)> {
-        anyhow::ensure!(!path.components().any(|c| matches!(c, Component::ParentDir)), "archive refuses parent traversal");
+        anyhow::ensure!(
+            !path.components().any(|c| matches!(c, Component::ParentDir)),
+            "archive refuses parent traversal"
+        );
         let leaf = CString::new(path.file_name().context("archive needs leaf")?.as_bytes())?;
-        let resolved = path.parent().filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")).canonicalize()?;
+        let resolved = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()?;
         let mut dir = File::open("/")?;
         for component in resolved.components() {
             match component {
                 Component::RootDir => {}
                 Component::Normal(name) => {
-                    dir = open_at(&dir, &CString::new(name.as_bytes())?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                    dir = open_at(
+                        &dir,
+                        &CString::new(name.as_bytes())?,
+                        libc::O_RDONLY | libc::O_DIRECTORY,
+                    )?;
                 }
                 _ => anyhow::bail!("archive parent must be absolute"),
             }
@@ -966,7 +1012,10 @@ mod daily_archive {
         fn drop(&mut self) {
             // SAFETY: remove only this guard's single staging/reservation entry.
             if unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), 0) } < 0 {
-                warn!("archive owned-entry cleanup failed: {}", std::io::Error::last_os_error());
+                warn!(
+                    "archive owned-entry cleanup failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }
@@ -979,7 +1028,14 @@ mod daily_archive {
     fn occupied(dir: &File, name: &CStr) -> Result<bool> {
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: fstatat initializes stat on success; no fields are read.
-        let rc = unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
         if rc == 0 {
             return Ok(true);
         }
@@ -995,7 +1051,11 @@ mod daily_archive {
     /// Existing dangling links, hardlinks and any other leaves occupy the stem.
     fn reserve<'a>(dir: &'a File, base: &str) -> Result<(Entry<'a>, String)> {
         for index in 0..=10_000 {
-            let stem = if index == 0 { base.to_string() } else { format!("{base}_{index}") };
+            let stem = if index == 0 {
+                base.to_string()
+            } else {
+                format!("{base}_{index}")
+            };
             let lock = match create(dir, CString::new(format!(".{stem}.reserve"))?) {
                 Ok(entry) => entry,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1030,13 +1090,27 @@ mod daily_archive {
         let name = CString::new(name)?;
         // SAFETY: atomic no-replace publication in the same pinned directory.
         // A newly planted final leaf causes EEXIST, never an overwrite.
-        if unsafe { libc::linkat(entry.dir.as_raw_fd(), entry.name.as_ptr(), entry.dir.as_raw_fd(), name.as_ptr(), 0) } < 0 {
+        if unsafe {
+            libc::linkat(
+                entry.dir.as_raw_fd(),
+                entry.name.as_ptr(),
+                entry.dir.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        } < 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
     }
 
-    pub(super) fn save_text(root: &Path, now: &DateTime<Local>, base: &str, text: &str) -> Result<PathBuf> {
+    pub(super) fn save_text(
+        root: &Path,
+        now: &DateTime<Local>,
+        base: &str,
+        text: &str,
+    ) -> Result<PathBuf> {
         let (dir, path) = day(root, now)?;
         let (_reservation, stem) = reserve(&dir, base)?;
         let mut entry = stage(&dir)?;
@@ -1047,10 +1121,17 @@ mod daily_archive {
     }
 
     pub(super) fn save(
-        root: &Path, source: &mut File, now: &DateTime<Local>, base: &str, text: Option<&str>,
+        root: &Path,
+        source: &mut File,
+        now: &DateTime<Local>,
+        base: &str,
+        text: Option<&str>,
         encode: impl FnOnce(&mut File, &mut File) -> Result<()>,
     ) -> Result<PathBuf> {
-        anyhow::ensure!(source.metadata()?.is_file(), "archive source must be regular");
+        anyhow::ensure!(
+            source.metadata()?.is_file(),
+            "archive source must be regular"
+        );
         let (dir, path) = day(root, now)?;
         let (_reservation, stem) = reserve(&dir, base)?;
         // The converter can neither mutate the admitted WAV nor published data.
@@ -1060,7 +1141,10 @@ mod daily_archive {
         input.seek(SeekFrom::Start(0))?;
         let mut encoded = tempfile::tempfile()?;
         let result = encode(&mut input, &mut encoded).and_then(|()| {
-            anyhow::ensure!(encoded.metadata()?.len() > 0, "archive encoder returned empty success");
+            anyhow::ensure!(
+                encoded.metadata()?.len() > 0,
+                "archive encoder returned empty success"
+            );
             Ok(())
         });
         let mut audio = stage(&dir)?;
@@ -1083,10 +1167,17 @@ mod daily_archive {
         if let Some(text) = text {
             let mut transcript = stage(&dir)?;
             transcript.file.write_all(text.as_bytes())?;
-            publish(&transcript, &format!("{stem}.txt"))
-                .with_context(|| format!("audio retained at {}; paired transcript failed", path.join(&audio_name).display()))?;
+            publish(&transcript, &format!("{stem}.txt")).with_context(|| {
+                format!(
+                    "audio retained at {}; paired transcript failed",
+                    path.join(&audio_name).display()
+                )
+            })?;
         }
-        info!("daily archive retained {}", path.join(&audio_name).display());
+        info!(
+            "daily archive retained {}",
+            path.join(&audio_name).display()
+        );
         Ok(path.join(audio_name))
     }
 }
@@ -1098,11 +1189,20 @@ mod daily_archive {
     pub(super) fn admit_source(_path: &Path) -> Result<fs::File> {
         anyhow::bail!("secure daily archive requires Unix directory descriptors")
     }
-    pub(super) fn save_text(_root: &Path, _now: &DateTime<Local>, _base: &str, _text: &str) -> Result<PathBuf> {
+    pub(super) fn save_text(
+        _root: &Path,
+        _now: &DateTime<Local>,
+        _base: &str,
+        _text: &str,
+    ) -> Result<PathBuf> {
         anyhow::bail!("secure daily archive requires Unix directory descriptors")
     }
     pub(super) fn save(
-        _root: &Path, _source: &mut fs::File, _now: &DateTime<Local>, _base: &str, _text: Option<&str>,
+        _root: &Path,
+        _source: &mut fs::File,
+        _now: &DateTime<Local>,
+        _base: &str,
+        _text: Option<&str>,
         _encode: impl FnOnce(&mut fs::File, &mut fs::File) -> Result<()>,
     ) -> Result<PathBuf> {
         anyhow::bail!("secure daily archive requires Unix directory descriptors")
@@ -1140,7 +1240,10 @@ mod tests {
 
     #[cfg(unix)]
     fn archive_fixture(
-        root: &Path, source: &mut fs::File, now: &DateTime<Local>, transcript: SessionTranscriptArchive<'_>,
+        root: &Path,
+        source: &mut fs::File,
+        now: &DateTime<Local>,
+        transcript: SessionTranscriptArchive<'_>,
         encode: impl FnOnce(&mut fs::File, &mut fs::File) -> Result<()>,
     ) -> Result<PathBuf> {
         let (slug, kind, text) = archive_classification(transcript);
@@ -1172,18 +1275,30 @@ mod tests {
                 }
                 _ => {
                     fs::create_dir_all(root.join("transcriptions")).expect("archive");
-                    root.join("transcriptions").join(now.format("%Y-%m-%d").to_string())
+                    root.join("transcriptions")
+                        .join(now.format("%Y-%m-%d").to_string())
                 }
             };
             symlink(&outside, target).expect("link");
             let source_path = tmp.path().join("source.wav");
             fs::write(&source_path, b"source survives").expect("source");
             let mut source = daily_archive::admit_source(&source_path).expect("admit");
-            assert!(archive_fixture(&root, &mut source, &now,
-                SessionTranscriptArchive::NoSpeech, refuse_encoder).is_err());
+            assert!(
+                archive_fixture(
+                    &root,
+                    &mut source,
+                    &now,
+                    SessionTranscriptArchive::NoSpeech,
+                    refuse_encoder
+                )
+                .is_err()
+            );
             assert_eq!(fs::read(source_path).expect("source"), b"source survives");
             assert_eq!(fs::read_dir(&outside).expect("outside").count(), 1);
-            assert_eq!(fs::read(outside.join("sentinel")).expect("sentinel"), b"untouched");
+            assert_eq!(
+                fs::read(outside.join("sentinel")).expect("sentinel"),
+                b"untouched"
+            );
         }
     }
 
@@ -1193,9 +1308,16 @@ mod tests {
         use std::os::unix::fs::symlink;
         let tmp = TempDir::new().expect("tempdir");
         let now = Local::now();
-        let day = tmp.path().join("transcriptions").join(now.format("%Y-%m-%d").to_string());
+        let day = tmp
+            .path()
+            .join("transcriptions")
+            .join(now.format("%Y-%m-%d").to_string());
         fs::create_dir_all(&day).expect("day");
-        let base = build_base_name(&now.format("%H%M%S").to_string(), "words", TranscriptKind::Raw);
+        let base = build_base_name(
+            &now.format("%H%M%S").to_string(),
+            "words",
+            TranscriptKind::Raw,
+        );
         let absent = tmp.path().join("absent");
         symlink(&absent, day.join(format!("{base}.m4a"))).expect("dangling");
         let outside = tmp.path().join("outside");
@@ -1203,12 +1325,24 @@ mod tests {
         fs::hard_link(&outside, day.join(format!("{base}_1.wav"))).expect("hardlink");
         symlink(&outside, day.join(format!("{base}_2.txt"))).expect("text link");
         let mut source = daily_archive::admit_source(&outside).expect("admit");
-        let audio = archive_fixture(tmp.path(), &mut source, &now,
-            SessionTranscriptArchive::Committed("words"), refuse_encoder).expect("archive");
-        assert_eq!(audio.file_stem().and_then(|s| s.to_str()), Some(format!("{base}_3").as_str()));
+        let audio = archive_fixture(
+            tmp.path(),
+            &mut source,
+            &now,
+            SessionTranscriptArchive::Committed("words"),
+            refuse_encoder,
+        )
+        .expect("archive");
+        assert_eq!(
+            audio.file_stem().and_then(|s| s.to_str()),
+            Some(format!("{base}_3").as_str())
+        );
         assert_eq!(fs::read(&outside).expect("outside"), b"outside inode");
         assert!(!absent.exists());
-        assert_eq!(fs::read(audio.with_extension("txt")).expect("text"), b"words");
+        assert_eq!(
+            fs::read(audio.with_extension("txt")).expect("text"),
+            b"words"
+        );
     }
 
     #[test]
@@ -1220,12 +1354,19 @@ mod tests {
         fs::write(&source_path, b"admitted voice").expect("source");
         let mut source = daily_archive::admit_source(&source_path).expect("admit");
         let now = Local::now();
-        let day = tmp.path().join("transcriptions").join(now.format("%Y-%m-%d").to_string());
+        let day = tmp
+            .path()
+            .join("transcriptions")
+            .join(now.format("%Y-%m-%d").to_string());
         let moved = tmp.path().join("moved-day");
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).expect("outside");
-        let audio = archive_fixture(tmp.path(), &mut source, &now,
-            SessionTranscriptArchive::Committed("voice"), |input, _| {
+        let audio = archive_fixture(
+            tmp.path(),
+            &mut source,
+            &now,
+            SessionTranscriptArchive::Committed("voice"),
+            |input, _| {
                 use std::io::{Read, Seek};
                 fs::rename(&source_path, tmp.path().join("original.wav"))?;
                 fs::write(&source_path, b"substituted")?;
@@ -1236,8 +1377,13 @@ mod tests {
                 input.read_to_end(&mut bytes)?;
                 assert_eq!(bytes, b"admitted voice");
                 anyhow::bail!("force WAV fallback")
-            }).expect("fallback");
-        assert_eq!(fs::read(moved.join(audio.file_name().expect("name"))).expect("audio"), b"admitted voice");
+            },
+        )
+        .expect("fallback");
+        assert_eq!(
+            fs::read(moved.join(audio.file_name().expect("name"))).expect("audio"),
+            b"admitted voice"
+        );
         assert_eq!(fs::read_dir(&outside).expect("outside").count(), 0);
         assert_eq!(fs::read_dir(&moved).expect("moved").count(), 2);
         assert_eq!(fs::read(source_path).expect("replacement"), b"substituted");
@@ -1252,14 +1398,29 @@ mod tests {
         fs::write(&source_path, b"source").expect("source");
         let mut source = daily_archive::admit_source(&source_path).expect("admit");
         let now = Local::now();
-        let day = tmp.path().join("transcriptions").join(now.format("%Y-%m-%d").to_string());
-        let base = build_base_name(&now.format("%H%M%S").to_string(), "", TranscriptKind::Failed);
+        let day = tmp
+            .path()
+            .join("transcriptions")
+            .join(now.format("%Y-%m-%d").to_string());
+        let base = build_base_name(
+            &now.format("%H%M%S").to_string(),
+            "",
+            TranscriptKind::Failed,
+        );
         let absent = tmp.path().join("absent");
-        assert!(archive_fixture(tmp.path(), &mut source, &now,
-            SessionTranscriptArchive::Unavailable("diagnostic"), |_, _| {
-                symlink(&absent, day.join(format!("{base}.wav")))?;
-                anyhow::bail!("fallback")
-            }).is_err());
+        assert!(
+            archive_fixture(
+                tmp.path(),
+                &mut source,
+                &now,
+                SessionTranscriptArchive::Unavailable("diagnostic"),
+                |_, _| {
+                    symlink(&absent, day.join(format!("{base}.wav")))?;
+                    anyhow::bail!("fallback")
+                }
+            )
+            .is_err()
+        );
         assert!(!absent.exists());
         assert_eq!(fs::read_dir(day).expect("day").count(), 1);
         assert_eq!(fs::read(source_path).expect("source"), b"source");
@@ -1277,27 +1438,41 @@ mod tests {
         let now = Local::now();
         let barrier = Arc::new(Barrier::new(2));
         let paths = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..2).map(|_| {
-                let barrier = Arc::clone(&barrier);
-                let root = tmp.path();
-                let source_path = &source_path;
-                let now = &now;
-                scope.spawn(move || {
-                    let mut source = daily_archive::admit_source(source_path).expect("admit");
-                    archive_fixture(root, &mut source, now,
-                        SessionTranscriptArchive::Committed("same words"), |_, output| {
-                            barrier.wait();
-                            output.write_all(b"fake encoded audio")?;
-                            Ok(())
-                        }).expect("archive")
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let barrier = Arc::clone(&barrier);
+                    let root = tmp.path();
+                    let source_path = &source_path;
+                    let now = &now;
+                    scope.spawn(move || {
+                        let mut source = daily_archive::admit_source(source_path).expect("admit");
+                        archive_fixture(
+                            root,
+                            &mut source,
+                            now,
+                            SessionTranscriptArchive::Committed("same words"),
+                            |_, output| {
+                                barrier.wait();
+                                output.write_all(b"fake encoded audio")?;
+                                Ok(())
+                            },
+                        )
+                        .expect("archive")
+                    })
                 })
-            }).collect();
-            workers.into_iter().map(|w| w.join().expect("worker")).collect::<Vec<_>>()
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("worker"))
+                .collect::<Vec<_>>()
         });
         assert_ne!(paths[0], paths[1]);
         for audio in paths {
             assert_eq!(fs::read(&audio).expect("audio"), b"fake encoded audio");
-            assert_eq!(fs::read(audio.with_extension("txt")).expect("text"), b"same words");
+            assert_eq!(
+                fs::read(audio.with_extension("txt")).expect("text"),
+                b"same words"
+            );
         }
         assert_eq!(recent_entries(10).len(), 2);
     }
@@ -1306,20 +1481,36 @@ mod tests {
     #[cfg(unix)]
     fn child_failure_deadline_and_empty_exit_publish_wav_and_clean_staging() {
         use crate::audio::archive::TestEncoderOutcome;
-        for outcome in [TestEncoderOutcome::Failed, TestEncoderOutcome::Empty, TestEncoderOutcome::Hanging] {
+        for outcome in [
+            TestEncoderOutcome::Failed,
+            TestEncoderOutcome::Empty,
+            TestEncoderOutcome::Hanging,
+        ] {
             let tmp = TempDir::new().expect("tempdir");
             let source_path = tmp.path().join("source.wav");
             fs::write(&source_path, b"original WAV").expect("source");
             let mut source = daily_archive::admit_source(&source_path).expect("admit");
-            let audio = archive_fixture(tmp.path(), &mut source, &Local::now(),
-                SessionTranscriptArchive::Committed("words"), |input, output| {
-                    crate::audio::archive::encode_test_child(input, output, outcome)
-                }).expect("fallback");
+            let audio = archive_fixture(
+                tmp.path(),
+                &mut source,
+                &Local::now(),
+                SessionTranscriptArchive::Committed("words"),
+                |input, output| crate::audio::archive::encode_test_child(input, output, outcome),
+            )
+            .expect("fallback");
             assert_eq!(audio.extension().and_then(|s| s.to_str()), Some("wav"));
             assert_eq!(fs::read(&audio).expect("audio"), b"original WAV");
             assert_eq!(fs::read(source_path).expect("source"), b"original WAV");
-            assert_eq!(fs::read(audio.with_extension("txt")).expect("text"), b"words");
-            assert_eq!(fs::read_dir(audio.parent().expect("day")).expect("day").count(), 2);
+            assert_eq!(
+                fs::read(audio.with_extension("txt")).expect("text"),
+                b"words"
+            );
+            assert_eq!(
+                fs::read_dir(audio.parent().expect("day"))
+                    .expect("day")
+                    .count(),
+                2
+            );
         }
     }
 
@@ -1331,26 +1522,48 @@ mod tests {
         let _guard = EnvGuard::set_to_temp_dir("CODESCRIBE_DATA_DIR", &tmp);
         let source_path = tmp.path().join("source.wav");
         fs::write(&source_path, b"recover this voice").expect("source");
-        for transcript in [SessionTranscriptArchive::Committed("spoken words"),
-            SessionTranscriptArchive::NoSpeech, SessionTranscriptArchive::Unavailable("SECRET diagnostic")]
-        {
+        for transcript in [
+            SessionTranscriptArchive::Committed("spoken words"),
+            SessionTranscriptArchive::NoSpeech,
+            SessionTranscriptArchive::Unavailable("SECRET diagnostic"),
+        ] {
             let mut source = daily_archive::admit_source(&source_path).expect("admit");
-            let audio = archive_fixture(tmp.path(), &mut source, &Local::now(), transcript,
-                |_, _| Ok(())).expect("empty-success WAV fallback");
+            let audio = archive_fixture(
+                tmp.path(),
+                &mut source,
+                &Local::now(),
+                transcript,
+                |_, _| Ok(()),
+            )
+            .expect("empty-success WAV fallback");
             assert_eq!(audio.extension().and_then(|s| s.to_str()), Some("wav"));
             assert_eq!(fs::read(&audio).expect("audio"), b"recover this voice");
             let text = audio.with_extension("txt");
             match transcript {
-                SessionTranscriptArchive::Committed(words) => assert_eq!(fs::read_to_string(text).expect("text"), words),
-                SessionTranscriptArchive::NoSpeech => assert_eq!(fs::read(text).expect("marker"), b""),
+                SessionTranscriptArchive::Committed(words) => {
+                    assert_eq!(fs::read_to_string(text).expect("text"), words)
+                }
+                SessionTranscriptArchive::NoSpeech => {
+                    assert_eq!(fs::read(text).expect("marker"), b"")
+                }
                 SessionTranscriptArchive::Unavailable(_) => assert!(!text.exists()),
             }
         }
         let entries = recent_entries(10);
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|e| e.kind == TranscriptKind::Failed && e.preview == NO_SPEECH_HISTORY_TITLE));
-        assert_eq!(latest_copyable_entry().expect("copyable").preview, "spoken words");
-        assert_eq!(fs::read(source_path).expect("source"), b"recover this voice");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.kind == TranscriptKind::Failed && e.preview == NO_SPEECH_HISTORY_TITLE)
+        );
+        assert_eq!(
+            latest_copyable_entry().expect("copyable").preview,
+            "spoken words"
+        );
+        assert_eq!(
+            fs::read(source_path).expect("source"),
+            b"recover this voice"
+        );
     }
 
     /// Write a short PCM16 sine WAV fixture for m4a archive size/decode checks.

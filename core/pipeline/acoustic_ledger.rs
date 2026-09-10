@@ -883,7 +883,9 @@ impl AcousticLedger {
         let occurrence = &observation.occurrence;
         if observation.producer != ObservationProducer::Apple
             || text.trim().is_empty()
-            || !self.serial_of(occurrence).is_some_and(AcousticSerial::vad_closed)
+            || !self
+                .serial_of(occurrence)
+                .is_some_and(AcousticSerial::vad_closed)
             || self.is_sealed(occurrence)
             || self.committed.contains_key(occurrence)
             || self.answered.contains(observation)
@@ -949,7 +951,10 @@ impl AcousticLedger {
         if !frontier.is_closed() {
             return Err(SealRefusal::FrontierOpen);
         }
-        if self.text_of(occurrence).is_none_or(|text| text.trim().is_empty()) {
+        if self
+            .text_of(occurrence)
+            .is_none_or(|text| text.trim().is_empty())
+        {
             return Err(SealRefusal::LabelMissing);
         }
         let answered = self
@@ -1071,16 +1076,20 @@ impl AcousticLedger {
 
     /// Read-only lookup of an already minted scope-bearing receipt.
     pub fn seal_receipt(&self, id: &str) -> Option<&LedgerSealReceipt> {
-        self.seals.values().chain(self.terminal_seals.iter())
+        self.seals
+            .values()
+            .chain(self.terminal_seals.iter())
             .find(|seal| seal.receipt_id == id)
     }
 
     /// A projected finality reference must cover this exact occurrence.
     pub fn authenticates_seal_reference(&self, occurrence: &OccurrenceIdentity, id: &str) -> bool {
-        self.seal_of(occurrence).is_some_and(|seal| seal.receipt_id == id)
-            || self.terminal_seals.iter().any(|seal| {
-                seal.receipt_id == id && seal.sealed_occurrences.contains(occurrence)
-            })
+        self.seal_of(occurrence)
+            .is_some_and(|seal| seal.receipt_id == id)
+            || self
+                .terminal_seals
+                .iter()
+                .any(|seal| seal.receipt_id == id && seal.sealed_occurrences.contains(occurrence))
     }
 
     /// The seal held for one occurrence, if it is sealed.
@@ -1097,7 +1106,11 @@ impl AcousticLedger {
     fn seal_id(scope: LedgerSealScope, coverage: &OccurrenceIdentity) -> String {
         format!(
             "seal-{}-{}-{}-{}-{}",
-            scope.as_str(), coverage.session, coverage.capture_epoch, coverage.sample_start, coverage.sample_end
+            scope.as_str(),
+            coverage.session,
+            coverage.capture_epoch,
+            coverage.sample_start,
+            coverage.sample_end
         )
     }
 
@@ -1263,13 +1276,17 @@ impl AcousticLedger {
         if super::light_plus::apply_with_left_context(left_context, source_label) != shaped_text {
             return Err("incremental_shaping_not_deterministic");
         }
-        if self.incremental_shapings.iter().rev().find(|held| {
-            &held.occurrence == occurrence
-        }).is_some_and(|held| {
-            held.source_label == source_label
-                && held.shaped_text == shaped_text
-                && held.left_context == left_context
-        }) {
+        if self
+            .incremental_shapings
+            .iter()
+            .rev()
+            .find(|held| &held.occurrence == occurrence)
+            .is_some_and(|held| {
+                held.source_label == source_label
+                    && held.shaped_text == shaped_text
+                    && held.left_context == left_context
+            })
+        {
             return Err("incremental_shaping_unchanged");
         }
 
@@ -2603,22 +2620,39 @@ mod tests {
         let (mut ledger, occurrence) = whisper_only_qualified_ledger();
         let serial = ledger.serial_of(&occurrence).unwrap().clone();
         let whisper = obs(ObservationProducer::Whisper, 0, occurrence.clone());
-        assert_eq!(ledger.admit(&whisper, " "), MutationReceipt::Refuse {
-            occurrence: occurrence.clone(), reason: RefuseReason::EmptyLabel,
-        });
+        assert_eq!(
+            ledger.admit(&whisper, " "),
+            MutationReceipt::Refuse {
+                occurrence: occurrence.clone(),
+                reason: RefuseReason::EmptyLabel,
+            }
+        );
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
         assert_eq!(ledger.seal(&occurrence), Err(SealRefusal::LabelMissing));
-        assert_eq!(ledger.seal_terminal("s1", 1), Err(SealRefusal::LabelMissing));
+        assert_eq!(
+            ledger.seal_terminal("s1", 1),
+            Err(SealRefusal::LabelMissing)
+        );
         let prior = ledger.frontier_of(&occurrence).unwrap().clone();
         let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
         assert!(ledger.schedule_late_apple_label(&apple, "real words"));
-        assert!(prior.returned.is_subset(&ledger.frontier_of(&occurrence).unwrap().returned));
-        assert_eq!(ledger.admit(&apple, "real words"), MutationReceipt::Insert {
-            occurrence: occurrence.clone(),
-        });
+        assert!(
+            prior
+                .returned
+                .is_subset(&ledger.frontier_of(&occurrence).unwrap().returned)
+        );
+        assert_eq!(
+            ledger.admit(&apple, "real words"),
+            MutationReceipt::Insert {
+                occurrence: occurrence.clone(),
+            }
+        );
         assert!(!ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
         let lexicon = obs(ObservationProducer::Lexicon, 0, occurrence.clone());
-        assert!(matches!(ledger.admit(&lexicon, "real words"), MutationReceipt::Preserve { .. }));
+        assert!(matches!(
+            ledger.admit(&lexicon, "real words"),
+            MutationReceipt::Preserve { .. }
+        ));
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Lexicon));
         let seal = ledger.seal(&occurrence).unwrap().clone();
         assert_eq!(seal.layer_trail_ordinals, vec![0, 1, 2]);
@@ -2632,14 +2666,22 @@ mod tests {
     fn duplicate_empty_returns_do_not_seal_or_erase_evidence() {
         let (mut ledger, occurrence) = whisper_only_qualified_ledger();
         let whisper = obs(ObservationProducer::Whisper, 0, occurrence.clone());
-        assert!(matches!(ledger.admit(&whisper, ""), MutationReceipt::Refuse {
-            reason: RefuseReason::EmptyLabel, ..
-        }));
+        assert!(matches!(
+            ledger.admit(&whisper, ""),
+            MutationReceipt::Refuse {
+                reason: RefuseReason::EmptyLabel,
+                ..
+            }
+        ));
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
         let frontier = ledger.frontier_of(&occurrence).unwrap().clone();
-        assert!(matches!(ledger.admit(&whisper, ""), MutationReceipt::Refuse {
-            reason: RefuseReason::BatchDuplicate, ..
-        }));
+        assert!(matches!(
+            ledger.admit(&whisper, ""),
+            MutationReceipt::Refuse {
+                reason: RefuseReason::BatchDuplicate,
+                ..
+            }
+        ));
         assert!(!ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
         assert_eq!(ledger.frontier_of(&occurrence), Some(&frontier));
         assert_eq!(ledger.layer_trail().len(), 2);
@@ -2658,18 +2700,30 @@ mod tests {
             occ(1, 16_000),
             occ(0, 16_001),
         ] {
-            assert!(!ledger.schedule_late_apple_label(
-                &obs(ObservationProducer::Apple, 0, foreign), "words"));
+            assert!(
+                !ledger.schedule_late_apple_label(
+                    &obs(ObservationProducer::Apple, 0, foreign),
+                    "words"
+                )
+            );
         }
         let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
         assert!(!ledger.schedule_late_apple_label(&apple, " "));
         assert!(!ledger.schedule_late_apple_label(
-            &obs(ObservationProducer::Whisper, 1, occurrence.clone()), "words"));
+            &obs(ObservationProducer::Whisper, 1, occurrence.clone()),
+            "words"
+        ));
         assert_eq!(ledger.frontier_of(&occurrence), Some(&frontier));
         assert!(ledger.schedule_late_apple_label(&apple, "words"));
         assert!(!ledger.schedule_late_apple_label(&apple, "words"));
         assert!(!ledger.schedule_observer(occurrence.clone(), ObservationProducer::Whisper));
-        assert!(ledger.frontier_of(&occurrence).unwrap().returned.contains(&ObservationProducer::Whisper));
+        assert!(
+            ledger
+                .frontier_of(&occurrence)
+                .unwrap()
+                .returned
+                .contains(&ObservationProducer::Whisper)
+        );
     }
 
     #[test]
@@ -2681,9 +2735,13 @@ mod tests {
         let seal = ledger.seal(&occurrence).unwrap().clone();
         let apple = obs(ObservationProducer::Apple, 0, occurrence.clone());
         assert!(!ledger.schedule_late_apple_label(&apple, "late words"));
-        assert!(matches!(ledger.admit(&apple, "late words"), MutationReceipt::Refuse {
-            reason: RefuseReason::SealedReplay, ..
-        }));
+        assert!(matches!(
+            ledger.admit(&apple, "late words"),
+            MutationReceipt::Refuse {
+                reason: RefuseReason::SealedReplay,
+                ..
+            }
+        ));
         assert_eq!(ledger.text_of(&occurrence), Some("successful words"));
         let human = obs(ObservationProducer::ManualHuman, 1, occurrence.clone());
         assert!(ledger.admit(&human, "human correction").grants_mutation());
@@ -3487,15 +3545,32 @@ mod tests {
         assert!(ledger.is_qualified(&occurrence));
         assert!(ledger.text_of(&occurrence).is_some());
         assert!(!ledger.is_sealed(&occurrence));
-        assert_eq!(ledger.record_incremental_shaping("s1", 4, 5, &occurrence,
-            "jakieś słowa", "", "Jakieś słowa."),
-            Err("incremental_shaping_occurrence_not_sealed"));
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                4,
+                5,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "Jakieś słowa."
+            ),
+            Err("incremental_shaping_occurrence_not_sealed")
+        );
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Whisper));
         ledger.seal(&occurrence).unwrap();
-        assert_eq!(ledger.record_incremental_shaping("s1", 4, 5, &occurrence,
-            "jakieś słowa", "", "Unrelated bytes."),
-            Err("incremental_shaping_not_deterministic"));
+        assert_eq!(
+            ledger.record_incremental_shaping(
+                "s1",
+                4,
+                5,
+                &occurrence,
+                "jakieś słowa",
+                "",
+                "Unrelated bytes."
+            ),
+            Err("incremental_shaping_not_deterministic")
+        );
         assert!(ledger.incremental_shapings().is_empty());
     }
-
 }

@@ -11,7 +11,8 @@ use std::sync::Mutex;
 
 use chrono::{SecondsFormat, Utc};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, IncrementalShapingReceipt, SealCoverageReceipt, TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, IncrementalShapingReceipt, SealCoverageReceipt,
+    TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::TranscriptSegment;
 use serde::{Deserialize, Serialize};
@@ -465,8 +466,13 @@ impl TranscriptBus {
         receipt: &SealCoverageReceipt,
         text: &str,
     ) -> bool {
-        let writer = self.writer.lock().unwrap_or_else(|error| error.into_inner());
-        writer.started && !writer.ended && !writer.sealed
+        let writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        writer.started
+            && !writer.ended
+            && !writer.sealed
             && receipt.session_id == self.session.session_id
             && writer.last_projection.as_ref().is_some_and(|last| {
                 last.capture_epoch == receipt.capture_epoch
@@ -551,9 +557,11 @@ impl TranscriptBus {
             .writer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if writer.last_projection.as_ref().is_some_and(|last| {
-            revision.revision <= last.reducer_revision
-        }) {
+        if writer
+            .last_projection
+            .as_ref()
+            .is_some_and(|last| revision.revision <= last.reducer_revision)
+        {
             return Vec::new();
         }
         let is_manual_edit = matches!(
@@ -1012,8 +1020,8 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::emitter::{TranscriptReducer, UserRevisionIntent};
+    use super::*;
     use codescribe_core::pipeline::acoustic_ledger::{
         AcousticEvidence, DocumentRevisionProvenance, EnergyCalibration, ObservationIdentity,
         ObservationProducer, OccurrenceIdentity,
@@ -1086,12 +1094,22 @@ mod tests {
     fn coverage_refusal_ends_once_without_sealing_the_book() {
         use codescribe_core::stt::tail_provider::TailSampleRange;
         let dir = tempfile::tempdir().unwrap();
-        let bus = TranscriptBus::open_at(session("refused-book"), dir.path().join("bus.jsonl"), None).unwrap();
+        let bus =
+            TranscriptBus::open_at(session("refused-book"), dir.path().join("bus.jsonl"), None)
+                .unwrap();
         bus.publish_started();
         let (mut ledger, mut reducer, _) = committed_fixture("refused-book");
-        let receipt = ledger.assess_seal_coverage("refused-book", 7, &[TailSampleRange {
-            session: "refused-book".into(), capture_epoch: 7, sample_start: 0, sample_end: 64_000,
-        }], 8_000);
+        let receipt = ledger.assess_seal_coverage(
+            "refused-book",
+            7,
+            &[TailSampleRange {
+                session: "refused-book".into(),
+                capture_epoch: 7,
+                sample_start: 0,
+                sample_end: 64_000,
+            }],
+            8_000,
+        );
         assert!(ledger.record_seal_coverage(receipt.clone()));
         let revision = reducer.apply_seal_coverage(&receipt, None);
         let published = bus.publish_revision(&revision, &ledger);
@@ -1102,19 +1120,31 @@ mod tests {
         let forged_revision = reducer.apply_seal_coverage(&forged, None);
         assert!(bus.publish_revision(&forged_revision, &ledger).is_empty());
         assert!(bus.matches_refused_document(&receipt, &revision.rendered_text));
-        let terminal = bus.publish_ended(
-            TranscriptSessionEndReason::CoverageRefused, true, TranscriptDelivery::SinkAccepted,
-        ).unwrap();
+        let terminal = bus
+            .publish_ended(
+                TranscriptSessionEndReason::CoverageRefused,
+                true,
+                TranscriptDelivery::SinkAccepted,
+            )
+            .unwrap();
         assert!(!bus.writer.lock().unwrap().sealed);
         assert_eq!(terminal.phase, TranscriptProjectionPhase::CoverageRefused);
         assert_eq!(terminal.delivery, TranscriptDelivery::SinkAccepted);
         assert_eq!(terminal.rendered_text, revision.rendered_text);
-        assert_eq!(terminal.seal_coverage, Some(ProjectedSealCoverageReceipt::from(&receipt)));
+        assert_eq!(
+            terminal.seal_coverage,
+            Some(ProjectedSealCoverageReceipt::from(&receipt))
+        );
         assert!(terminal.lifecycle_terminal);
         assert!(terminal.can_retranscribe);
-        assert!(bus.publish_ended(
-            TranscriptSessionEndReason::Completed, true, TranscriptDelivery::SinkAccepted,
-        ).is_none());
+        assert!(
+            bus.publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::SinkAccepted,
+            )
+            .is_none()
+        );
         assert!(!bus.matches_refused_document(&receipt, &revision.rendered_text));
     }
 
@@ -1161,7 +1191,10 @@ mod tests {
         assert!(!revision.rendered_text.is_empty());
         for (event, entry) in events.iter().zip(&revision.entries) {
             assert_eq!(event.session_id, id);
-            assert_eq!(event.rendered_text.as_bytes(), revision.rendered_text.as_bytes());
+            assert_eq!(
+                event.rendered_text.as_bytes(),
+                revision.rendered_text.as_bytes()
+            );
             assert_eq!(event.occurrence_session_id, entry.occurrence.session);
             assert_eq!(event.capture_epoch, entry.occurrence.capture_epoch);
             assert_eq!(event.sample_start, entry.occurrence.sample_start);
@@ -1169,7 +1202,10 @@ mod tests {
             let receipt = &event.acoustic_receipts[0];
             assert_eq!(receipt.session_id, id);
             assert_eq!(receipt.word_evidence_receipts, entry.word_evidence_receipts);
-            assert_eq!(receipt.layer_decision_receipts, entry.layer_decision_receipts);
+            assert_eq!(
+                receipt.layer_decision_receipts,
+                entry.layer_decision_receipts
+            );
             assert_eq!(receipt.seal_receipt, entry.seal_receipt);
             assert_eq!(receipt.manual_edit_receipt, entry.manual_edit_receipt);
             assert_eq!(event.delivery, TranscriptDelivery::Unattempted);
@@ -1178,22 +1214,30 @@ mod tests {
     }
 
     fn end_once(bus: &TranscriptBus, expected: &str) -> TranscriptBusEvidenceEvent {
-        let terminal = bus.publish_ended(
-            TranscriptSessionEndReason::Completed,
-            true,
-            TranscriptDelivery::ComposerPending,
-        ).expect("live terminal survives persistence failure");
+        let terminal = bus
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::ComposerPending,
+            )
+            .expect("live terminal survives persistence failure");
         assert_eq!(terminal.rendered_text.as_bytes(), expected.as_bytes());
         assert!(terminal.lifecycle_terminal);
         assert!(terminal.terminal);
         assert!(terminal.can_copy);
         assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
-        assert!(bus.publish_ended(
-            TranscriptSessionEndReason::Completed,
-            true,
-            TranscriptDelivery::SinkAccepted,
-        ).is_none());
-        assert_eq!(bus.writer.lock().unwrap().last_projection.as_ref(), Some(&terminal));
+        assert!(
+            bus.publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::SinkAccepted,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            bus.writer.lock().unwrap().last_projection.as_ref(),
+            Some(&terminal)
+        );
         terminal
     }
 
@@ -1225,7 +1269,10 @@ mod tests {
             .with_writer(move || log_file.try_clone().unwrap())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            let bus = TranscriptBus::open_with_path(session("diagnostic-fault"), temp.path().to_path_buf());
+            let bus = TranscriptBus::open_with_path(
+                session("diagnostic-fault"),
+                temp.path().to_path_buf(),
+            );
             bus.publish_started();
             let (ledger, _, revision) = committed_fixture("diagnostic-fault");
             bus.publish_revision(&revision, &ledger);
@@ -1258,7 +1305,10 @@ mod tests {
             assert_eq!(events[1].sequence, 3);
             end_once(&bus, &revision.rendered_text);
             assert!(bus.writer.lock().unwrap().file.is_none());
-            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), usize::from(!fail_start));
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap().lines().count(),
+                usize::from(!fail_start)
+            );
         }
     }
 
@@ -1282,7 +1332,10 @@ mod tests {
             assert_eq!(terminal.sequence, 4);
             assert_eq!(terminal.acoustic_receipts, events[1].acoustic_receipts);
             assert!(bus.writer.lock().unwrap().file.is_none());
-            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), if flush { 4 } else { 3 });
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap().lines().count(),
+                if flush { 4 } else { 3 }
+            );
         }
     }
 
@@ -1296,7 +1349,11 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
         fault.lock().unwrap().remaining = Some(19);
         let (ledger, _, revision) = committed_fixture("prefix");
-        assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "prefix");
+        assert_committed(
+            &bus.publish_revision(&revision, &ledger),
+            &revision,
+            "prefix",
+        );
         let partial = std::fs::read(&path).unwrap();
         assert_eq!(partial.len(), before.len() + 19);
         assert!(!partial.ends_with(b"\n"));
@@ -1308,9 +1365,13 @@ mod tests {
 
         let next = TranscriptBus::open_with_path(session("next"), path.clone());
         next.publish_started();
-        let empty = next.publish_ended(
-            TranscriptSessionEndReason::Completed, false, TranscriptDelivery::Unattempted,
-        ).unwrap();
+        let empty = next
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                false,
+                TranscriptDelivery::Unattempted,
+            )
+            .unwrap();
         assert!(empty.rendered_text.is_empty());
         assert_eq!(empty.session_id, "next");
         assert_eq!(empty.phase, TranscriptProjectionPhase::NoSpeech);
@@ -1322,7 +1383,11 @@ mod tests {
         let recovered = TranscriptBus::open_with_path(session("recovered"), path.clone());
         recovered.publish_started();
         let (ledger, _, revision) = committed_fixture("recovered");
-        assert_committed(&recovered.publish_revision(&revision, &ledger), &revision, "recovered");
+        assert_committed(
+            &recovered.publish_revision(&revision, &ledger),
+            &revision,
+            "recovered",
+        );
         end_once(&recovered, &revision.rendered_text);
         let rows = std::fs::read_to_string(path).unwrap();
         assert_eq!(rows.lines().count(), 4);
@@ -1341,7 +1406,11 @@ mod tests {
         bus.publish_started();
         fault.lock().unwrap().flush = true;
         let (ledger, _, revision) = committed_fixture("flush");
-        assert_committed(&bus.publish_revision(&revision, &ledger), &revision, "flush");
+        assert_committed(
+            &bus.publish_revision(&revision, &ledger),
+            &revision,
+            "flush",
+        );
         let uncertain = std::fs::read(&path).unwrap();
         let writes = fault.lock().unwrap().writes;
         let flushes = fault.lock().unwrap().flushes;
@@ -1352,9 +1421,13 @@ mod tests {
         assert_eq!(fault.lock().unwrap().flushes, flushes);
         let next = TranscriptBus::open_with_path(session("after-flush"), path.clone());
         next.publish_started();
-        let terminal = next.publish_ended(
-            TranscriptSessionEndReason::Completed, false, TranscriptDelivery::Unattempted,
-        ).unwrap();
+        let terminal = next
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                false,
+                TranscriptDelivery::Unattempted,
+            )
+            .unwrap();
         assert!(terminal.rendered_text.is_empty());
         let rows = std::fs::read_to_string(path).unwrap();
         assert_eq!(rows.lines().count(), 4);
@@ -1385,20 +1458,40 @@ mod tests {
             if failing {
                 fault.lock().unwrap().remaining = Some(0);
             }
-            let edited = reducer.apply_user_revision(&mut ledger, &UserRevisionIntent {
-                session_id: "edit".to_string(),
-                source_revision: sealed.revision,
-                rendered_text: "Poprawione — dokładne bajty.\nDrugi wiersz.".to_string(),
-                provenance: DocumentRevisionProvenance::UserEdit,
-            }).unwrap();
+            let edited = reducer
+                .apply_user_revision(
+                    &mut ledger,
+                    &UserRevisionIntent {
+                        session_id: "edit".to_string(),
+                        source_revision: sealed.revision,
+                        rendered_text: "Poprawione — dokładne bajty.\nDrugi wiersz.".to_string(),
+                        provenance: DocumentRevisionProvenance::UserEdit,
+                    },
+                )
+                .unwrap();
             let events = bus.publish_revision(&edited, &ledger);
             assert_committed(&events, &edited, "edit");
-            assert!(events.iter().all(|event| event.terminal && event.reducer_action == "apply_manual_edit"));
-            assert!(bus.publish_ended(
-                TranscriptSessionEndReason::Completed, true, TranscriptDelivery::ComposerPending,
-            ).is_none());
-            assert_eq!(bus.writer.lock().unwrap().last_projection.as_ref(), events.last());
-            assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), if failing { 6 } else { 8 });
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.terminal && event.reducer_action == "apply_manual_edit")
+            );
+            assert!(
+                bus.publish_ended(
+                    TranscriptSessionEndReason::Completed,
+                    true,
+                    TranscriptDelivery::ComposerPending,
+                )
+                .is_none()
+            );
+            assert_eq!(
+                bus.writer.lock().unwrap().last_projection.as_ref(),
+                events.last()
+            );
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap().lines().count(),
+                if failing { 6 } else { 8 }
+            );
         }
     }
 
@@ -1648,12 +1741,17 @@ mod tests {
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
         let seal = ledger.seal(&occurrence).unwrap().clone();
         reducer.apply_ledger_seal(&seal).unwrap();
-        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let mut revision = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .unwrap();
         revision.rendered_text = "Unrelated replacement without source authority.".to_string();
         let temp = tempfile::tempdir().unwrap();
         let bus = TranscriptBus::open_at(
-            session("shaping-bytes"), temp.path().join("bus.jsonl"), None,
-        ).unwrap();
+            session("shaping-bytes"),
+            temp.path().join("bus.jsonl"),
+            None,
+        )
+        .unwrap();
         assert!(bus.publish_revision(&revision, &ledger).is_empty());
         assert!(bus.writer.lock().unwrap().last_projection.is_none());
     }
@@ -1666,7 +1764,9 @@ mod tests {
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
         let seal = ledger.seal(&occurrence).unwrap().clone();
         reducer.apply_ledger_seal(&seal).unwrap();
-        let mut revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let mut revision = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .unwrap();
         let crate::presentation::emitter::ReducerAction::ApplyIncrementalShaping { receipt } =
             &mut revision.action
         else {
@@ -1675,8 +1775,11 @@ mod tests {
         receipt.receipt_id = "light-plus-incremental-not-minted".to_string();
         let temp = tempfile::tempdir().unwrap();
         let bus = TranscriptBus::open_at(
-            session("shaping-forgery"), temp.path().join("bus.jsonl"), None,
-        ).unwrap();
+            session("shaping-forgery"),
+            temp.path().join("bus.jsonl"),
+            None,
+        )
+        .unwrap();
         assert!(bus.publish_revision(&revision, &ledger).is_empty());
         assert!(bus.writer.lock().unwrap().last_projection.is_none());
     }
@@ -1750,11 +1853,14 @@ mod tests {
             let seal = ledger.seal(occurrence).unwrap().clone();
             reducer.apply_ledger_seal(&seal).unwrap();
         }
-        let shaped = reducer.apply_incremental_shaping(&mut ledger, &first).unwrap();
+        let shaped = reducer
+            .apply_incremental_shaping(&mut ledger, &first)
+            .unwrap();
         let revision = reducer.record_context_marker(0, "context").unwrap();
         assert!(revision.revision > shaped.revision);
         let temp = tempfile::tempdir().unwrap();
-        let bus = TranscriptBus::open_at(session("retained-proof"), temp.path().join("bus"), None).unwrap();
+        let bus = TranscriptBus::open_at(session("retained-proof"), temp.path().join("bus"), None)
+            .unwrap();
         let mut candidates = Vec::new();
         let mut altered = revision.clone();
         altered.rendered_text.push_str(" injected");
@@ -1763,10 +1869,19 @@ mod tests {
         missing.entries[0].presentation_receipt = None;
         candidates.push(missing);
         let mut fabricated = revision.clone();
-        fabricated.entries[0].presentation_receipt.as_mut().unwrap().receipt_id.push_str("-forged");
+        fabricated.entries[0]
+            .presentation_receipt
+            .as_mut()
+            .unwrap()
+            .receipt_id
+            .push_str("-forged");
         candidates.push(fabricated);
         let mut stale_source = revision.clone();
-        stale_source.entries[0].presentation_receipt.as_mut().unwrap().source_revision += 1;
+        stale_source.entries[0]
+            .presentation_receipt
+            .as_mut()
+            .unwrap()
+            .source_revision += 1;
         candidates.push(stale_source);
         let mut reordered = revision.clone();
         reordered.entries.swap(0, 1);
@@ -1794,8 +1909,15 @@ mod tests {
         assert!(bus.publish_revision(&revision, &without_shaping).is_empty());
         let rows = bus.publish_revision(&revision, &ledger);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].acoustic_receipts[0].presentation_receipt.as_ref().unwrap().revision,
-            shaped.revision, "retained provenance names its original revision");
+        assert_eq!(
+            rows[0].acoustic_receipts[0]
+                .presentation_receipt
+                .as_ref()
+                .unwrap()
+                .revision,
+            shaped.revision,
+            "retained provenance names its original revision"
+        );
         assert!(rows[1].acoustic_receipts[0].presentation_receipt.is_none());
         let bytes = std::fs::read(temp.path().join("bus")).unwrap();
         assert!(bus.publish_revision(&revision, &ledger).is_empty());
@@ -1803,19 +1925,29 @@ mod tests {
 
         let manual = ObservationIdentity::new(ObservationProducer::ManualHuman, 99, 0, first);
         assert!(ledger.admit(&manual, "replacement").grants_mutation());
-        let fresh_bus = TranscriptBus::open_at(session("retained-proof"), temp.path().join("stale"), None).unwrap();
-        assert!(fresh_bus.publish_revision(&revision, &ledger).is_empty(),
-            "an intact old snapshot is still refused after its acoustic source changes");
+        let fresh_bus =
+            TranscriptBus::open_at(session("retained-proof"), temp.path().join("stale"), None)
+                .unwrap();
+        assert!(
+            fresh_bus.publish_revision(&revision, &ledger).is_empty(),
+            "an intact old snapshot is still refused after its acoustic source changes"
+        );
     }
 
     #[test]
     fn serialized_projection_absence_and_malformed_proof_never_mint_authority() {
         let (mut ledger, mut reducer, plain) = committed_fixture("serialized-shape");
         let temp = tempfile::tempdir().unwrap();
-        let bus = TranscriptBus::open_at(session("serialized-shape"), temp.path().join("bus"), None).unwrap();
+        let bus =
+            TranscriptBus::open_at(session("serialized-shape"), temp.path().join("bus"), None)
+                .unwrap();
         let plain_rows = bus.publish_revision(&plain, &ledger);
         let old = serde_json::to_value(&plain_rows[0]).unwrap();
-        assert!(old["acoustic_receipts"][0].get("presentation_receipt").is_none());
+        assert!(
+            old["acoustic_receipts"][0]
+                .get("presentation_receipt")
+                .is_none()
+        );
         let old: TranscriptBusEvidenceEvent = serde_json::from_value(old).unwrap();
         assert!(old.acoustic_receipts[0].presentation_receipt.is_none());
         let occurrence = OccurrenceIdentity::new("serialized-shape", 7, 0, 16_000);
@@ -1823,27 +1955,45 @@ mod tests {
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
         let seal = ledger.seal(&occurrence).unwrap().clone();
         reducer.apply_ledger_seal(&seal).unwrap();
-        let revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let revision = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .unwrap();
         let rows = bus.publish_revision(&revision, &ledger);
         let encoded = serde_json::to_value(&rows[0]).unwrap();
         let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(decoded.acoustic_receipts[0].presentation_receipt,
-            rows[0].acoustic_receipts[0].presentation_receipt);
-        for field in ["source_revision", "source_seal_receipt", "left_context", "left_context_sha256", "shaped_text"] {
+        assert_eq!(
+            decoded.acoustic_receipts[0].presentation_receipt,
+            rows[0].acoustic_receipts[0].presentation_receipt
+        );
+        for field in [
+            "source_revision",
+            "source_seal_receipt",
+            "left_context",
+            "left_context_sha256",
+            "shaped_text",
+        ] {
             let mut incomplete = encoded.clone();
-            incomplete["acoustic_receipts"][0]["presentation_receipt"].as_object_mut().unwrap().remove(field);
+            incomplete["acoustic_receipts"][0]["presentation_receipt"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
             assert!(serde_json::from_value::<TranscriptBusEvidenceEvent>(incomplete).is_err());
         }
         // A decoded observer record is not a TranscriptRevision capability.
         // Rewriting it never enters publish_revision or creates a ledger receipt.
         let count = ledger.incremental_shapings().len();
         let mut fabricated = encoded;
-        fabricated["acoustic_receipts"][0]["presentation_receipt"]["receipt_id"] = "not-minted".into();
+        fabricated["acoustic_receipts"][0]["presentation_receipt"]["receipt_id"] =
+            "not-minted".into();
         let decoded: TranscriptBusEvidenceEvent = serde_json::from_value(fabricated).unwrap();
         assert!(!ledger.incremental_shapings().iter().any(|receipt| {
-            receipt.receipt_id == decoded.acoustic_receipts[0].presentation_receipt.as_ref().unwrap().receipt_id
+            receipt.receipt_id
+                == decoded.acoustic_receipts[0]
+                    .presentation_receipt
+                    .as_ref()
+                    .unwrap()
+                    .receipt_id
         }));
         assert_eq!(ledger.incremental_shapings().len(), count);
     }
-
 }

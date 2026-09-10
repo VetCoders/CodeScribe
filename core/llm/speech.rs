@@ -583,7 +583,10 @@ mod rc_w1_tests {
         speed.speed = 1.25;
         variants.push(speed);
         for variant in variants {
-            assert_ne!(key, authenticated_cache_key(&variant, "Hello", &auth, ENDPOINT));
+            assert_ne!(
+                key,
+                authenticated_cache_key(&variant, "Hello", &auth, ENDPOINT)
+            );
         }
         for (text, endpoint, bearer, source) in [
             ("Other", ENDPOINT, "test-key", AuthSource::ApiKey),

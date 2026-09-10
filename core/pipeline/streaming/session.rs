@@ -48,7 +48,10 @@ impl LocalExecutionOwner {
         T: Send + 'static,
         F: FnOnce(&crate::stt::LocalExecutionControl) -> Result<T> + Send + 'static,
     {
-        let mut handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.control.check()?;
         // Reap finished requests during long captures; never accumulate one
         // native handle per utterance until Stop.
@@ -64,13 +67,15 @@ impl LocalExecutionOwner {
         }
         let control = self.control.clone();
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let handle = std::thread::Builder::new().name("local-stt".into()).spawn(move || {
-            let result = control.check().and_then(|()| work(&control));
-            // A native call may return after cancellation. Its label is never
-            // a successful completion, even if the provider ignored control.
-            let result = control.check().and(result);
-            let _ = sender.send(result);
-        })?;
+        let handle = std::thread::Builder::new()
+            .name("local-stt".into())
+            .spawn(move || {
+                let result = control.check().and_then(|()| work(&control));
+                // A native call may return after cancellation. Its label is never
+                // a successful completion, even if the provider ignored control.
+                let result = control.check().and(result);
+                let _ = sender.send(result);
+            })?;
         handles.push(handle);
         Ok(receiver)
     }
@@ -79,7 +84,10 @@ impl LocalExecutionOwner {
         self.control.cancel();
         loop {
             let finished = {
-                let handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let handles = self
+                    .handles
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 handles.iter().all(std::thread::JoinHandle::is_finished)
             };
             if finished {
@@ -93,7 +101,10 @@ impl LocalExecutionOwner {
     }
 
     fn join_retained(&self) {
-        let mut handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut handles = self
+            .handles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for handle in handles.drain(..) {
             if handle.join().is_err() {
                 warn!("local execution worker panicked while joining");
@@ -357,7 +368,9 @@ pub(super) fn compute_tail_patch_job(
         request,
         config,
         move |request, pcm, control| {
-            crate::stt::tail_provider::transcribe_selected_controlled(provider, request, pcm, control)
+            crate::stt::tail_provider::transcribe_selected_controlled(
+                provider, request, pcm, control,
+            )
         },
     )
 }
@@ -373,8 +386,13 @@ fn compute_tail_patch_job_with<F>(
     transcribe: F,
 ) -> futures_util::future::BoxFuture<'static, Result<TailPatchJobResult>>
 where
-    F: FnOnce(&TailProviderRequest, &[f32], &crate::stt::LocalExecutionControl)
-        -> Result<TailProviderPayload> + Send + 'static,
+    F: FnOnce(
+            &TailProviderRequest,
+            &[f32],
+            &crate::stt::LocalExecutionControl,
+        ) -> Result<TailProviderPayload>
+        + Send
+        + 'static,
 {
     debug_assert_eq!(
         committed_text.trim(),
@@ -400,7 +418,9 @@ where
     });
     let control = owner.control.clone();
     Box::pin(async move {
-        let result = receiver?.await.map_err(|e| anyhow!("tail patch worker task failed: {e}"))?;
+        let result = receiver?
+            .await
+            .map_err(|e| anyhow!("tail patch worker task failed: {e}"))?;
         control.check()?;
         result
     })
@@ -811,21 +831,30 @@ mod local_execution_tests {
         let owner = LocalExecutionOwner::default();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let receiver = owner.spawn(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok("late label")
-        }).unwrap();
+        let receiver = owner
+            .spawn(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("late label")
+            })
+            .unwrap();
         entered_rx.await.unwrap();
         // The ledger's accounting may now close and discard its receiver.
         drop(receiver);
         let mut join = Box::pin(owner.close_and_join());
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut join).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut join)
+                .await
+                .is_err()
+        );
         assert_eq!(owner.handles.lock().unwrap().len(), 1);
         release_tx.send(()).unwrap();
         join.await;
         assert!(owner.handles.lock().unwrap().is_empty());
-        assert!(owner.spawn(|_| Ok(())).is_err(), "closed admission cannot restart");
+        assert!(
+            owner.spawn(|_| Ok(())).is_err(),
+            "closed admission cannot restart"
+        );
     }
 
     #[tokio::test]
@@ -834,16 +863,26 @@ mod local_execution_tests {
         let successor = LocalExecutionOwner::default();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let receiver = owner.spawn(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok("old-session label")
-        }).unwrap();
+        let receiver = owner
+            .spawn(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("old-session label")
+            })
+            .unwrap();
         entered_rx.await.unwrap();
         owner.control.cancel();
         release_tx.send(()).unwrap();
         assert!(receiver.await.unwrap().is_err());
-        assert_eq!(successor.spawn(|_| Ok("new-session label")).unwrap().await.unwrap().unwrap(), "new-session label");
+        assert_eq!(
+            successor
+                .spawn(|_| Ok("new-session label"))
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap(),
+            "new-session label"
+        );
         owner.close_and_join().await;
         successor.close_and_join().await;
     }
@@ -853,13 +892,19 @@ mod local_execution_tests {
         let owner = LocalExecutionOwner::default();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let receiver = owner.spawn(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok(())
-        }).unwrap();
+        let receiver = owner
+            .spawn(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
         entered_rx.await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(20), owner.close_and_join()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), owner.close_and_join())
+                .await
+                .is_err()
+        );
         assert_eq!(owner.handles.lock().unwrap().len(), 1);
         release_tx.send(()).unwrap();
         owner.close_and_join().await;
@@ -875,27 +920,45 @@ mod local_execution_tests {
         let request = TailProviderRequest {
             identity: TailRequestIdentity {
                 request_id: 42,
-                range: TailSampleRange { session: "original".into(), capture_epoch: 7, sample_start: 100, sample_end: 104 },
+                range: TailSampleRange {
+                    session: "original".into(),
+                    capture_epoch: 7,
+                    sample_start: 100,
+                    sample_end: 104,
+                },
             },
             sample_rate: 16_000,
             language: None,
         };
         let job = compute_tail_patch_job_with(
-            &owner, 42, "Iwo".into(), String::new(), vec![0.25; 4], request,
+            &owner,
+            42,
+            "Iwo".into(),
+            String::new(),
+            vec![0.25; 4],
+            request,
             TailPatchConfig::default(),
             move |request, pcm, _| {
                 request.validate_pcm(pcm)?;
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(TailProviderPayload {
-                    identity: request.identity.clone(), text: "Iwo".into(),
-                    segments: vec![TimedTailSegment { text: "Iwo".into(), range: request.identity.range.clone() }],
-                    avg_logprob: None, compression_ratio: None,
-                    provider_id: TailProviderId::Fake, elapsed_ms: 0,
+                    identity: request.identity.clone(),
+                    text: "Iwo".into(),
+                    segments: vec![TimedTailSegment {
+                        text: "Iwo".into(),
+                        range: request.identity.range.clone(),
+                    }],
+                    avg_logprob: None,
+                    compression_ratio: None,
+                    provider_id: TailProviderId::Fake,
+                    elapsed_ms: 0,
                     evidence: crate::stt::tail_provider::TailProviderEvidence {
-                        source: TailEvidenceSource::Whisper, revision: None,
+                        source: TailEvidenceSource::Whisper,
+                        revision: None,
                         stability: TailEvidenceStability::Final,
-                        timing_quality: TailTimingQuality::ExactSampleRange, avg_logprob: None,
+                        timing_quality: TailTimingQuality::ExactSampleRange,
+                        avg_logprob: None,
                     },
                 })
             },
@@ -905,7 +968,10 @@ mod local_execution_tests {
         assert_eq!(owner.handles.lock().unwrap().len(), 1);
         owner.control.cancel();
         release_tx.send(()).unwrap();
-        assert!(job.await.is_err(), "cancelled native success cannot become a tail completion");
+        assert!(
+            job.await.is_err(),
+            "cancelled native success cannot become a tail completion"
+        );
         owner.close_and_join().await;
         assert!(owner.handles.lock().unwrap().is_empty());
     }

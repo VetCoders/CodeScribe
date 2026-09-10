@@ -8,7 +8,8 @@ use codescribe::presentation::status_projection::{
     PresentationStatusKind, PresentationStatusProjection,
 };
 use codescribe::presentation::transcript_bus::{
-    ProjectedAcousticReceipt, ProjectedPresentationReceipt, TranscriptBusEvidenceEvent, TranscriptDelivery,
+    ProjectedAcousticReceipt, ProjectedPresentationReceipt, TranscriptBusEvidenceEvent,
+    TranscriptDelivery,
 };
 use codescribe_core::pipeline::contracts::{AnnotationKind, LayerSource, LayerSummary};
 use cpal::traits::{DeviceTrait, HostTrait};
@@ -210,7 +211,9 @@ impl CsProjectedAcousticReceipt {
             layer_decision_receipts: receipt.layer_decision_receipts.clone(),
             seal_receipt: receipt.seal_receipt.clone(),
             manual_edit_receipt: receipt.manual_edit_receipt.clone(),
-            presentation_receipt: receipt.presentation_receipt.as_ref()
+            presentation_receipt: receipt
+                .presentation_receipt
+                .as_ref()
                 .map(CsProjectedPresentationReceipt::from_bus_receipt),
         }
     }
@@ -962,38 +965,67 @@ mod tests {
         let occurrence = OccurrenceIdentity::new("bridge-shaping", 3, 32_000, 48_000);
         let calibration = EnergyCalibration::new("bridge-fixture", 1.0, 1);
         let evidence = AcousticEvidence {
-            occurrence: occurrence.clone(), duration_ms: 1_000.0, energy_integral: 10.0,
-            mean_rms_dbfs: -12.0, peak_dbfs: -3.0,
-            vad_open_sample: Some(32_000), vad_close_sample: Some(48_000),
+            occurrence: occurrence.clone(),
+            duration_ms: 1_000.0,
+            energy_integral: 10.0,
+            mean_rms_dbfs: -12.0,
+            peak_dbfs: -3.0,
+            vad_open_sample: Some(32_000),
+            vad_close_sample: Some(48_000),
             evidence_calibration_version: calibration.version.clone(),
         };
         assert!(ledger.qualify(&evidence, &calibration).is_qualified());
-        let observation = ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence.clone());
+        let observation =
+            ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence.clone());
         let mutation = ledger.admit(&observation, "zażółć gęślą");
-        reducer.apply_ledger_mutation(&ledger, &observation, &mutation).unwrap();
+        reducer
+            .apply_ledger_mutation(&ledger, &observation, &mutation)
+            .unwrap();
         ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
         assert!(ledger.note_frontier_return(&occurrence, ObservationProducer::Apple));
         let seal = ledger.seal(&occurrence).unwrap().clone();
         reducer.apply_ledger_seal(&seal).unwrap();
-        let revision = reducer.apply_incremental_shaping(&mut ledger, &occurrence).unwrap();
+        let revision = reducer
+            .apply_incremental_shaping(&mut ledger, &occurrence)
+            .unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let bus = TranscriptBus::open_at(TranscriptSession {
-            session_id: "bridge-shaping".to_string(), mode: TranscriptMode::Agent,
-            has_latched_target: false, latched_target_is_self: false,
-        }, temp.path().join("bus"), None).unwrap();
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "bridge-shaping".to_string(),
+                mode: TranscriptMode::Agent,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            temp.path().join("bus"),
+            None,
+        )
+        .unwrap();
         let events = bus.publish_revision(&revision, &ledger);
         assert_eq!(events.len(), 1);
         let projected = CsTranscriptProjectionEvent::from_bus_event(&events[0]);
-        let actual = projected.acoustic_receipts[0].presentation_receipt.as_ref().unwrap();
+        let actual = projected.acoustic_receipts[0]
+            .presentation_receipt
+            .as_ref()
+            .unwrap();
         let minted = &ledger.incremental_shapings()[0];
-        assert_eq!(actual, &CsProjectedPresentationReceipt {
-            receipt_id: minted.receipt_id.clone(), provenance: "light-plus".to_string(),
-            session_id: "bridge-shaping".to_string(), source_revision: minted.source_revision,
-            revision: minted.revision, capture_epoch: 3, sample_start: 32_000, sample_end: 48_000,
-            source_seal_receipt: seal.receipt_id, source_label: "zażółć gęślą".to_string(),
-            left_context: String::new(), left_context_sha256: minted.left_context_sha256.clone(),
-            shaped_text: "Zażółć gęślą.".to_string(),
-        });
+        assert_eq!(
+            actual,
+            &CsProjectedPresentationReceipt {
+                receipt_id: minted.receipt_id.clone(),
+                provenance: "light-plus".to_string(),
+                session_id: "bridge-shaping".to_string(),
+                source_revision: minted.source_revision,
+                revision: minted.revision,
+                capture_epoch: 3,
+                sample_start: 32_000,
+                sample_end: 48_000,
+                source_seal_receipt: seal.receipt_id,
+                source_label: "zażółć gęślą".to_string(),
+                left_context: String::new(),
+                left_context_sha256: minted.left_context_sha256.clone(),
+                shaped_text: "Zażółć gęślą.".to_string(),
+            }
+        );
         assert_eq!(projected.rendered_text, actual.shaped_text);
         assert!(projected.acoustic_receipts[0].manual_edit_receipt.is_none());
         assert_eq!(projected.phase, "listening");

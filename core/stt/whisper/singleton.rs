@@ -380,9 +380,7 @@ fn with_engine_initial_prompt<R>(
     initial_prompt: Option<String>,
     f: impl FnOnce(&mut LocalWhisperEngine) -> Result<R>,
 ) -> Result<R> {
-    with_engine(|engine| {
-        engine.with_request(initial_prompt, f)
-    })
+    with_engine(|engine| engine.with_request(initial_prompt, f))
 }
 
 /// Full-file decoding is deliberately prompt-free. The live A/B measured a
@@ -473,7 +471,11 @@ pub fn transcribe_with_segments_with_initial_prompt(
     initial_prompt: Option<String>,
 ) -> Result<RawTranscript> {
     transcribe_controlled(
-        samples, sample_rate, language, initial_prompt, &LocalExecutionControl::default(),
+        samples,
+        sample_rate,
+        language,
+        initial_prompt,
+        &LocalExecutionControl::default(),
     )
 }
 
