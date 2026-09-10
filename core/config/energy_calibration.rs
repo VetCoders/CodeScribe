@@ -779,7 +779,17 @@ impl SealedEnergyCalibration {
     /// Read the artifact once. Never fails: absence and refusal are encoded as
     /// explicit states so the snapshot still seals and admission can name them.
     pub fn load(path: &Path) -> Self {
-        match EnergyCalibrationArtifact::load(path) {
+        super::loader::note_startup_acquisition("calibration file");
+        Self::from_captured(path, EnergyCalibrationArtifact::load(path))
+    }
+
+    /// Seal an already captured acquisition result, including absence/refusal.
+    /// This does not read a file, clock or device or invent calibration evidence.
+    pub fn from_captured(
+        path: &Path,
+        captured: Result<Option<EnergyCalibrationArtifact>, EnergyCalibrationRefusal>,
+    ) -> Self {
+        match captured {
             Ok(Some(artifact)) => Self {
                 status: EnergyCalibrationStatus::Sealed {
                     path: path.to_path_buf(),
@@ -1201,5 +1211,27 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod captured_calibration_tests {
+    use super::*;
+
+    #[test]
+    fn captured_missing_and_refused_never_invent_artifacts() {
+        let probe = crate::config::StartupAcquisitionProbe::forbid();
+        let path = Path::new("/fixture/calibration.json");
+        let missing = SealedEnergyCalibration::from_captured(path, Ok(None));
+        assert!(matches!(missing.status(), EnergyCalibrationStatus::Missing { path: p } if p == path));
+        assert!(missing.artifact().is_none());
+        assert!(missing.sha256().is_none());
+        let refused = SealedEnergyCalibration::from_captured(path, Err(EnergyCalibrationRefusal::Malformed {
+            path: path.to_path_buf(), reason: "captured corrupt bytes".into(),
+        }));
+        assert!(matches!(refused.status(), EnergyCalibrationStatus::Refused { path: p, .. } if p == path));
+        assert!(refused.artifact().is_none());
+        assert!(refused.sha256().is_none());
+        assert!(probe.attempts().is_empty());
     }
 }
