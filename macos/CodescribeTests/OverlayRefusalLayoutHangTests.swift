@@ -47,6 +47,23 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
     try assertStatusCardLayoutReturns(revisions: 14, label: "control")
   }
 
+  @MainActor
+  func testToastClearObservationThrowsWhenDeadlineExpiresWithToastPresent() throws {
+    let state = OverlayState()
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    state.applyTranscriptProjection(listeningProjection(sentence, sequence: 1))
+    state.handleError(message: refusal)
+    let toast = try XCTUnwrap(state.toast)
+
+    // The real expiry task cannot run during this synchronous MainActor beat.
+    // An already-expired observation deadline must fail, never count as removal.
+    XCTAssertThrowsError(try waitForToastClear(state, timeout: 0)) { error in
+      XCTAssertEqual(error as? ToastClearObservationError, .toastStillPresent(toast))
+    }
+    XCTAssertEqual(state.toast, toast, "observation must not clear the toast itself")
+  }
+
   // MARK: Production transition (handleError → abort → toast)
 
   @MainActor
@@ -79,7 +96,9 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
     )
 
     // Second preference change of the same beat: the toast clears after 2.6 s.
-    RunLoop.main.run(until: Date().addingTimeInterval(3.0))
+    // Its production timer already ran during measureLayout. Keep the former
+    // 3 s ceiling, but stop waiting as soon as removal is actually observed.
+    try waitForToastClear(state)
     XCTAssertNil(state.toast, "toast must have cleared before measuring its removal")
     let toastElapsed = measureLayout(root)
     print(
@@ -104,6 +123,24 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
   }
 
   // MARK: Harness
+
+  private enum ToastClearObservationError: Error, Equatable {
+    case toastStillPresent(String)
+  }
+
+  @MainActor
+  private func waitForToastClear(_ state: OverlayState, timeout: TimeInterval = 3.0) throws {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while let toast = state.toast {
+      let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      guard remaining > 0 else {
+        throw ToastClearObservationError.toastStillPresent(toast)
+      }
+      // Service AppKit, SwiftUI and the real MainActor expiry task between
+      // observations. No blocking sleep, fake expiry or busy polling.
+      RunLoop.main.run(until: Date().addingTimeInterval(min(0.01, remaining)))
+    }
+  }
 
   private struct Harness {
     let state: OverlayState
