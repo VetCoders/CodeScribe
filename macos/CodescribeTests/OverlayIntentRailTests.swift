@@ -286,10 +286,16 @@ final class OverlayIntentRailTests: XCTestCase {
   // MARK: Retained-work recovery on the sole action surface
 
   /// Negative then positive: the two recovery commands appear only when work is
-  /// actually retained, and they appear even in `.error`, whose frozen table is
-  /// `[.close]` alone. An error phase must not be the reason an unacknowledged
-  /// edit becomes unreachable.
+  /// actually retained. Error recovery follows usable text and capabilities;
+  /// only an empty error with no capabilities has a close-only rail.
   func testRecoveryCommandsAppearOnlyWithRetainedWorkAndSurviveErrorMode() {
+    let empty = projectedState(
+      phase: "error", text: "", canPaste: false, canInsert: false,
+      canCopy: false, canRetranscribe: false, canFormat: false, terminal: true)
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: empty), [.close])
+    XCTAssertEqual(OverlayIntentRail.recoveryIntents(for: empty), [])
+    XCTAssertFalse(empty.hasRecoverableSupersededWork)
+
     let clean = projectedState(
       phase: "error",
       text: "draft",
@@ -301,7 +307,11 @@ final class OverlayIntentRailTests: XCTestCase {
       terminal: true
     )
     XCTAssertEqual(OverlayIntentRail.recoveryIntents(for: clean), [])
-    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: clean), [.close])
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: clean), [.insertPaste, .copy, .retranscribe, .close])
+    XCTAssertFalse(OverlayIntentRail.projectedIntents(for: clean).contains(.format))
+    XCTAssertEqual(clean.mode, .error)
+    XCTAssertEqual(clean.activeText, "draft")
     XCTAssertFalse(clean.hasRecoverableSupersededWork)
 
     let retained = stateWithOneRetainedEdit()
@@ -564,6 +574,35 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(engine.copiedTaggedText, "usable but unsealed")
     XCTAssertEqual(state.mode, .coverageRefused, "recovery must not relabel the phase")
     XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: state.statusText), "incomplete coverage")
+  }
+
+  func testErrorRecoveryCopyUsesProductionRouteWithoutFormatting() async {
+    let state = projectedState(
+      phase: "error", text: "usable error words", canPaste: false, canInsert: false,
+      canCopy: true, canRetranscribe: true, canFormat: true, terminal: true)
+    let engine = OverlayIntentBoundaryEngine()
+    state.engine = engine
+    let projection = state.latestTranscriptProjection
+    let rail = OverlayIntentRail(
+      phase: state.statusText,
+      intents: OverlayIntentRail.projectedIntents(for: state),
+      palette: .dark,
+      onIntent: state.relayIntent
+    )
+    XCTAssertEqual(rail.intents, [.copy, .retranscribe, .close])
+    let copied = expectation(description: "error recovery copy reached the production relay")
+    engine.onCopyTagged = { copied.fulfill() }
+    rail.dispatch(.copy)
+    await fulfillment(of: [copied], timeout: 1)
+
+    XCTAssertEqual(engine.copiedTaggedText, "usable error words")
+    XCTAssertEqual(state.mode, .error)
+    XCTAssertEqual(state.activeText, "usable error words")
+    XCTAssertEqual(state.latestTranscriptProjection?.sequence, projection?.sequence)
+    XCTAssertEqual(state.latestTranscriptProjection?.reducerRevision, projection?.reducerRevision)
+    XCTAssertEqual(state.latestTranscriptProjection?.reducerAction, "intent_rail_fixture")
+    XCTAssertTrue(engine.formatterRequests.isEmpty, "copy recovery must not create a revision or seal")
+    XCTAssertTrue(engine.formatLevelWrites.isEmpty)
   }
 
   /// Unacknowledged superseded work still LEADS the rail on a refused take.

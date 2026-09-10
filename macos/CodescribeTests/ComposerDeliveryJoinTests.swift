@@ -455,6 +455,56 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["unseen A"])
   }
 
+  func testDuplicateCaptureStartCannotReplaceAdmittedIdentity() async throws {
+    let f = makeFixture(recording: [false])
+    f.dictation.toggle()
+    await settle(f)
+    let request = try XCTUnwrap(f.store.currentComposerCaptureRequestID)
+    let handle = try XCTUnwrap(f.store.composerCaptureHandle)
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+
+    // Replayed success remains idempotent even when telemetry says idle.
+    f.store.completeComposerCaptureStart(request, live: false, handle: handle)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-A")
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationPhase, .recording)
+    XCTAssertEqual(f.store.draft, "B typed")
+
+    // B cannot obtain a new request while A owns admission. A duplicate reply
+    // cannot use that existing request to register a foreign delivery owner.
+    XCTAssertEqual(f.store.beginComposerCaptureRequest(threadID: f.threadB), request)
+    f.store.completeComposerCaptureStart(
+      request, live: true, handle: CsCaptureHandle(captureId: "foreign"))
+    f.store.completeComposerCaptureStart(request, live: false, handle: nil)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-A")
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.dictationThreadID, f.threadA)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertEqual(f.store.dictationPhase, .recording)
+
+    sessionEnded("foreign words", to: state, sessionId: "foreign")
+    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["foreign words"])
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-A")
+    XCTAssertEqual(f.store.draft, "B typed")
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, [.isRecording, .startComposerTurn, .stop("capture-A")])
+
+    sessionEnded("A words", to: state, sessionId: "capture-A")
+    sessionEnded("A words", to: state, sessionId: "capture-A")
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    XCTAssertEqual(f.store.draft, "B typed")
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "A words")
+    XCTAssertEqual(f.store.composerRecoveryDocuments.map(\.text), ["foreign words"])
+    XCTAssertTrue(f.store.threads.allSatisfy { $0.messages.isEmpty })
+  }
+
   func testTerminalBeforeStartReplyRetainsTextAndCannotResurrectStopPermission() {
     let f = makeFixture(recording: [false, true])
     let state = OverlayState()
@@ -582,9 +632,11 @@ final class ComposerDeliveryJoinTests: XCTestCase {
 
     f.dictation.toggle()
     await settle(f)
+    let request = f.store.currentComposerCaptureRequestID
     XCTAssertEqual(
       f.store.dictationThreadID, f.threadA, "a failed stop keeps the pending destination")
     XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    XCTAssertTrue(f.store.composerStopRetryAvailable)
 
     let calls = f.surface.calls
     f.surface.stopThrows = false
@@ -592,8 +644,17 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     await settle(f)
 
     XCTAssertEqual(
-      f.surface.calls, calls,
-      "the pending request must not query or start again")
+      f.surface.calls, calls + [.stop("capture-A")],
+      "explicit retry addresses the same handle without querying or starting again")
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-A")
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    XCTAssertFalse(f.store.composerStopRetryAvailable)
+    XCTAssertFalse(f.store.finishDictationCapture(sessionID: "foreign"))
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    f.dictation.toggle()
+    await settle(f)
+    XCTAssertEqual(f.surface.calls, calls + [.stop("capture-A")], "pending success is not retry permission")
     let state = OverlayState()
     state.connectComposer(to: f.store)
     sessionEnded("eventual words", to: state, sessionId: "capture-A")
@@ -652,18 +713,30 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     f.dictation.toggle()
     await settle(f)
     await fulfillment(of: [expiry.entered], timeout: 1)
+    let request = f.store.currentComposerCaptureRequestID
     let bannerTask = f.store.dictationFailureTask
     f.store.select(f.threadB)
     f.store.draft = "B typed"
     expiry.release()
     await bannerTask?.value
-    XCTAssertEqual(f.store.dictationPhase, .preparing)
+    guard case .failed = f.store.dictationPhase else {
+      return XCTFail("expiry must preserve the actionable Stop retry")
+    }
+    XCTAssertTrue(f.store.composerStopRetryAvailable)
     XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
     XCTAssertEqual(f.store.dictationThreadID, f.threadA)
     let calls = f.surface.calls
+    f.surface.stopThrows = false
     f.dictation.toggle()
     await settle(f)
-    XCTAssertEqual(f.surface.calls, calls)
+    XCTAssertEqual(f.surface.calls, calls + [.stop("capture-A")])
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "capture-A")
+    XCTAssertTrue(f.store.composerCaptureAwaitingTerminal)
+    XCTAssertFalse(f.store.composerStopRetryAvailable)
+    XCTAssertFalse(f.store.finishDictationCapture(sessionID: "foreign"))
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, request)
+    XCTAssertEqual(f.store.draft, "B typed")
     let state = OverlayState()
     state.connectComposer(to: f.store)
     sessionEnded("  A exact words  ", to: state, sessionId: "capture-A")
@@ -1336,10 +1409,22 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     state.finishControllerRecording()
     let afterFirst = stopped
 
-    // A second take is admitted before the first one's terminal ever arrives.
+    // An explicit addressed stop response releases the request, but preserves
+    // its delivery receipt. Presentation completion alone cannot admit B.
+    let predecessor = f.store.currentComposerCaptureRequestID
+    XCTAssertEqual(f.store.beginComposerCaptureRequest(threadID: f.threadB), predecessor)
+    if let request = predecessor, let handle = f.store.composerCaptureHandle {
+      f.store.applyComposerStopOutcome(.noLiveCapture, requestID: request, handle: handle)
+    } else {
+      return XCTFail("predecessor must still own an admitted request")
+    }
+    XCTAssertFalse(f.store.hasComposerCaptureRequest)
+    // A second take is legally admitted before the first terminal arrives.
     f.store.select(f.threadB)
     f.store.draft = "B typed"
     admitCapture(f.store, threadID: f.threadB, id: "session-2")
+    let successor = f.store.currentComposerCaptureRequestID
+    XCTAssertNotEqual(successor, predecessor)
     f.store.dictationBlocked = true
     state.handleRecordingPreparing()
     XCTAssertEqual(
@@ -1357,6 +1442,8 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertEqual(stopped, afterFirst, "and never issues a stop for the successor")
     XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "session-2")
     XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+    XCTAssertEqual(f.store.currentComposerCaptureRequestID, successor)
+    XCTAssertEqual(f.store.dictationPhase, .recording)
     XCTAssertTrue(f.store.ownsLiveDictation)
     XCTAssertTrue(f.store.dictationBlocked)
     XCTAssertEqual(f.store.draft, "B typed", "the successor's composer is untouched")
@@ -1368,6 +1455,10 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertEqual(state.activeText, "second take")
     XCTAssertEqual(state.mode, .listening)
     XCTAssertFalse(state.terminal)
+    f.store.select(f.threadA)
+    XCTAssertEqual(f.store.draft, "first take", "late delivery still belongs to the predecessor")
+    f.store.select(f.threadB)
+    XCTAssertEqual(f.store.draft, "B typed")
   }
 
   // MARK: Refusal recovery (rc-w2-refusal-ui) — UNRUN under W2

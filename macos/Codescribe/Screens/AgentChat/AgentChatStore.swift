@@ -722,6 +722,9 @@ final class AgentChatStore: ObservableObject {
     _ requestID: UUID, live: Bool, handle: CsCaptureHandle?
   ) {
     guard isCurrentComposerCaptureRequest(requestID), !composerCaptureAwaitingTerminal else { return }
+    // Admission is one-shot for this request. Same-handle duplicates are inert;
+    // a foreign or missing handle cannot replace the identity or gain a receipt.
+    guard composerCaptureHandle == nil else { return }
     if let handle, let owner = dictationThreadID {
       captureOwners[handle.captureId] = owner
       // The terminal may beat the FFI start reply. Until the admitted identity
@@ -1418,9 +1421,10 @@ final class AgentChatStore: ObservableObject {
         keepLocalDrafts: threadSearchQuery.isEmpty, allowEmpty: !threadSearchQuery.isEmpty,
         preserveSelection: !threadSearchQuery.isEmpty
       )
-      threadSearchError = nil
+      if threadSearchError != nil { threadSearchError = nil }
     } catch {
-      threadSearchError = "Could not refresh threads. The previous list is still shown."
+      let message = "Could not refresh threads. The previous list is still shown."
+      if threadSearchError != message { threadSearchError = message }
     }
   }
 
