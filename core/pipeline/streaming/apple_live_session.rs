@@ -4842,11 +4842,18 @@ mod c13a_lifecycle_tests {
                 if observation.producer == LedgerObservationProducer::Whisper
                     && receipt.grants_mutation()
         )));
-        assert_eq!(events.iter().filter(|event| matches!(event,
-            EngineEvent::LedgerMutation { observation, receipt, .. }
-                if observation.producer == LedgerObservationProducer::Whisper
-                    && !receipt.grants_mutation()
-        )).count(), 2, "each member retains its no-label refusal receipt");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    EngineEvent::LedgerMutation { observation, receipt, .. }
+                        if observation.producer == LedgerObservationProducer::Whisper
+                            && !receipt.grants_mutation()
+                ))
+                .count(),
+            2,
+            "each member retains its no-label refusal receipt"
+        );
         let ledger = state.acoustic_ledger.lock().expect("ledger");
         assert!(ledger.is_sealed(&first));
         assert!(ledger.is_sealed(&second));
@@ -4961,9 +4968,12 @@ mod c13a_lifecycle_tests {
             .iter()
             .filter_map(|event| match event {
                 EngineEvent::LedgerMutation {
-                    observation, label, receipt,
+                    observation,
+                    label,
+                    receipt,
                 } if observation.producer == LedgerObservationProducer::Whisper
-                    && receipt.grants_mutation() => {
+                    && receipt.grants_mutation() =>
+                {
                     Some((observation.occurrence.clone(), label.clone()))
                 }
                 _ => None,
@@ -4981,9 +4991,13 @@ mod c13a_lifecycle_tests {
             "a straddling candidate must not be poured into the first span"
         );
 
-        assert_eq!(events.iter().filter(|event| matches!(event,
-            EngineEvent::LedgerSeal { .. }
-        )).count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                .count(),
+            2
+        );
         assert!(events.iter().any(|event| matches!(event,
             EngineEvent::LedgerMutation { observation, receipt, .. }
                 if observation.producer == LedgerObservationProducer::Whisper
@@ -5083,7 +5097,13 @@ mod c13a_lifecycle_tests {
         assert!(state.pending_events.is_empty());
         assert_eq!(state.tail_patch_awaiting_completion, 0);
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(events.iter().filter(|event| matches!(event, EngineEvent::LedgerSeal { .. })).count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                .count(),
+            2
+        );
         let final_count = events
             .iter()
             .filter(|event| matches!(event, EngineEvent::UtteranceFinal { .. }))
@@ -5093,7 +5113,10 @@ mod c13a_lifecycle_tests {
             "A and B each emit exactly one pending final"
         );
         assert!(!state.flush_layer1_coalesce(&tx));
-        assert!(event_rx.try_recv().is_err(), "drained members cannot seal twice");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "drained members cannot seal twice"
+        );
     }
 
     #[test]
@@ -7667,7 +7690,10 @@ mod rc_w2_acoustic_tests {
             },
         ));
         let request = tail_rx.try_recv().expect("legally submitted request");
-        request.provider_request.validate_pcm(&request.audio).unwrap();
+        request
+            .provider_request
+            .validate_pcm(&request.audio)
+            .unwrap();
         let identity = request.provider_request.identity.clone();
         assert_eq!(state.refinement_submitted.len(), 1);
         assert_eq!(state.tail_patch_awaiting_completion, 1);
@@ -9359,7 +9385,10 @@ mod live_refinement_admission_tests {
                 reconcile_silero_ledger(&mut state, &events, &closed(1), &[]);
                 assert!(state.flush_layer1_coalesce(&events));
                 let request = requests.try_recv().unwrap();
-                request.provider_request.validate_pcm(&request.audio).unwrap();
+                request
+                    .provider_request
+                    .validate_pcm(&request.audio)
+                    .unwrap();
                 let occurrence = &request.member_occurrences[0].1;
                 let mut completion = labelled_completion(&request);
                 let payload = completion.payload.as_mut().unwrap();
@@ -9376,7 +9405,11 @@ mod live_refinement_admission_tests {
                 state.complete_whisper_window(&events, completion, 20.0);
                 let accepted = context == FusionContextMode::UtteranceOnly && defect == "none";
                 let ledger = state.acoustic_ledger.lock().unwrap();
-                assert_eq!(ledger.text_of(occurrence), accepted.then_some("hello"), "{context:?}/{defect}");
+                assert_eq!(
+                    ledger.text_of(occurrence),
+                    accepted.then_some("hello"),
+                    "{context:?}/{defect}"
+                );
                 assert_eq!(ledger.is_sealed(occurrence), accepted);
                 assert!(
                     ledger
@@ -9389,16 +9422,29 @@ mod live_refinement_admission_tests {
                 assert_eq!(state.tail_patch_awaiting_completion, 0);
                 assert!(state.refinement_submitted.is_empty());
                 let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
-                assert_eq!(emitted.iter().filter(|event| matches!(event,
-                    EngineEvent::LedgerMutation { receipt, .. } if receipt.grants_mutation()
-                )).count(), usize::from(accepted));
-                assert_eq!(emitted.iter().filter(|event| matches!(event,
-                    EngineEvent::LedgerSeal { .. }
-                )).count(), usize::from(accepted));
+                assert_eq!(
+                    emitted
+                        .iter()
+                        .filter(|event| matches!(event,
+                            EngineEvent::LedgerMutation { receipt, .. } if receipt.grants_mutation()
+                        ))
+                        .count(),
+                    usize::from(accepted)
+                );
+                assert_eq!(
+                    emitted
+                        .iter()
+                        .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                        .count(),
+                    usize::from(accepted)
+                );
                 // A corrected payload on a consumed request is still a replay.
                 state.complete_whisper_window(&events, labelled_completion(&request), 20.0);
                 assert!(receiver.try_recv().is_err());
-                assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(occurrence), accepted.then_some("hello"));
+                assert_eq!(
+                    state.acoustic_ledger.lock().unwrap().text_of(occurrence),
+                    accepted.then_some("hello")
+                );
             }
         }
     }
@@ -9412,8 +9458,16 @@ mod live_refinement_admission_tests {
         let occurrence = &request.member_occurrences[0].1;
         while receiver.try_recv().is_ok() {}
         for defect in [
-            "request", "session", "epoch", "start", "end", "member", "member_span", "members",
-            "utterance", "missing",
+            "request",
+            "session",
+            "epoch",
+            "start",
+            "end",
+            "member",
+            "member_span",
+            "members",
+            "utterance",
+            "missing",
         ] {
             let mut completion = labelled_completion(&request);
             let identity = completion.request_identity.as_mut().unwrap();
@@ -9448,15 +9502,30 @@ mod live_refinement_admission_tests {
             assert!(receiver.try_recv().is_err());
         }
         state.complete_whisper_window(&events, labelled_completion(&request), 20.0);
-        assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(occurrence), Some("hello"));
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().text_of(occurrence),
+            Some("hello")
+        );
         assert!(state.acoustic_ledger.lock().unwrap().is_sealed(occurrence));
         assert_eq!(state.tail_patch_awaiting_completion, 0);
         assert!(state.refinement_submitted.is_empty());
         let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
-        assert_eq!(emitted.iter().filter(|event| matches!(event,
-            EngineEvent::LedgerMutation { receipt, .. } if receipt.grants_mutation()
-        )).count(), 1);
-        assert_eq!(emitted.iter().filter(|event| matches!(event, EngineEvent::LedgerSeal { .. })).count(), 1);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event,
+                    EngineEvent::LedgerMutation { receipt, .. } if receipt.grants_mutation()
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                .count(),
+            1
+        );
         state.complete_whisper_window(&events, labelled_completion(&request), 20.0);
         assert!(receiver.try_recv().is_err());
     }
@@ -9490,7 +9559,10 @@ mod live_refinement_admission_tests {
         assert!(state.flush_layer1_coalesce(&events));
         let request = requests.try_recv().unwrap();
         state.complete_whisper_window(&events, labelled_completion(&request), 20.0);
-        assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(occurrence), Some("hello"));
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().text_of(occurrence),
+            Some("hello")
+        );
         assert!(state.acoustic_ledger.lock().unwrap().is_sealed(occurrence));
     }
 
@@ -9531,7 +9603,11 @@ mod live_refinement_admission_tests {
             assert!(!emitted.iter().any(|event| matches!(event,
                 EngineEvent::LedgerMutation { receipt, .. } if receipt.grants_mutation()
             )));
-            assert!(!emitted.iter().any(|event| matches!(event, EngineEvent::LedgerSeal { .. })));
+            assert!(
+                !emitted
+                    .iter()
+                    .any(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+            );
             assert!(emitted.iter().any(|event| matches!(event,
                 EngineEvent::Warning { code, .. } if code == TAIL_PATCH_IDENTITY_MISMATCH_WARNING_CODE
             )));
@@ -9639,7 +9715,10 @@ mod live_refinement_admission_tests {
         let occurrence = request.member_occurrences[0].1.clone();
         assert_eq!(occurrence.sample_end, 400);
         assert_eq!(request.provider_request.identity.range.sample_end, 800);
-        request.provider_request.validate_pcm(&request.audio).unwrap();
+        request
+            .provider_request
+            .validate_pcm(&request.audio)
+            .unwrap();
         let completion = labelled_completion(&request);
         state.complete_whisper_window(&events, completion, 20.0);
         let ledger = state.acoustic_ledger.lock().unwrap();
