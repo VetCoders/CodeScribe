@@ -47,12 +47,12 @@ with tempfile.TemporaryDirectory(prefix='validate-gates-test-') as tmp:
     # A whitelist prevents accidental tool escalation even if the validator drifts.
     bin_dir = base / 'bin'
     bin_dir.mkdir()
-    for name in ('sed', 'sort', 'grep', 'find', 'cat', 'bash', 'mktemp', 'rm', 'wc', 'tr'):
+    for name in ('sed', 'sort', 'grep', 'find', 'cat', 'bash', 'mktemp', 'rm', 'wc', 'tr', 'dirname'):
         os.symlink('/bin/bash' if name == 'bash' else shutil.which(name), bin_dir / name)
     os.symlink(sys.executable, bin_dir / 'python3')
     env = dict(PATH=str(bin_dir), LC_ALL='C', TMPDIR=str(base))
 
-    def check(label, make=make_source, helper=helper_source, diagnostic=None, workflow=None):
+    def check(label, make=make_source, helper=helper_source, diagnostic=None, workflow=None, code_case=None):
         global passed
         repo = base / label
         (repo / 'scripts').mkdir(parents=True)
@@ -62,14 +62,43 @@ with tempfile.TemporaryDirectory(prefix='validate-gates-test-') as tmp:
             (repo / '.github/workflows/counterexample.yml').write_text(workflow)
         if helper is not None:
             (repo / 'scripts/test-swift.sh').write_text(helper)
-        result = subprocess.run(['/bin/bash', str(validator)], cwd=repo, env=env,
+        selected_validator = validator
+        if code_case is not None:
+            # Independent code root, including spaces; candidate sources stay in repo.
+            code = base / (label + ' code') / 'scripts'
+            code.mkdir(parents=True)
+            selected_validator = code / validator.name
+            selected_validator.write_text(validator.read_text())
+            module = code / 'validate_swift_gate.py'
+            module.write_text((source / 'scripts/validate_swift_gate.py').read_text())
+            # A candidate-local decoy must never replace missing trusted code.
+            (repo / 'scripts/validate_swift_gate.py').write_text(
+                'from pathlib import Path\nPath("EXECUTED").touch()\n')
+            if code_case == 'missing':
+                module.unlink()
+            elif code_case == 'unreadable':
+                module.chmod(0)
+                assert not os.access(module, os.R_OK), 'unreadable witness needs an unprivileged user'
+            elif code_case == 'directory':
+                module.unlink()
+                module.mkdir()
+            elif code_case == 'wrong-path':
+                selected_validator.write_text(replace(selected_validator.read_text(),
+                    '/validate_swift_gate.py"', '/disconnected_swift_gate.py"'))
+            elif code_case == 'failure':
+                module.write_text('import sys\nprint("fixture-module-exit-47", file=sys.stderr)\nsys.exit(47)\n')
+            elif code_case == 'syntax':
+                module.write_text('def broken(:\n')
+            else:
+                assert code_case == 'valid', code_case
+        result = subprocess.run(['/bin/bash', str(selected_validator)], cwd=repo, env=env,
                                 text=True, capture_output=True)
         receipt = evidence / label
         receipt.mkdir()
         (receipt / 'stdout').write_text(result.stdout)
         (receipt / 'stderr').write_text(result.stderr)
         (receipt / 'result.json').write_text(json.dumps(dict(
-            argv=['/bin/bash', str(validator)], exit=result.returncode,
+            argv=['/bin/bash', str(selected_validator)], cwd=str(repo), exit=result.returncode,
             expected_diagnostic=diagnostic), indent=2) + '\n')
         (receipt / 'source.diff').write_text(''.join(difflib.unified_diff(
             make_source.splitlines(True), make.splitlines(True), fromfile='Makefile', tofile=label + '/Makefile'))
@@ -80,6 +109,20 @@ with tempfile.TemporaryDirectory(prefix='validate-gates-test-') as tmp:
             assert 'verification targets classified' in result.stdout, label
         else:
             assert result.returncode == 1 and diagnostic in result.stderr, (label, result.returncode, result.stderr)
+            assert 'verification targets classified' not in result.stdout, label
+        if code_case == 'failure':
+            assert 'fixture-module-exit-47' in result.stderr and '[module-failure]' in result.stderr, result
+        if code_case == 'syntax':
+            assert 'SyntaxError' in result.stderr and '[module-failure]' in result.stderr, result
+        if code_case is not None:
+            (receipt / 'validator.sh').write_text(selected_validator.read_text())
+            if module.is_file() and code_case != 'unreadable':
+                (receipt / 'module.py').write_bytes(module.read_bytes())
+            (receipt / 'module-state.json').write_text(json.dumps(dict(
+                case=code_case, path=str(module), exists=module.exists(),
+                mode=oct(module.stat().st_mode) if module.exists() else None), indent=2) + '\n')
+            if code_case == 'unreadable':
+                module.chmod(0o644)
         assert not (repo / 'EXECUTED').exists(), 'validator executed candidate shell text'
         passed += 1
         print(f'PASS {label}: exit={result.returncode}, diagnostic={diagnostic or "none"}', flush=True)
@@ -150,6 +193,15 @@ with tempfile.TemporaryDirectory(prefix='validate-gates-test-') as tmp:
     check('ledger-stale', make=make_source + '\n# gate: test-absent class=hermetic ci=no -- absent\n', diagnostic="ledger row 'test-absent' names no verification target")
     check('ledger-illegal-class', make=replace(make_source, '# gate: verify class=hermetic', '# gate: verify class=fiction'), diagnostic="'verify' has class=fiction")
     check('ci-drift', workflow='steps:\n  - run: make test-swift\n', diagnostic="'test-swift' claims ci=no")
+
+    # Packaging failures cannot borrow the real checkout or candidate-local code.
+    check('module-code-root-spaces', code_case='valid')
+    check('module-candidate-mutant', code_case='valid',
+          helper=replace(helper_source, selftest, 'exit 0\n' + selftest), diagnostic='[self-test]')
+    for code_case in ('missing', 'unreadable', 'directory', 'wrong-path'):
+        check('module-' + code_case, code_case=code_case, diagnostic='[module-missing]')
+    check('module-failure', code_case='failure', diagnostic='[module-failure]')
+    check('module-syntax', code_case='syntax', diagnostic='[module-failure]')
 
     # Execute only the extracted, unchanged verify recipe with tool stand-ins.
     # Do not parse/evaluate the full Makefile: it has unrelated shell expansions.
