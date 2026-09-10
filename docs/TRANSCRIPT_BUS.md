@@ -295,20 +295,79 @@ forbids.
 
 A pending capture paints no previous speech and inherits no action capabilities:
 phase, terminal flag, reducer revision and the five action bits are reset, and
-the previous projection leaves the paint path. It is retired, not destroyed. The
-superseded document and the last superseded uncommitted draft each stay readable
-in one bounded slot; delivery recovery still belongs to the composer store and
-the existing retained-delivery documents, and no second transcript history store
-exists. A scheduled draft commit for the superseded take is cancelled rather than
-sent, so no revision request crosses FFI for a closed session while a new capture
-is live.
+the previous projection leaves the paint path. It is retired, not destroyed.
 
-Retiring a session also fences its late events. A retired projection may still
-complete its own addressed delivery and capture release, but it cannot repaint
-the successor's canvas, change its chrome, finalize it, arm its countdown or
-close it. Duplicate `preparing` / `started` beats for an open capture are
-idempotent: they do not re-fence the take, erase already admitted text, or
-restart the session clock.
+Superseded work has exactly one owner. Each superseded take is retained as a
+single identity-associated unit — Rust's session id, the last projected
+document, its reducer revision and the uncommitted draft that differed from it —
+never as separate string and projection slots that a later capture can move
+independently. A take with no observed projection has no identity and is
+therefore not retained, rather than retained under one this receiver minted.
+Delivery recovery still belongs to the composer store and the existing
+retained-delivery documents, and no second transcript history store exists.
+
+Retention is never implicitly evicted. No capture boundary, late event or
+watchdog may drop an unsaved edit; only an explicit user decision resolves one.
+
+Capacity is asymmetric, and the asymmetry is stated rather than dressed up as a
+bound. Clean documents are genuinely capped at one, because each remains
+authoritative in the ledger and reproducible from it. Unsaved edits have no
+count limit. From this presentation fence the only two ways to impose one would
+be discarding a user's edit, which is the silent loss the owner exists to
+prevent, or refusing microphone admission, which is not this layer's decision to
+make. So the store is bounded by the user's own unresolved decisions and not by
+a constant, and the reported count is disclosure, not enforcement. That residual
+capacity boundary is open and belongs to an owner outside this fence; it is not
+closed by a second history store, and no receiver counter should be read as
+closing it.
+
+Recovery is reachable and explicit. The sole overlay action surface projects two
+commands whenever retained work exists — recover and discard — and they are the
+only commands on that rail sourced from local presentation state rather than the
+reducer, because the bytes they protect are an edit Rust never saw. They are
+offered independently of error mode, whose projection table is otherwise
+`[close]` alone, and during a live capture the rail shows those labelled
+commands only: the previous words never return to the canvas as current speech.
+Recovery hands the retained bytes to the pasteboard, and consumes the retained
+item only on a confirmed write. A refused write keeps the exact item — identity
+and draft included — and surfaces the failure, because the alternative is
+destroying the only copy of an edit at the precise moment the copy did not
+happen. Recovery commits nothing to the reducer, mints no session, forges no
+seal, submits no delivery and takes no focus. A scheduled draft commit for the superseded take is cancelled rather than
+sent, so no revision request crosses FFI for a closed session while a new
+capture is live.
+
+Retiring a session also fences its late events, on both receiver paths. A
+retired projection may still complete its own addressed delivery and capture
+release, but it cannot repaint the successor's canvas, change its chrome,
+finalize it, arm its countdown or close it. The sibling presentation-status path
+is fenced by the same identity: a status for a known retired session leaves the
+current capture, text, mode and countdown untouched and paints no card, while a
+status addressed to the current capture still presents and still releases it.
+
+Status identity has an explicit disposition, read off the producer rather than
+guessed. `PresentationStatusProjection` carries `session_id: Option<String>` and
+a typed `kind`. A non-retired session id — including one this receiver has never
+observed — is addressed to the current capture, because the lifecycle callbacks
+carry no session id at all and the sole producer of `admission_refused` emits it
+from the start path of the take the user just asked for; a refusal with no
+session id is that same capture verdict and still lands. The two calibration
+outcomes carry no session by construction: they are Settings-owned microphone
+results, so while a capture is in flight such a status paints its card but may
+not end a take it cannot name. Ending it would be minting capture identity for
+an event that has none.
+
+Duplicate `preparing` / `started` beats for an open capture are idempotent: they
+do not re-fence the take, erase already admitted text, or restart the session
+clock. A `preparing` that repeats for a capture which already proved it is alive
+— recorder confirmed, audio or speech measured, final pass begun, or text
+admitted — additionally may not un-prove it. Regressing the warmup state there
+re-armed the orphaned-"starting" watchdog against a live take, and because the
+capture and its generation were unchanged the generation fence passed and the
+wake aborted a capture the user was still speaking into. Warmup is the only
+state that watchdog may dismiss, so a genuine first warmup timeout — including
+one whose `preparing` was itself duplicated before any audio arrived — still
+recovers.
 
 Visibility follows the current capture route plus the explicit overlay
 preference. An enabled Dictation take stays visible through measured silence; an

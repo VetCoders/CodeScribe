@@ -8,8 +8,21 @@ struct OverlayDockLayout: Equatable {
 }
 
 enum OverlayChromeVisibility {
-  static func actionsVisible(pointerInside: Bool, keyboardFocus: Bool, voiceOver: Bool) -> Bool {
-    pointerInside || keyboardFocus || voiceOver
+  /// Chrome stays ephemeral (Founder cut): pointer, keyboard focus or VoiceOver
+  /// reveal it, nothing else. `retainedWork` is the one standing exception and
+  /// it defaults off, so every existing caller keeps the ephemeral contract.
+  ///
+  /// Unacknowledged superseded work has to be reachable without the user first
+  /// guessing to hover a panel that is currently showing a NEW take. Revealing
+  /// the rail exposes the labelled recover/discard commands only — never the
+  /// previous words, which stay off the canvas.
+  static func actionsVisible(
+    pointerInside: Bool,
+    keyboardFocus: Bool,
+    voiceOver: Bool,
+    retainedWork: Bool = false
+  ) -> Bool {
+    pointerInside || keyboardFocus || voiceOver || retainedWork
   }
 }
 
@@ -159,16 +172,29 @@ struct OverlayIntentRail: View {
       return []
     }
     if state.isRevisionDraftDirty {
-      return [.commitRevision, .discardRevision, .close]
+      return recoveryIntents(for: state) + [.commitRevision, .discardRevision, .close]
     }
-    return projectedIntents(
-      phase: state.mode,
-      canPaste: state.canPaste,
-      canInsert: state.canInsert,
-      canCopy: state.canCopy,
-      canRetranscribe: state.canRetranscribe,
-      canFormat: state.canFormat
-    )
+    return recoveryIntents(for: state)
+      + projectedIntents(
+        phase: state.mode,
+        canPaste: state.canPaste,
+        canInsert: state.canInsert,
+        canCopy: state.canCopy,
+        canRetranscribe: state.canRetranscribe,
+        canFormat: state.canFormat
+      )
+  }
+
+  /// The two commands the reducer does not project, and the only ones sourced
+  /// from local presentation state. They LEAD the rail because the phase table
+  /// below is allowed to be nearly empty — `.error` projects `[.close]` and a
+  /// live `.listening` capture projects `[.finish, .close]` — and neither an
+  /// error nor a new take may be the reason an unacknowledged edit becomes
+  /// unreachable. They carry no delivery legality: recovery copies retained
+  /// bytes to the pasteboard, discard drops them, and neither touches the
+  /// reducer, the current canvas or focus.
+  static func recoveryIntents(for state: OverlayState) -> [OverlayIntent] {
+    state.hasRecoverableSupersededWork ? [.recoverSuperseded, .discardSuperseded] : []
   }
 
   /// Frozen `overlay-canvas-v1` projection table. A false bit omits its
@@ -254,6 +280,8 @@ extension OverlayIntent {
     case .insertPaste: "Insert transcript"
     case .retranscribe: "Retranscribe recording"
     case .format: "Format transcript"
+    case .recoverSuperseded: "Recover previous transcript"
+    case .discardSuperseded: "Discard previous transcript"
     case .close: "Close overlay"
     }
   }
@@ -267,6 +295,9 @@ extension OverlayIntent {
     case .insertPaste: "Sends the projected transcript to the selected destination"
     case .retranscribe: "Requests another transcription of this recording"
     case .format: "Requests formatting between takes"
+    case .recoverSuperseded:
+      "Copies the retained previous take, including any unsaved edit, to the clipboard"
+    case .discardSuperseded: "Drops the retained previous take without recovering it"
     case .close: "Closes the dictation overlay"
     }
   }
@@ -280,6 +311,8 @@ extension OverlayIntent {
     case .insertPaste: "arrow.down.doc"
     case .retranscribe: "arrow.clockwise"
     case .format: "textformat"
+    case .recoverSuperseded: "clock.arrow.circlepath"
+    case .discardSuperseded: "trash"
     case .close: "circle.fill"
     }
   }

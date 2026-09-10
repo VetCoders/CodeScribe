@@ -75,6 +75,54 @@ struct OverlayPresentationStatus: Equatable {
   let calibrationVersion: String?
 }
 
+/// One superseded take, retained as a single identity-associated unit.
+///
+/// Retention used to be two disconnected slots — a projection and a draft
+/// string — with no production reader and no association between them, so a
+/// third capture could clear the draft while the projection still described the
+/// take that authored it. Identity, document and unsent edit now move together
+/// or not at all.
+///
+/// The identity is Rust's: a take with no observed projection has no session id
+/// and is therefore not retained, rather than retained under a minted one.
+struct OverlaySupersededTake: Equatable, Identifiable {
+  let sessionId: String
+  /// The last authoritative document Rust projected for this session.
+  let renderedText: String
+  let reducerRevision: UInt64
+  /// The user's uncommitted edit at the capture boundary, when it differed from
+  /// `renderedText`. `nil` means nothing was unsaved — the document itself is
+  /// still ledger-authoritative and reproducible.
+  let unsavedDraft: String?
+
+  var id: String { "\(sessionId)#\(reducerRevision)" }
+  var hasUnsavedEdits: Bool { unsavedDraft != nil }
+  /// What an explicit recovery hands back: the user's own edit when one was
+  /// unsaved, otherwise the projected document.
+  var recoverableText: String { unsavedDraft ?? renderedText }
+}
+
+/// How a sibling presentation status addresses the receiver's current capture.
+///
+/// The producer states this, it is never guessed: `PresentationStatusProjection`
+/// carries `session_id: Option<String>` and a typed `kind`
+/// (`app/presentation/status_projection.rs`). `admission_refused` is a capture
+/// lifecycle verdict — with the refused session when one exists, without it when
+/// the refusal happened before a session did. The two calibration outcomes carry
+/// no session by construction: they are Settings-owned microphone results, so
+/// letting one release a live capture would be minting capture identity for an
+/// event that has none.
+enum OverlayStatusAddressing: Equatable {
+  /// Addressed to the capture the receiver is showing (or to the one it just
+  /// optimistically opened). Presents and releases exactly as before.
+  case currentCapture
+  /// A known retired session's delayed status. It may not touch the successor.
+  case retiredSession
+  /// A status with no capture identity, arriving while a capture is in flight.
+  /// The card is still product truth; the capture is not its to end.
+  case foreignToLiveCapture
+}
+
 /// Presentation phase supplied by the reducer-owned projection. Swift parses
 /// the wire value but never derives a phase from text, callbacks, or seals.
 enum OverlayMode: String, Equatable {
@@ -121,6 +169,12 @@ enum OverlayIntent: String, Equatable, Hashable {
   case insertPaste = "insert-paste"
   case retranscribe
   case format
+  /// Hand one retained superseded take back to the user, or drop it on an
+  /// explicit acknowledgement. These are the only two commands on the rail the
+  /// reducer does not project: retained work is presentation-local by
+  /// construction, because the bytes it protects are an edit Rust never saw.
+  case recoverSuperseded = "recover-superseded"
+  case discardSuperseded = "discard-superseded"
   case close
 }
 
@@ -393,16 +447,26 @@ final class OverlayState {
   /// owns all five, and a UI counter that started naming them would be exactly
   /// the forged transcript authority this overlay is forbidden to invent.
   @ObservationIgnored private(set) var captureGeneration: UInt64 = 0
-  /// The previous take's authoritative document, moved OUT of the paint path
-  /// when a new capture is admitted, so a pending capture cannot show it as new
-  /// speech. Delivery recovery still belongs to the composer store and
-  /// `retainedComposerDocuments`; this single slot only keeps the last
-  /// superseded document readable instead of dropping it on the floor.
-  @ObservationIgnored private(set) var supersededTranscriptProjection:
-    CsTranscriptProjectionEvent?
-  /// The last superseded uncommitted draft. One bounded slot, replaced per
-  /// capture — deliberately not a second transcript history store.
-  @ObservationIgnored private(set) var supersededRevisionDraft: String?
+  /// The ONE owner of superseded work, oldest first.
+  ///
+  /// Every entry is an identity-associated `OverlaySupersededTake` moved OUT of
+  /// the paint path when a new capture is admitted, so a pending capture can
+  /// never show a previous take as new speech. This is not a second transcript
+  /// history store: delivery recovery still belongs to the composer store and
+  /// `retainedComposerDocuments`, and nothing here can be replayed into the
+  /// reducer.
+  ///
+  /// Capacity is asymmetric, and the asymmetry is stated plainly rather than
+  /// dressed up as a bound. Clean documents ARE capped at one, because each
+  /// stays authoritative in the ledger and is reproducible from it. Unsaved
+  /// edits have NO count limit: from a UI-only fence the only two ways to
+  /// impose one would be dropping a user's edit (silent loss — forbidden) or
+  /// refusing microphone admission (not this layer's call). So this array is
+  /// bounded by the user's own unresolved decisions, not by a constant, and
+  /// `unacknowledgedSupersededEditCount` reports that count — it does not
+  /// enforce anything. That residual capacity boundary is disclosed, not fixed
+  /// here; closing it needs an owner outside this fence.
+  private(set) var supersededTakes: [OverlaySupersededTake] = []
   private var agentSessionArmed = false
   private var agentFinalTranscriptAppeared = false
   private var agentAutoSendCancelled = false
@@ -698,6 +762,10 @@ final class OverlayState {
       relayRetranscribeIntent(pass: .fullHq)
     case .format:
       relayFormatIntent()
+    case .recoverSuperseded:
+      recoverSupersededTake()
+    case .discardSuperseded:
+      discardSupersededTake()
     case .close:
       close()
     }
@@ -1159,7 +1227,36 @@ final class OverlayState {
     handleRecordingPreparing()
   }
 
+  /// True once THIS capture proved it is alive: the recorder confirmed, audio
+  /// or speech was measured, the final pass began, or Rust admitted text for it.
+  /// Warmup is the only state the watchdog is allowed to dismiss, so this is
+  /// exactly the predicate that must never regress under a duplicate beat.
+  private var captureProvedLife: Bool {
+    audioReady || vadActive || hasMeasuredAudioLevel || transcribing
+      || latestTranscriptProjection != nil
+  }
+
   func handleRecordingPreparing() {
+    // A `preparing` that repeats for a capture which already PROVED it is alive
+    // must not un-prove it. The unconditional `warmingUp = true` /
+    // `audioReady = false` below, followed by `armWarmupWatchdog()`, re-armed
+    // the orphan watchdog against a live take: four seconds later it saw
+    // `warmingUp && !finalized` for an UNCHANGED generation, so the generation
+    // fence passed, and it aborted the capture the user was still speaking into.
+    // The generation guard cannot help here — same capture, same generation.
+    //
+    // Only the warmup fields and the watchdog are off limits. The route is
+    // still re-derived, because the documented mid-hold Fn -> Fn+Shift upgrade
+    // is delivered on exactly such a repeated beat (docs/TRANSCRIPT_BUS.md,
+    // tray identity boundary), and suppressing it here would trade one silent
+    // failure for another.
+    if recording, captureProvedLife {
+      agentSessionArmed = indicatorMode == .assistive
+      autoPasteControlAvailable = !agentSessionArmed
+      refreshOverlayPolicyTruth()
+      onRecordingPreparing?()
+      return
+    }
     agentSessionArmed = indicatorMode == .assistive
     autoPasteControlAvailable = !agentSessionArmed
     finalized = false
@@ -1475,10 +1572,70 @@ final class OverlayState {
 
   // MARK: Listener-driven mutations (called on the main actor by DictationListener)
 
+  /// Classify a status against the current capture using only what the producer
+  /// stated. See `OverlayStatusAddressing` for the protocol evidence.
+  func statusAddressing(for event: CsPresentationStatusEvent) -> OverlayStatusAddressing {
+    // An empty string is not an identity. Normalise it to "no identity" here
+    // rather than letting it match nothing and slip through as an unobserved
+    // session — that is the difference between an explicit disposition and an
+    // accident of set membership.
+    let sessionId = event.sessionId.flatMap { $0.isEmpty ? nil : $0 }
+    if let sessionId, retiredProjectionSessions.contains(sessionId) {
+      return .retiredSession
+    }
+    // Present and not retired: either the live take or a session this receiver
+    // has never observed. The lifecycle callbacks carry no session id, so an
+    // unobserved identity cannot be classified as a predecessor — and the sole
+    // producer of `admission_refused` emits it from the start path of the take
+    // the user just asked for. It is addressed here, and the paired control for
+    // that is a current addressed failure still presenting and releasing.
+    guard sessionId == nil else { return .currentCapture }
+    let carriesNoCaptureIdentity =
+      event.kind == "calibration_succeeded" || event.kind == "calibration_failed"
+    if carriesNoCaptureIdentity, recording || warmingUp || transcribing {
+      return .foreignToLiveCapture
+    }
+    return .currentCapture
+  }
+
   /// Paint one Rust-owned status card. This sibling projection may close a
   /// failed/preparing capture lifecycle, but it never creates transcript text,
-  /// receipts, or product actions in Swift.
+  /// receipts, or product actions in Swift — and it may only close the capture
+  /// its own identity addresses.
   func applyPresentationStatus(_ event: CsPresentationStatusEvent) {
+    let addressing = statusAddressing(for: event)
+    switch addressing {
+    case .retiredSession:
+      // A known retired session's delayed terminal. `applyTranscriptProjection`
+      // has fenced this since the donor cut, but this sibling path released the
+      // capture BEFORE it ever looked at `event.sessionId`, so a predecessor's
+      // late refusal aborted its successor and reset the successor's transcript.
+      // The status carries the identity needed to refuse it; nothing else about
+      // the current capture, text, mode or countdown may move.
+      return
+    case .foreignToLiveCapture:
+      // A status with no capture identity, arriving mid-capture. It is still
+      // product truth, so the card and its notice are painted, but it may not
+      // end a take it cannot name.
+      presentationStatus = OverlayPresentationStatus(
+        schema: event.schema,
+        emittedAt: event.emittedAt,
+        sessionId: event.sessionId,
+        kind: event.kind,
+        code: event.code,
+        statusLabel: event.statusLabel,
+        headline: event.headline,
+        message: event.message,
+        isError: event.isError,
+        terminal: event.terminal,
+        calibrationVersion: event.calibrationVersion
+      )
+      onPresentationStatus?()
+      showToast(event.headline)
+      return
+    case .currentCapture:
+      break
+    }
     abortRecordingSession(resetTranscript: true)
     let status = OverlayPresentationStatus(
       schema: event.schema,
@@ -1788,6 +1945,123 @@ final class OverlayState {
     noSpeechNotice = message
   }
 
+  /// Move the outgoing take into the single retention owner.
+  ///
+  /// The counterexample this exists to refuse: edited take A -> capture B
+  /// retains A -> B ends clean or empty -> capture C. The old one-slot store
+  /// replaced A's draft with `nil` at C's boundary, so an edit no user decision
+  /// had ever consumed was gone. Nothing here evicts unsaved work; a capture
+  /// boundary is not a user decision.
+  ///
+  /// `prior` is the outgoing take's own projection. A capture with no observed
+  /// projection never reaches here, so nothing is retained under a minted
+  /// identity — and, just as importantly, nothing is dropped either: an earlier
+  /// unacknowledged take is not this boundary's to discard.
+  private func retainSupersededTake(
+    _ prior: CsTranscriptProjectionEvent, draftWasDirty: Bool
+  ) {
+    let unsavedDraft = draftWasDirty ? revisionDraft : nil
+    guard unsavedDraft != nil || !prior.renderedText.isEmpty else { return }
+    let take = OverlaySupersededTake(
+      sessionId: prior.sessionId,
+      renderedText: prior.renderedText,
+      reducerRevision: prior.reducerRevision,
+      unsavedDraft: unsavedDraft
+    )
+    if !take.hasUnsavedEdits {
+      // Clean documents are genuinely capped at one. Unsaved edits are never
+      // evicted to make room for this, and are never capped here at all.
+      supersededTakes.removeAll { !$0.hasUnsavedEdits }
+    }
+    supersededTakes.append(take)
+    if take.hasUnsavedEdits {
+      // Tell the user at the moment the edit is set aside, and how many are now
+      // waiting. This is disclosure, not a capacity mechanism.
+      showFooterNotice(supersededRecoveryNotice)
+    }
+  }
+
+  /// The retained take an explicit recovery or discard acts on. Oldest first,
+  /// so a queue of unacknowledged edits is walked in the order it was created.
+  var pendingSupersededTake: OverlaySupersededTake? { supersededTakes.first }
+  var hasRecoverableSupersededWork: Bool { !supersededTakes.isEmpty }
+  var unacknowledgedSupersededEditCount: Int {
+    supersededTakes.filter(\.hasUnsavedEdits).count
+  }
+  /// Human-readable retention state. It reports how many decisions are waiting;
+  /// it does not cap them. See `supersededTakes` for the disclosed boundary.
+  var supersededRecoveryNotice: String {
+    let edits = unacknowledgedSupersededEditCount
+    switch edits {
+    case 0: return "previous take retained"
+    case 1: return "1 unsaved edit to recover"
+    default: return "\(edits) unsaved edits to recover"
+    }
+  }
+
+  /// The single write the recovery action performs, and its honest outcome.
+  ///
+  /// This is a WRITER seam, not merely an injectable `NSPasteboard`, because no
+  /// real pasteboard can be made to fail on demand — so the failure branch of
+  /// the production action would otherwise be untestable, which is exactly how
+  /// an ignored `setString` result survives review. Tests inject both outcomes
+  /// and neither one touches the user's real clipboard.
+  @ObservationIgnored var recoveryClipboardWriter: (String) -> Bool = { text in
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    return pasteboard.setString(text, forType: .string)
+  }
+
+  /// Set when a recovery write failed. The retained item is still present, so
+  /// this is a "try again", never a loss report. Cleared by the next successful
+  /// recovery or by an explicit discard.
+  private(set) var recoveryFailure: String?
+
+  /// Hand one retained take back to the user.
+  ///
+  /// Recovery is deliberately NOT a reducer path. It commits nothing, mints no
+  /// session, forges no seal, submits nothing, and takes no focus: the bytes
+  /// leave through `recoveryClipboardWriter`. The current canvas is untouched,
+  /// so a pending capture keeps its empty screen while the previous words reach
+  /// the clipboard — the retained take is never painted as current speech.
+  ///
+  /// The item is consumed ONLY on a confirmed write. Dropping it on an
+  /// unchecked return value would destroy the only copy of an unsaved edit at
+  /// the exact moment the copy did not happen — the silent loss this owner
+  /// exists to prevent, reintroduced one line lower.
+  func recoverSupersededTake() {
+    guard let take = supersededTakes.first else { return }
+    guard recoveryClipboardWriter(take.recoverableText) else {
+      recoveryFailure =
+        take.hasUnsavedEdits
+        ? "Couldn't copy the unsaved edit — it is still retained, try again"
+        : "Couldn't copy the previous take — it is still retained, try again"
+      // Persisting: a failure the user must be able to read after the 2.6 s
+      // fade, and the retained work already keeps this rail revealed. The
+      // `.formatted` body shows the full sentence; the footer covers every
+      // other phase, including a live capture.
+      showFooterNotice("recover failed — kept", persists: true)
+      if terminal, !isEditingTranscript { restartAutoHideCountdown() }
+      return
+    }
+    recoveryFailure = nil
+    supersededTakes.removeFirst()
+    showFooterNotice(take.hasUnsavedEdits ? "unsaved edit copied" : "previous take copied")
+    // Mirrors `discardRevisionDraft`: interacting with the panel must not be
+    // the reason a terminal take closes under the user's hand.
+    if terminal, !isEditingTranscript { restartAutoHideCountdown() }
+  }
+
+  /// The only path that drops retained work. No capture boundary, late event or
+  /// watchdog may reach it; the user acknowledges the loss explicitly.
+  func discardSupersededTake() {
+    guard !supersededTakes.isEmpty else { return }
+    let take = supersededTakes.removeFirst()
+    recoveryFailure = nil
+    showFooterNotice(take.hasUnsavedEdits ? "unsaved edit discarded" : "previous take discarded")
+    if terminal, !isEditingTranscript { restartAutoHideCountdown() }
+  }
+
   /// One capture boundary.
   ///
   /// Called only from the lifecycle admission the controller already owns
@@ -1807,18 +2081,20 @@ final class OverlayState {
     // empty projection and misclassify a clean draft as unsaved work.
     let draftWasDirty = isRevisionDraftDirty
     captureGeneration &+= 1
-    if let prior = latestTranscriptProjection {
-      retiredProjectionSessions.insert(prior.sessionId)
-      supersededTranscriptProjection = prior
-    }
-    latestTranscriptProjection = nil
     // A scheduled focus-exit commit belongs to the take being superseded.
     // Letting it fire across the boundary would send an FFI revision for a
     // closed session while a new capture is live, so the bytes are preserved
     // for recovery rather than committed behind the user's back.
     revisionFocusCommitTask?.cancel()
     revisionFocusCommitTask = nil
-    supersededRevisionDraft = draftWasDirty ? revisionDraft : nil
+    // Retire and retain in one step, while the outgoing projection is still
+    // readable: the identity is passed in rather than re-read, so no later
+    // reordering of this method can silently turn retention into a no-op.
+    if let prior = latestTranscriptProjection {
+      retiredProjectionSessions.insert(prior.sessionId)
+      retainSupersededTake(prior, draftWasDirty: draftWasDirty)
+    }
+    latestTranscriptProjection = nil
     revisionDraft = ""
     // Retained chrome is evidence about the previous take, not this one.
     transcriptMode = "dictation"

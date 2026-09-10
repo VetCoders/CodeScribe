@@ -257,7 +257,7 @@ final class OverlayRefusalLayoutHangTests: XCTestCase {
       "clearing a \(harness.chars)-char canvas took \(elapsed)s — the repaint is not bounded"
     )
     XCTAssertEqual(
-      harness.state.supersededTranscriptProjection?.renderedText.count, harness.chars,
+      harness.state.pendingSupersededTake?.renderedText.count, harness.chars,
       "the refused take's words are retired, not destroyed")
   }
 

@@ -228,7 +228,7 @@ final class OverlayIntentRailTests: XCTestCase {
   func testEveryIntentHasVoiceOverCopyAndRailReportsProjectedPhase() {
     let intents: [OverlayIntent] = [
       .finish, .commitRevision, .discardRevision, .copy, .insertPaste, .retranscribe, .format,
-      .close,
+      .recoverSuperseded, .discardSuperseded, .close,
     ]
 
     XCTAssertEqual(
@@ -241,6 +241,8 @@ final class OverlayIntentRailTests: XCTestCase {
         "Insert transcript",
         "Retranscribe recording",
         "Format transcript",
+        "Recover previous transcript",
+        "Discard previous transcript",
         "Close overlay",
       ]
     )
@@ -249,6 +251,115 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertEqual(OverlayDockVisuals.hoverOpacity(isHovering: false), 0)
     XCTAssertGreaterThan(OverlayDockVisuals.hoverOpacity(isHovering: true), 0)
     XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: "no speech"), "no speech")
+  }
+
+  // MARK: Retained-work recovery on the sole action surface
+
+  /// Negative then positive: the two recovery commands appear only when work is
+  /// actually retained, and they appear even in `.error`, whose frozen table is
+  /// `[.close]` alone. An error phase must not be the reason an unacknowledged
+  /// edit becomes unreachable.
+  func testRecoveryCommandsAppearOnlyWithRetainedWorkAndSurviveErrorMode() {
+    let clean = projectedState(
+      phase: "error",
+      text: "draft",
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: true,
+      terminal: true
+    )
+    XCTAssertEqual(OverlayIntentRail.recoveryIntents(for: clean), [])
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: clean), [.close])
+    XCTAssertFalse(clean.hasRecoverableSupersededWork)
+
+    let retained = stateWithOneRetainedEdit()
+    XCTAssertTrue(retained.hasRecoverableSupersededWork)
+    XCTAssertEqual(
+      OverlayIntentRail.recoveryIntents(for: retained),
+      [.recoverSuperseded, .discardSuperseded])
+
+    // A live capture still shows at most the labelled affordance — never the
+    // previous words, which stay off the canvas.
+    retained.handleRecordingStarted()
+    XCTAssertEqual(retained.canvasText, "")
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: retained),
+      [.recoverSuperseded, .discardSuperseded, .finish, .close])
+
+    // And the ephemeral chrome reveals itself, so discovery does not depend on
+    // the user guessing to hover a panel that is showing a NEW take.
+    XCTAssertTrue(
+      OverlayChromeVisibility.actionsVisible(
+        pointerInside: false, keyboardFocus: false, voiceOver: false, retainedWork: true))
+    XCTAssertFalse(
+      OverlayChromeVisibility.actionsVisible(
+        pointerInside: false, keyboardFocus: false, voiceOver: false, retainedWork: false))
+  }
+
+  /// The rail's own dispatch route reaches the retention owner, and the
+  /// retained bytes leave through the injected pasteboard rather than the
+  /// reducer, a seal, a delivery or the canvas.
+  func testRailDispatchRecoversAndDiscardsThroughTheProductionRoute() {
+    let recovered = stateWithOneRetainedEdit()
+    let engine = OverlayIntentBoundaryEngine()
+    recovered.engine = engine
+    var written: [String] = []
+    recovered.recoveryClipboardWriter = { text in
+      written.append(text)
+      return true
+    }
+    let rail = OverlayIntentRail(
+      phase: recovered.statusText,
+      intents: OverlayIntentRail.projectedIntents(for: recovered),
+      palette: .dark,
+      onIntent: recovered.relayIntent
+    )
+    XCTAssertTrue(rail.intents.contains(.recoverSuperseded))
+    XCTAssertTrue(rail.intents.contains(.discardSuperseded))
+
+    rail.dispatch(.recoverSuperseded)
+
+    XCTAssertEqual(written, ["Zdanie z moją poprawką."])
+    XCTAssertFalse(recovered.hasRecoverableSupersededWork)
+    XCTAssertNil(recovered.recoveryFailure)
+    XCTAssertTrue(engine.formatterRequests.isEmpty, "recovery is not a reducer path")
+    XCTAssertTrue(engine.formatLevelWrites.isEmpty)
+    XCTAssertFalse(recovered.isEditingTranscript, "recovery takes no focus")
+
+    let discarded = stateWithOneRetainedEdit()
+    discarded.relayIntent(.discardSuperseded)
+    XCTAssertFalse(discarded.hasRecoverableSupersededWork)
+
+    // A refused write keeps the item, so the rail keeps offering both choices.
+    let refused = stateWithOneRetainedEdit()
+    refused.recoveryClipboardWriter = { _ in false }
+    refused.relayIntent(.recoverSuperseded)
+    XCTAssertTrue(refused.hasRecoverableSupersededWork)
+    XCTAssertNotNil(refused.recoveryFailure)
+    XCTAssertEqual(
+      OverlayIntentRail.recoveryIntents(for: refused),
+      [.recoverSuperseded, .discardSuperseded])
+  }
+
+  /// One formatted take with an uncommitted edit, superseded by a new capture.
+  private func stateWithOneRetainedEdit() -> OverlayState {
+    let state = projectedState(
+      phase: "formatted",
+      text: "Zdanie.",
+      canPaste: true,
+      canInsert: true,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: true,
+      terminal: true
+    )
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("Zdanie z moją poprawką.")
+    state.endTranscriptEdit()
+    state.handleRecordingPreparing()
+    return state
   }
 
   func testProjectedRetranscribeIntentReachesInjectedEngineBoundary() async {

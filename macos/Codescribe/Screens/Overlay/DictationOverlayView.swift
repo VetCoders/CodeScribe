@@ -109,7 +109,8 @@ struct DictationOverlayView: View {
       pointerInside: pointerInside,
       keyboardFocus: actionsFocused || state.isEditingTranscript
         || NSApp.isFullKeyboardAccessEnabled,
-      voiceOver: voiceOverEnabled
+      voiceOver: voiceOverEnabled,
+      retainedWork: state.hasRecoverableSupersededWork
     )
   }
 
@@ -357,7 +358,13 @@ struct DictationOverlayView: View {
       .accessibilityElement(children: .combine)
       .accessibilityIdentifier("overlay-revision-status")
 
-      if let error = state.revisionCommitError ?? state.formatterError {
+      // `recoveryFailure` joins the chain because a failed recovery keeps the
+      // retained item: the user needs the full sentence, not just the footer
+      // chip. This row is `.formatted`-only, so the persisting footer notice
+      // remains the surface that covers a live capture.
+      if let error = state.revisionCommitError ?? state.formatterError
+        ?? state.recoveryFailure
+      {
         Label(error, systemImage: "exclamationmark.triangle")
           .csMono(10, .medium)
           .foregroundStyle(CSColor.terracotta)

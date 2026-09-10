@@ -1344,7 +1344,7 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     state.handleRecordingPreparing()
     XCTAssertEqual(
       state.activeText, "", "the successor's canvas opens empty at capture admission")
-    XCTAssertEqual(state.supersededTranscriptProjection?.sessionId, "session-1")
+    XCTAssertEqual(state.pendingSupersededTake?.sessionId, "session-1")
     state.handleRecordingStarted()
     listening("second take", to: state, sessionId: "session-2")
 
