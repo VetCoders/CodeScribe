@@ -177,7 +177,7 @@ The projection contract is one snapshot, not a bag of Swift inputs:
 | Field                               | Source of truth                                                                                                                                                                                                                                         |
 | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `reducer_revision`, `rendered_text` | Exact committed reducer revision                                                                                                                                                                                                                        |
-| `phase`                             | `listening` for open book revisions, `finalizing` after a terminal ledger seal, then `formatted` or `no_speech` from `session_ended` plus the last committed render; a terminal user revision remains `formatted`; failed/superseded starts are `error` |
+| `phase`                             | `listening` for open book revisions, `finalizing` after a terminal ledger seal, then `formatted`, `coverage_refused` or `no_speech` from `session_ended` plus the last committed render; a terminal user revision remains `formatted`; failed/superseded starts are `error` |
 | `can_paste`                         | The delivery throne selects `ClipboardPaste`, a latched target exists, and the take has ended                                                                                                                                                           |
 | `can_insert`                        | The delivery throne selects `ClipboardPaste` or `DeferredInsert`, and the take has ended                                                                                                                                                                |
 | `can_copy`                          | The committed render is non-empty                                                                                                                                                                                                                       |
@@ -325,8 +325,9 @@ Recovery is reachable and explicit. The sole overlay action surface projects two
 commands whenever retained work exists — recover and discard — and they are the
 only commands on that rail sourced from local presentation state rather than the
 reducer, because the bytes they protect are an edit Rust never saw. They are
-offered independently of error mode, whose projection table is otherwise
-`[close]` alone, and during a live capture the rail shows those labelled
+offered independently of the phase table, so even a terminal outcome that
+projects nothing but Close cannot make an unsaved edit unreachable, and
+during a live capture the rail shows those labelled
 commands only: the previous words never return to the canvas as current speech.
 Recovery hands the retained bytes to the pasteboard, and consumes the retained
 item only on a confirmed write. A refused write keeps the exact item — identity
@@ -336,6 +337,81 @@ happen. Recovery commits nothing to the reducer, mints no session, forges no
 seal, submits no delivery and takes no focus. A scheduled draft commit for the superseded take is cancelled rather than
 sent, so no revision request crosses FFI for a closed session while a new
 capture is live.
+
+### Refused coverage at the receiver (rc-w2-refusal-ui, W2 source checkpoint)
+
+`coverage_refused` is a terminal presentation outcome of its own, parsed from
+the wire like every other phase. Before it existed as an `OverlayMode` case the
+receiver's `OverlayMode(rawValue:) ?? mode` fallback kept the previous phase, so
+a settled refused take finished its life painted as `finalizing`. That is the
+concrete defect this section closes; the fallback itself is unchanged and still
+retains chrome for any phase the producer invents next.
+
+The receiver states three things at once and may not collapse them:
+
+- The words are the reducer's committed bytes and stay on the canvas verbatim.
+- No seal was recorded. The success callback and the Agent final-text hint
+  remain gated on `formatted` alone, so a refused take cannot fire the seam
+  that arms auto-send, and no auto-send policy changes here.
+- The destination is reported separately from both. A terminal ends capture;
+  it does not acknowledge a receiver.
+
+A standing, accessible explanation is painted from state rather than scheduled
+as a toast, and the panel refuses an Assistive tray tick for this phase exactly
+as it already did for `formatted` and `no_speech` — a refused take is the one
+outcome whose only recovery handle lives on that panel. The explanation mirrors
+the producer: it is present while the last terminal projection carried
+`coverage_refused` and gone otherwise, so it cannot outlive the fact. The next
+capture clears the notice and any persisting chip, and clears neither the
+retained delivery documents nor the superseded takes, which are keyed by their
+own session identities.
+
+The `rc-w2-refusal-visibility` correction protects both auto-hide arming and
+deadline evaluation while the current mode is `coverage_refused`. Hover exit,
+drag and resize cannot rearm it, and a wake armed before refusal cannot close
+the recovery panel or reach Agent delivery. The existing capture-generation
+guard rejects a predecessor's wake before it touches a successor's timer.
+Explicit human Close still reaches the normal close callback without changing
+the refused verdict or deleting the retained document. A legitimate successor
+capture owns its own presentation; its ordinary successful terminal still gets
+the five-second countdown. The notice continues to mirror the producer's phase;
+this receiver does not certify a later `formatted` revision as a valid seal.
+
+Stored bytes and accessible controls are separate claims. Keeping a document in
+`retainedComposerDocuments` proves storage in this receiver, not a reachable UI.
+The correction keeps the current refused panel and its capability-driven
+controls available until human dismissal or a successor transition. Recovery
+after that transition depends on the existing receiver/superseded-take controls;
+no new history or recovery store is introduced. Installed accessibility and
+original-thread delivery still require joined runtime verification.
+
+The rail projects the producer's capability bits on `coverage_refused` and on
+`error` instead of a fixed `[close]`. A delivery failure keeps its words and its
+retained audio, so Copy, Insert and Retranscribe are exactly the recovery the
+user needs at that moment, and the previous fixed list hid them behind the word
+"error". Format is the one command withheld on both phases: its production relay
+refuses outside `formatted`, so projecting it would paint a dead button whose
+only working form would relabel a refused take as a sealed one. A false bit is
+honoured everywhere; on these two phases a true `can_format` is declined by the
+receiver, and that decision is stated here rather than inferred.
+
+Delivery is unchanged and deliberately not phase-aware. Refused documents take
+the same `ComposerPending` route, and only the receiver's typed receipt is
+admission: `admitted`/`parked` consume the session's delivery slot, `retained`
+keeps the bytes stored, `empty` claims nothing. A retained handover now shows
+a persisting notice rather than a chip that fades after the toast window, since
+a handover that came back is standing state. An empty typed refusal arrives as
+`error` with no text and no bits; nothing is invented for it.
+
+BOUNDARY — `end_reason` does not cross the projection contract, so Swift cannot
+distinguish `coverage_refused_empty` from an ordinary transcription failure and
+does not guess: both render the existing error card. Distinguishing them needs a
+producer-side field, not a receiver heuristic. A user revision of refused words
+may currently return `formatted` from the producer; its seal provenance remains
+a producer boundary, not something this timer correction repairs. All tests
+here are UNRUN under W2. The visibility tests use the existing injected clock
+and deadline evaluator, including a saved pre-refusal deadline; no new test
+uses wall-clock sleeps. BUILD/TEST/RUNTIME=NOT_ASSESSED; no W2 closure is claimed.
 
 Retiring a session also fences its late events, on both receiver paths. A
 retired projection may still complete its own addressed delivery and capture

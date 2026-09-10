@@ -59,10 +59,22 @@ struct OverlayAppearancePalette: Equatable, Sendable {
     appearance == .dark ? .dark : .light
   }
 
+  /// Refused coverage reuses the caution amber rather than gaining a token of
+  /// its own. The choice is deliberate and it is a constraint, not a
+  /// preference: every token here is held to a measured contrast floor by
+  /// `OverlayAppearanceTests`, and a new pair of hex values authored under the
+  /// compile embargo would be two unverified colours shipped on the strength
+  /// of an agent's eye. Amber is already proven in both appearances and it is
+  /// the honest hue for "settled, but not complete".
+  ///
+  /// What matters far more than which warm colour it is: it must never be
+  /// `successStatus`. Green here would be the palette agreeing with a seal
+  /// that was refused.
   func statusToken(for mode: OverlayMode) -> OverlayColorToken {
     switch mode {
     case .listening: listeningStatus
     case .finalizing: processingStatus
+    case .coverageRefused: processingStatus
     case .formatted: successStatus
     case .noSpeech: neutralStatus
     case .error: errorStatus

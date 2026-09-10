@@ -1369,4 +1369,123 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertEqual(state.mode, .listening)
     XCTAssertFalse(state.terminal)
   }
+
+  // MARK: Refusal recovery (rc-w2-refusal-ui) — UNRUN under W2
+
+  /// One lifecycle terminal carrying `coverage_refused`, one production
+  /// receiver, one admission.
+  ///
+  /// The whole point of routing refusal through the SAME `ComposerPending`
+  /// path is that the receiver never learns the take was refused — a
+  /// destination is not a quality judgement. What the receiver must see is a
+  /// document for the thread that opened the capture, exactly once.
+  private func refusedSessionEnded(
+    _ text: String, to state: OverlayState, sessionId: String = "join-session",
+    delivery: CsTranscriptDelivery = .composerPending
+  ) {
+    project(
+      text, to: state, sessionId: sessionId, phase: "coverage_refused", terminal: true,
+      lifecycleTerminal: true, delivery: delivery, reducerAction: "session_ended")
+  }
+
+  func testRefusedCoverageIsAdmittedOnceByTheThreadThatOwnsTheCapture() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "join-session")
+    f.store.select(f.threadA)
+    f.store.draft = "typed"
+
+    refusedSessionEnded("unsealed words", to: state)
+
+    XCTAssertEqual(f.store.draft, "typed\nunsealed words")
+    XCTAssertEqual(state.mode, .coverageRefused, "the receiver's acceptance is not a seal")
+    XCTAssertNotNil(state.coverageRefusalNotice)
+    XCTAssertNil(state.retainedComposerDelivery, "an admitted document is not retained twice")
+    XCTAssertTrue(
+      f.store.threads.allSatisfy { $0.messages.isEmpty },
+      "a refused take must not acquire auto-send it never had")
+
+    // A duplicate lifecycle terminal for the same identity is one delivery.
+    refusedSessionEnded("unsealed words", to: state)
+    XCTAssertEqual(f.store.draft, "typed\nunsealed words")
+  }
+
+  /// The receiver refuses and owns the recovery. The overlay must record that
+  /// the words are somewhere reachable WITHOUT keeping a second copy of its
+  /// own — two owners for one document is how one of them goes stale.
+  func testRefusedCoverageWithNoOwningThreadLandsInReceiverRecovery() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    // No `admitCapture`: the store has no owner for this capture identity.
+
+    refusedSessionEnded("orphaned but real", to: state, sessionId: "unowned-capture")
+
+    XCTAssertEqual(
+      f.store.composerRecoveryDocuments.map(\.text), ["orphaned but real"],
+      "the receiver did not take ownership of the refused document")
+    XCTAssertNil(
+      state.retainedComposerDelivery,
+      "the overlay kept a second copy of a document the receiver already owns")
+    XCTAssertEqual(state.toast, "kept in composer recovery")
+    XCTAssertEqual(state.mode, .coverageRefused)
+  }
+
+  /// No receiver wired at all. This is the fallback the overlay owns, and it
+  /// is the one case where it may hold the bytes itself.
+  func testRefusedCoverageWithNoReceiverStaysVisibleOnTheOverlay() {
+    let state = OverlayState()
+    refusedSessionEnded("nobody is listening", to: state)
+
+    XCTAssertEqual(state.retainedComposerDelivery, "nobody is listening")
+    XCTAssertEqual(state.toast, "no composer receiver")
+    XCTAssertEqual(
+      state.coverageRefusalDetail,
+      "The handover came back. These words are retained here — recover them before the next take.")
+    XCTAssertEqual(state.activeText, "nobody is listening", "the canvas still holds the words")
+  }
+
+  /// A predecessor's refused terminal arriving after its successor opened.
+  /// It may recover to its OWN receiver and it may not touch the successor's
+  /// canvas, phase or notice — a late refusal cannot retroactively mark a
+  /// live take as incomplete.
+  func testLateRefusedPredecessorRecoversWithoutRepaintingTheSuccessor() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    admitCapture(f.store, threadID: f.threadA, id: "session-1")
+    f.store.select(f.threadA)
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    listening("first take", to: state, sessionId: "session-1")
+    state.finishControllerRecording()
+
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    admitCapture(f.store, threadID: f.threadB, id: "session-2")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    listening("second take", to: state, sessionId: "session-2")
+
+    refusedSessionEnded("first take refused", to: state, sessionId: "session-1")
+
+    XCTAssertEqual(f.store.draft, "B typed", "a late refusal edited the successor's composer")
+    XCTAssertEqual(state.activeText, "second take")
+    XCTAssertEqual(state.mode, .listening, "a late refusal repainted the live take")
+    XCTAssertNil(state.coverageRefusalNotice, "the successor inherited a refusal it never had")
+    XCTAssertFalse(state.terminal)
+
+    // Parked, not lost. Asserted the way the user meets it — by going back to
+    // the conversation that opened the take — because the store's composition
+    // map is private and a test that reached into it would be checking an
+    // implementation detail instead of the delivery.
+    f.store.select(f.threadA)
+    XCTAssertEqual(
+      f.store.draft, "first take refused",
+      "the predecessor's refused words never reached their own thread")
+    XCTAssertTrue(
+      f.store.threads.allSatisfy { $0.messages.isEmpty },
+      "a parked refusal must never be submitted on the user's behalf")
+  }
 }

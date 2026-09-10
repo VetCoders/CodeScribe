@@ -129,6 +129,12 @@ enum OverlayMode: String, Equatable {
   case listening
   case finalizing
   case formatted
+  /// The lifecycle settled with usable words whose acoustic coverage the
+  /// ledger refused. It is its own terminal outcome, not a dialect of the
+  /// other two: `formatted` would claim a seal that was never recorded, and
+  /// `error` would claim the words are lost when they are on the canvas.
+  /// Producer: `TranscriptProjectionPhase::CoverageRefused`.
+  case coverageRefused = "coverage_refused"
   case noSpeech = "no_speech"
   case error
 }
@@ -288,6 +294,14 @@ final class OverlayState {
   private(set) var presentationStatus: OverlayPresentationStatus?
   private(set) var errorLifecycleDetail =
 "No transcript was delivered."
+  /// Standing explanation for a take whose acoustic coverage the ledger
+  /// refused. Non-nil exactly while the last terminal projection carried
+  /// `coverage_refused`, so the surface cannot outlive the fact it describes.
+  ///
+  /// It is a notice, never a document: it holds no transcript bytes, cannot
+  /// be delivered, and does not touch `formattedText`. The words themselves
+  /// stay exactly where the reducer put them — on the canvas.
+  private(set) var coverageRefusalNotice: String?
   /// Prompt-free policy snapshot from C02's persisted settings owner. These
   /// values are replaced only by a fresh engine read, never by optimistic UI.
   private(set) var autoPasteEnabled = true
@@ -414,6 +428,12 @@ final class OverlayState {
   @ObservationIgnored private var eventTask: Task<Void, Never>?
 
   static let defaultNoSpeechNotice = "No speech detected"
+  /// The sentence a refused take shows instead of a seal. It states the two
+  /// facts that are true at once — the words are here, the coverage is not
+  /// complete — because dropping either half is how this outcome gets
+  /// mistaken for success or for loss.
+  static let defaultCoverageRefusalNotice =
+    "Incomplete coverage — these words were kept, not sealed"
 
   private var recording = false
   /// Reason from `on_no_speech`, captured before the terminal stop.
@@ -486,7 +506,7 @@ final class OverlayState {
 
   // MARK: Activity-anchored auto-hide for terminal outcomes
   private var autoHideTask: Task<Void, Never>?
-  private var autoHideDeadline: TimeInterval?
+  private(set) var autoHideDeadline: TimeInterval?
   private var isPointerHovering = false
   private let nowProvider: () -> TimeInterval
   /// Single source of truth for the Founder-dictated terminal lifetime.
@@ -534,6 +554,10 @@ final class OverlayState {
     case .listening: return "listening"
     case .finalizing: return "finalizing"
     case .formatted: return "formatted"
+    // Never "formatted": the pill is the first thing a user reads, and the
+    // one word it must not say about a refused take is the word that means
+    // sealed.
+    case .coverageRefused: return "incomplete coverage"
     case .noSpeech: return "no speech"
     case .error: return "error"
     }
@@ -601,8 +625,24 @@ final class OverlayState {
   /// Post-take review owns the floating panel. The formatted / no-speech
   /// surface must not yield to an Assistive tray tick — that path calls
   /// `hide()` and arms Agent auto-send.
+  ///
+  /// A refused take is the case that needs this most, not least. It is the one
+  /// terminal outcome whose only recovery handle lives on this panel, so
+  /// letting a tray tick take the panel away would remove the handle while
+  /// arming the auto-send the refusal explicitly did not earn.
   var blocksAssistiveOverlayHide: Bool {
-    presentationStatus != nil || mode == .formatted || mode == .noSpeech
+    presentationStatus != nil || mode == .formatted || mode == .coverageRefused
+      || mode == .noSpeech
+  }
+
+  /// Second line of the refusal card. Both branches are statements about what
+  /// did NOT happen, which is the only thing this surface can honestly assert:
+  /// the overlay is the postman, so it may report a handover that came back,
+  /// and it may report the missing seal — never an acceptance.
+  var coverageRefusalDetail: String {
+    retainedComposerDelivery != nil
+      ? "The handover came back. These words are retained here — recover them before the next take."
+      : "No seal was recorded for this take, so nothing here is certified complete."
   }
 
   var audioLevelAccessibilityValue: String {
@@ -1378,6 +1418,12 @@ final class OverlayState {
   }
 
   private func restartAutoHideCountdown() {
+    // Refused coverage still needs reachable recovery controls. A timer is
+    // not human dismissal, even when the document is retained in memory.
+    guard mode != .coverageRefused else {
+      cancelAutoHide()
+      return
+    }
     // A take under review (caret in the canvas, or an uncommitted draft) is
     // never auto-hidden out from under the user.
     guard isTerminalMode, !isPointerHovering, !isEditingTranscript, !isRevisionDraftDirty
@@ -1406,6 +1452,12 @@ final class OverlayState {
   private func evaluateAutoHideDeadline(rescheduleIfEarly: Bool, generation: UInt64) {
     guard generation == captureGeneration else { return }
     autoHideTask = nil
+    // Recheck the current verdict: this wake may have been armed before the
+    // refusal arrived. It may neither close recovery nor reach Agent delivery.
+    guard mode != .coverageRefused else {
+      cancelAutoHide()
+      return
+    }
     guard isTerminalMode, !isPointerHovering, let deadline = autoHideDeadline else { return }
     let remaining = deadline - nowProvider()
     if remaining > 0 {
@@ -1426,13 +1478,17 @@ final class OverlayState {
 
   /// Deterministic XCTest seam: tests inject a monotonic clock, advance it,
   /// and evaluate the same deadline logic without wall-clock sleeps.
-  func fireAutoHideNowForTests() {
+  /// Supplying a previously armed deadline models a pending wake independently
+  /// of scheduling cancellation, so the deadline's refusal guard is falsifiable.
+  func fireAutoHideNowForTests(armedDeadline: TimeInterval? = nil) {
+    if let armedDeadline { autoHideDeadline = armedDeadline }
     fireAutoHideForTests(generation: captureGeneration)
   }
 
   /// Deterministic negative seam: replay a wake that was armed by an EARLIER
   /// capture (pass its generation) and prove it cannot close the successor.
   func fireAutoHideForTests(generation: UInt64) {
+    guard generation == captureGeneration else { return }
     autoHideTask?.cancel()
     autoHideTask = nil
     evaluateAutoHideDeadline(rescheduleIfEarly: false, generation: generation)
@@ -1709,6 +1765,10 @@ final class OverlayState {
       && projection.sessionId == pendingRevisionSessionId
       && projection.reducerRevision > (pendingRevisionSource ?? UInt64.max)
       && formatterReceipt != nil
+    // `formatted` and nothing else. This is the success callback and it feeds
+    // the Agent auto-send arming below, so widening it to "any terminal" —
+    // the obvious-looking simplification — would let a refused take fire the
+    // success seam and then submit words the ledger declined to seal.
     let signalsFirstSuccessfulTerminal =
       !terminal && projection.terminal && projection.phase == OverlayMode.formatted.rawValue
     // Initialize before the first event can obtain a receiver receipt or retain
@@ -1803,6 +1863,14 @@ final class OverlayState {
       if projection.phase == OverlayMode.noSpeech.rawValue {
         noSpeechNotice = pendingNoSpeechMessage ?? OverlayState.defaultNoSpeechNotice
       }
+      // Mirrors the producer's phase rather than latching: a later terminal
+      // revision of the same session carries its own verdict, and a notice
+      // that outlived it would be this layer asserting a refusal the reducer
+      // has stopped stating.
+      coverageRefusalNotice =
+        projection.phase == OverlayMode.coverageRefused.rawValue
+        ? OverlayState.defaultCoverageRefusalNotice
+        : nil
       restartAutoHideCountdown()
       if revisionReceipt != nil {
         captureQualityIfEdited(action: "revision")
@@ -1857,8 +1925,16 @@ final class OverlayState {
   }
 
   /// Keep a refused delivery accessible. This is not an error state for the
-  /// transcript — the words are real and sealed exactly as they were; what
-  /// failed is the handover, and saying so is the honest chrome.
+  /// transcript — the words are exactly the bytes the reducer committed, and
+  /// what failed is the handover. It says nothing about a seal: a document
+  /// reaches this path under `coverage_refused` too, where the ledger
+  /// explicitly refused coverage, so claiming these bytes are sealed would
+  /// mint the one receipt this whole route exists to avoid faking.
+  ///
+  /// The notice persists. A handover that came back is standing state, not an
+  /// event: a chip that fades after 2.6 s leaves a user with words on screen,
+  /// no destination, and nothing saying so. `resetTranscript` clears it when
+  /// the next capture starts.
   private func retainComposerDelivery(
     _ text: String, sessionID: String, notice: String, showsNotice: Bool = true
   ) {
@@ -1867,7 +1943,7 @@ final class OverlayState {
     }
     if showsNotice {
       errorMessage = nil
-      showFooterNotice(notice)
+      showFooterNotice(notice, persists: true)
     }
   }
 
@@ -2125,6 +2201,16 @@ final class OverlayState {
     deliveredText = ""
     pendingNoSpeechMessage = nil
     noSpeechNotice = OverlayState.defaultNoSpeechNotice
+    coverageRefusalNotice = nil
+    // A persisting chip belongs to the take that raised it. Nothing else
+    // cleared one, so a retained-delivery or deferred-insert notice used to
+    // ride into the next capture and describe the wrong take. Clearing the
+    // NOTICE is not clearing the WORK: `retainedComposerDocuments` and
+    // `supersededTakes` are keyed by their own session identities and are
+    // deliberately untouched here.
+    toastTask?.cancel()
+    toastTask = nil
+    toast = nil
     presentationStatus = nil
     errorLifecycleDetail = "No transcript was delivered."
     finalized = false
