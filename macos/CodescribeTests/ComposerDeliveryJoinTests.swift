@@ -1305,4 +1305,68 @@ final class ComposerDeliveryJoinTests: XCTestCase {
     XCTAssertTrue(
       f.store.threads.allSatisfy { $0.messages.isEmpty }, "recovery never submits anything")
   }
+
+  /// The overlay's new presentation fence retires the previous take at the
+  /// controller's capture admission (`preparing`/`started`). This is the owned
+  /// delivery-side proof that the fence changed presentation only: the retired
+  /// take's late lifecycle terminal still completes its addressed release, and
+  /// it still cannot touch the successor's capture, composer or canvas.
+  ///
+  /// The sibling test `testDelayedPriorSessionTerminalDoesNotReleaseTheCurrentCapture`
+  /// covers the same seam WITHOUT lifecycle beats; the beats are what this cut
+  /// added, so they get their own witness rather than a loosened existing one.
+  func testCaptureAdmissionBetweenTakesKeepsRetiredDeliveryAndSuccessorCanvasApart() {
+    let f = makeFixture(recording: [false, true])
+    let state = OverlayState()
+    state.connectComposer(to: f.store)
+    var stopped = 0
+    state.onRecordingStopped = { stopped += 1 }
+    var endedSessions: [String] = []
+    let storeRelease = state.onCaptureEnded
+    state.onCaptureEnded = { sessionID in
+      endedSessions.append(sessionID)
+      storeRelease?(sessionID)
+    }
+
+    admitCapture(f.store, threadID: f.threadA, id: "session-1")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    listening("first take", to: state, sessionId: "session-1")
+    XCTAssertEqual(state.activeText, "first take")
+    state.finishControllerRecording()
+    let afterFirst = stopped
+
+    // A second take is admitted before the first one's terminal ever arrives.
+    f.store.select(f.threadB)
+    f.store.draft = "B typed"
+    admitCapture(f.store, threadID: f.threadB, id: "session-2")
+    f.store.dictationBlocked = true
+    state.handleRecordingPreparing()
+    XCTAssertEqual(
+      state.activeText, "", "the successor's canvas opens empty at capture admission")
+    XCTAssertEqual(state.pendingSupersededTake?.sessionId, "session-1")
+    state.handleRecordingStarted()
+    listening("second take", to: state, sessionId: "session-2")
+
+    // Now the predecessor's lifecycle terminal lands.
+    sessionEnded("first take", to: state, sessionId: "session-1")
+
+    XCTAssertEqual(
+      endedSessions, ["session-1"],
+      "the retired take still releases exactly its own capture")
+    XCTAssertEqual(stopped, afterFirst, "and never issues a stop for the successor")
+    XCTAssertEqual(f.store.composerCaptureHandle?.captureId, "session-2")
+    XCTAssertEqual(f.store.dictationThreadID, f.threadB)
+    XCTAssertTrue(f.store.ownsLiveDictation)
+    XCTAssertTrue(f.store.dictationBlocked)
+    XCTAssertEqual(f.store.draft, "B typed", "the successor's composer is untouched")
+    XCTAssertTrue(
+      f.store.threads.allSatisfy { $0.messages.isEmpty },
+      "a retired terminal is never auto-submitted")
+
+    XCTAssertEqual(state.latestTranscriptProjection?.sessionId, "session-2")
+    XCTAssertEqual(state.activeText, "second take")
+    XCTAssertEqual(state.mode, .listening)
+    XCTAssertFalse(state.terminal)
+  }
 }
