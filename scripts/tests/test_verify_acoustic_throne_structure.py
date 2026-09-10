@@ -162,7 +162,7 @@ def body_payload(
     start_line: int = 1,
     language: str = "rs",
 ) -> dict[str, object]:
-    total_lines = source.count("\n") + 1
+    total_lines = len(source.splitlines())
     return {
         "symbol": symbol,
         "bodies": [
@@ -1681,6 +1681,96 @@ class CorridorProofTests(unittest.TestCase):
             VERIFIER.verify_code_corridors(
                 self.verifier_for_ordering(), contract
             )
+
+
+class CorridorBodyRecoveryTests(unittest.TestCase):
+    file = "bridge/src/recording.rs"
+    symbol = "from_bus_receipt"
+    signature = "fn from_bus_receipt(receipt: &ProjectedAcousticReceipt) -> Self"
+
+    def typed_payload(self, source: str) -> dict[str, object]:
+        return body_payload(self.symbol, self.file, source, start_line=194)
+
+    def select(self, payload: dict[str, object]) -> list[dict[str, object]]:
+        return VERIFIER.corridor_body_rows(
+            payload, symbol=self.symbol, file=self.file,
+            signature_contains=self.signature,
+        )
+
+    def test_selects_acoustic_method_among_two_real_types(self) -> None:
+        payload = self.typed_payload(
+            f"pub(crate) {self.signature} {{ Self {{}} }}"
+        )
+        other = body_payload(
+            self.symbol, self.file,
+            "fn from_bus_receipt(receipt: &ProjectedPresentationReceipt) -> Self { Self {} }",
+            start_line=71,
+        )
+        payload["bodies"].extend(other["bodies"])
+        self.assertEqual([row["start_line"] for row in self.select(payload)], [194])
+
+    def test_wrong_type_cannot_borrow_selector_from_comment_string_or_nested_body(self) -> None:
+        for decoy in (
+            f"// {self.signature}\n",
+            f'let decoy = "{self.signature}";',
+            f"{self.signature} {{ Self {{}} }}",
+        ):
+            with self.subTest(decoy=decoy):
+                payload = self.typed_payload(
+                    "fn from_bus_receipt(receipt: &ProjectedPresentationReceipt) -> Self {\n"
+                    f"{decoy}\nSelf {{}}\n}}"
+                )
+                self.assertEqual(self.select(payload), [])
+
+    def test_duplicate_typed_bodies_still_fail_corridor_cardinality(self) -> None:
+        payload = self.typed_payload(f"{self.signature} {{ Self {{}} }}")
+        payload["bodies"].extend(copy.deepcopy(payload["bodies"]))
+        verifier = StubVerifier(Path("/repo"), bodies={(self.symbol, self.file): payload})
+        contract = [{
+            "name": "typed_receipt",
+            "hops": [{"symbol": self.symbol, "file": self.file,
+                      "signature_contains": self.signature,
+                      "required_code": [self.signature]}],
+            "required_invocations": [{"caller": "from_bus_event", "caller_file": self.file,
+                                      "callee": self.symbol, "callee_file": self.file}],
+        }]
+        _, failures = VERIFIER.verify_code_corridors(verifier, contract)
+        self.assertTrue(any("expected one body" in failure for failure in failures))
+
+    def test_incomplete_extent_cannot_be_blessed_by_flipping_truncated(self) -> None:
+        for mutation in (
+            {"truncated": True},
+            {"extent": "window", "truncated": False},
+            {"extent": None},
+            {"total_lines": 41},
+            {"end_line": 234},
+        ):
+            with self.subTest(mutation=mutation):
+                payload = self.typed_payload(f"{self.signature} {{ Self {{}} }}")
+                payload["bodies"][0].update(mutation)
+                with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                    self.select(payload)
+
+    def test_complete_generic_helper_is_accepted_but_window_is_refused(self) -> None:
+        # Structural specimen only; it does not reproduce the product pipeline.
+        source = "fn helper<F>(provider: F) -> bool\nwhere F: Fn() -> bool,\n{\nprovider()\n}"
+        payload = body_payload("helper", "core/helper.rs", source)
+        args = {"symbol": "helper", "file": "core/helper.rs", "signature_contains": "fn helper<F>"}
+        self.assertEqual(len(VERIFIER.corridor_body_rows(payload, **args)), 1)
+        payload["bodies"][0].update(extent="window", truncated=True)
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            VERIFIER.corridor_body_rows(payload, **args)
+
+    def test_snapshot_refresh_is_requested_on_both_coherence_reads(self) -> None:
+        from unittest.mock import patch
+
+        verifier = VERIFIER.StructuralVerifier(Path("/repo"))
+        with patch.object(verifier, "run_loct", return_value=VERIFIER.LoctResult([], {})) as run:
+            verifier.context()
+            verifier.context()
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertIn("--fresh", call.args)
 
 
 class RustModuleResolutionTests(unittest.TestCase):

@@ -210,7 +210,9 @@ class StructuralVerifier:
         return self._run_loct_json([ALLOWED_EXECUTABLE, expression])
 
     def context(self) -> dict[str, Any]:
-        return self.run_loct("context", "--full", "--no-aicx").payload
+        # Rebuild source positions before evidence collection and at the final
+        # coherence check; a cached definition can survive a moved Swift body.
+        return self.run_loct("context", "--full", "--no-aicx", "--fresh").payload
 
     def occurrences(self, symbol: str) -> dict[str, Any]:
         if symbol not in self._occurrences:
@@ -1231,9 +1233,23 @@ def corridor_body_rows(
             or not isinstance(end_line, int)
             or end_line < start_line
             or row.get("truncated") is not False
+            or row.get("extent") != "brace"
+            or type(row.get("total_lines")) is not int
+            or row["total_lines"] != end_line - start_line + 1
+            or len(source.splitlines()) != row["total_lines"]
         ):
             raise RuntimeError(f"Loctree body for {symbol} is incomplete: {row}")
-        if signature_contains is None or signature_contains in source:
+        # Select the declaration, never a comment, string or nested function
+        # in another typed method. Ambiguous declarations still fail upstream.
+        header = code_without_comments_or_strings(source).partition("{")[0]
+        signature = (
+            code_without_comments_or_strings(signature_contains)
+            if signature_contains is not None
+            else None
+        )
+        if signature is not None and not signature:
+            raise RuntimeError(f"empty executable signature selector for {symbol}")
+        if signature is None or signature in header:
             rows.append(row)
     return rows
 
