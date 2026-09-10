@@ -922,6 +922,7 @@
             {
               "symbol": "from_bus_receipt",
               "file": "bridge/src/recording.rs",
+              "signature_contains": "fn from_bus_receipt(receipt: &ProjectedAcousticReceipt) -> Self",
               "required_code": [
                 "fn from_bus_receipt(receipt: &ProjectedAcousticReceipt) -> Self",
                 "session_id: receipt.session_id.clone()",
@@ -1500,6 +1501,7 @@
             {
               "symbol": "from_bus_receipt",
               "file": "bridge/src/recording.rs",
+              "signature_contains": "fn from_bus_receipt(receipt: &ProjectedAcousticReceipt) -> Self",
               "required_code": [
                 "fn from_bus_receipt(receipt: &ProjectedAcousticReceipt) -> Self",
                 "acoustic_serial_version: receipt.acoustic_serial_version",
