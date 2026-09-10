@@ -201,21 +201,53 @@ pub struct ProjectedSealCoverageRange {
 }
 
 /// Additive coverage evidence attached to `codescribe.transcript-evidence.v1`.
+///
+/// # Reader contract
+///
+/// `status` is one of `complete`, `incomplete`, `unavailable`. A reader
+/// branches on that token and, for `unavailable`, on the typed
+/// `unavailable_reason` — never on display copy and never on the ratio.
+///
+/// `coverage_ratio` is **absent** whenever no authenticated acoustic
+/// measurement backs the verdict. It is never `NaN` and never a synthetic
+/// `1.0`: a take nobody measured has no covered fraction, and rendering one
+/// made absence of evidence look like a perfect take. `speech_samples`,
+/// `covered_samples` and `max_uncovered_samples` are all `0` in that case and
+/// carry no meaning; `observed_samples` is likewise absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectedSealCoverageReceipt {
     pub status: String,
+    /// Typed reason the measurement was missing. Present only when
+    /// `status == "unavailable"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub speech_samples: u64,
     pub covered_samples: u64,
     pub uncovered_speech_ranges: Vec<ProjectedSealCoverageRange>,
     pub max_uncovered_samples: u64,
     pub incomplete_threshold_samples: u64,
-    pub coverage_ratio: f64,
+    /// Which acoustic observer supplied the measurement.
+    #[serde(default)]
+    pub speech_producer: String,
+    /// Availability token reported by that observer.
+    #[serde(default)]
+    pub availability: String,
+    /// Contiguous PCM extent the observer measured; absent when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_samples: Option<u64>,
+    /// Covered fraction of measured speech; absent when unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_ratio: Option<f64>,
 }
 
 impl From<&SealCoverageReceipt> for ProjectedSealCoverageReceipt {
     fn from(receipt: &SealCoverageReceipt) -> Self {
         Self {
             status: receipt.status.as_str().to_string(),
+            unavailable_reason: receipt
+                .status
+                .unavailable_reason()
+                .map(|gap| gap.as_str().to_string()),
             speech_samples: receipt.speech_samples,
             covered_samples: receipt.covered_samples,
             uncovered_speech_ranges: receipt
@@ -228,6 +260,9 @@ impl From<&SealCoverageReceipt> for ProjectedSealCoverageReceipt {
                 .collect(),
             max_uncovered_samples: receipt.max_uncovered_samples,
             incomplete_threshold_samples: receipt.incomplete_threshold_samples,
+            speech_producer: receipt.speech_producer.clone(),
+            availability: receipt.availability.clone(),
+            observed_samples: receipt.observed_samples,
             coverage_ratio: receipt.coverage_ratio(),
         }
     }
@@ -1092,6 +1127,9 @@ mod tests {
     /// sets the ledger-seal latch, even when an external sink accepted words.
     #[test]
     fn coverage_refusal_ends_once_without_sealing_the_book() {
+        use codescribe_core::audio::capture_receipt::{
+            AcousticAvailability, AcousticSpeechEvidence, CaptureEvidenceIdentity,
+        };
         use codescribe_core::stt::tail_provider::TailSampleRange;
         let dir = tempfile::tempdir().unwrap();
         let bus =
@@ -1102,12 +1140,19 @@ mod tests {
         let receipt = ledger.assess_seal_coverage(
             "refused-book",
             7,
-            &[TailSampleRange {
-                session: "refused-book".into(),
-                capture_epoch: 7,
-                sample_start: 0,
-                sample_end: 64_000,
-            }],
+            &AcousticSpeechEvidence::measured(
+                CaptureEvidenceIdentity::new("refused-book", 7),
+                "capture_energy",
+                AcousticAvailability::Observed {
+                    observed_samples: 64_000,
+                },
+                vec![TailSampleRange {
+                    session: "refused-book".into(),
+                    capture_epoch: 7,
+                    sample_start: 0,
+                    sample_end: 64_000,
+                }],
+            ),
             8_000,
         );
         assert!(ledger.record_seal_coverage(receipt.clone()));
@@ -1146,6 +1191,129 @@ mod tests {
             .is_none()
         );
         assert!(!bus.matches_refused_document(&receipt, &revision.rendered_text));
+    }
+
+    /// The projection carries the typed availability reason, an explicitly
+    /// absent ratio, and survives a JSON round-trip byte-for-byte — including
+    /// the exact-receipt equality the recovery guard depends on.
+    #[test]
+    fn coverage_projection_round_trips_missing_ratio_and_exact_receipt_equality() {
+        use codescribe_core::pipeline::acoustic_ledger::{
+            AcousticEvidenceGap, SealCoverageReceipt, SealCoverageStatus,
+        };
+
+        let unavailable = SealCoverageReceipt {
+            session_id: "round-trip".into(),
+            capture_epoch: 7,
+            speech_samples: 0,
+            covered_samples: 0,
+            uncovered_speech_ranges: Vec::new(),
+            max_uncovered_samples: 0,
+            incomplete_threshold_samples: 4_000,
+            status: SealCoverageStatus::Unavailable(AcousticEvidenceGap::NotObserved),
+            speech_producer: "capture_energy".into(),
+            availability: "not_observed".into(),
+            observed_samples: None,
+        };
+        let projected = ProjectedSealCoverageReceipt::from(&unavailable);
+        assert_eq!(projected.status, "unavailable");
+        assert_eq!(
+            projected.unavailable_reason.as_deref(),
+            Some("not_observed")
+        );
+        assert_eq!(projected.coverage_ratio, None);
+        assert_eq!(projected.observed_samples, None);
+
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(
+            !json.contains("coverage_ratio"),
+            "an absent ratio is absent from the wire, never NaN and never 1.0: {json}"
+        );
+        assert!(!json.contains("NaN"), "{json}");
+        assert!(
+            json.contains("\"unavailable_reason\":\"not_observed\""),
+            "{json}"
+        );
+        let decoded: ProjectedSealCoverageReceipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, projected);
+        assert_eq!(
+            decoded,
+            ProjectedSealCoverageReceipt::from(&unavailable),
+            "exact projected equality must survive the round-trip"
+        );
+
+        // Measured silence keeps a real 1.0 and no reason token.
+        let silence = SealCoverageReceipt {
+            status: SealCoverageStatus::Complete,
+            availability: "observed".into(),
+            observed_samples: Some(16_000),
+            ..unavailable.clone()
+        };
+        let projected = ProjectedSealCoverageReceipt::from(&silence);
+        assert_eq!(projected.status, "complete");
+        assert_eq!(projected.unavailable_reason, None);
+        assert_eq!(projected.coverage_ratio, Some(1.0));
+        let decoded: ProjectedSealCoverageReceipt =
+            serde_json::from_str(&serde_json::to_string(&projected).unwrap()).unwrap();
+        assert_eq!(decoded, projected);
+        assert_ne!(
+            decoded,
+            ProjectedSealCoverageReceipt::from(&unavailable),
+            "measured silence and absent measurement must not project equal"
+        );
+    }
+
+    /// A refused document is matched on the whole projected receipt. An
+    /// unavailable receipt must match its own projection exactly, and a forged
+    /// one — same session, different availability — must not.
+    #[test]
+    fn refused_document_match_survives_the_added_availability_fields() {
+        use codescribe_core::audio::capture_receipt::{
+            AcousticAvailability, AcousticSpeechEvidence, CaptureEvidenceIdentity,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus =
+            TranscriptBus::open_at(session("refused-avail"), dir.path().join("bus.jsonl"), None)
+                .unwrap();
+        bus.publish_started();
+        let (mut ledger, mut reducer, _) = committed_fixture("refused-avail");
+        // No observer measured this take: the words are committed, the extent
+        // is unknown, and the ledger refuses on that ground alone.
+        let receipt = ledger.assess_seal_coverage(
+            "refused-avail",
+            7,
+            &AcousticSpeechEvidence::unavailable(
+                CaptureEvidenceIdentity::new("refused-avail", 7),
+                "capture_energy",
+                AcousticAvailability::NotObserved,
+            ),
+            8_000,
+        );
+        assert!(!receipt.status.is_complete());
+        assert_eq!(receipt.coverage_ratio(), None);
+        assert!(ledger.record_seal_coverage(receipt.clone()));
+        let revision = reducer.apply_seal_coverage(&receipt, None);
+        assert_eq!(bus.publish_revision(&revision, &ledger).len(), 2);
+        assert!(bus.matches_refused_document(&receipt, &revision.rendered_text));
+
+        let mut forged = receipt.clone();
+        forged.availability = "observed".into();
+        forged.observed_samples = Some(64_000);
+        assert!(
+            !bus.matches_refused_document(&forged, &revision.rendered_text),
+            "a forged availability must not match the published projection"
+        );
+        assert!(
+            !bus.matches_refused_document(&receipt, "inne słowa"),
+            "the document text is still part of the match"
+        );
+        let mut foreign = receipt.clone();
+        foreign.session_id = "successor".into();
+        assert!(
+            !bus.matches_refused_document(&foreign, &revision.rendered_text),
+            "a foreign session never matches this bus"
+        );
     }
 
     /// Synthetic calibrated evidence admitted by the actual ledger and reducer.

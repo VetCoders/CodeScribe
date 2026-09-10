@@ -15,7 +15,7 @@
 use crate::asr_session::recorder::{RecorderLifecycleHandle, recorder_lifecycle_channel};
 use crate::audio::recorder::{Recorder, RecorderConfig};
 use crate::config::{RuntimeSettingsSnapshot, UserSettings};
-use crate::pipeline::acoustic_ledger::{AcousticLedger, SealCoverageReceipt, SealCoverageStatus};
+use crate::pipeline::acoustic_ledger::{AcousticLedger, SealCoverageReceipt};
 use crate::pipeline::contracts::{EngineEvent, EventSink};
 use crate::pipeline::streaming::{
     SessionConfig, TailPatchSessionReceipt, collect_buffered_engine_events_with_config,
@@ -674,7 +674,10 @@ impl StreamingRecorder {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .latest_seal_coverage()
-                .filter(|receipt| receipt.status == SealCoverageStatus::Incomplete)
+                // Every non-complete verdict refuses the terminal transcript,
+                // including the ones that say no measurement exists. The typed
+                // refusal below is also what preserves the committed words.
+                .filter(|receipt| !receipt.status.is_complete())
                 .cloned()
         });
         if let Some(receipt) = incomplete_coverage {
@@ -1382,6 +1385,9 @@ mod terminal_seal_refusal_tests {
                 max_uncovered_samples: 2_111_488,
                 incomplete_threshold_samples: 12_000,
                 status: SealCoverageStatus::Incomplete,
+                speech_producer: "capture_energy".to_string(),
+                availability: "observed".to_string(),
+                observed_samples: Some(2_696_704),
             },
             audio_path,
             committed_text: String::new(),
@@ -1416,6 +1422,7 @@ mod terminal_seal_refusal_tests {
 #[cfg(test)]
 mod capture_stop_failure_tests {
     use super::*;
+    use crate::pipeline::acoustic_ledger::SealCoverageStatus;
 
     fn recorder() -> StreamingRecorder {
         let mut recorder = StreamingRecorder::new().unwrap();
@@ -1617,6 +1624,9 @@ mod capture_stop_failure_tests {
             max_uncovered_samples: 4,
             incomplete_threshold_samples: 1,
             status: SealCoverageStatus::Incomplete,
+            speech_producer: "capture_energy".to_string(),
+            availability: "observed".to_string(),
+            observed_samples: Some(4),
         };
         assert!(ledger.record_seal_coverage(receipt.clone()));
         recorder.acoustic_ledger = Some(Arc::new(StdMutex::new(ledger)));
@@ -1676,11 +1686,59 @@ mod capture_stop_failure_tests {
             max_uncovered_samples: 100,
             incomplete_threshold_samples: 10,
             status: SealCoverageStatus::Incomplete,
+            speech_producer: "capture_energy".to_string(),
+            availability: "observed".to_string(),
+            observed_samples: Some(100),
         }));
         recorder.acoustic_ledger = Some(Arc::new(StdMutex::new(ledger)));
         let error = recorder.complete_stop(Ok(None)).await.unwrap_err();
         assert!(error.downcast_ref::<TerminalSealRefused>().is_some());
         assert!(error.downcast_ref::<CaptureStopFailure>().is_none());
+        assert_released(&recorder);
+    }
+
+    /// Missing acoustic measurement refuses the terminal transcript on the same
+    /// typed path as measured uncovered speech — and the committed words and
+    /// the take WAV survive it. A guard pinned to `Incomplete` alone would let
+    /// this outcome through as a success and lose the words.
+    #[tokio::test]
+    async fn unavailable_measurement_refuses_through_the_same_typed_path() {
+        use crate::pipeline::acoustic_ledger::AcousticEvidenceGap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unavailable.wav");
+        let bytes = write_wav(&path);
+        let mut recorder = recorder();
+        *recorder.transcript_buffer.lock().await = "słowa które przetrwały".to_string();
+        let mut ledger = AcousticLedger::new();
+        let receipt = SealCoverageReceipt {
+            session_id: "capture-owner".into(),
+            capture_epoch: 7,
+            speech_samples: 0,
+            covered_samples: 0,
+            uncovered_speech_ranges: Vec::new(),
+            max_uncovered_samples: 0,
+            incomplete_threshold_samples: 4_000,
+            status: SealCoverageStatus::Unavailable(AcousticEvidenceGap::NotObserved),
+            speech_producer: "capture_energy".to_string(),
+            availability: "not_observed".to_string(),
+            observed_samples: None,
+        };
+        assert!(ledger.record_seal_coverage(receipt.clone()));
+        recorder.acoustic_ledger = Some(Arc::new(StdMutex::new(ledger)));
+
+        let error = recorder
+            .complete_stop(Ok(Some(path.clone())))
+            .await
+            .unwrap_err();
+        let refused = error
+            .downcast_ref::<TerminalSealRefused>()
+            .expect("unavailable measurement is a typed seal refusal");
+        assert_eq!(refused.receipt, receipt);
+        assert!(!refused.receipt.status.is_complete());
+        assert_eq!(refused.committed_text, "słowa które przetrwały");
+        assert_eq!(refused.audio_path.as_ref(), Some(&path));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
         assert_released(&recorder);
     }
 }
