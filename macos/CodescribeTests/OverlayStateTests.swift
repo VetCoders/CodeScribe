@@ -1943,6 +1943,10 @@ final class OverlayStateTests: XCTestCase {
         ("finalizing", "final pass", "assistive", false, false, true, false, false, false),
         ("formatted", "final text", "dictation", true, true, true, true, true, true),
         ("no_speech", "", "dictation", false, false, false, true, false, true),
+        // The refused phase round-trips its raw value like any other. Before
+        // the enum case existed this row would have failed on `mode.rawValue`
+        // alone, because the parse fell back to the previous phase.
+        ("coverage_refused", "unsealed words", "dictation", false, false, true, true, false, true),
         ("error", "kept draft", "dictation", false, false, true, true, false, true),
       ]
 
@@ -2894,5 +2898,162 @@ final class OverlayStateTests: XCTestCase {
     XCTAssertFalse(realPanel.isMainWindow)
     realPanel.orderOut(nil)
     withExtendedLifetime([offController, agentController, visibleController]) {}
+  }
+
+  // MARK: Refusal recovery (rc-w2-refusal-ui) — UNRUN under W2
+
+  /// The gap this cut closes, stated as its falsifier. Before the enum case
+  /// existed, `OverlayMode(rawValue:) ?? mode` kept the PREVIOUS phase, so a
+  /// refused take finished its life painted as `finalizing` — a spinner over a
+  /// settled document. The assertion on `formattedText` is the other half: a
+  /// new terminal phase may not cost the user a single byte.
+  func testRefusedCoverageIsItsOwnTerminalPhaseAndKeepsEveryWord() {
+    let state = OverlayState()
+    projectText("mowa w toku", to: state, phase: "finalizing")
+    XCTAssertEqual(state.mode, .finalizing)
+
+    let refused = "Zażółć gęślą jaźń — słowa bez pieczęci."
+    projectText(refused, to: state, phase: "coverage_refused", canCopy: true, terminal: true)
+
+    XCTAssertEqual(state.mode, .coverageRefused)
+    XCTAssertEqual(state.statusText, "incomplete coverage")
+    XCTAssertEqual(Array(state.activeText.utf8), Array(refused.utf8))
+    XCTAssertEqual(state.canvasText, refused)
+    XCTAssertTrue(state.terminal)
+    XCTAssertFalse(state.statusRippling)
+  }
+
+  /// Positive and negative in one place: the explanation is present and
+  /// persistent, and none of the success machinery fires. `onSuccessfulDictation`
+  /// is the seam that arms Agent auto-send, so a refused take reaching it would
+  /// submit words the ledger declined to seal.
+  func testRefusedCoverageExplainsItselfWithoutMintingSuccess() {
+    let state = OverlayState()
+    var successes = 0
+    state.onSuccessfulDictation = { successes += 1 }
+
+    projectText("usable words", to: state, phase: "coverage_refused", canCopy: true, terminal: true)
+
+    XCTAssertEqual(state.coverageRefusalNotice, OverlayState.defaultCoverageRefusalNotice)
+    XCTAssertEqual(
+      state.coverageRefusalDetail,
+      "No seal was recorded for this take, so nothing here is certified complete.")
+    XCTAssertEqual(successes, 0, "a refused seal fired the success callback")
+    XCTAssertNil(state.errorMessage, "refusal is not an error message")
+    XCTAssertFalse(state.isTranscriptEditable, "the producer authorized no user revision")
+    XCTAssertTrue(state.blocksAssistiveOverlayHide)
+
+    // The same document arriving as a real seal clears the notice, because the
+    // notice mirrors the producer rather than latching on the first refusal.
+    projectText(
+      "usable words", to: state, phase: "formatted", canCopy: true, terminal: true,
+      reducerAction: "apply_manual_edit", manualEditReceipt: "formatter-refusal-followup")
+    XCTAssertNil(state.coverageRefusalNotice)
+    XCTAssertEqual(state.mode, .formatted)
+  }
+
+  /// A refused take must survive the Assistive tray tick that calls `hide()`.
+  /// Every other terminal outcome already did; the refusal is the one whose
+  /// only recovery handle lives on this panel.
+  func testAssistiveTickCannotTakeTheRecoveryPanelAway() {
+    let state = OverlayState()
+    XCTAssertFalse(state.blocksAssistiveOverlayHide, "an idle overlay yields normally")
+    projectText("live", to: state, phase: "listening")
+    XCTAssertFalse(state.blocksAssistiveOverlayHide, "a live capture is not post-take review")
+
+    projectText("refused", to: state, phase: "coverage_refused", canCopy: true, terminal: true)
+    XCTAssertTrue(state.blocksAssistiveOverlayHide)
+  }
+
+  /// The next capture owns its own chrome and nothing else. It clears the
+  /// predecessor's notice — otherwise the panel describes the wrong take — and
+  /// it must NOT clear the predecessor's retained work, which is keyed by that
+  /// take's own identity and is the only copy the user has left.
+  func testNextCaptureClearsTheNoticeAndKeepsThePredecessorsRetainedWork() {
+    let state = OverlayState()
+    state.onComposerTranscript = { text, _ in .retained(text) }
+
+    projectText(
+      "words with nowhere to go", to: state, phase: "coverage_refused", canCopy: true,
+      terminal: true, delivery: .composerPending, sessionId: "refused-A",
+      reducerAction: "session_ended")
+
+    XCTAssertEqual(state.retainedComposerDelivery, "words with nowhere to go")
+    XCTAssertEqual(state.toast, "kept for recovery")
+    XCTAssertEqual(
+      state.coverageRefusalDetail,
+      "The handover came back. These words are retained here — recover them before the next take.")
+    XCTAssertNotNil(state.coverageRefusalNotice)
+
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+
+    XCTAssertNil(state.coverageRefusalNotice, "the successor inherited a refusal it never had")
+    XCTAssertNil(state.toast, "a persisting chip described the wrong take")
+    XCTAssertEqual(
+      state.retainedComposerDelivery, "words with nowhere to go",
+      "the successor erased the predecessor's only remaining copy")
+    XCTAssertEqual(state.mode, .listening)
+  }
+
+  /// A retained handover is standing state, not an event. The chip used to
+  /// clear itself after `showFooterNotice`'s 2.6 s window, leaving words on
+  /// screen with nothing saying their destination refused them.
+  ///
+  /// This test spends real time on purpose. There is no injected clock behind
+  /// `showFooterNotice`, so the only honest falsifier is to outlive the window
+  /// the transient path would have used — a shorter sleep would pass with or
+  /// without the fix and prove nothing. The paired transient assertion is what
+  /// makes the wait meaningful: it shows the window really does expire in this
+  /// same test run.
+  func testRetainedDeliveryNoticePersistsWhileOrdinaryChipsExpire() async {
+    let transient = OverlayState()
+    transient.showFooterNotice("copied")
+
+    let state = OverlayState()
+    state.onComposerTranscript = { text, _ in .retained(text) }
+    projectText(
+      "retained", to: state, phase: "coverage_refused", canCopy: true, terminal: true,
+      delivery: .composerPending, sessionId: "refused-persist",
+      reducerAction: "session_ended")
+    XCTAssertEqual(state.toast, "kept for recovery")
+
+    try? await Task.sleep(nanoseconds: 2_900_000_000)
+
+    XCTAssertNil(transient.toast, "the ordinary toast window did not expire; the wait proves nothing")
+    XCTAssertEqual(state.toast, "kept for recovery", "the recovery notice was scheduled away")
+  }
+
+  /// Empty typed refusal (`coverage_refused_empty`) reaches Swift as an Error
+  /// phase with no text and no capability bits. Nothing may be invented for it.
+  func testEmptyRefusalInventsNoTextAndNoRecovery() {
+    let state = OverlayState()
+    var deliveries: [String] = []
+    state.onComposerTranscript = { text, _ in
+      deliveries.append(text)
+      return .admitted(threadID: UUID())
+    }
+
+    projectText(
+      "", to: state, phase: "error", canCopy: false, terminal: true,
+      delivery: .composerPending, sessionId: "refused-empty", reducerAction: "session_ended")
+
+    XCTAssertEqual(state.mode, .error)
+    XCTAssertEqual(state.activeText, "")
+    XCTAssertTrue(deliveries.isEmpty, "an empty document was offered to the receiver")
+    XCTAssertNil(state.retainedComposerDelivery)
+    XCTAssertNil(state.coverageRefusalNotice, "an empty refusal is not the refused-words card")
+    XCTAssertEqual(OverlayIntentRail.projectedIntents(for: state), [.close])
+  }
+
+  /// An unfamiliar phase must still behave as it did before this cut: the
+  /// enum grew by one case, and that is not a licence to start rejecting the
+  /// next phase the producer invents.
+  func testAddingRefusedCoverageDidNotChangeUnknownPhaseHandling() {
+    let state = OverlayState()
+    projectText("kept", to: state, phase: "coverage_refused", canCopy: true, terminal: true)
+    projectText("still kept", to: state, phase: "future_engine_phase", canCopy: true, terminal: true)
+    XCTAssertEqual(state.mode, .coverageRefused, "an unknown phase retains the current chrome")
+    XCTAssertEqual(state.activeText, "still kept")
   }
 }

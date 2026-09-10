@@ -199,6 +199,21 @@ struct OverlayIntentRail: View {
 
   /// Frozen `overlay-canvas-v1` projection table. A false bit omits its
   /// command; the dock never reconstructs delivery legality from local state.
+  ///
+  /// The two terminal outcomes that are not `formatted` still route through
+  /// the producer's bits rather than through a fixed list. A refused take and
+  /// a failed handover both leave real words on the canvas, and the whole
+  /// reason they end up here is that their destination did not work — which
+  /// is exactly when a user needs Copy, Insert or Retranscribe most. Printing
+  /// only Close would have hidden the recovery behind the word "error" while
+  /// the producer was saying, bit by bit, that recovery was available.
+  ///
+  /// Format is the deliberate exception on both. `OverlayState.relayFormatIntent`
+  /// refuses unless `mode == .formatted`, so projecting it here would paint a
+  /// button that does nothing — and the shape it would produce if that guard
+  /// were ever loosened is a refused take relabelled `formatted` by a UI
+  /// command. A false `canFormat` bit is honoured everywhere; on these two
+  /// phases a true one is declined by the receiver, not by the producer.
   static func projectedIntents(
     phase: OverlayMode,
     canPaste: Bool,
@@ -218,10 +233,13 @@ struct OverlayIntentRail: View {
         + (canRetranscribe ? [.retranscribe] : [])
         + (canFormat ? [.format] : [])
         + [.close]
+    case .coverageRefused, .error:
+      ((canPaste || canInsert) ? [.insertPaste] : [])
+        + (canCopy ? [.copy] : [])
+        + (canRetranscribe ? [.retranscribe] : [])
+        + [.close]
     case .noSpeech:
       (canRetranscribe ? [.retranscribe] : []) + [.close]
-    case .error:
-      [.close]
     }
   }
 

@@ -9,6 +9,8 @@ private final class OverlayIntentBoundaryEngine: DictationEngine {
   var onTranscribeFile: (() -> Void)?
   var receivedTranscribePath: String?
   var onFormatter: (() -> Void)?
+  var onCopyTagged: (() -> Void)?
+  var copiedTaggedText: String?
   var formatterRequests: [(sessionId: String, sourceRevision: UInt64)] = []
   var policy = OverlayPolicySnapshot(autoPasteEnabled: true, autoFormatLevel: .correction)
   var formatLevelWrites: [FormattingPolicyOption] = []
@@ -52,7 +54,10 @@ private final class OverlayIntentBoundaryEngine: DictationEngine {
   }
   func pasteText(text: String) async throws -> CsPasteResult { pasteResult() }
   func deferText(text: String) async throws -> CsPasteResult { pasteResult() }
-  func copyTaggedTranscript(text: String) async throws {}
+  func copyTaggedTranscript(text: String) async throws {
+    copiedTaggedText = text
+    onCopyTagged?()
+  }
   func pasteTargetAppName() async -> String? { nil }
   func sendAssistiveTranscript(text: String) async throws -> Bool { false }
   func lastSessionAudioPath() -> String? { "/tmp/overlay-intent-boundary.wav" }
@@ -89,7 +94,32 @@ final class OverlayIntentRailTests: XCTestCase {
           [.insertPaste, .copy, .retranscribe, .format, .close]
         ),
         ("no_speech", "", false, false, false, true, false, true, [.retranscribe, .close]),
-        ("error", "draft", true, true, true, true, true, true, [.close]),
+        // Refused coverage: the ledger declined the seal, the words are real.
+        // Every producer-authorized recovery is painted; Format is not, because
+        // its production relay refuses outside `formatted` and a projected
+        // Format here would be a dead button whose only working version would
+        // relabel a refused take as a sealed one.
+        (
+          "coverage_refused", "usable words", true, true, true, true, true, true,
+          [.insertPaste, .copy, .retranscribe, .close]
+        ),
+        // Empty typed refusal: nothing to act on, and the rail invents nothing.
+        ("coverage_refused", "", false, false, false, false, false, true, [.close]),
+        // Contract change (rc-w2-refusal-ui): `error` used to return `[.close]`
+        // regardless of the producer's bits. A delivery failure keeps its words
+        // and its audio, so that fixed list hid Copy/Insert/Retranscribe behind
+        // the word "error" at exactly the moment they were the recovery.
+        (
+          "error", "draft", true, true, true, true, true, true,
+          [.insertPaste, .copy, .retranscribe, .close]
+        ),
+        // Sink failure with retained audio, no destination left: no Insert.
+        (
+          "error", "draft", false, false, true, true, false, true,
+          [.copy, .retranscribe, .close]
+        ),
+        // All-false error stays exactly as strict as before.
+        ("error", "", false, false, false, false, false, true, [.close]),
       ]
 
     for row in rows {
@@ -434,6 +464,160 @@ final class OverlayIntentRailTests: XCTestCase {
     XCTAssertLessThan(
       bitmap.colorAt(x: bitmap.pixelsWide - 1, y: 0)?.alphaComponent ?? 0,
       0.2
+    )
+  }
+
+  // MARK: Refusal recovery (rc-w2-refusal-ui) — UNRUN under W2
+
+  /// The census claim, stated as a test rather than as prose: every case of
+  /// `OverlayMode` is asked for its rail, and the two terminal outcomes that
+  /// are not `formatted` must not collapse to a bare Close when the producer
+  /// says recovery exists.
+  func testEveryProjectionPhaseAnswersTheRailAndOnlySilenceProducesBareClose() {
+    // A flat list, not a dictionary: every case is named exactly once, so a
+    // seventh phase added to `OverlayMode` without a row here is a visible
+    // omission rather than a silently missing key.
+    let allBitsOn: [(mode: OverlayMode, expected: [OverlayIntent])] = [
+      (.listening, [.finish, .copy, .close]),
+      (.finalizing, [.copy, .close]),
+      (.formatted, [.insertPaste, .copy, .retranscribe, .format, .close]),
+      (.coverageRefused, [.insertPaste, .copy, .retranscribe, .close]),
+      (.noSpeech, [.retranscribe, .close]),
+      (.error, [.insertPaste, .copy, .retranscribe, .close]),
+    ]
+
+    for (mode, expected) in allBitsOn {
+      XCTAssertEqual(
+        OverlayIntentRail.projectedIntents(
+          phase: mode, canPaste: true, canInsert: true, canCopy: true,
+          canRetranscribe: true, canFormat: true),
+        expected,
+        "\(mode) did not paint its full producer-authorized rail"
+      )
+      let silent = OverlayIntentRail.projectedIntents(
+        phase: mode, canPaste: false, canInsert: false, canCopy: false,
+        canRetranscribe: false, canFormat: false)
+      XCTAssertEqual(
+        silent.filter { $0 != .finish }, [.close],
+        "\(mode) invented a command the producer did not authorize"
+      )
+    }
+  }
+
+  /// Negative control for the one command deliberately withheld. `canFormat`
+  /// is honoured on `formatted` and declined on both refusal phases, so the
+  /// difference is a receiver decision about a dead relay — not a producer bit
+  /// being quietly dropped everywhere.
+  func testFormatIsProjectedOnlyWhereItsProductionRelayWillRun() {
+    for mode in [OverlayMode.coverageRefused, .error] {
+      XCTAssertFalse(
+        OverlayIntentRail.projectedIntents(
+          phase: mode, canPaste: false, canInsert: false, canCopy: false,
+          canRetranscribe: false, canFormat: true
+        ).contains(.format),
+        "\(mode) projected Format, whose relay refuses outside .formatted"
+      )
+    }
+    XCTAssertTrue(
+      OverlayIntentRail.projectedIntents(
+        phase: .formatted, canPaste: false, canInsert: false, canCopy: false,
+        canRetranscribe: false, canFormat: true
+      ).contains(.format)
+    )
+  }
+
+  /// A refused take reaching the rail through the real projection boundary,
+  /// with its recovery commands dispatched into the production relay. Copy is
+  /// the falsifier that matters: if the relay had been phase-gated, this would
+  /// silently do nothing while the button was on screen.
+  func testRefusedCoverageRecoveryReachesTheProductionRelay() async {
+    let state = projectedState(
+      phase: "coverage_refused",
+      text: "usable but unsealed",
+      canPaste: false,
+      canInsert: false,
+      canCopy: true,
+      canRetranscribe: true,
+      canFormat: false,
+      terminal: true
+    )
+    let engine = OverlayIntentBoundaryEngine()
+    state.engine = engine
+
+    XCTAssertEqual(state.mode, .coverageRefused)
+    XCTAssertEqual(state.statusText, "incomplete coverage")
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state), [.copy, .retranscribe, .close])
+
+    let rail = OverlayIntentRail(
+      phase: state.statusText,
+      intents: OverlayIntentRail.projectedIntents(for: state),
+      palette: .dark,
+      onIntent: state.relayIntent,
+      onRetranscribe: state.retranscribe
+    )
+    let copied = expectation(description: "copy intent reached the production relay")
+    engine.onCopyTagged = { copied.fulfill() }
+    rail.dispatch(.copy)
+    await fulfillment(of: [copied], timeout: 1)
+
+    XCTAssertEqual(engine.copiedTaggedText, "usable but unsealed")
+    XCTAssertEqual(state.mode, .coverageRefused, "recovery must not relabel the phase")
+    XCTAssertEqual(OverlayIntentRail.accessibilityValue(for: state.statusText), "incomplete coverage")
+  }
+
+  /// Unacknowledged superseded work still LEADS the rail on a refused take.
+  /// The refusal is precisely the case where the phase table is thin, and a
+  /// thin table may not be the reason an unsaved edit becomes unreachable.
+  func testRetainedWorkStillLeadsTheRailOnARefusedTake() {
+    let state = projectedState(
+      phase: "formatted",
+      text: "previous take",
+      canPaste: false,
+      canInsert: false,
+      canCopy: true,
+      canRetranscribe: false,
+      canFormat: false,
+      terminal: true
+    )
+    state.beginTranscriptEdit()
+    state.updateRevisionDraft("previous take, edited")
+    state.handleRecordingPreparing()
+    state.handleRecordingStarted()
+    XCTAssertTrue(state.hasRecoverableSupersededWork)
+
+    state.applyTranscriptProjection(
+      CsTranscriptProjectionEvent(
+        schema: "codescribe.transcript_projection.v1",
+        sequence: 9,
+        emittedAt: "2026-09-10T00:00:00Z",
+        sessionId: "intent-rail-successor",
+        mode: "dictation",
+        reducerRevision: 9,
+        reducerAction: "session_ended",
+        occurrenceSessionId: "intent-rail-successor",
+        captureEpoch: 2,
+        sampleStart: 16_000,
+        sampleEnd: 32_000,
+        documentIndex: 1,
+        label: "terminal",
+        renderedText: "refused words",
+        phase: "coverage_refused",
+        canPaste: false,
+        canInsert: false,
+        canCopy: true,
+        canRetranscribe: true,
+        canFormat: false,
+        terminal: true,
+        lifecycleTerminal: true,
+        delivery: .unattempted,
+        acousticReceipts: []
+      )
+    )
+
+    XCTAssertEqual(
+      OverlayIntentRail.projectedIntents(for: state),
+      [.recoverSuperseded, .discardSuperseded, .copy, .retranscribe, .close]
     )
   }
 

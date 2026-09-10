@@ -270,6 +270,9 @@ struct DictationOverlayView: View {
           EmptyView()
         case .formatted:
           revisionStatusRow
+        case .coverageRefused:
+          coverageRefusedBody
+            .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
         case .noSpeech:
           noSpeechBody
             .transition(reduceMotion ? .identity : .opacity.combined(with: .offset(y: 8)))
@@ -395,6 +398,38 @@ struct DictationOverlayView: View {
       Spacer(minLength: 0)
     }
     .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
+  }
+
+  /// Terminal outcome for a take the ledger settled without accepting its
+  /// acoustic coverage. The words stay on the canvas above, untouched: this
+  /// row explains why they carry no seal and what is still possible with
+  /// them. It is not an error card and not a success card, and it exists
+  /// precisely because reusing either one would have been a lie the user
+  /// cannot see through.
+  ///
+  /// Persistent by construction — it is painted from state, not scheduled
+  /// like a toast — and combined into one accessibility element so VoiceOver
+  /// reads the refusal and its consequence as a single sentence rather than
+  /// two orphaned fragments.
+  private var coverageRefusedBody: some View {
+    HStack(spacing: 12) {
+      CSIconView(icon: .warning, size: 18, weight: .regular)
+        .foregroundStyle(palette.processingStatus.color)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(state.coverageRefusalNotice ?? OverlayState.defaultCoverageRefusalNotice)
+          .csFont(15, .medium)
+          .foregroundStyle(palette.bodyText.color)
+          .fixedSize(horizontal: false, vertical: true)
+        Text(state.coverageRefusalDetail)
+          .csMono(11, .medium)
+          .foregroundStyle(palette.mutedText.color)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, minHeight: bodyMinHeight, alignment: .leading)
+    .accessibilityElement(children: .combine)
+    .accessibilityIdentifier("overlay-coverage-refused")
   }
 
   /// Terminal outcome for a recording/transcription failure. Unlike a toast, this
