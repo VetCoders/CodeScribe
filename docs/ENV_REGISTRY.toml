@@ -1019,6 +1019,13 @@ reload = "hot"
 category = "storage"
 description = "Optional absolute override for the agent bridge home used by active-name leases and bus demultiplexing; unset resolves the normal user data path"
 
+[vars.CODESCRIBE_CODEX_BACKEND_ENDPOINT]
+default = "https://chatgpt.com/backend-api/codex/responses"
+type = "string"
+reload = "hot"
+category = "llm"
+description = "Full Responses endpoint URL override for the Agent's signed-in OpenAI account (Codex backend) lane; does not affect the API-key lane endpoint. Read from the process environment on each account-lane stream request. Leading/trailing whitespace is trimmed; unset, empty or whitespace-only values use the default. Use only a trusted destination: the account bearer token is sent to this URL."
+
 [vars.CODESCRIBE_AGENT_USE_PREVIOUS_RESPONSE_ID]
 default = "1"
 type = "bool"
