@@ -443,3 +443,99 @@ an approval, moves the return of every deferred gate to the integrator, and
 permits `--no-verify` only for a declared phase checkpoint with a full
 skipped-hook receipt. It does not authorize worker pushes or convert skipped
 verification into delivery.
+
+## 13. Neutral delivery/Stop AST exception (2026-09-10)
+
+The `rc-w3-guard-ast` plan admits **only** `codescribe-structural-ast` under
+`tools/structural-ast`, using locked `syn=2.0.118`. It has no app/core/bridge
+dependency and reads complete Loctree body JSON from stdin; it never opens
+product source, executes snippets, loads models or opens devices. Python remains
+the gate owner and still requires production definitions and real callsites.
+The only additional verifier subprocess is exactly:
+
+```sh
+cargo run --offline --locked --package codescribe-structural-ast --bin codescribe-structural-ast --quiet
+```
+
+Cargo checks/builds the current neutral sources before execution. Python records
+the command, root, input and source/lock digests, parser identity and macro import
+receipts, and rejects source drift, failed builds, malformed evidence, alternative
+packages/arguments and injected package targets/build scripts. Compiler wrappers,
+Rust flags and arbitrary Cargo override environment variables are not inherited.
+The default target is `<selected-repository>/target`. An explicit
+`CARGO_TARGET_DIR` must name an existing directory; relative values resolve
+against the selected repository, never the caller's working directory. Validation
+rejects empty values, whitespace at component boundaries, control characters,
+shell expansion markers (`~`, `$`), backslashes and colons; no expansion is
+performed. Root, home,
+repository roots and ancestors of the repository or home are refused, as are
+non-directory components and symlinks anywhere in the target path (including
+before `..` normalization). The selected repository itself is canonicalized first.
+Validation creates, deletes and cleans nothing; Cargo may create a missing default
+`target`. Only the resolved validated target and `CARGO_BUILD_JOBS=4` enter the
+sanitized child environment, and the receipt records that exact target. Fleet
+leases belong in run artifacts, never shipped defaults. The v2 schema requires a
+canonical absolute target spelling; filesystem and ownership checks belong to
+Python's pre-execution validation, not JSON Schema.
+
+Active gates for this tool are package-selected offline tests and Clippy,
+package formatting, Python instrument tests, the complete wired verifier,
+scoped static security and `git diff --check`. These are neutral instrument
+gates, not product W1/W2 execution or RC acceptance. Only `SKIP=cargo-check` is
+admitted for its checkpoint: that hook compiles app/core/bridge while the new
+tool/receipt contract is being assembled. It returns immediately when the
+integrator admits the tool/receipt wiring; full workspace Cargo check is then
+mandatory. This is not an extension of the resolved Whisper embargo. Security,
+hygiene, provenance and formatting remain active. Broad formatting is checked
+read-only before commit; foreign changes are never repaired by this worker.
+
+The evidence language is intentionally closed. Typed `syn` statement productions
+recognize target-binding provenance, the guarded paste/deferred branches, recorder
+Stop delegation, optional archive publication, task join, sink drain/drop, archive
+failure classification and typed incomplete-coverage refusal. Structural AST
+comparison checks every nested node, binding, argument and attribute, not source
+substring order. A separate AST visitor inventories all paste call expressions,
+tracks then/else guard scope and refuses guards borrowed by deferred closures.
+Extra statements/effects, altered branches, unsupported attributes, callbacks,
+loops, macros or signatures produce `BOUNDARY`; even a safe equivalent rewrite
+can require a reviewed grammar extension. This is deliberately not a general
+Rust control-flow engine. Formatting/comments do not affect evidence; punctuation
+inside macro token trees and exact callback shapes remain part of the grammar.
+
+Assumptions are explicit and bounded to the named bodies:
+
+- Calls retain their resolved ordinary Rust/library meaning and return normally
+  unless their explicit `Result` is handled. Panics, aborts, cancellation, dynamic
+  dispatch, overloaded trait behavior and hidden effects inside callees are not
+  proved. The fixed argument/receiver shapes prevent arbitrary callees from
+  borrowing a known operation's label. The drain loop proves lexical shutdown
+  ordering, not real-time progress or scheduler fairness.
+- `Option` callbacks, the known drain loop and match arms are recognized in full;
+  no arbitrary closure return or `?` can stand in for a function exit. The join
+  captures errors without `?`; both archive error and success flow through the
+  shutdown sequence. The incomplete branch returns the original receipt,
+  audio path and committed text before the only final success.
+- `debug!`, `info!`, `warn!` are the imported `tracing` macros, not shadowed macros.
+  Current Loctree import receipts authenticate both source modules. Their locked
+  `tracing 0.1.44` definitions expand to event reporting; only the exact reviewed
+  argument trees are admitted (including the route-formatting call). No blanket
+  logging-macro exemption exists. Shadowing in an unprovided ancestor module or
+  changes in dependency macro semantics require renewed review.
+- Standard `matches!` and `format!` retain their standard definitions. The former
+  lowers its exact target/frontmost predicate to a Boolean match; the latter
+  constructs diagnostic text. Only the enumerated invocations are recognized;
+  an added macro or control-bearing argument is refused. Definition inspection
+  used the installed Rust 1.95 source and cached tracing source, without builds
+  of the product or dependency downloads.
+
+Synthetic bypasses test the instrument; they are not discovered product exploits.
+The eight other unresolved corridor obligations remain independent and red.
+
+The neutral command changes the receipt format to
+`codescribe.acoustic-structure-receipt.v2`. Its complete JSON Schema is embedded
+at `tests/fixtures/acoustic_throne_stages.json#/tool_contract/receipt_schema`,
+inside this cut's admitted tool-contract domain. The frozen external v1 schema
+remains a legacy artifact; v2 receipts no longer claim to conform to it. The v2
+schema includes existing ordering observations as well as neutral evidence;
+ordering verdicts and all unrelated corridor obligations retain their existing
+Python checks. Schema consumers must select the receipt's declared generation.

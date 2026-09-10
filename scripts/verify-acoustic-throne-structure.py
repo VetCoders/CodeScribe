@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Emit structure-only receipts for the one-throne transplant.
 
-This verifier deliberately knows no Cargo, compiler, Swift runner, application
-launcher, or runtime probe. Its only subprocess executable is `loct`; every
-executed command is recorded in the receipt and checked before dispatch. A
+This verifier never compiles or executes the product. Loctree supplies source
+evidence; one exact offline/locked Cargo command builds and runs the neutral
+syn instrument. Every command is recorded and checked before dispatch. A
 small local Rust-module resolution pass complements Loctree so deleted files
 cannot remain referenced by `mod name;` declarations.
 """
@@ -13,6 +13,9 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import hashlib
+import os
+import tomllib
 import re
 import subprocess
 import sys
@@ -21,9 +24,166 @@ from pathlib import Path
 from typing import Any
 
 
-RECEIPT_SCHEMA = "codescribe.acoustic-structure-receipt.v1"
+RECEIPT_SCHEMA = "codescribe.acoustic-structure-receipt.v2"
 DEFAULT_MANIFEST = "tests/fixtures/acoustic_throne_stages.json"
 ALLOWED_EXECUTABLE = "loct"
+AST_COMMAND = (
+    "cargo", "run", "--offline", "--locked", "--package",
+    "codescribe-structural-ast", "--bin", "codescribe-structural-ast", "--quiet",
+)
+AST_IDENTITY = "codescribe-structural-ast/0.1.0;syn=2.0.118;grammar=1"
+AST_BODIES = {
+    "paste_text_from_overlay": "app/controller/mod.rs",
+    "execute_clipboard_paste": "app/controller/mod.rs",
+    "stop": "core/audio/streaming_recorder.rs",
+    "complete_stop": "core/audio/streaming_recorder.rs",
+}
+
+
+def resolve_ast_target(repo: Path) -> Path:
+    """Select a target without creating it or following target-path symlinks."""
+    try:
+        repo = repo.resolve(strict=True)
+        override = os.environ.get("CARGO_TARGET_DIR")
+        spelling = override if override is not None else str(repo / "target")
+        if (
+            not spelling or any(part != part.strip() for part in spelling.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in spelling)
+            or any(char in spelling for char in ("~", "$", "\\", ":"))
+        ):
+            raise RuntimeError("neutral AST target is empty or malformed")
+        candidate = Path(override) if override is not None else repo / "target"
+        if not candidate.is_absolute():
+            candidate = repo / candidate
+        # Inspect the lexical path before resolving '..': a redirect must not
+        # disappear during normalization (including dangling links and loops).
+        for component in (*reversed(candidate.parents), candidate):
+            if component.is_symlink():
+                raise RuntimeError("neutral AST target contains a symlink")
+            if component.exists() and not component.is_dir():
+                raise RuntimeError("neutral AST target contains a non-directory")
+        target = candidate.resolve(strict=override is not None)
+        home = Path.home().resolve()
+        if target in {Path(target.anchor), home, repo} or target in repo.parents or target in home.parents:
+            raise RuntimeError("neutral AST target is a root, home, repository or broad ancestor")
+        if target.exists() and not target.is_dir():
+            raise RuntimeError("neutral AST target is not a directory")
+        return target
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"neutral AST target unavailable: {error}") from error
+
+
+def command_allowed(command: list[str] | tuple[str, ...]) -> bool:
+    return bool(command) and (command[0] == ALLOWED_EXECUTABLE or tuple(command) == AST_COMMAND)
+
+
+def ast_tool_digest(repo: Path) -> str:
+    """Authenticate the closed neutral package before Cargo can execute it."""
+    root = repo / "tools/structural-ast"
+    manifest = tomllib.loads((root / "Cargo.toml").read_text())
+    expected = {
+        "package": {"name": "codescribe-structural-ast", "version": "0.1.0",
+                    "edition": "2024", "publish": False},
+        "dependencies": {
+            "syn": {"version": "=2.0.118", "features": ["full", "extra-traits", "visit"]},
+            "serde": {"workspace": True}, "serde_json": {"workspace": True},
+        },
+    }
+    if manifest != expected or (root / "build.rs").exists():
+        raise RuntimeError("neutral AST package dependency/build contract changed")
+    # Cargo auto-discovers targets; prohibit injected bins/examples/build scripts.
+    if any((root / name).exists() for name in ("src/bin", "examples", ".cargo")):
+        raise RuntimeError("neutral AST package has unadmitted executable targets")
+    files = [root / "Cargo.toml", *sorted((root / "src").rglob("*"))]
+    if {path.relative_to(root).as_posix() for path in files} != {
+        "Cargo.toml", "src/lib.rs", "src/main.rs", "src/productions.rs",
+    } or any(path.is_symlink() or not path.is_file() for path in files):
+        raise RuntimeError("neutral AST source inventory changed")
+    workspace = tomllib.loads((repo / "Cargo.toml").read_text())["workspace"]["dependencies"]
+    if workspace["serde"] != {"version": "1", "features": ["derive"]} or workspace["serde_json"] != "1":
+        raise RuntimeError("neutral AST inherited dependencies changed")
+    digest = hashlib.sha256()
+    for path in [repo / "Cargo.toml", repo / "Cargo.lock", *files]:
+        digest.update(path.relative_to(repo).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def run_ast_json(repo: Path, command: list[str], payload: dict[str, Any]) -> dict[str, Any]:
+    if tuple(command) != AST_COMMAND:
+        raise RuntimeError(f"refused non-neutral AST command: {command}")
+    target = str(resolve_ast_target(repo))
+    before = ast_tool_digest(repo)
+    # Do not inherit compiler wrappers, Cargo overrides, injected Rust flags or
+    # dynamic-library preload settings. Only the validated target is configurable.
+    env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT") if key in os.environ}
+    env.update(CARGO_TARGET_DIR=target, CARGO_BUILD_JOBS="4")
+    serialized = json.dumps(payload)
+    try:
+        completed = subprocess.run(command, cwd=repo, env=env, input=serialized,
+                                   check=False, capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"neutral AST unavailable: {error}") from error
+    if completed.returncode != 0:
+        raise RuntimeError(f"neutral AST failed ({completed.returncode}): {completed.stderr.strip()}")
+    if before != ast_tool_digest(repo):
+        raise RuntimeError("neutral AST sources changed during invocation")
+    try:
+        evidence = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("neutral AST returned malformed JSON") from error
+    if not isinstance(evidence, dict) or evidence.get("identity") != AST_IDENTITY or evidence.get("schema") != "codescribe.structural-ast-evidence.v1":
+        raise RuntimeError("neutral AST identity/schema mismatch")
+    contracts = evidence.get("contracts")
+    if (type(evidence.get("accepted")) is not bool or not isinstance(evidence.get("failures"), list)
+        or not isinstance(contracts, list) or len(contracts) != len(AST_BODIES)
+        or any(not isinstance(row, dict) for row in contracts)
+        or {row.get("symbol") for row in contracts} != set(AST_BODIES)):
+        raise RuntimeError("neutral AST malformed contract results")
+    for row in contracts:
+        if (type(row.get("accepted")) is not bool or not isinstance(row.get("failures"), list)
+            or not isinstance(row.get("events"), list)
+            or any(not isinstance(item, str) for item in row["events"] + row["failures"])
+            or row["accepted"] != (not row["failures"])):
+            raise RuntimeError("neutral AST contradictory contract result")
+    if evidence["accepted"] != (not evidence["failures"] and all(row["accepted"] for row in contracts)):
+        raise RuntimeError("neutral AST contradictory overall result")
+    evidence["invocation"] = {"command": command, "cwd": str(repo.resolve()),
+        "source_sha256": before, "input_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+        "build_policy": "cargo-run-current-sources-offline-locked", "target_dir": target, "jobs": 4}
+    return evidence
+
+
+def structural_ast_evidence(verifier: StructuralVerifier) -> dict[str, Any]:
+    cached = getattr(verifier, "_structural_ast_evidence", None)
+    if cached is not None:
+        return cached
+    bodies = []
+    for symbol, file in AST_BODIES.items():
+        rows = corridor_body_rows(verifier.body(symbol, file), symbol=symbol, file=file, signature_contains=None)
+        if len(rows) != 1:
+            raise RuntimeError(f"neutral AST requires one complete body for {file}::{symbol}")
+        bodies.append(rows[0])
+    command = list(AST_COMMAND)
+    verifier.command_inventory.append(command)
+    imports = []
+    for file, literal in (
+        ("app/controller/mod.rs", "use tracing::{debug, error, info, warn};"),
+        ("core/audio/streaming_recorder.rs", "use tracing::{debug, info, warn};"),
+    ):
+        rows = require_complete_literal_evidence(verifier.literal_occurrences(literal), literal)
+        matching = [row for row in rows if row.get("file") == file
+                    and row.get("match_role") == "import"
+                    and row.get("scope_classification") == "production"]
+        if len(matching) != 1:
+            raise RuntimeError(f"neutral AST observational macro import not authenticated: {file}")
+        imports.extend(matching)
+    evidence = run_ast_json(verifier.repo, command, {"schema": "codescribe.structural-ast-input.v1", "bodies": bodies})
+    evidence["macro_imports"] = imports
+    verifier._structural_ast_evidence = evidence
+    return evidence
+
+
 STAGE_VERDICTS = {
     "demolished": "OLD_AUTHORITY_REMOVED",
     "assembled": "STRUCTURALLY_COMPLETE_NOT_WIRED",
@@ -344,6 +504,9 @@ def classify_substring_residue(
 
     if file in VERIFIER_LITERAL_PATHS:
         return "verifier_self_literal", "verifier-owned evidence literal"
+    if (file in {"tools/structural-ast/src/lib.rs", "tools/structural-ast/src/productions.rs"}
+        and matched_identifier in {"OverlayPasteResult", "OverlayPasteDelivery"}):
+        return "verifier_self_literal", "neutral syn grammar type token; package has no product dependency"
     if is_fixture_path(file):
         return "fixture", "fixture or frozen structural manifest"
     if file.startswith("docs/"):
@@ -1416,6 +1579,11 @@ def verify_code_corridors(
             file = hop.get("file")
             signature = hop.get("signature_contains")
             required_code = hop.get("required_code")
+            ast_contract = hop.get("ast_contract")
+            if ast_contract is not None and (
+                ast_contract != symbol or AST_BODIES.get(symbol) != file
+            ):
+                raise RuntimeError("unadmitted AST hop contract")
             if (
                 not isinstance(symbol, str)
                 or not symbol
@@ -1424,7 +1592,7 @@ def verify_code_corridors(
                 or Path(file).is_absolute()
                 or (signature is not None and not isinstance(signature, str))
                 or not isinstance(required_code, list)
-                or not required_code
+                or (not required_code and ast_contract is None)
                 or any(not isinstance(item, str) or not item for item in required_code)
             ):
                 raise RuntimeError(f"corridor {name} has malformed hop: {hop}")
@@ -1492,8 +1660,21 @@ def verify_code_corridors(
                     )
                     for row in production_occurrences(verifier.occurrences(symbol))
                 )
+            ast_result = None
+            if ast_contract is not None:
+                evidence = structural_ast_evidence(verifier)
+                ast_result = next(row for row in evidence["contracts"] if row["symbol"] == symbol)
+                companion = {"paste_text_from_overlay": "execute_clipboard_paste", "stop": "complete_stop"}.get(symbol)
+                companion_failures = [failure for row in evidence["contracts"]
+                                      if row["symbol"] == companion for failure in row["failures"]]
+                if not ast_result["accepted"] or evidence["failures"] or companion_failures:
+                    failures.append(f"corridor {name} AST {symbol} refused: {ast_result['failures'] + evidence['failures'] + companion_failures}")
+                # This hop has no fragment-order claim; the complete AST contract
+                # owns its control-flow evidence, including callbacks and exits.
+                required_code_in_order = True
             observed_hops.append(
                 {
+                    "ast_contract": ast_result,
                     "symbol": symbol,
                     "file": file,
                     "signature_contains": signature,
@@ -1580,6 +1761,15 @@ def verify_code_corridors(
                 and row["enclosing_symbol"].get("name") == caller
                 and row["enclosing_symbol"].get("file") == caller_file
             ]
+            if caller in AST_BODIES and caller_file == AST_BODIES[caller]:
+                caller_rows = corridor_body_rows(verifier.body(caller, caller_file),
+                    symbol=caller, file=caller_file, signature_contains=None)
+                if len(caller_rows) != 1:
+                    matching_rows = []
+                else:
+                    caller_body = caller_rows[0]
+                    matching_rows = [row for row in matching_rows if type(row.get("line")) is int
+                                     and caller_body["start_line"] <= row["line"] <= caller_body["end_line"]]
             observed_invocations.append(
                 {
                     "callee": callee,
@@ -2087,7 +2277,7 @@ def verify_stage(
     expected_verdict = STAGE_VERDICTS[stage]
     conformant = not failures
     receipt = {
-        "$schema": "tests/fixtures/acoustic_structure_receipt.schema.json",
+        "$schema": "tests/fixtures/acoustic_throne_stages.json#/tool_contract/receipt_schema",
         "schema": RECEIPT_SCHEMA,
         "stage": stage,
         "scope": scope,
@@ -2125,12 +2315,11 @@ def verify_stage(
             "runtime": "NOT_ASSESSED",
         },
         "command_inventory": [" ".join(command) for command in verifier.command_inventory],
+        "neutral_ast": getattr(verifier, "_structural_ast_evidence", None),
         "command_policy": {
             "allowed_executable": ALLOWED_EXECUTABLE,
-            "all_commands_allowed": all(
-                command and command[0] == ALLOWED_EXECUTABLE
-                for command in verifier.command_inventory
-            ),
+            "neutral_ast_command": list(AST_COMMAND),
+            "all_commands_allowed": all(command_allowed(command) for command in verifier.command_inventory),
         },
     }
     return receipt, conformant
@@ -2139,6 +2328,7 @@ def verify_stage(
 def inventory() -> dict[str, Any]:
     return {
         "allowed_executable": ALLOWED_EXECUTABLE,
+        "neutral_ast_command": list(AST_COMMAND),
         "command_templates": [
             "loct context --json",
             "loct occurrences <literal-identifier> --json",
@@ -2166,11 +2356,17 @@ def validate_receipt_shape(receipt: dict[str, Any]) -> None:
     inventory_rows = receipt.get("command_inventory")
     if not isinstance(inventory_rows, list) or not inventory_rows:
         raise RuntimeError("receipt command inventory must be a non-empty list")
-    if not all(isinstance(row, str) and row.startswith("loct ") for row in inventory_rows):
-        raise RuntimeError(f"receipt contains a non-Loctree command: {inventory_rows}")
+    if not all(isinstance(row, str) and (row.startswith("loct ") or row == " ".join(AST_COMMAND)) for row in inventory_rows):
+        raise RuntimeError(f"receipt contains an unadmitted command: {inventory_rows}")
     policy = receipt.get("command_policy", {})
-    if policy != {"allowed_executable": ALLOWED_EXECUTABLE, "all_commands_allowed": True}:
+    if policy != {"allowed_executable": ALLOWED_EXECUTABLE, "neutral_ast_command": list(AST_COMMAND), "all_commands_allowed": True}:
         raise RuntimeError(f"receipt command policy is not fail-closed: {policy}")
+    if " ".join(AST_COMMAND) in inventory_rows:
+        evidence = receipt.get("neutral_ast")
+        if (not isinstance(evidence, dict) or evidence.get("identity") != AST_IDENTITY
+            or evidence.get("invocation", {}).get("command") != list(AST_COMMAND)
+            or not re.fullmatch(r"[0-9a-f]{64}", evidence.get("invocation", {}).get("source_sha256", ""))):
+            raise RuntimeError("neutral AST invocation lacks authenticated tool receipt")
     assessment = receipt.get("assessment", {})
     if set(assessment) != {"build", "lint", "unit", "swift", "runtime"} or any(
         value != "NOT_ASSESSED" for value in assessment.values()
