@@ -1773,6 +1773,140 @@ class CorridorBodyRecoveryTests(unittest.TestCase):
             self.assertIn("--fresh", call.args)
 
 
+class NeutralTargetTests(unittest.TestCase):
+    """Intercept every child: portability probes must never create a Cargo target."""
+
+    def invoke(self, repo, overrides):
+        from subprocess import CompletedProcess
+        from unittest.mock import patch
+        evidence = {
+            "identity": VERIFIER.AST_IDENTITY,
+            "schema": "codescribe.structural-ast-evidence.v1",
+            "accepted": True, "failures": [],
+            "contracts": [{"symbol": symbol, "accepted": True, "failures": [], "events": []}
+                          for symbol in VERIFIER.AST_BODIES],
+        }
+        with patch.dict(VERIFIER.os.environ, overrides, clear=True), \
+             patch.object(VERIFIER, "ast_tool_digest", return_value="a" * 64), \
+             patch.object(VERIFIER.subprocess, "run", return_value=CompletedProcess(
+                 [], 0, json.dumps(evidence), "")) as run:
+            receipt = VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], list(VERIFIER.AST_COMMAND))
+        self.assertEqual(run.call_args.kwargs["cwd"], repo)
+        self.assertEqual(receipt["invocation"]["cwd"], str(repo.resolve()))
+        target = receipt["invocation"]["target_dir"]
+        self.assertEqual(run.call_args.kwargs["env"],
+                         {"CARGO_TARGET_DIR": target, "CARGO_BUILD_JOBS": "4"})
+        return target
+
+    def test_two_repository_defaults_without_creating_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            targets = []
+            for name in ("checkout-one", "checkout-two"):
+                repo = root / name
+                repo.mkdir()
+                targets.append(self.invoke(repo, {}))
+                self.assertEqual(targets[-1], str(repo / "target"))
+                self.assertFalse((repo / "target").exists())
+            self.assertNotEqual(*targets)
+
+    def test_existing_absolute_and_relative_shared_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, shared = root / "repo", root / "shared target"
+            repo.mkdir()
+            shared.mkdir()
+            sentinel = shared / "preserved"
+            sentinel.write_text("original evidence")
+            for value in (str(shared), "../shared target"):
+                with self.subTest(value=value):
+                    self.assertEqual(self.invoke(repo, {"CARGO_TARGET_DIR": value}), str(shared))
+                    self.assertEqual(sentinel.read_text(), "original evidence")
+            (repo / "target").mkdir()
+            self.assertEqual(self.invoke(repo, {}), str(repo / "target"))
+            self.assertEqual(self.invoke(repo, {"CARGO_TARGET_DIR": "target"}), str(repo / "target"))
+
+    def test_invalid_targets_refused_before_execution_without_mutation(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            file = root / "file"
+            file.write_text("preserve")
+            values = ["", " ", " target", "target ", "bad\npath", "bad\x00path",
+                      "bad\x7fpath", "~/target", "$HOME/target", "C:\\target", "file:///target",
+                      "/", str(Path.home()), str(repo), str(root), ".", "..",
+                      str(file), str(file / "child"), str(repo / "missing"),
+                      str(repo / "missing" / "child")]
+            before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+            for value in values:
+                with self.subTest(value=value), \
+                     patch.object(VERIFIER.os, "environ", {"CARGO_TARGET_DIR": value}), \
+                     patch.object(VERIFIER.subprocess, "run") as run, \
+                     self.assertRaises(RuntimeError):
+                    try:
+                        VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+                    finally:
+                        run.assert_not_called()
+            self.assertEqual(before, sorted(str(p.relative_to(root)) for p in root.rglob("*")))
+            self.assertEqual(file.read_text(), "preserve")
+
+    def test_symlink_redirects_including_default_are_refused_before_execution(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            repo, shared = root / "repo", root / "shared"
+            repo.mkdir()
+            shared.mkdir()
+            (repo / "target").symlink_to(shared, target_is_directory=True)
+            (root / "alias").symlink_to(shared, target_is_directory=True)
+            (root / "dangling").symlink_to(root / "absent")
+            (root / "loop").symlink_to(root / "loop")
+            for overrides in ({}, *({"CARGO_TARGET_DIR": value} for value in (
+                "target", str(root / "alias" / "child"), str(root / "dangling"),
+                str(root / "loop"), str(root / "alias" / ".." / "shared")))):
+                with self.subTest(overrides=overrides), \
+                     patch.dict(VERIFIER.os.environ, overrides, clear=True), \
+                     patch.object(VERIFIER.subprocess, "run") as run, \
+                     self.assertRaises(RuntimeError):
+                    try:
+                        VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+                    finally:
+                        run.assert_not_called()
+            self.assertTrue((repo / "target").is_symlink())
+            self.assertFalse((shared / "child").exists())
+
+    def test_default_non_directory_is_refused_before_execution(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            (repo / "target").write_text("preserve")
+            with patch.dict(VERIFIER.os.environ, {}, clear=True), \
+                 patch.object(VERIFIER.subprocess, "run") as run, \
+                 self.assertRaises(RuntimeError):
+                try:
+                    VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+                finally:
+                    run.assert_not_called()
+            self.assertEqual((repo / "target").read_text(), "preserve")
+
+    def test_target_schema_requires_canonical_absolute_spelling(self):
+        import re
+        schema = json.loads((SCRIPT.parents[1] / VERIFIER.DEFAULT_MANIFEST).read_text())[
+            "tool_contract"]["receipt_schema"]["$defs"]["neutralInvocation"]["properties"]["target_dir"]
+        self.assertEqual(schema["type"], "string")
+        pattern = schema["pattern"]
+        for value in ("/checkout/target", "/shared build/target", "/t"):
+            self.assertIsNotNone(re.search(pattern, value), value)
+        for value in ("", "/", "target", "./target", " /target", "/target ",
+                      "/target\n", "/a//target", "/a/../target", "/a/./target", "/a/..",
+                      "/target/", "/a/\x00target", "/$HOME/target", "/~/target", "/a/C:target"):
+            self.assertIsNone(re.search(pattern, value), repr(value))
+
+
 class NeutralAstTests(unittest.TestCase):
     """Actual neutral executable on fresh Loctree data; never import product code."""
 
@@ -1929,13 +2063,19 @@ class NeutralAstTests(unittest.TestCase):
         from unittest.mock import patch
         from subprocess import CompletedProcess
         evidence = self.run_payload(self.payload)
-        with patch.dict(VERIFIER.os.environ, {"RUSTC_WRAPPER": "/tmp/evil", "RUSTFLAGS": "injected", "CARGO_TARGET_DIR": "/tmp/private"}), \
+        with patch.dict(VERIFIER.os.environ, {"RUSTC_WRAPPER": "/tmp/evil", "RUSTFLAGS": "injected",
+                    "CARGO_TARGET_DIR": evidence["invocation"]["target_dir"],
+                    "CARGO_ENCODED_RUSTFLAGS": "injected", "RUSTC_WORKSPACE_WRAPPER": "/tmp/evil",
+                    "CARGO_BUILD_TARGET": "injected", "DYLD_INSERT_LIBRARIES": "/tmp/evil"}), \
              patch.object(VERIFIER.subprocess, "run", return_value=CompletedProcess([], 0, json.dumps(evidence), "")) as run:
             self.run_payload(self.payload)
             env = run.call_args.kwargs["env"]
             self.assertNotIn("RUSTC_WRAPPER", env)
             self.assertNotIn("RUSTFLAGS", env)
-            self.assertEqual(env["CARGO_TARGET_DIR"], VERIFIER.AST_TARGET)
+            for key in ("CARGO_ENCODED_RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER",
+                        "CARGO_BUILD_TARGET", "DYLD_INSERT_LIBRARIES"):
+                self.assertNotIn(key, env)
+            self.assertEqual(env["CARGO_TARGET_DIR"], evidence["invocation"]["target_dir"])
             self.assertEqual(env["CARGO_BUILD_JOBS"], "4")
             self.assertFalse(run.call_args.kwargs.get("shell", False))
         verifier = StubVerifier(Path("/repo"))

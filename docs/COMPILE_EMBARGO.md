@@ -461,9 +461,22 @@ Cargo checks/builds the current neutral sources before execution. Python records
 the command, root, input and source/lock digests, parser identity and macro import
 receipts, and rejects source drift, failed builds, malformed evidence, alternative
 packages/arguments and injected package targets/build scripts. Compiler wrappers,
-Rust flags and Cargo override environment variables are not inherited. The shared
-lease is `CARGO_TARGET_DIR=/Users/maciejgad/vc-workspace/vetcoders/codescribe/target`
-and `CARGO_BUILD_JOBS=4`; no private target is admitted.
+Rust flags and arbitrary Cargo override environment variables are not inherited.
+The default target is `<selected-repository>/target`. An explicit
+`CARGO_TARGET_DIR` must name an existing directory; relative values resolve
+against the selected repository, never the caller's working directory. Validation
+rejects empty values, whitespace at component boundaries, control characters,
+shell expansion markers (`~`, `$`), backslashes and colons; no expansion is
+performed. Root, home,
+repository roots and ancestors of the repository or home are refused, as are
+non-directory components and symlinks anywhere in the target path (including
+before `..` normalization). The selected repository itself is canonicalized first.
+Validation creates, deletes and cleans nothing; Cargo may create a missing default
+`target`. Only the resolved validated target and `CARGO_BUILD_JOBS=4` enter the
+sanitized child environment, and the receipt records that exact target. Fleet
+leases belong in run artifacts, never shipped defaults. The v2 schema requires a
+canonical absolute target spelling; filesystem and ownership checks belong to
+Python's pre-execution validation, not JSON Schema.
 
 Active gates for this tool are package-selected offline tests and Clippy,
 package formatting, Python instrument tests, the complete wired verifier,

@@ -1912,7 +1912,8 @@
               "const": "cargo-run-current-sources-offline-locked"
             },
             "target_dir": {
-              "const": "/Users/maciejgad/vc-workspace/vetcoders/codescribe/target"
+              "type": "string",
+              "pattern": "^/(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\u0000-\\u001f\\u007f~$\\\\:])[^/\\s](?:[^/]*[^/\\s])?(?:/[^/\\s](?:[^/]*[^/\\s])?)*$"
             },
             "jobs": {
               "const": 4

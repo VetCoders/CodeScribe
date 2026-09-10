@@ -38,7 +38,39 @@ AST_BODIES = {
     "stop": "core/audio/streaming_recorder.rs",
     "complete_stop": "core/audio/streaming_recorder.rs",
 }
-AST_TARGET = "/Users/maciejgad/vc-workspace/vetcoders/codescribe/target"
+
+
+def resolve_ast_target(repo: Path) -> Path:
+    """Select a target without creating it or following target-path symlinks."""
+    try:
+        repo = repo.resolve(strict=True)
+        override = os.environ.get("CARGO_TARGET_DIR")
+        spelling = override if override is not None else str(repo / "target")
+        if (
+            not spelling or any(part != part.strip() for part in spelling.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in spelling)
+            or any(char in spelling for char in ("~", "$", "\\", ":"))
+        ):
+            raise RuntimeError("neutral AST target is empty or malformed")
+        candidate = Path(override) if override is not None else repo / "target"
+        if not candidate.is_absolute():
+            candidate = repo / candidate
+        # Inspect the lexical path before resolving '..': a redirect must not
+        # disappear during normalization (including dangling links and loops).
+        for component in (*reversed(candidate.parents), candidate):
+            if component.is_symlink():
+                raise RuntimeError("neutral AST target contains a symlink")
+            if component.exists() and not component.is_dir():
+                raise RuntimeError("neutral AST target contains a non-directory")
+        target = candidate.resolve(strict=override is not None)
+        home = Path.home().resolve()
+        if target in {Path(target.anchor), home, repo} or target in repo.parents or target in home.parents:
+            raise RuntimeError("neutral AST target is a root, home, repository or broad ancestor")
+        if target.exists() and not target.is_dir():
+            raise RuntimeError("neutral AST target is not a directory")
+        return target
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"neutral AST target unavailable: {error}") from error
 
 
 def command_allowed(command: list[str] | tuple[str, ...]) -> bool:
@@ -80,11 +112,12 @@ def ast_tool_digest(repo: Path) -> str:
 def run_ast_json(repo: Path, command: list[str], payload: dict[str, Any]) -> dict[str, Any]:
     if tuple(command) != AST_COMMAND:
         raise RuntimeError(f"refused non-neutral AST command: {command}")
+    target = str(resolve_ast_target(repo))
     before = ast_tool_digest(repo)
     # Do not inherit compiler wrappers, Cargo overrides, injected Rust flags or
-    # dynamic-library preload settings. The plan owns the shared target lease.
+    # dynamic-library preload settings. Only the validated target is configurable.
     env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT") if key in os.environ}
-    env.update(CARGO_TARGET_DIR=AST_TARGET, CARGO_BUILD_JOBS="4")
+    env.update(CARGO_TARGET_DIR=target, CARGO_BUILD_JOBS="4")
     serialized = json.dumps(payload)
     try:
         completed = subprocess.run(command, cwd=repo, env=env, input=serialized,
@@ -117,7 +150,7 @@ def run_ast_json(repo: Path, command: list[str], payload: dict[str, Any]) -> dic
         raise RuntimeError("neutral AST contradictory overall result")
     evidence["invocation"] = {"command": command, "cwd": str(repo.resolve()),
         "source_sha256": before, "input_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
-        "build_policy": "cargo-run-current-sources-offline-locked", "target_dir": AST_TARGET, "jobs": 4}
+        "build_policy": "cargo-run-current-sources-offline-locked", "target_dir": target, "jobs": 4}
     return evidence
 
 
