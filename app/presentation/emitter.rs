@@ -12,10 +12,10 @@ use std::{collections::BTreeMap, io::Write as _, sync::Arc};
 use codescribe_core::llm::ai_formatting::{AiFormatResult, AiFormatStatus};
 use codescribe_core::llm::inline_format::{LabelProposalDisposition, OccurrenceLabelProposal};
 use codescribe_core::pipeline::acoustic_ledger::{
-    AcousticLedger, AcousticSerial, DocumentRevisionProvenance, IncrementalShapingReceipt,
-    LedgerSealReceipt, ManualDocumentRevisionReceipt, MutationReceipt, ObservationIdentity,
-    ObservationProducer, OccurrenceIdentity, SealCoverageReceipt, SealCoverageStatus,
-    TranscriptComparisonReceipt,
+    AcousticLedger, AcousticSerial, DocumentRevisionProvenance, IncrementalShapingInput,
+    IncrementalShapingReceipt, LedgerSealReceipt, ManualDocumentRevisionReceipt, MutationReceipt,
+    ObservationIdentity, ObservationProducer, OccurrenceIdentity, SealCoverageReceipt,
+    SealCoverageStatus, TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
 use sha2::{Digest, Sha256};
@@ -775,15 +775,15 @@ impl TranscriptReducer {
             .checked_add(1)
             .ok_or(IncrementalShapingRefusal::RevisionExhausted)?;
         let receipt = ledger
-            .record_incremental_shaping(
-                &session_id,
-                self.revision,
+            .record_incremental_shaping(IncrementalShapingInput {
+                session_id: &session_id,
+                source_revision: self.revision,
                 revision,
                 occurrence,
-                &source_label,
-                &left_context,
-                &shaped,
-            )
+                source_label: &source_label,
+                left_context: &left_context,
+                shaped_text: &shaped,
+            })
             .map_err(IncrementalShapingRefusal::LedgerRefusal)?;
         self.shaped_by_occurrence
             .insert(occurrence.clone(), receipt.clone());
