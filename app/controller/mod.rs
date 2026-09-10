@@ -2028,9 +2028,12 @@ impl RecordingController {
     {
         let refusal = error.downcast::<TerminalSealRefused>()?;
         let take_id = self.session_id.read().await.clone();
+        // A refusal must name this capture and must actually be a refusal. Any
+        // non-complete verdict qualifies: measured uncovered speech and missing
+        // acoustic measurement both leave authenticated words worth recovering,
+        // and pinning this guard to one reason would drop them for the other.
         if retainable_session_id(take_id.as_deref()) != Some(refusal.receipt.session_id.as_str())
-            || refusal.receipt.status
-                != codescribe_core::pipeline::acoustic_ledger::SealCoverageStatus::Incomplete
+            || refusal.receipt.status.is_complete()
         {
             return Err(anyhow::anyhow!(
                 "terminal refusal does not match the active capture"
@@ -4994,6 +4997,9 @@ mod refusal_recovery_tests {
     use crate::presentation::transcript_bus::{
         ProjectedSealCoverageReceipt, TranscriptBusEvidenceEvent, TranscriptProjectionPhase,
     };
+    use codescribe_core::audio::capture_receipt::{
+        AcousticAvailability, AcousticSpeechEvidence, CaptureEvidenceIdentity,
+    };
     use codescribe_core::pipeline::acoustic_ledger::{
         AcousticEvidence, AcousticLedger, EnergyCalibration, ObservationIdentity,
         ObservationProducer, OccurrenceIdentity, SealRefusal,
@@ -5014,6 +5020,13 @@ mod refusal_recovery_tests {
     }
 
     async fn take(state: State, words: bool) -> Take {
+        take_with(state, words, true).await
+    }
+
+    /// `observed` selects which refusal the ledger issues: measured uncovered
+    /// speech, or no authenticated acoustic measurement at all. Both must reach
+    /// the same recovery path and keep the same committed words.
+    async fn take_with(state: State, words: bool, observed: bool) -> Take {
         let controller = RecordingController::new_without_keychain();
         controller.set_state(state).await;
         *controller.session_id.write().await = Some(format!("{TAKE}:stopping"));
@@ -5076,17 +5089,30 @@ mod refusal_recovery_tests {
         }
         let receipt = {
             let mut ledger = ledger.lock().unwrap();
-            let coverage = ledger.assess_seal_coverage(
-                TAKE,
-                7,
-                &[TailSampleRange {
-                    session: TAKE.into(),
-                    capture_epoch: 7,
-                    sample_start: 0,
-                    sample_end: 48_000,
-                }],
-                8_000,
-            );
+            let identity = CaptureEvidenceIdentity::new(TAKE, 7);
+            let evidence = if observed {
+                AcousticSpeechEvidence::measured(
+                    identity,
+                    "capture_energy",
+                    AcousticAvailability::Observed {
+                        observed_samples: 48_000,
+                    },
+                    vec![TailSampleRange {
+                        session: TAKE.into(),
+                        capture_epoch: 7,
+                        sample_start: 0,
+                        sample_end: 48_000,
+                    }],
+                )
+            } else {
+                AcousticSpeechEvidence::unavailable(
+                    identity,
+                    "capture_energy",
+                    AcousticAvailability::NotObserved,
+                )
+            };
+            let coverage = ledger.assess_seal_coverage(TAKE, 7, &evidence, 8_000);
+            assert!(!coverage.status.is_complete());
             assert!(ledger.record_seal_coverage(coverage.clone()));
             assert_eq!(
                 ledger.seal_terminal(TAKE, 7),
@@ -5210,6 +5236,108 @@ mod refusal_recovery_tests {
                 1
             );
             assert!(rows.contains("\"end_reason\":\"coverage_refused\""));
+        }
+    }
+
+    /// Missing acoustic measurement reaches the same authenticated recovery
+    /// path as measured uncovered speech: the committed words are delivered, the
+    /// take WAV is retained, and the lifecycle is released.
+    ///
+    /// This is the guard the earlier shape would have failed. It compared the
+    /// receipt against `Incomplete` specifically, so an unavailable refusal —
+    /// which the ledger, recorder and emitter all now refuse on — would have
+    /// been rejected here as "not the active capture" and the words lost.
+    #[tokio::test]
+    async fn unavailable_measurement_recovers_the_committed_words() {
+        for state in [State::RecHold, State::RecToggle] {
+            let mut take = take_with(state, true, false).await;
+            assert_eq!(
+                take.refusal.receipt.status,
+                codescribe_core::pipeline::acoustic_ledger::SealCoverageStatus::Unavailable(
+                    codescribe_core::pipeline::acoustic_ledger::AcousticEvidenceGap::NotObserved
+                )
+            );
+            assert_eq!(take.refusal.receipt.coverage_ratio(), None);
+            assert!(
+                take.bus
+                    .matches_refused_document(&take.refusal.receipt, WORDS)
+            );
+            let controller = &take.controller;
+            let result = take
+                .controller
+                .process_terminal_stop_error(
+                    anyhow::Error::new(take.refusal.clone()),
+                    |text| async move {
+                        controller
+                            .deliver_stop_transcript(
+                                Some(TAKE),
+                                &text,
+                                true,
+                                false,
+                                CaptureTurnIntent::SingleTurn,
+                                true,
+                            )
+                            .await
+                    },
+                )
+                .await;
+            let outcome = result
+                .as_ref()
+                .expect("unavailable measurement is a recoverable refusal");
+            assert!(outcome.refusal.is_some());
+            assert!(outcome.transcript_present);
+            take.controller
+                .reset_finished_recording_state(&result)
+                .await;
+            take.controller
+                .handle_processed_recording_result(true, &result)
+                .await;
+            take.controller
+                .reset_finished_recording_state(&result)
+                .await;
+
+            let (terminals, warnings) = terminal_events(&mut take);
+            assert_eq!(terminals.len(), 1);
+            let terminal = &terminals[0];
+            assert_eq!(terminal.rendered_text, WORDS, "the words must survive");
+            assert_eq!(terminal.phase, TranscriptProjectionPhase::CoverageRefused);
+            assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
+            let projected = terminal
+                .seal_coverage
+                .as_ref()
+                .expect("the refusal projects its coverage evidence");
+            assert_eq!(projected.status, "unavailable");
+            assert_eq!(
+                projected.unavailable_reason.as_deref(),
+                Some("not_observed")
+            );
+            assert_eq!(
+                projected.coverage_ratio, None,
+                "the Bus must not render an unknown extent as a covered fraction"
+            );
+            assert_eq!(
+                projected,
+                &ProjectedSealCoverageReceipt::from(&take.refusal.receipt)
+            );
+            assert!(
+                terminal
+                    .acoustic_receipts
+                    .iter()
+                    .all(|receipt| receipt.seal_receipt.is_none()),
+                "no occurrence may acquire a terminal seal on this path"
+            );
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].0, "terminal_coverage_refused");
+            assert_eq!(
+                std::fs::read(take.refusal.audio_path.as_ref().unwrap()).unwrap(),
+                b"synthetic retained WAV witness"
+            );
+            let rows = std::fs::read_to_string(take.dir.path().join("bus.jsonl")).unwrap();
+            assert!(rows.contains("\"end_reason\":\"coverage_refused\""));
+            assert!(
+                !rows.contains("\"coverage_ratio\""),
+                "an absent ratio must be absent on the wire too: {rows}"
+            );
         }
     }
 

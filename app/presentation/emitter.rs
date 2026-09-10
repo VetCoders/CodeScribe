@@ -15,7 +15,7 @@ use codescribe_core::pipeline::acoustic_ledger::{
     AcousticLedger, AcousticSerial, DocumentRevisionProvenance, IncrementalShapingInput,
     IncrementalShapingReceipt, LedgerSealReceipt, ManualDocumentRevisionReceipt, MutationReceipt,
     ObservationIdentity, ObservationProducer, OccurrenceIdentity, SealCoverageReceipt,
-    SealCoverageStatus, TranscriptComparisonReceipt,
+    TranscriptComparisonReceipt,
 };
 use codescribe_core::pipeline::contracts::{DeltaSink, EngineEvent, EventSink, TranscriptDelta};
 use sha2::{Digest, Sha256};
@@ -597,7 +597,9 @@ impl TranscriptReducer {
             && self
                 .latest_seal_coverage
                 .as_ref()
-                .is_some_and(|coverage| coverage.status == SealCoverageStatus::Incomplete)
+                // Absence of acoustic measurement blocks a terminal projection
+                // exactly as measured uncovered speech does.
+                .is_some_and(|coverage| !coverage.status.is_complete())
         {
             return None;
         }

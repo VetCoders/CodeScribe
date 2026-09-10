@@ -48,8 +48,8 @@ use crate::asr_session::recorder::{
 };
 use crate::asr_session::{SessionId as Layer1SessionId, SessionInput as Layer1SessionInput};
 use crate::audio::capture_receipt::{
-    CaptureLevelAccumulator, CapturePathMeta, begin_session_energy_clock,
-    emit_capture_level_receipt, session_active_speech_ranges,
+    AcousticAvailability, AcousticSpeechEvidence, CaptureEnergyOwner, CaptureLevelAccumulator,
+    CapturePathMeta, emit_capture_level_receipt,
 };
 use crate::audio::streaming_recorder::CaptureTurnIntent;
 use crate::config::{FormattingPolicy, RuntimeSettingsSnapshot};
@@ -591,8 +591,12 @@ pub(crate) async fn apple_stream_transcription_session(
         mut lifecycle_events,
         terminal_audio,
     } = config;
-    let mut capture_level = CaptureLevelAccumulator::new();
-    begin_session_energy_clock();
+    // One owner for this capture epoch's acoustic evidence. This async arm is
+    // the writer and the blocking Apple worker below is the reader; both hold
+    // the same handle, so no process-global slot and no reset entrypoint sit
+    // between them.
+    let capture_energy = CaptureEnergyOwner::bind(session_id.clone(), capture_epoch);
+    let mut capture_level = CaptureLevelAccumulator::bound_to(&capture_energy);
     // Hands-free silence is the ENGINE LIFECYCLE on this lane, not a chunker
     // knob: SFSpeech still owns phrase boundaries inside an utterance, but the
     // threshold decides when the engine rests (mic + Silero keep watching) and
@@ -699,6 +703,7 @@ pub(crate) async fn apple_stream_transcription_session(
     let worker_formatter_tx = formatter_on.then_some(formatter_tx);
 
     let worker_session_id = session_id.clone();
+    let worker_capture_energy = capture_energy.clone();
     let worker_execution = Arc::clone(&tail_patch_lane.execution);
     let worker = thread::spawn(move || {
         apple_stream_worker(
@@ -715,6 +720,7 @@ pub(crate) async fn apple_stream_transcription_session(
                 language: language.as_deref(),
                 session_id: worker_session_id,
                 capture_epoch,
+                capture_energy: worker_capture_energy,
                 runtime_settings,
                 acoustic_ledger,
                 settings_digest,
@@ -1110,6 +1116,9 @@ struct AppleSealState {
     /// Measured threshold frozen into the same settings snapshot. Absence is a
     /// fail-closed W2 state: no occurrence qualifies and no text mutates.
     energy_calibration: Option<EnergyCalibration>,
+    /// This take's capture energy ladder, bound to session and capture epoch.
+    /// The live writer is the async capture arm; this is its reader handle.
+    capture_energy: CaptureEnergyOwner,
 }
 
 impl AppleSealState {
@@ -1131,6 +1140,7 @@ impl AppleSealState {
     }
 
     fn new_for_session(sample_rate: u32, session_id: String, capture_epoch: u64) -> Self {
+        let session_id_for_energy = session_id.clone();
         Self {
             session_id,
             capture_epoch,
@@ -1179,7 +1189,23 @@ impl AppleSealState {
             reconciled_silero: BTreeSet::new(),
             acoustic_ledger: Arc::new(Mutex::new(AcousticLedger::new())),
             energy_calibration: None,
+            capture_energy: CaptureEnergyOwner::bind(session_id_for_energy, capture_epoch),
         }
+    }
+
+    /// Adopt the capture arm's energy-ladder owner.
+    ///
+    /// The worker is the reader; the writer lives on the async capture arm.
+    /// Installing its handle here is what makes the two threads share one
+    /// measurement instead of two ladders that agree by coincidence.
+    fn bind_capture_energy(&mut self, owner: CaptureEnergyOwner) {
+        debug_assert!(
+            owner
+                .identity()
+                .matches(&self.session_id, self.capture_epoch),
+            "the capture owner must name this take"
+        );
+        self.capture_energy = owner;
     }
 
     fn new_for_session_with_ledger(
@@ -2812,32 +2838,6 @@ fn admit_full_pass_gap_segments(
     admitted
 }
 
-/// Which instrument produced the speech set a coverage receipt was measured
-/// against. Text-free; it names the producer, never what was said.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CoverageSpeechSource {
-    /// Raw Silero threshold crossings — the acoustic answer.
-    SileroBoundaries,
-    /// Padded fusion ownership windows — wider than the truth, and the answer
-    /// only when spans exist without any observed crossing. In production that
-    /// combination contradicts the one-VAD contract (an utterance is minted
-    /// from an edge), so the producer field is what makes it visible rather
-    /// than silently absorbed into the same number as the acoustic set.
-    FusionUtterances,
-    /// Capture energy ladder — neither instrument produced anything.
-    CaptureEnergy,
-}
-
-impl CoverageSpeechSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::SileroBoundaries => "silero_boundaries",
-            Self::FusionUtterances => "fusion_utterances",
-            Self::CaptureEnergy => "capture_energy",
-        }
-    }
-}
-
 /// Padded fusion ownership windows, summed. Diagnostics only: this is the
 /// number that read a whole archived take as 99.5% speech.
 fn fusion_utterance_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
@@ -2856,73 +2856,79 @@ fn fusion_utterance_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
         .unwrap_or_default()
 }
 
-/// Choose the producer: the narrowest acoustic evidence that actually exists.
+/// Choose the acoustic observer: the narrowest one that actually measured.
 ///
-/// Observed crossings first — a set that exists is proof the VAD ran, which is
-/// stronger than any availability flag. Then the padded fusion windows, which
-/// are wider than the truth but are still speech evidence. Only when neither
-/// instrument produced anything does the capture energy ladder answer.
+/// Silero crossings first — a set that exists is proof the VAD ran and heard
+/// speech, which is the narrowest honest answer. Otherwise the capture energy
+/// ladder, the other authenticated observer over the same PCM. Padded fusion
+/// ownership windows are no longer a candidate: they stay open across pauses
+/// and close on the capture cursor, so they measure ownership, never speech.
 ///
-/// The order matters more than the reason for an empty set. Narrowing when a
-/// narrower measurement exists is the whole cut; falling back when nothing
-/// exists is what keeps a VAD-less take measurable instead of trivially
-/// "complete".
-fn select_coverage_speech_source(
-    acoustic_present: bool,
-    utterances_present: bool,
-) -> CoverageSpeechSource {
-    if acoustic_present {
-        CoverageSpeechSource::SileroBoundaries
-    } else if utterances_present {
-        CoverageSpeechSource::FusionUtterances
-    } else {
-        CoverageSpeechSource::CaptureEnergy
+/// When neither observer measured, the answer is the unavailable evidence the
+/// capture owner itself reports. Absence keeps its own name here instead of
+/// arriving at the ledger as an empty set.
+fn coverage_speech_evidence(state: &AppleSealState) -> AcousticSpeechEvidence {
+    let captured_samples = state.audio.session_sample_end();
+    let capture_energy = state.capture_energy.session_active_speech_ranges(
+        &state.session_id,
+        state.capture_epoch,
+        state.sample_rate,
+    );
+    // The capture writer adjudicates the PCM it wrote. When it measured samples
+    // it could not read, no later observer over the same buffer may certify
+    // them: a downstream reader sees the identical NaN as a probability that
+    // fails every threshold, which is indistinguishable from silence.
+    if matches!(
+        capture_energy.availability(),
+        AcousticAvailability::InvalidMeasurement { .. }
+    ) {
+        return capture_energy;
     }
+    if let Some(fusion) = state.fusion.as_ref() {
+        let acoustic = fusion.acoustic_speech_evidence();
+        if acoustic.observed_speech() {
+            return within_capture(acoustic, captured_samples);
+        }
+    }
+    within_capture(capture_energy, captured_samples)
 }
 
-/// The speech set a terminal coverage receipt is measured against.
+/// Hold an observer's measured extent against the capture the take produced.
 ///
-/// Raw Silero threshold crossings are the acoustic authority: they say where
-/// speech actually was. Fusion utterance ranges say who owns which occurrence,
-/// which is a different question — their padded windows stay open across pauses
-/// and close on the capture cursor, so using them as the speech set counts
-/// silence as speech the ledger then "fails" to cover.
-fn coverage_speech_ranges_with_source(
-    state: &AppleSealState,
-) -> (Vec<TailSampleRange>, CoverageSpeechSource) {
-    let samples_seen = state.audio.session_sample_end();
-    let Some(fusion) = state.fusion.as_ref() else {
-        return (
-            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate),
-            CoverageSpeechSource::CaptureEnergy,
-        );
+/// An observer reports how much PCM reached *it*. Nothing in the pipeline
+/// guarantees that equals what the microphone produced — a chunk lane that
+/// stops forwarding leaves no hole to detect, because the extent simply ends
+/// early. The ledger compares committed and measured spans against the extent
+/// the observer claims, so without this the unheard remainder was certified
+/// covered whenever no word happened to be committed inside it.
+///
+/// `state.audio` is the capture owner's own count of samples seen this
+/// session — retained or evicted — so this compares two authenticated facts.
+/// It only ever downgrades: a short observer becomes unavailable, and no
+/// evidence is promoted.
+fn within_capture(
+    evidence: AcousticSpeechEvidence,
+    captured_samples: u64,
+) -> AcousticSpeechEvidence {
+    let Some(observed_samples) = evidence.availability().observed_samples() else {
+        return evidence;
     };
-    let acoustic = fusion.acoustic_speech_ranges(samples_seen);
-    let utterances = fusion_utterance_ranges(state);
-    match select_coverage_speech_source(!acoustic.is_empty(), !utterances.is_empty()) {
-        CoverageSpeechSource::SileroBoundaries => {
-            (acoustic, CoverageSpeechSource::SileroBoundaries)
-        }
-        CoverageSpeechSource::FusionUtterances => {
-            (utterances, CoverageSpeechSource::FusionUtterances)
-        }
-        CoverageSpeechSource::CaptureEnergy => (
-            session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate),
-            CoverageSpeechSource::CaptureEnergy,
-        ),
+    if observed_samples >= captured_samples {
+        return evidence;
     }
-}
-
-fn coverage_speech_ranges(state: &AppleSealState) -> Vec<TailSampleRange> {
-    coverage_speech_ranges_with_source(state).0
+    AcousticSpeechEvidence::unavailable(
+        evidence.identity().clone(),
+        evidence.producer(),
+        AcousticAvailability::Discontinuous { observed_samples },
+    )
 }
 
 fn publish_terminal_coverage(
     state: &AppleSealState,
     ev_tx: &mpsc::UnboundedSender<EngineEvent>,
 ) -> SealCoverageReceipt {
-    let (speech, source) = coverage_speech_ranges_with_source(state);
-    let speech_samples = sum_range_samples(&speech);
+    let speech = coverage_speech_evidence(state);
+    let speech_samples = sum_range_samples(speech.ranges());
     let utterance_ranges = fusion_utterance_ranges(state);
 
     // Both numbers on one line, text-free. The acoustic set is what the receipt
@@ -2932,8 +2938,10 @@ fn publish_terminal_coverage(
     info!(
         session_id = %state.session_id,
         capture_epoch = state.capture_epoch,
-        producer = source.as_str(),
-        speech_ranges = speech.len(),
+        producer = speech.producer(),
+        availability = speech.availability().as_str(),
+        observed_samples = speech.availability().observed_samples(),
+        speech_ranges = speech.ranges().len(),
         speech_samples,
         utterance_ranges = utterance_ranges.len(),
         utterance_samples = sum_range_samples(&utterance_ranges),
@@ -3032,7 +3040,7 @@ where
     // One speech set for the whole terminal path. Repairing against a wider set
     // than the one the published receipt is measured against would send Whisper
     // after "gaps" that were never speech.
-    let speech_ranges = coverage_speech_ranges(state);
+    let speech_evidence = coverage_speech_evidence(state);
     let initial = {
         let ledger = state
             .acoustic_ledger
@@ -3041,7 +3049,7 @@ where
         ledger.assess_seal_coverage(
             &state.session_id,
             state.capture_epoch,
-            &speech_ranges,
+            &speech_evidence,
             threshold_samples,
         )
     };
@@ -3130,7 +3138,7 @@ where
         .assess_seal_coverage(
             &state.session_id,
             state.capture_epoch,
-            &speech_ranges,
+            &speech_evidence,
             threshold_samples,
         );
     state
@@ -3659,6 +3667,9 @@ struct AppleWorkerConfig<'a> {
     language: Option<&'a str>,
     session_id: String,
     capture_epoch: u64,
+    /// The capture arm's energy-ladder owner. The worker reads the same handle
+    /// the async writer feeds; it never opens a ladder of its own.
+    capture_energy: CaptureEnergyOwner,
     runtime_settings: Arc<RuntimeSettingsSnapshot>,
     acoustic_ledger: Arc<Mutex<AcousticLedger>>,
     settings_digest: String,
@@ -3686,6 +3697,7 @@ fn apple_stream_worker(
         language,
         session_id,
         capture_epoch,
+        capture_energy,
         runtime_settings,
         acoustic_ledger,
         settings_digest,
@@ -3750,6 +3762,7 @@ fn apple_stream_worker(
             energy_calibration,
         ),
     };
+    state.bind_capture_energy(capture_energy);
     state.formatter = formatter;
     // The session's ONE Silero. Both consumers of speech edges read it: the
     // utterance ledger (identity, ranges) and the engine lifecycle (wake/sleep).
@@ -4019,17 +4032,31 @@ fn apple_stream_worker(
         retained_unmatched_words = state.unmatched_silero_words.len(),
         "apple_fusion_session_receipt"
     );
-    if seal_coverage.status == SealCoverageStatus::Incomplete {
-        let _ = ev_tx.send(EngineEvent::Warning {
-            code: "terminal_seal_coverage_incomplete".to_string(),
-            message: format!(
-                "covered={}/{} max_uncovered={} threshold={}",
-                seal_coverage.covered_samples,
-                seal_coverage.speech_samples,
-                seal_coverage.max_uncovered_samples,
-                seal_coverage.incomplete_threshold_samples,
+    // Any non-complete verdict takes the same non-success path. The warning
+    // names which one it was; neither may reach the terminal seal below.
+    if !seal_coverage.status.is_complete() {
+        let (code, message) = match seal_coverage.status.unavailable_reason() {
+            Some(gap) => (
+                "terminal_seal_coverage_unavailable".to_string(),
+                format!(
+                    "reason={} producer={} availability={}",
+                    gap.as_str(),
+                    seal_coverage.speech_producer,
+                    seal_coverage.availability,
+                ),
             ),
-        });
+            None => (
+                "terminal_seal_coverage_incomplete".to_string(),
+                format!(
+                    "covered={}/{} max_uncovered={} threshold={}",
+                    seal_coverage.covered_samples,
+                    seal_coverage.speech_samples,
+                    seal_coverage.max_uncovered_samples,
+                    seal_coverage.incomplete_threshold_samples,
+                ),
+            ),
+        };
+        let _ = ev_tx.send(EngineEvent::Warning { code, message });
         return Ok(AppleStreamOutcome {
             sealed: state.sealed_count,
             filtered_empty_drops: state.filtered_empty_drops,
@@ -6845,9 +6872,15 @@ mod storm_tests {
 #[cfg(test)]
 mod rc_w1_live_ledger_tests {
     use super::*;
+    use crate::audio::capture_receipt::{AcousticAvailability, CAPTURE_ENERGY_PRODUCER};
     use crate::audio::chunker::{VadBoundaryEvidence, VadBoundaryKind};
+    use crate::pipeline::streaming::silero_fusion::SILERO_BOUNDARIES_PRODUCER;
 
     const RATE: u32 = 16_000;
+    /// `ACOUSTIC_SPEECH_PAD_SECS` (64 ms) at [`RATE`].
+    const PAD: u64 = 1_024;
+    /// `SEAL_COVERAGE_INCOMPLETE_MS` (250 ms) at [`RATE`].
+    const THRESHOLD: u64 = 4_000;
 
     fn at(secs: f32) -> u64 {
         (secs * RATE as f32) as u64
@@ -6872,29 +6905,99 @@ mod rc_w1_live_ledger_tests {
         }
     }
 
-    /// The producer decision, exhaustively: the narrowest evidence that exists
-    /// wins, and an absence of every instrument still reaches the energy ladder
-    /// rather than reporting nothing to cover.
+    /// The producer decision: the narrowest observer that actually measured
+    /// speech wins, padded ownership windows are never a candidate, and when no
+    /// observer measured, the answer carries its own unavailability instead of
+    /// an empty set that reads as silence.
     #[test]
-    fn coverage_producer_picks_the_narrowest_evidence_that_exists() {
-        use CoverageSpeechSource::*;
+    fn coverage_producer_picks_a_measuring_observer_and_never_ownership_windows() {
+        // Ownership windows spanning the whole take, no crossings, no ladder.
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w3-producer".into(), 0);
+        push_capture(&mut state, 10.0);
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress
+            .ledger_mut()
+            .open_or_extend(&state.session_id, 0, 0, at(10.0));
+        ingress.ledger_mut().close_open(at(10.0));
+        state.fusion = Some(ingress);
+        assert_eq!(
+            sum_range_samples(&fusion_utterance_ranges(&state)),
+            at(10.0),
+            "ownership keeps its padded window; this test is about who may use it"
+        );
 
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
         assert_eq!(
-            select_coverage_speech_source(true, true),
-            SileroBoundaries,
-            "crossings outrank the padded ownership windows"
+            evidence.availability(),
+            AcousticAvailability::NotObserved,
+            "padded ownership is not an acoustic measurement, and nothing else measured"
         );
-        assert_eq!(select_coverage_speech_source(true, false), SileroBoundaries);
+        assert!(evidence.ranges().is_empty());
+
+        // The capture energy ladder measured the take: it becomes the observer.
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.25f32; at(1.0) as usize]);
+        writer.push_samples(&vec![0.0f32; at(9.0) as usize]);
+        let measured = coverage_speech_evidence(&state);
+        assert_eq!(measured.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert!(measured.observed_speech());
+        assert_eq!(measured.ranges().len(), 1);
+        assert_eq!(measured.ranges()[0].sample_end, at(1.0));
+
+        // Silero crossings are narrower still and outrank the ladder.
+        let fusion = state.fusion.as_mut().unwrap();
+        fusion.ingest(&vec![0.25f32; at(10.0) as usize], at(10.0));
+        fusion.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(2.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(3.0)),
+        ]);
+        let acoustic = coverage_speech_evidence(&state);
+        assert_eq!(acoustic.producer(), SILERO_BOUNDARIES_PRODUCER);
+        assert_eq!(acoustic.ranges().len(), 1);
+        assert_eq!(acoustic.ranges()[0].sample_start, at(2.0) - PAD);
+    }
+
+    /// Ownership padding cannot raise the acoustic speech figure, and a real
+    /// measured gap still refuses. Both halves in one witness, because the
+    /// failure this cut exists for was the padded set passing as coverage.
+    #[test]
+    fn ownership_padding_cannot_increase_measured_speech() {
+        let mut state = AppleSealState::new_for_session(RATE, "rc-w3-padding".into(), 0);
+        push_capture(&mut state, 10.0);
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.ingest(&vec![0.25f32; at(10.0) as usize], at(10.0));
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+        ]);
+        // The ownership window is the whole take; the crossing is one second.
+        ingress
+            .ledger_mut()
+            .open_or_extend(&state.session_id, 0, 0, at(10.0));
+        ingress.ledger_mut().close_open(at(10.0));
+        state.fusion = Some(ingress);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), SILERO_BOUNDARIES_PRODUCER);
         assert_eq!(
-            select_coverage_speech_source(false, true),
-            FusionUtterances,
-            "spans without crossings still measure speech, and are named as such"
+            sum_range_samples(evidence.ranges()),
+            at(1.0) + 2 * PAD,
+            "the acoustic figure is the crossing plus its 64 ms margin, not the window"
         );
-        assert_eq!(
-            select_coverage_speech_source(false, false),
-            CaptureEnergy,
-            "no instrument produced anything: the energy ladder keeps the take measurable"
+        assert!(
+            sum_range_samples(evidence.ranges())
+                < sum_range_samples(&fusion_utterance_ranges(&state)),
+            "ownership padding may not raise measured speech"
         );
+
+        // Nothing is committed, so the measured second is an uncovered gap.
+        let receipt = {
+            let ledger = state.acoustic_ledger.lock().unwrap();
+            ledger.assess_seal_coverage(&state.session_id, 0, &evidence, THRESHOLD)
+        };
+        assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
+        assert_eq!(receipt.max_uncovered_samples, at(1.0) + 2 * PAD);
     }
 
     /// The regression this cut exists for. A padded ownership window spanning a
@@ -6919,14 +7022,16 @@ mod rc_w1_live_ledger_tests {
         // One padded ownership window covering the entire take, exactly as the
         // fusion ledger legitimately mints it.
         ingress.observe(Some((0, at(10.0))), true, at(10.0));
+        ingress.note_observed_pcm(at(10.0), at(10.0));
         state.fusion = Some(ingress);
 
-        let (speech, source) = coverage_speech_ranges_with_source(&state);
-        assert_eq!(source, CoverageSpeechSource::SileroBoundaries);
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), SILERO_BOUNDARIES_PRODUCER);
+        let speech = evidence.ranges();
         assert_eq!(speech.len(), 2, "two bursts, not one window");
         assert_eq!(speech[0].session, "rc-w1-coverage");
 
-        let acoustic_samples = sum_range_samples(&speech);
+        let acoustic_samples = sum_range_samples(speech);
         let utterance_samples = sum_range_samples(&fusion_utterance_ranges(&state));
         assert_eq!(utterance_samples, at(10.0), "ownership keeps its window");
         // Two 1 s bursts, each padded 64 ms on both sides.
@@ -6939,15 +7044,26 @@ mod rc_w1_live_ledger_tests {
 
     /// Without a fusion ingress at all, the capture energy ladder still answers.
     /// This lane may not remove the fallback that keeps a VAD-less take
-    /// measurable.
+    /// measurable — but the ladder must have actually measured to answer.
     #[test]
     fn coverage_falls_back_to_capture_energy_without_a_fusion_ingress() {
         let mut state = AppleSealState::new_for_session(RATE, "rc-w1-no-vad".into(), 0);
         push_capture(&mut state, 4.0);
         assert!(state.fusion.is_none());
 
-        let (_, source) = coverage_speech_ranges_with_source(&state);
-        assert_eq!(source, CoverageSpeechSource::CaptureEnergy);
+        let unmeasured = coverage_speech_evidence(&state);
+        assert_eq!(unmeasured.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            unmeasured.availability(),
+            AcousticAvailability::NotObserved,
+            "a ladder nobody fed cannot answer for a VAD-less take"
+        );
+
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.25f32; at(4.0) as usize]);
+        let measured = coverage_speech_evidence(&state);
+        assert_eq!(measured.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert!(measured.observed_speech());
     }
 
     /// An open crossing at stop is speech up to the capture cursor, and the
@@ -6959,10 +7075,12 @@ mod rc_w1_live_ledger_tests {
 
         let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
         ingress.observe_boundaries(&[crossing(VadBoundaryKind::SpeechStart, at(2.0))]);
+        ingress.note_observed_pcm(at(3.0), at(3.0));
         state.fusion = Some(ingress);
 
-        let (speech, source) = coverage_speech_ranges_with_source(&state);
-        assert_eq!(source, CoverageSpeechSource::SileroBoundaries);
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), SILERO_BOUNDARIES_PRODUCER);
+        let speech = evidence.ranges();
         assert_eq!(speech.len(), 1);
         assert_eq!(speech[0].sample_start, at(2.0) - 1_024);
         assert_eq!(
@@ -6986,9 +7104,11 @@ mod rc_w1_live_ledger_tests {
             crossing(VadBoundaryKind::SpeechStart, at(1.0)),
             crossing(VadBoundaryKind::SpeechEnd, at(1.0) + 1_280),
         ]);
+        ingress.note_observed_pcm(at(5.0), at(5.0));
         state.fusion = Some(ingress);
 
-        let (speech, _) = coverage_speech_ranges_with_source(&state);
+        let evidence = coverage_speech_evidence(&state);
+        let speech = evidence.ranges();
         assert_eq!(speech.len(), 1, "a short word is not discarded");
         assert_eq!(speech[0].sample_start, at(1.0) - 1_024);
         assert_eq!(speech[0].sample_end, at(1.0) + 1_280 + 1_024);
@@ -7049,8 +7169,11 @@ mod rc_w1_live_ledger_tests {
 #[cfg(test)]
 mod rc_w2_acoustic_tests {
     use super::*;
+    use crate::audio::capture_receipt::{
+        AcousticAvailability, CAPTURE_ENERGY_PRODUCER, CaptureEvidenceIdentity,
+    };
     use crate::audio::chunker::{VadBoundaryEvidence, VadBoundaryKind};
-    use crate::pipeline::acoustic_ledger::RefuseReason;
+    use crate::pipeline::acoustic_ledger::{AcousticEvidenceGap, RefuseReason};
 
     const RATE: u32 = 16_000;
     /// `ACOUSTIC_SPEECH_PAD_SECS` (64 ms) at [`RATE`].
@@ -7096,6 +7219,9 @@ mod rc_w2_acoustic_tests {
     fn one_burst_in_a_ten_second_take(session: &str) -> AppleSealState {
         let mut state = state_for(session, 10.0);
         let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        // The same ten seconds `state_for` pushed into the audio buffer reached
+        // the VAD. Synthetic crossings still stand in for the model read.
+        ingress.note_observed_pcm(at(10.0), at(10.0));
         ingress.observe_boundaries(&[
             crossing(VadBoundaryKind::SpeechStart, at(1.0)),
             crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
@@ -7108,6 +7234,7 @@ mod rc_w2_acoustic_tests {
     fn two_bursts(session: &str) -> AppleSealState {
         let mut state = state_for(session, 10.0);
         let mut ingress = SileroIngress::new(RATE, session, 0);
+        ingress.note_observed_pcm(at(10.0), at(10.0));
         ingress.observe_boundaries(&[
             crossing(VadBoundaryKind::SpeechStart, at(1.0)),
             crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
@@ -7148,7 +7275,7 @@ mod rc_w2_acoustic_tests {
     #[test]
     fn owned_terminal_repair_still_admits_both_exact_gaps() {
         let mut state = two_bursts("owned-repair");
-        let ranges = coverage_speech_ranges(&state);
+        let ranges = coverage_speech_evidence(&state).ranges().to_vec();
         assert_eq!(ranges.len(), 2);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&calls);
@@ -7191,7 +7318,7 @@ mod rc_w2_acoustic_tests {
     #[test]
     fn multigap_expiry_uses_one_budget_and_cannot_publish_late_native_success() {
         let mut state = two_bursts("expired-repair");
-        let expected_ranges = coverage_speech_ranges(&state);
+        let expected_ranges = coverage_speech_evidence(&state).ranges().to_vec();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -7227,7 +7354,7 @@ mod rc_w2_acoustic_tests {
     fn terminal_failure_and_foreign_identity_preserve_uncovered_pcm() {
         for foreign in [false, true] {
             let mut state = two_bursts("original-repair");
-            let expected_ranges = coverage_speech_ranges(&state);
+            let expected_ranges = coverage_speech_evidence(&state).ranges().to_vec();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let execution = LocalExecutionOwner::default();
             let receipt = repair_terminal_seal_coverage_with(
@@ -7326,12 +7453,23 @@ mod rc_w2_acoustic_tests {
         commit_the_burst(&mut state, &tx);
         let _ = warning_codes(&mut rx);
 
+        // What the padded ownership set *would* answer if it were still allowed
+        // to be the speech measurement. It is not — production reads
+        // `coverage_speech_evidence` — so this is minted explicitly here as the
+        // counterfactual the assertion below depends on.
         let padded_answer = {
             let ledger = state.acoustic_ledger.lock().unwrap();
             ledger.assess_seal_coverage(
                 &state.session_id,
                 state.capture_epoch,
-                &fusion_utterance_ranges(&state),
+                &AcousticSpeechEvidence::measured(
+                    CaptureEvidenceIdentity::new(&state.session_id, state.capture_epoch),
+                    "fusion_utterances_counterfactual",
+                    AcousticAvailability::Observed {
+                        observed_samples: state.audio.session_sample_end(),
+                    },
+                    fusion_utterance_ranges(&state),
+                ),
                 THRESHOLD,
             )
         };
@@ -7442,14 +7580,12 @@ mod rc_w2_acoustic_tests {
     /// no longer holds.
     #[test]
     fn repair_reports_unresolvable_gap_pcm_instead_of_inventing_a_witness() {
-        begin_session_energy_clock();
-        let mut accumulator = CaptureLevelAccumulator::new();
-        accumulator.push_samples(&vec![0.25f32; at(3.0) as usize]);
-
         // Capture energy measured three seconds of speech; the live buffer holds
         // none of it, which is exactly the retention-loss case.
         let mut state = state_for("rc-w2-unresolvable", 0.0);
         assert!(state.fusion.is_none());
+        let mut accumulator = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        accumulator.push_samples(&vec![0.25f32; at(3.0) as usize]);
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let receipt = repair_terminal_seal_coverage(
@@ -7478,17 +7614,22 @@ mod rc_w2_acoustic_tests {
     /// recorded — not a flag, and not the whole take.
     #[test]
     fn capture_energy_fallback_measures_recorded_hops() {
-        begin_session_energy_clock();
-        let mut accumulator = CaptureLevelAccumulator::new();
+        let state = state_for("rc-w2-energy", 2.0);
+        assert!(state.fusion.is_none());
+        let mut accumulator = CaptureLevelAccumulator::bound_to(&state.capture_energy);
         accumulator.push_samples(&vec![0.25f32; at(1.0) as usize]);
         accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
 
-        let state = state_for("rc-w2-energy", 2.0);
-        assert!(state.fusion.is_none());
+        let evidence = coverage_speech_evidence(&state);
 
-        let (speech, source) = coverage_speech_ranges_with_source(&state);
-
-        assert_eq!(source, CoverageSpeechSource::CaptureEnergy);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            evidence.availability(),
+            AcousticAvailability::Observed {
+                observed_samples: at(2.0)
+            }
+        );
+        let speech = evidence.ranges();
         assert_eq!(speech.len(), 1, "the silent second is not speech");
         assert_eq!(speech[0].sample_start, 0);
         assert_eq!(speech[0].sample_end, at(1.0));
@@ -7496,31 +7637,40 @@ mod rc_w2_acoustic_tests {
         assert_eq!(speech[0].capture_epoch, state.capture_epoch);
     }
 
-    /// Measured silence and an absent energy ladder produce the same empty
-    /// speech set today, and therefore the same trivially complete receipt.
-    ///
-    /// This is a recorded coverage gap, not a proof of silence: the seam carries
-    /// no "the ladder ran and heard nothing" fact, so a take whose capture path
-    /// never opened the clock is indistinguishable from a take that was silent.
-    /// The assertions below pin the honest half — neither input may invent
-    /// speech — and name the missing half for the runtime phases. The threshold
-    /// is not lowered and no fabricated distinction is introduced here.
+    /// The gap this cut closes. Captured zeros and no samples at all both
+    /// produce an empty speech set, and they must no longer produce the same
+    /// finality: the first is a measurement whose answer is silence, the second
+    /// is no measurement.
     #[test]
-    fn measured_silence_and_absent_evidence_are_both_empty_and_not_yet_distinguishable() {
-        begin_session_energy_clock();
-        let mut accumulator = CaptureLevelAccumulator::new();
-        accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
+    fn measured_silence_and_absent_evidence_reach_different_finality() {
         let silent_state = state_for("rc-w2-silent", 1.0);
-        let (silent_speech, silent_source) = coverage_speech_ranges_with_source(&silent_state);
+        let mut accumulator = CaptureLevelAccumulator::bound_to(&silent_state.capture_energy);
+        accumulator.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        let silent_evidence = coverage_speech_evidence(&silent_state);
 
-        begin_session_energy_clock();
         let absent_state = state_for("rc-w2-absent", 1.0);
-        let (absent_speech, absent_source) = coverage_speech_ranges_with_source(&absent_state);
+        let absent_evidence = coverage_speech_evidence(&absent_state);
 
-        assert!(silent_speech.is_empty(), "silence is never speech");
-        assert!(absent_speech.is_empty(), "absence is never speech");
-        assert_eq!(silent_source, CoverageSpeechSource::CaptureEnergy);
-        assert_eq!(absent_source, CoverageSpeechSource::CaptureEnergy);
+        assert!(
+            silent_evidence.ranges().is_empty(),
+            "silence is never speech"
+        );
+        assert!(
+            absent_evidence.ranges().is_empty(),
+            "absence is never speech"
+        );
+        assert_eq!(silent_evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(absent_evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            silent_evidence.availability(),
+            AcousticAvailability::Observed {
+                observed_samples: at(1.0)
+            }
+        );
+        assert_eq!(
+            absent_evidence.availability(),
+            AcousticAvailability::NotObserved
+        );
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let silent = publish_terminal_coverage(&silent_state, &tx);
@@ -7528,10 +7678,151 @@ mod rc_w2_acoustic_tests {
         assert_eq!(silent.speech_samples, 0);
         assert_eq!(absent.speech_samples, 0);
         assert_eq!(
-            silent.status, absent.status,
-            "the recorded gap: this seam cannot yet tell measured silence from a \
-             ladder that never ran"
+            silent.status,
+            SealCoverageStatus::Complete,
+            "a ladder that ran and heard nothing has covered everything there was"
         );
+        assert_eq!(
+            absent.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::NotObserved),
+            "a ladder that never ran cannot certify the take"
+        );
+        assert_eq!(silent.coverage_ratio(), Some(1.0));
+        assert_eq!(
+            absent.coverage_ratio(),
+            None,
+            "absence of measurement has no ratio"
+        );
+        assert_eq!(silent.observed_samples, Some(at(1.0)));
+        assert_eq!(absent.observed_samples, None);
+
+        // And the finality consumers agree: one may seal, the other may not.
+        assert!(
+            silent_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w2-silent", 0)
+                .is_err(),
+            "an empty ledger still has no occurrence to seal"
+        );
+        assert_eq!(
+            absent_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w2-absent", 0),
+            Err(SealRefusal::CoverageIncomplete),
+            "unavailable measurement refuses before the ledger even looks for occurrences"
+        );
+    }
+
+    /// rc-w3-acoustic-validity: three capture qualities, three honest outcomes,
+    /// all through `publish_terminal_coverage` and the ledger's own finality.
+    ///
+    /// Valid silence still succeeds — that is the outcome the validity repair
+    /// must not cost. An all-invalid capture and a mixed valid/invalid capture
+    /// both refuse, and both name invalid measurement rather than a gap or an
+    /// absent observer.
+    #[test]
+    fn valid_silence_all_invalid_and_mixed_capture_reach_distinct_outcomes() {
+        let silent_state = state_for("rc-w3-quality-silent", 1.0);
+        let mut silent_writer = CaptureLevelAccumulator::bound_to(&silent_state.capture_energy);
+        silent_writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+
+        let invalid_state = state_for("rc-w3-quality-invalid", 1.0);
+        let mut invalid_writer = CaptureLevelAccumulator::bound_to(&invalid_state.capture_energy);
+        invalid_writer.push_samples(&vec![f32::NAN; at(1.0) as usize]);
+
+        let mixed_state = state_for("rc-w3-quality-mixed", 2.0);
+        let mut mixed_writer = CaptureLevelAccumulator::bound_to(&mixed_state.capture_energy);
+        mixed_writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        mixed_writer.push_samples(&vec![f32::INFINITY; at(1.0) as usize]);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let silent = publish_terminal_coverage(&silent_state, &tx);
+        let invalid = publish_terminal_coverage(&invalid_state, &tx);
+        let mixed = publish_terminal_coverage(&mixed_state, &tx);
+
+        assert_eq!(
+            silent.status,
+            SealCoverageStatus::Complete,
+            "a ladder that ran over finite silence covered everything there was"
+        );
+        assert_eq!(silent.coverage_ratio(), Some(1.0));
+        assert_eq!(silent.observed_samples, Some(at(1.0)));
+
+        for (label, receipt) in [("all invalid", &invalid), ("mixed", &mixed)] {
+            assert_eq!(
+                receipt.status,
+                SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement),
+                "{label} capture measured nothing it can stand behind"
+            );
+            assert_eq!(receipt.coverage_ratio(), None, "{label} has no ratio");
+            assert_eq!(receipt.observed_samples, None, "{label} has no extent");
+            assert_eq!(receipt.availability, "invalid_measurement");
+            assert_eq!(receipt.speech_producer, CAPTURE_ENERGY_PRODUCER);
+        }
+
+        // The three receipts are genuinely different documents, not one status
+        // rendered three ways.
+        assert_ne!(silent.status, invalid.status);
+        assert_eq!(
+            invalid.status, mixed.status,
+            "both invalid captures name the same reason; only the diagnostic \
+             prefix differs, and that never reaches the receipt"
+        );
+
+        // Finality agrees with the receipts.
+        assert_eq!(
+            invalid_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w3-quality-invalid", 0),
+            Err(SealRefusal::CoverageIncomplete),
+            "invalid measurement refuses the terminal seal"
+        );
+        assert_eq!(
+            mixed_state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .seal_terminal("rc-w3-quality-mixed", 0),
+            Err(SealRefusal::CoverageIncomplete),
+            "a valid second in front of an invalid one does not rescue the seal"
+        );
+    }
+
+    /// rc-w3-acoustic-validity: the extent guard is not Silero-specific.
+    ///
+    /// The capture energy ladder sits upstream of the retained buffer, so in
+    /// production it cannot fall behind it. This pins the guard's second arm
+    /// anyway: whichever observer answers, an extent shorter than the capture
+    /// is reported as an unobserved remainder rather than covered silence.
+    #[test]
+    fn a_short_capture_energy_extent_cannot_certify_the_unheard_remainder() {
+        let state = state_for("rc-w3-validity-short-ladder", 10.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.0f32; at(4.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            evidence.availability(),
+            AcousticAvailability::Discontinuous {
+                observed_samples: at(4.0)
+            },
+            "four measured seconds of a ten-second capture leave six unheard"
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let receipt = publish_terminal_coverage(&state, &tx);
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
     }
 
     /// The terminal coverage threshold is 250 ms of the capture clock, and the
@@ -8228,6 +8519,190 @@ mod rc_w2_acoustic_tests {
             "s5 + frozen s6 + s7 → at least 3 seals, got {}",
             state.sealed_count
         );
+    }
+
+    /// rc-w3-acoustic-validity: invalid PCM *after* valid PCM, through the real
+    /// writer -> owner -> ledger chain.
+    ///
+    /// One second of finite zeros, then one second of NaN, on one bound
+    /// accumulator. The reader used to refuse only when the non-finite count
+    /// reached the whole observed extent (`16_000 >= 32_000` is false), so the
+    /// NaN second was measured as silence, the hop was published with a zero
+    /// RMS, and an empty ledger certified the take Complete.
+    #[test]
+    fn invalid_pcm_after_valid_pcm_is_not_certified_as_silence() {
+        let state = state_for("rc-w3-validity-after", 2.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![0.0f32; at(1.0) as usize]);
+        writer.push_samples(&vec![f32::NAN; at(1.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(evidence.producer(), CAPTURE_ENERGY_PRODUCER);
+        assert_eq!(
+            evidence.availability().as_str(),
+            "invalid_measurement",
+            "a NaN second measured nothing, and a valid second in front of it \
+             does not turn it into silence"
+        );
+        assert!(!evidence.is_observed());
+        assert!(evidence.ranges().is_empty());
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement),
+            "an unmeasurable region may not reach a successful seal"
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
+        assert_eq!(receipt.observed_samples, None);
+    }
+
+    /// rc-w3-acoustic-validity: invalid PCM *before* valid PCM.
+    ///
+    /// The mirror case, with infinities rather than NaN — `is_finite` rejects
+    /// both, and both are substituted with zero before measurement. The valid
+    /// tail's speech may not be published on evidence whose head was never
+    /// measurable.
+    #[test]
+    fn invalid_pcm_before_valid_pcm_is_not_certified_as_silence() {
+        let state = state_for("rc-w3-validity-before", 2.0);
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![f32::NEG_INFINITY; at(1.0) as usize]);
+        writer.push_samples(&vec![0.25f32; at(1.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(
+            evidence.availability().as_str(),
+            "invalid_measurement",
+            "an infinite head is as unmeasurable as a NaN one"
+        );
+        assert!(
+            evidence.ranges().is_empty(),
+            "unavailable evidence publishes no speech, not even the valid tail's"
+        );
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement)
+        );
+    }
+
+    /// rc-w3-acoustic-validity: a measuring observer cannot overrule the
+    /// capture owner's invalid verdict on the same PCM.
+    ///
+    /// Silero reports a crossing over a take whose capture writer measured
+    /// nothing but NaN. Selection preferred any observer that "measured
+    /// speech", so the downstream observer won and the invalid capture never
+    /// reached the ledger.
+    #[test]
+    fn a_measuring_observer_cannot_overrule_an_invalid_capture() {
+        let state = one_burst_in_a_ten_second_take("rc-w3-validity-bypass");
+        assert!(
+            coverage_speech_evidence(&state).observed_speech(),
+            "the fixture must start with a downstream observer that measured speech"
+        );
+
+        let mut writer = CaptureLevelAccumulator::bound_to(&state.capture_energy);
+        writer.push_samples(&vec![f32::NAN; at(10.0) as usize]);
+
+        let evidence = coverage_speech_evidence(&state);
+        assert_eq!(
+            evidence.producer(),
+            CAPTURE_ENERGY_PRODUCER,
+            "the capture owner adjudicates the PCM it wrote; no later observer \
+             may certify audio the writer measured as invalid"
+        );
+        assert_eq!(evidence.availability().as_str(), "invalid_measurement");
+
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::InvalidMeasurement)
+        );
+    }
+
+    /// rc-w3-acoustic-validity: a partly observed capture cannot certify its
+    /// unobserved tail, even when no word was committed inside that tail.
+    ///
+    /// Forwarding stops after four seconds of a ten-second take. No chunk ever
+    /// skips, so nothing is discontinuous — the observer's extent simply ends
+    /// early. Its one measured burst is committed, so the coverage arithmetic
+    /// is perfect and the six unheard seconds were the whole lie: the ledger
+    /// compared committed and measured spans against the observer's extent and
+    /// never against the capture the take actually produced.
+    #[test]
+    fn a_partly_observed_capture_cannot_certify_its_unobserved_tail() {
+        let mut state = state_for("rc-w3-validity-tail", 10.0);
+        let mut ingress = SileroIngress::new(RATE, state.session_id.clone(), 0);
+        ingress.note_observed_pcm(at(4.0), at(4.0));
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+        ]);
+        ingress.observe(Some((0, at(4.0))), true, at(4.0));
+        state.fusion = Some(ingress);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        commit_the_burst(&mut state, &tx);
+
+        let evidence = coverage_speech_evidence(&state);
+        let receipt = {
+            let ledger = state
+                .acoustic_ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ledger.assess_seal_coverage(
+                &state.session_id,
+                state.capture_epoch,
+                &evidence,
+                THRESHOLD,
+            )
+        };
+        assert_ne!(
+            receipt.status,
+            SealCoverageStatus::Complete,
+            "six seconds of this capture never reached any observer; covering \
+             the measured burst does not certify them silent"
+        );
+        assert_eq!(
+            receipt.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+        assert_eq!(receipt.coverage_ratio(), None);
     }
 }
 
@@ -10155,11 +10630,23 @@ mod live_refinement_admission_tests {
                 assert!(!ledger.is_sealed(occurrence));
                 assert!(ledger.text_of(occurrence).is_none());
             }
-            let speech = closed(3)
-                .utterances()
-                .iter()
-                .map(|u| u.range.clone())
-                .collect::<Vec<_>>();
+            let speech = crate::audio::capture_receipt::AcousticSpeechEvidence::measured(
+                crate::audio::capture_receipt::CaptureEvidenceIdentity::new("live-admission", 7),
+                "test_observer",
+                crate::audio::capture_receipt::AcousticAvailability::Observed {
+                    observed_samples: closed(3)
+                        .utterances()
+                        .iter()
+                        .map(|u| u.range.sample_end)
+                        .max()
+                        .unwrap_or_default(),
+                },
+                closed(3)
+                    .utterances()
+                    .iter()
+                    .map(|u| u.range.clone())
+                    .collect::<Vec<_>>(),
+            );
             let coverage = ledger.assess_seal_coverage("live-admission", 7, &speech, 250);
             assert_eq!(coverage.covered_samples, 0);
             assert_eq!(coverage.status, SealCoverageStatus::Incomplete);

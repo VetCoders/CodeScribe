@@ -55,6 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
+use crate::audio::capture_receipt::{AcousticAvailability, AcousticSpeechEvidence};
 use crate::stt::tail_provider::TailSampleRange;
 
 /// A physical acoustic occurrence: a PCM range in one capture epoch.
@@ -487,14 +488,20 @@ impl AcousticLedger {
         self.latest_seal_coverage.as_ref()
     }
 
-    /// Compare committed occurrence ranges with measured speech ranges on the
-    /// same capture clock. Ranges are unioned before subtraction, so overlap or
-    /// repeated labels can neither inflate nor erase coverage.
+    /// Compare committed occurrence ranges with authenticated measured speech
+    /// on the same capture clock. Ranges are unioned before subtraction, so
+    /// overlap or repeated labels can neither inflate nor erase coverage.
+    ///
+    /// The speech input is an observer's own [`AcousticSpeechEvidence`], not a
+    /// bare range vector: an empty set means silence only when the observer
+    /// says it measured the extent. Missing, foreign, invalid or partial
+    /// measurement leaves the take [`SealCoverageStatus::Unavailable`] instead
+    /// of being filtered into a trivially complete receipt.
     pub fn assess_seal_coverage(
         &self,
         session: &str,
         capture_epoch: u64,
-        speech_ranges: &[TailSampleRange],
+        speech: &AcousticSpeechEvidence,
         incomplete_threshold_samples: u64,
     ) -> SealCoverageReceipt {
         fn merged_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
@@ -513,10 +520,57 @@ impl AcousticLedger {
             merged
         }
 
+        let refuse = |gap: AcousticEvidenceGap| SealCoverageReceipt {
+            session_id: session.to_string(),
+            capture_epoch,
+            speech_samples: 0,
+            covered_samples: 0,
+            uncovered_speech_ranges: Vec::new(),
+            max_uncovered_samples: 0,
+            incomplete_threshold_samples,
+            status: SealCoverageStatus::Unavailable(gap),
+            speech_producer: speech.producer().to_string(),
+            availability: speech.availability().as_str().to_string(),
+            observed_samples: None,
+        };
+
+        // The evidence must name this take. A caller cannot authenticate a
+        // foreign observer by asking about its own session.
+        if !speech.identity().matches(session, capture_epoch) {
+            return refuse(AcousticEvidenceGap::IdentityMismatch);
+        }
+        let Some(observed_samples) = speech.availability().observed_samples() else {
+            return refuse(match speech.availability() {
+                AcousticAvailability::IdentityMismatch => AcousticEvidenceGap::IdentityMismatch,
+                AcousticAvailability::InvalidMeasurement { .. } => {
+                    AcousticEvidenceGap::InvalidMeasurement
+                }
+                AcousticAvailability::Discontinuous { .. } => {
+                    AcousticEvidenceGap::PartialObservation
+                }
+                // `observed_samples()` already excluded the observed arm.
+                AcousticAvailability::NotObserved | AcousticAvailability::Observed { .. } => {
+                    AcousticEvidenceGap::NotObserved
+                }
+            });
+        };
+        // A foreign range inside otherwise-authenticated evidence is a mismatch
+        // that must survive adjudication. Filtering it away is what turned an
+        // all-foreign input into an empty successful receipt.
+        if speech
+            .ranges()
+            .iter()
+            .any(|range| range.session != session || range.capture_epoch != capture_epoch)
+        {
+            return refuse(AcousticEvidenceGap::IdentityMismatch);
+        }
+
+        let producer = speech.producer();
+        let availability = speech.availability();
         let speech = merged_ranges(
-            speech_ranges
+            speech
+                .ranges()
                 .iter()
-                .filter(|range| range.session == session && range.capture_epoch == capture_epoch)
                 .map(|range| (range.sample_start, range.sample_end))
                 .collect(),
         );
@@ -529,6 +583,17 @@ impl AcousticLedger {
                 .map(|occurrence| (occurrence.sample_start, occurrence.sample_end))
                 .collect(),
         );
+
+        // Committed speech, or a measured span, past the observed extent means
+        // the remainder was never heard by this observer. An unobserved tail is
+        // not silence and may not be certified as covered.
+        if speech
+            .iter()
+            .chain(committed.iter())
+            .any(|(_, end)| *end > observed_samples)
+        {
+            return refuse(AcousticEvidenceGap::PartialObservation);
+        }
 
         let speech_samples = speech
             .iter()
@@ -586,6 +651,9 @@ impl AcousticLedger {
             max_uncovered_samples,
             incomplete_threshold_samples,
             status,
+            speech_producer: producer.to_string(),
+            availability: availability.as_str().to_string(),
+            observed_samples: Some(observed_samples),
         }
     }
 
@@ -1008,10 +1076,14 @@ impl AcousticLedger {
         session: &str,
         capture_epoch: u64,
     ) -> Result<LedgerSealReceipt, SealRefusal> {
+        // Two distinct refusals, both terminal-blocking: measured uncovered
+        // speech, and no authenticated measurement at all. Absence of evidence
+        // may not certify a seal simply because it is not `Incomplete`.
         if self.latest_seal_coverage.as_ref().is_some_and(|coverage| {
             coverage.session_id == session
                 && coverage.capture_epoch == capture_epoch
-                && coverage.status == SealCoverageStatus::Incomplete
+                && (coverage.status == SealCoverageStatus::Incomplete
+                    || coverage.status.unavailable_reason().is_some())
         }) {
             return Err(SealRefusal::CoverageIncomplete);
         }
@@ -2366,12 +2438,50 @@ pub struct LedgerSealReceipt {
     pub layer_trail_ordinals: Vec<usize>,
 }
 
+/// Why no authenticated acoustic measurement backs a coverage verdict.
+///
+/// Absence of evidence is its own outcome. None of these may certify a
+/// successful terminal seal, and none of them is silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcousticEvidenceGap {
+    /// No acoustic observer measured this take at all.
+    NotObserved,
+    /// A measurement exists but names another session or capture epoch.
+    IdentityMismatch,
+    /// PCM reached the observer and some of it was not finite, so nothing it
+    /// measured for this take can be trusted — an unmeasurable region reads as
+    /// silence and there is no way to tell the two apart after the fact.
+    InvalidMeasurement,
+    /// The observer measured only part of the capture: committed speech or a
+    /// measured span reaches past its extent, or that extent stops short of the
+    /// PCM the take actually produced.
+    PartialObservation,
+}
+
+impl AcousticEvidenceGap {
+    /// Stable token for logs, receipts and the Bus projection.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "not_observed",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::InvalidMeasurement => "invalid_measurement",
+            Self::PartialObservation => "partial_observation",
+        }
+    }
+}
+
 /// Whether the committed occurrence union covers the measured speech span
 /// closely enough to become terminal transcript truth.
+///
+/// [`Self::Complete`] is the only outcome that may certify one. It requires an
+/// authenticated measurement — measured silence qualifies, missing measurement
+/// does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealCoverageStatus {
     Complete,
     Incomplete,
+    /// No authenticated measurement; the take's speech extent is unknown.
+    Unavailable(AcousticEvidenceGap),
 }
 
 impl SealCoverageStatus {
@@ -2379,6 +2489,22 @@ impl SealCoverageStatus {
         match self {
             Self::Complete => "complete",
             Self::Incomplete => "incomplete",
+            Self::Unavailable(_) => "unavailable",
+        }
+    }
+
+    /// Whether this verdict may certify terminal transcript truth. Every
+    /// finality consumer branches on this, so a new non-complete outcome can
+    /// never fall through a guard that only knew one refusal.
+    pub fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+
+    /// Why measurement was missing, if it was.
+    pub fn unavailable_reason(self) -> Option<AcousticEvidenceGap> {
+        match self {
+            Self::Unavailable(gap) => Some(gap),
+            Self::Complete | Self::Incomplete => None,
         }
     }
 }
@@ -2395,14 +2521,29 @@ pub struct SealCoverageReceipt {
     pub max_uncovered_samples: u64,
     pub incomplete_threshold_samples: u64,
     pub status: SealCoverageStatus,
+    /// Which acoustic observer supplied the measurement this receipt judged.
+    pub speech_producer: String,
+    /// Availability token of that observer, kept for the log/Bus reader.
+    pub availability: String,
+    /// Contiguous PCM extent the observer measured. `None` when unavailable.
+    pub observed_samples: Option<u64>,
 }
 
 impl SealCoverageReceipt {
-    pub fn coverage_ratio(&self) -> f64 {
-        if self.speech_samples == 0 {
-            return 1.0;
+    /// Covered fraction of measured speech.
+    ///
+    /// `None` when no authenticated measurement exists: an unknown extent has
+    /// no ratio, and rendering it as `1.0` is exactly how absence used to look
+    /// like a perfect take. Measured silence keeps a real `1.0` — there was
+    /// nothing to cover and the observer was there to say so.
+    pub fn coverage_ratio(&self) -> Option<f64> {
+        if self.status.unavailable_reason().is_some() {
+            return None;
         }
-        self.covered_samples as f64 / self.speech_samples as f64
+        if self.speech_samples == 0 {
+            return Some(1.0);
+        }
+        Some(self.covered_samples as f64 / self.speech_samples as f64)
     }
 }
 
@@ -2625,6 +2766,7 @@ impl OccurrenceComposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::capture_receipt::CaptureEvidenceIdentity;
 
     fn occ(start: u64, end: u64) -> OccurrenceIdentity {
         OccurrenceIdentity::new("s1", 1, start, end)
@@ -3338,12 +3480,17 @@ mod tests {
             2,
             "Dość śmiesznym i ciekawym linie",
         );
-        let speech = vec![TailSampleRange {
-            session: SESSION.to_string(),
-            capture_epoch: EPOCH,
-            sample_start: 304_819,
-            sample_end: 1_602_560,
-        }];
+        let speech = measured_speech(
+            SESSION,
+            EPOCH,
+            1_602_560,
+            vec![TailSampleRange {
+                session: SESSION.to_string(),
+                capture_epoch: EPOCH,
+                sample_start: 304_819,
+                sample_end: 1_602_560,
+            }],
+        );
 
         let incomplete = ledger.assess_seal_coverage(SESSION, EPOCH, &speech, THRESHOLD);
         assert_eq!(incomplete.status, SealCoverageStatus::Incomplete);
@@ -3387,10 +3534,165 @@ mod tests {
         let rendered = ledger.rendered_text();
         assert!(rendered.contains("wychodzą spontanicznie w tym"));
         assert!(rendered.ends_with("Nie sądzisz?"));
+        assert_eq!(complete.coverage_ratio(), Some(1.0));
+        assert_eq!(complete.observed_samples, Some(1_602_560));
         assert!(ledger.record_seal_coverage(complete));
         ledger
             .seal_terminal(SESSION, EPOCH)
             .expect("complete recorded coverage may become terminal truth");
+    }
+
+    /// Evidence the two acoustic observers mint. Tests use it directly so the
+    /// ledger's own adjudication is exercised, not a bare range vector.
+    fn measured_speech(
+        session: &str,
+        capture_epoch: u64,
+        observed_samples: u64,
+        ranges: Vec<TailSampleRange>,
+    ) -> AcousticSpeechEvidence {
+        AcousticSpeechEvidence::measured(
+            CaptureEvidenceIdentity::new(session, capture_epoch),
+            "test_observer",
+            AcousticAvailability::Observed { observed_samples },
+            ranges,
+        )
+    }
+
+    /// Measured silence is a verdict. Absence of measurement is not, and the
+    /// two must not collapse into the same trivially complete receipt.
+    #[test]
+    fn measured_silence_seals_and_absent_measurement_refuses() {
+        let ledger = AcousticLedger::new();
+        let silence = ledger.assess_seal_coverage(
+            "quiet",
+            1,
+            &measured_speech("quiet", 1, 16_000, Vec::new()),
+            4_000,
+        );
+        assert_eq!(silence.status, SealCoverageStatus::Complete);
+        assert_eq!(silence.speech_samples, 0);
+        assert_eq!(silence.coverage_ratio(), Some(1.0));
+        assert_eq!(silence.observed_samples, Some(16_000));
+
+        for availability in [
+            AcousticAvailability::NotObserved,
+            AcousticAvailability::InvalidMeasurement { valid_samples: 0 },
+            AcousticAvailability::InvalidMeasurement {
+                valid_samples: 8_000,
+            },
+            AcousticAvailability::Discontinuous {
+                observed_samples: 8_000,
+            },
+        ] {
+            let receipt = ledger.assess_seal_coverage(
+                "quiet",
+                1,
+                &AcousticSpeechEvidence::unavailable(
+                    CaptureEvidenceIdentity::new("quiet", 1),
+                    "test_observer",
+                    availability,
+                ),
+                4_000,
+            );
+            assert!(
+                receipt.status.unavailable_reason().is_some(),
+                "{availability:?} cannot certify a take"
+            );
+            assert!(!receipt.status.is_complete());
+            assert_eq!(
+                receipt.coverage_ratio(),
+                None,
+                "an unknown extent has no ratio; 1.0 would read as a perfect take"
+            );
+            assert_eq!(receipt.observed_samples, None);
+            assert_eq!(receipt.status.as_str(), "unavailable");
+        }
+    }
+
+    /// A discontinuous observer names `PartialObservation`, and so does an
+    /// observer whose measured extent stops short of committed speech.
+    #[test]
+    fn unobserved_tails_and_foreign_evidence_refuse_terminal_truth() {
+        let mut ledger = AcousticLedger::new();
+        let discontinuous = ledger.assess_seal_coverage(
+            "partial",
+            1,
+            &AcousticSpeechEvidence::unavailable(
+                CaptureEvidenceIdentity::new("partial", 1),
+                "test_observer",
+                AcousticAvailability::Discontinuous {
+                    observed_samples: 8_000,
+                },
+            ),
+            4_000,
+        );
+        assert_eq!(
+            discontinuous.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+
+        // A speech span past the observed extent is an unobserved tail.
+        let beyond = ledger.assess_seal_coverage(
+            "partial",
+            1,
+            &measured_speech(
+                "partial",
+                1,
+                8_000,
+                vec![TailSampleRange {
+                    session: "partial".into(),
+                    capture_epoch: 1,
+                    sample_start: 0,
+                    sample_end: 16_000,
+                }],
+            ),
+            4_000,
+        );
+        assert_eq!(
+            beyond.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::PartialObservation)
+        );
+
+        // Evidence bound to another take cannot be authenticated by asking
+        // about this one, and a foreign range inside otherwise-valid evidence
+        // survives adjudication instead of being filtered into silence.
+        let foreign_owner = ledger.assess_seal_coverage(
+            "partial",
+            1,
+            &measured_speech("successor", 1, 16_000, Vec::new()),
+            4_000,
+        );
+        assert_eq!(
+            foreign_owner.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::IdentityMismatch)
+        );
+        let foreign_range = ledger.assess_seal_coverage(
+            "partial",
+            1,
+            &measured_speech(
+                "partial",
+                1,
+                16_000,
+                vec![TailSampleRange {
+                    session: "successor".into(),
+                    capture_epoch: 1,
+                    sample_start: 0,
+                    sample_end: 16_000,
+                }],
+            ),
+            4_000,
+        );
+        assert_eq!(
+            foreign_range.status,
+            SealCoverageStatus::Unavailable(AcousticEvidenceGap::IdentityMismatch)
+        );
+
+        assert!(ledger.record_seal_coverage(discontinuous));
+        assert_eq!(
+            ledger.seal_terminal("partial", 1),
+            Err(SealRefusal::CoverageIncomplete),
+            "a non-complete verdict blocks the terminal seal whatever its reason"
+        );
     }
 
     /// A sealed occurrence, its exact committed label, and the left context the

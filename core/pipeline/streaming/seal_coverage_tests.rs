@@ -204,6 +204,12 @@ fn recovery_formatter_created_by_gap_closes_before_coverage_and_terminal_seal() 
     let (formatter, mut requests) = mpsc::channel(FORMATTER_QUEUE_CAP);
     state.formatter = Some(formatter);
     let (tx, _) = mpsc::unbounded_channel();
+    // The capture energy ladder measured this second, so the coverage question
+    // has an authenticated answer instead of an empty set. Silero's crossings
+    // are not driven here; ownership windows are no longer a speech measurement.
+    let mut capture_level =
+        crate::audio::capture_receipt::CaptureLevelAccumulator::bound_to(&state.capture_energy);
+    capture_level.push_samples(&vec![0.25f32; 16_000]);
     observe(&mut state, &tx, 0, 16_000, 1).unwrap();
     assert_eq!(
         publish_terminal_coverage(&state, &tx).status,
