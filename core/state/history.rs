@@ -1485,6 +1485,10 @@ mod tests {
             TestEncoderOutcome::Failed,
             TestEncoderOutcome::Empty,
             TestEncoderOutcome::Hanging,
+            TestEncoderOutcome::Symlink,
+            TestEncoderOutcome::Directory,
+            TestEncoderOutcome::Fifo,
+            TestEncoderOutcome::Hardlink,
         ] {
             let tmp = TempDir::new().expect("tempdir");
             let source_path = tmp.path().join("source.wav");
@@ -1885,6 +1889,51 @@ mod tests {
             fs::read_to_string(copyable.path).unwrap(),
             "usable transcript"
         );
+    }
+
+    /// Real encoder witness using held files after both public paths are replaced.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn production_encoder_preserves_held_source_and_destination_and_decodes_m4a() {
+        use std::io::{Read, Seek};
+        let tmp = TempDir::new().expect("tempdir");
+        let source_path = tmp.path().join("source.wav");
+        write_pcm16_sine_wav(&source_path, 16_000, 5);
+        let original = fs::read(&source_path).expect("original WAV");
+        let mut source = daily_archive::admit_source(&source_path).expect("admit source");
+        let moved_source = tmp.path().join("held.wav");
+        fs::rename(&source_path, &moved_source).expect("move source");
+        fs::write(&source_path, b"foreign source").expect("replace source");
+        let destination_path = tmp.path().join("destination.m4a");
+        let mut destination = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&destination_path)
+            .expect("held destination");
+        let moved_destination = tmp.path().join("held.m4a");
+        fs::rename(&destination_path, &moved_destination).expect("move destination");
+        fs::write(&destination_path, b"foreign destination").expect("replace destination");
+
+        crate::audio::archive::encode_wav_to_m4a(&mut source, &mut destination)
+            .expect("production afconvert conversion");
+        let mut encoded = Vec::new();
+        destination.read_to_end(&mut encoded).expect("held result");
+        assert!(encoded.len() > 12 && encoded.len() < original.len());
+        assert_eq!(&encoded[4..8], b"ftyp", "M4A container, never WAV fallback");
+        let (decoded, rate) = crate::audio::load_audio_file(&moved_destination)
+            .expect("decode production M4A");
+        assert!(rate > 0 && !decoded.is_empty());
+        let seconds = decoded.len() as f32 / rate as f32;
+        assert!((4.0..=6.0).contains(&seconds), "decoded duration {seconds}");
+        assert!(decoded.iter().any(|sample| sample.abs() > 0.01), "non-silent PCM");
+        source.rewind().expect("rewind source");
+        let mut preserved = Vec::new();
+        source.read_to_end(&mut preserved).expect("read source");
+        assert_eq!(preserved, original);
+        assert_eq!(fs::read(&moved_source).expect("held source"), original);
+        assert_eq!(fs::read(&source_path).expect("foreign source"), b"foreign source");
+        assert_eq!(fs::read(&destination_path).expect("foreign destination"), b"foreign destination");
     }
 
     /// macOS: save_audio archives to smaller m4a that still decodes near source duration.
