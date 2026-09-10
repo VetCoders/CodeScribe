@@ -321,7 +321,14 @@ fn private_archive_acoustic_recovery_bench() {
     state.terminal_pcm = Some(owned);
     let (tx, _) = mpsc::unbounded_channel();
     let before = publish_terminal_coverage(&state, &tx);
-    repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+    let execution = LocalExecutionOwner::default();
+    // Repair uses blocking_recv, so only the execution join enters Tokio.
+    repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &execution);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("local execution join runtime")
+        .block_on(execution.close_and_join());
     let after = publish_terminal_coverage(&state, &tx);
     let mut ledger = state.acoustic_ledger.lock().unwrap();
     let terminal = if after.status == SealCoverageStatus::Complete {
