@@ -1257,7 +1257,12 @@ pub(crate) fn transcribe_selected(
     request: &TailProviderRequest,
     pcm: &[f32],
 ) -> Result<TailProviderPayload> {
-    transcribe_selected_controlled(provider_id, request, pcm, &super::LocalExecutionControl::default())
+    transcribe_selected_controlled(
+        provider_id,
+        request,
+        pcm,
+        &super::LocalExecutionControl::default(),
+    )
 }
 
 struct ControlledInProcess<'a>(&'a super::LocalExecutionControl);
@@ -1267,7 +1272,11 @@ impl TailProvider for ControlledInProcess<'_> {
         TailProviderId::InProcess
     }
 
-    fn transcribe(&self, request: &TailProviderRequest, pcm: &[f32]) -> Result<TailProviderPayload> {
+    fn transcribe(
+        &self,
+        request: &TailProviderRequest,
+        pcm: &[f32],
+    ) -> Result<TailProviderPayload> {
         InProcessTailProvider.transcribe_controlled(request, pcm, self.0)
     }
 }

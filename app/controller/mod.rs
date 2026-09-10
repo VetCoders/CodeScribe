@@ -258,10 +258,7 @@ fn retainable_session_id(session_id: Option<&str>) -> Option<&str> {
 /// Bus-demux assigns this path to attached followers. `last_session.wav` is
 /// only a latest-take alias for overlay / `codescribe transcribe last`.
 fn session_audio_path(root: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
-    valid_session_audio_id(session_id).map(|id| {
-        root.join("sessions")
-            .join(format!("{id}.wav"))
-    })
+    valid_session_audio_id(session_id).map(|id| root.join("sessions").join(format!("{id}.wav")))
 }
 
 /// Keep the take WAV under its Bus `session_id` so named followers never
@@ -307,7 +304,10 @@ fn retain_session_audio_at(
         &source_name,
         libc::O_RDONLY | libc::O_NONBLOCK,
     )?;
-    anyhow::ensure!(source.metadata()?.is_file(), "audio retention source is not a regular file");
+    anyhow::ensure!(
+        source.metadata()?.is_file(),
+        "audio retention source is not a regular file"
+    );
 
     // Pin both destinations before the callback, too. Each result is retained
     // independently so a refused sessions directory does not skip the alias.
@@ -315,7 +315,9 @@ fn retain_session_audio_at(
         let (parent, name) = open_retention_parent(root)?;
         retention_subdirectory(&parent, &name)
     })();
-    let sessions_directory = root_directory.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))
+    let sessions_directory = root_directory
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error:#}"))
         .and_then(|directory| retention_subdirectory(directory, c"sessions"));
     let mut failures = Vec::new();
     if archive(&mut source, transcript).is_none() {
@@ -326,12 +328,21 @@ fn retain_session_audio_at(
     let session_name = std::ffi::CString::new(format!("{id}.wav"))?;
     for (directory, name, dest) in [
         (&sessions_directory, session_name.as_c_str(), session_path),
-        (&root_directory, c"last_session.wav", root.join("last_session.wav")),
+        (
+            &root_directory,
+            c"last_session.wav",
+            root.join("last_session.wav"),
+        ),
     ] {
-        let copied = directory.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))
+        let copied = directory
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error:#}"))
             .and_then(|directory| publish_retained_audio(&mut source, directory, name));
         match copied {
-            Ok(()) => info!("session audio retained in pinned directory for {}", dest.display()),
+            Ok(()) => info!(
+                "session audio retained in pinned directory for {}",
+                dest.display()
+            ),
             Err(error) => failures.push(format!("{}: {error:#}", dest.display())),
         }
     }
@@ -340,7 +351,8 @@ fn retain_session_audio_at(
     } else {
         Err(anyhow::anyhow!(
             "audio retention failed (source {} preserved): {}",
-            path.display(), failures.join("; ")
+            path.display(),
+            failures.join("; ")
         ))
     }
 }
@@ -355,12 +367,18 @@ fn open_retention_parent(path: &std::path::Path) -> Result<(std::fs::File, std::
     use std::path::Component;
 
     anyhow::ensure!(
-        !path.components().any(|part| matches!(part, Component::ParentDir)),
+        !path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir)),
         "audio retention refuses parent traversal"
     );
-    let leaf = path.file_name().ok_or_else(|| anyhow::anyhow!("audio retention requires a leaf"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("audio retention requires a leaf"))?;
     let name = std::ffi::CString::new(leaf.as_bytes())?;
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
     let resolved = parent.canonicalize()?;
     let mut directory = std::fs::File::open("/")?;
@@ -369,7 +387,8 @@ fn open_retention_parent(path: &std::path::Path) -> Result<(std::fs::File, std::
             Component::RootDir => {}
             Component::Normal(part) => {
                 let part = std::ffi::CString::new(part.as_bytes())?;
-                directory = open_retention_entry(&directory, &part, libc::O_RDONLY | libc::O_DIRECTORY)?;
+                directory =
+                    open_retention_entry(&directory, &part, libc::O_RDONLY | libc::O_DIRECTORY)?;
             }
             _ => anyhow::bail!("audio retention parent is not absolute and normalized"),
         }
@@ -386,14 +405,21 @@ fn open_retention_entry(
     use std::os::fd::{AsRawFd, FromRawFd};
 
     anyhow::ensure!(
-        !name.to_bytes().is_empty() && !name.to_bytes().contains(&b'/')
-            && name.to_bytes() != b"." && name.to_bytes() != b"..",
+        !name.to_bytes().is_empty()
+            && !name.to_bytes().contains(&b'/')
+            && name.to_bytes() != b"."
+            && name.to_bytes() != b"..",
         "audio retention requires one safe component"
     );
     // SAFETY: the directory and NUL-terminated name live through openat. A
     // successful descriptor has exactly one File owner; all errors close none.
     let fd = unsafe {
-        libc::openat(directory.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o600)
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
     };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -403,7 +429,10 @@ fn open_retention_entry(
 
 /// mkdirat cannot follow the leaf; openat rejects an existing link or special
 /// file even if it was substituted between creation and opening.
-fn retention_subdirectory(directory: &std::fs::File, name: &std::ffi::CStr) -> Result<std::fs::File> {
+fn retention_subdirectory(
+    directory: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> Result<std::fs::File> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: caller supplies a single component and both arguments stay live.
@@ -429,7 +458,9 @@ fn publish_retained_audio(
 
     let temporary = std::ffi::CString::new(format!(".retain-{}.tmp", Uuid::new_v4()))?;
     let mut output = open_retention_entry(
-        directory, &temporary, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        directory,
+        &temporary,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
     )?;
     let result = (|| -> Result<()> {
         source.seek(SeekFrom::Start(0))?;
@@ -438,8 +469,14 @@ fn publish_retained_audio(
         // SAFETY: both names and the held directory survive the call. renameat
         // replaces the leaf entry, never follows it, and stays on this directory.
         if unsafe {
-            libc::renameat(directory.as_raw_fd(), temporary.as_ptr(), directory.as_raw_fd(), name.as_ptr())
-        } < 0 {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                name.as_ptr(),
+            )
+        } < 0
+        {
             return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
@@ -447,7 +484,10 @@ fn publish_retained_audio(
     if result.is_err() {
         // SAFETY: unlink only the temporary entry relative to the held directory.
         if unsafe { libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0) } < 0 {
-            return result.context(format!("retention temporary cleanup failed: {}", std::io::Error::last_os_error()));
+            return result.context(format!(
+                "retention temporary cleanup failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     result
@@ -532,15 +572,17 @@ async fn stop_recorder_for_terminal(
                         err,
                         session_id,
                         (capture_session.as_deref(), capture_epoch),
-                        |id, path| retain_session_audio_at(
-                            Some(id),
-                            path,
-                            codescribe_core::state::SessionTranscriptArchive::Unavailable(
-                                "capture processing failed; committed text unavailable",
-                            ),
-                            &Config::config_dir(),
-                            codescribe_core::state::archive_session_take_from_file,
-                        ),
+                        |id, path| {
+                            retain_session_audio_at(
+                                Some(id),
+                                path,
+                                codescribe_core::state::SessionTranscriptArchive::Unavailable(
+                                    "capture processing failed; committed text unavailable",
+                                ),
+                                &Config::config_dir(),
+                                codescribe_core::state::archive_session_take_from_file,
+                            )
+                        },
                     ))
                 } else {
                     Err(err.context("Failed to stop recorder"))
@@ -719,7 +761,11 @@ struct StopDeliveryFailure {
 
 impl std::fmt::Display for StopDeliveryFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Transcript retained; destination handoff failed: {:#}", self.cause)
+        write!(
+            f,
+            "Transcript retained; destination handoff failed: {:#}",
+            self.cause
+        )
     }
 }
 
@@ -1790,16 +1836,21 @@ impl RecordingController {
     ) -> Result<TranscriptDelivery> {
         let config = self.get_config().await;
         self.deliver_stop_transcript_with_sink(
-            take_id, text, (assistive, force_ai, capture_turn, seal_refused),
+            take_id,
+            text,
+            (assistive, force_ai, capture_turn, seal_refused),
             &config,
             |route, text, target| async move {
                 if route == DeliveryRoute::DeferredInsert {
-                    self.arm_overlay_text(&text, target, Some("Codescribe".to_string())).await
+                    self.arm_overlay_text(&text, target, Some("Codescribe".to_string()))
+                        .await
                 } else {
-                    self.execute_clipboard_paste(text, target, "Stop-path paste").await
+                    self.execute_clipboard_paste(text, target, "Stop-path paste")
+                        .await
                 }
             },
-        ).await
+        )
+        .await
     }
 
     async fn deliver_stop_transcript_with_sink<F, Fut>(
@@ -1819,7 +1870,9 @@ impl RecordingController {
         {
             let mut delivered = self.delivered_take.lock().await;
             if !claim_take_delivery(&mut delivered, take_id) {
-                return Err(anyhow::anyhow!("stop-path handoff already attempted for this take"));
+                return Err(anyhow::anyhow!(
+                    "stop-path handoff already attempted for this take"
+                ));
             }
         }
         // A one-turn take has exactly one destination: the Agent composer draft
@@ -1889,7 +1942,8 @@ impl RecordingController {
                 // A declined payload or missing permission is not acceptance.
                 let disposition = if matches!(
                     result.delivery,
-                    OverlayPasteDelivery::Noop | OverlayPasteDelivery::AccessibilityPermissionNeeded
+                    OverlayPasteDelivery::Noop
+                        | OverlayPasteDelivery::AccessibilityPermissionNeeded
                 ) {
                     TranscriptDelivery::Retained
                 } else {
@@ -1947,7 +2001,9 @@ impl RecordingController {
             || refusal.receipt.status
                 != codescribe_core::pipeline::acoustic_ledger::SealCoverageStatus::Incomplete
         {
-            return Err(anyhow::anyhow!("terminal refusal does not match the active capture"));
+            return Err(anyhow::anyhow!(
+                "terminal refusal does not match the active capture"
+            ));
         }
         if refusal.committed_text.trim().is_empty() {
             return Err(anyhow::Error::new(refusal));
@@ -1956,7 +2012,9 @@ impl RecordingController {
         if bus.as_ref().is_none_or(|bus| {
             !bus.matches_refused_document(&refusal.receipt, &refusal.committed_text)
         }) {
-            return Err(anyhow::anyhow!("terminal refusal has no matching authenticated Bus document"));
+            return Err(anyhow::anyhow!(
+                "terminal refusal has no matching authenticated Bus document"
+            ));
         }
         match deliver(refusal.committed_text.clone()).await {
             Ok(_) => Ok(ProcessRecordingOutcome {
@@ -2384,8 +2442,7 @@ impl RecordingController {
 
     fn publish_stop_warning(&self, code: &str, message: String) {
         let _ = self.event_broadcast.send(IpcEvent {
-            timestamp: chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             payload: IpcEventPayload::Engine(EngineEventWire::Warning {
                 code: code.to_string(),
                 message,
@@ -2625,12 +2682,21 @@ impl RecordingController {
             let Ok(state) = self.state.try_read() else {
                 return Err(anyhow::anyhow!("hotkey admission unavailable"));
             };
-            matches!((event.key_type, event.action, *state),
-                (HotkeyType::Hold, HotkeyAction::Up, State::RecHold | State::Busy)
-                | (HotkeyType::Toggle, HotkeyAction::Press, State::RecToggle | State::Busy))
-                || (event.key_type == HotkeyType::Toggle
-                    && event.action == HotkeyAction::Press && event.force_raw
-                    && *state == State::RecHold)
+            matches!(
+                (event.key_type, event.action, *state),
+                (
+                    HotkeyType::Hold,
+                    HotkeyAction::Up,
+                    State::RecHold | State::Busy
+                ) | (
+                    HotkeyType::Toggle,
+                    HotkeyAction::Press,
+                    State::RecToggle | State::Busy
+                )
+            ) || (event.key_type == HotkeyType::Toggle
+                && event.action == HotkeyAction::Press
+                && event.force_raw
+                && *state == State::RecHold)
         };
         if stop_gesture {
             return self.stop_recording_from_external_surface().await;
@@ -2910,7 +2976,9 @@ impl RecordingController {
         if self.shutdown_requested.load(Ordering::SeqCst)
             || self.current_state().await != State::Idle
         {
-            return Err(anyhow::anyhow!("conversation capture admission unavailable"));
+            return Err(anyhow::anyhow!(
+                "conversation capture admission unavailable"
+            ));
         }
         info!("Starting conversation mode (Moshi full-duplex)");
 
@@ -4098,18 +4166,48 @@ impl RecordingController {
     /// telemetry. Keep this closed controller in the bridge slot until runtime
     /// teardown so a concurrent composer cannot lazily construct a fresh owner.
     pub fn capture_shutdown_settled(&self) -> bool {
-        if !self.shutdown_requested.load(Ordering::SeqCst) { return false; }
-        let Ok(slot) = self.capture_settlement.try_lock() else { return false; };
-        if slot.as_ref().is_some_and(|op| !op.task.is_finished() || op.result.borrow().is_none()) { return false; }
-        let Ok(_serial) = self.serial_lock.try_lock() else { return false; };
-        let Ok(state) = self.state.try_read() else { return false; };
-        if *state != State::Idle { return false; }
-        let Ok(identity) = self.session_id.try_read() else { return false; };
-        if identity.is_some() { return false; }
-        let Ok(recorder) = self.recorder.try_lock() else { return false; };
-        if recorder.as_ref().is_some_and(|rec| rec.recorder.is_active()) { return false; }
-        let Ok(conversation) = self.conversation_task.try_lock() else { return false; };
-        !conversation.as_ref().is_some_and(|task| !task.is_finished())
+        if !self.shutdown_requested.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Ok(slot) = self.capture_settlement.try_lock() else {
+            return false;
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|op| !op.task.is_finished() || op.result.borrow().is_none())
+        {
+            return false;
+        }
+        let Ok(_serial) = self.serial_lock.try_lock() else {
+            return false;
+        };
+        let Ok(state) = self.state.try_read() else {
+            return false;
+        };
+        if *state != State::Idle {
+            return false;
+        }
+        let Ok(identity) = self.session_id.try_read() else {
+            return false;
+        };
+        if identity.is_some() {
+            return false;
+        }
+        let Ok(recorder) = self.recorder.try_lock() else {
+            return false;
+        };
+        if recorder
+            .as_ref()
+            .is_some_and(|rec| rec.recorder.is_active())
+        {
+            return false;
+        }
+        let Ok(conversation) = self.conversation_task.try_lock() else {
+            return false;
+        };
+        !conversation
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     /// Stop-current is admitted without queuing behind a start or a terminal
@@ -4119,7 +4217,10 @@ impl RecordingController {
             let Ok(mut slot) = self.capture_settlement.try_lock() else {
                 return Ok(CaptureStopOutcome::AdmissionUnavailable);
             };
-            if let Some(operation) = slot.as_ref().filter(|op| !op.task.is_finished() || op.result.borrow().is_none()) {
+            if let Some(operation) = slot
+                .as_ref()
+                .filter(|op| !op.task.is_finished() || op.result.borrow().is_none())
+            {
                 operation.result.clone()
             } else {
                 let Ok(_serial) = self.serial_lock.try_lock() else {
@@ -4171,15 +4272,23 @@ impl RecordingController {
         let assistive = *self.assistive_mode.read().await;
         let single_turn = if state == State::RecToggle {
             let recorder = self.recorder.lock().await;
-            recorder.as_ref().is_none_or(|rec| rec.capture_turn_intent() == CaptureTurnIntent::SingleTurn)
-        } else { false };
-        if single_turn || should_use_toggle_adjudicated_stop(state, assistive, toggle_final_pass_enabled()) {
+            recorder
+                .as_ref()
+                .is_none_or(|rec| rec.capture_turn_intent() == CaptureTurnIntent::SingleTurn)
+        } else {
+            false
+        };
+        if single_turn
+            || should_use_toggle_adjudicated_stop(state, assistive, toggle_final_pass_enabled())
+        {
             self.stop_toggle_and_adjudicate_inner(expected).await
         } else if matches!(state, State::RecHold | State::RecToggle) {
             #[cfg(test)]
             self.observe_capture_settlement(CaptureSettlementStage::Admitted);
             self.cancel_pending_hold_start().await;
-            self.finish_recording_locked().await.map(|()| CaptureStopOutcome::Stopped)
+            self.finish_recording_locked()
+                .await
+                .map(|()| CaptureStopOutcome::Stopped)
         } else {
             Ok(CaptureStopOutcome::AlreadyStopping)
         }
@@ -4200,7 +4309,10 @@ impl RecordingController {
     /// hopeful guess: a start that produced no session slot produced no take,
     /// and its caller receives no stop permission to hand back later.
     pub async fn start_composer_turn_recording(&self) -> Result<String> {
-        match self.start_toggle_recording(true, CaptureTurnIntent::SingleTurn).await? {
+        match self
+            .start_toggle_recording(true, CaptureTurnIntent::SingleTurn)
+            .await?
+        {
             CaptureAdmission::Admitted(id) => Ok(id),
             CaptureAdmission::NotAdmitted => Err(anyhow::anyhow!(
                 "composer take refused: start admitted no capture"
@@ -4240,14 +4352,20 @@ impl RecordingController {
     ///
     /// A foreign take survives untouched and no new take is started in its
     /// place: refusing is the whole point of naming the capture.
-    pub async fn stop_capture_if_owned(self: &Arc<Self>, capture_id: &str) -> Result<CaptureStopOutcome> {
+    pub async fn stop_capture_if_owned(
+        self: &Arc<Self>,
+        capture_id: &str,
+    ) -> Result<CaptureStopOutcome> {
         let result = {
             let Ok(mut slot) = self.capture_settlement.try_lock() else {
                 return Ok(CaptureStopOutcome::AdmissionUnavailable);
             };
             if let Some(operation) = slot.as_ref().filter(|op| op.capture_id == capture_id) {
                 operation.result.clone()
-            } else if slot.as_ref().is_some_and(|op| !op.task.is_finished() || op.result.borrow().is_none()) {
+            } else if slot
+                .as_ref()
+                .is_some_and(|op| !op.task.is_finished() || op.result.borrow().is_none())
+            {
                 return Ok(CaptureStopOutcome::AdmissionUnavailable);
             } else {
                 self.register_capture_stop(&mut slot, capture_id)
@@ -4267,7 +4385,9 @@ impl RecordingController {
         let controller = Arc::clone(self);
         let owned_id = capture_id.to_owned();
         let task = tokio::spawn(async move {
-            let settled = controller.stop_external_capture(Some(&owned_id)).await
+            let settled = controller
+                .stop_external_capture(Some(&owned_id))
+                .await
                 .map_err(|error| format!("{error:#}"));
             sender.send_replace(Some(settled));
         });
@@ -4294,7 +4414,8 @@ impl RecordingController {
                     "capture settlement task ended without a terminal result; recovery remains owed"
                 ))?;
             }
-        }).await;
+        })
+        .await;
         match settled {
             Ok(result) => result,
             Err(_) => Ok(CaptureStopOutcome::Pending),
@@ -4460,19 +4581,21 @@ impl RecordingController {
         let (streaming_text, raw_audio_path_opt) = match stopped {
             Ok(stopped) => stopped,
             Err(err) => {
-                return self.process_terminal_stop_error(err, |text| async move {
-                    self.deliver_stop_transcript(
-                        take_id.as_deref(),
-                        &text,
-                        assistive,
-                        force_ai,
-                        // The hold path has no composer surface: no caller here
-                        // can open a one-turn take.
-                        CaptureTurnIntent::HandsFree,
-                        true,
-                    )
-                    .await
-                }).await;
+                return self
+                    .process_terminal_stop_error(err, |text| async move {
+                        self.deliver_stop_transcript(
+                            take_id.as_deref(),
+                            &text,
+                            assistive,
+                            force_ai,
+                            // The hold path has no composer surface: no caller here
+                            // can open a one-turn take.
+                            CaptureTurnIntent::HandsFree,
+                            true,
+                        )
+                        .await
+                    })
+                    .await;
             }
         };
 
@@ -4683,7 +4806,8 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 false,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4706,7 +4830,8 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 false,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4729,7 +4854,8 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 true,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4865,67 +4991,117 @@ mod refusal_recovery_tests {
         *controller.pre_overlay_frontmost_app.write().await = Some("original-editor".into());
         let events = controller.subscribe_events();
         let dir = tempfile::tempdir().unwrap();
-        let bus = Arc::new(TranscriptBus::open_at(TranscriptSession {
-            session_id: TAKE.into(), mode: TranscriptMode::Agent,
-            has_latched_target: true, latched_target_is_self: false,
-        }, dir.path().join("bus.jsonl"), None).unwrap());
+        let bus = Arc::new(
+            TranscriptBus::open_at(
+                TranscriptSession {
+                    session_id: TAKE.into(),
+                    mode: TranscriptMode::Agent,
+                    has_latched_target: true,
+                    latched_target_is_self: false,
+                },
+                dir.path().join("bus.jsonl"),
+                None,
+            )
+            .unwrap(),
+        );
         bus.publish_started();
         *controller.active_transcript_bus.write().await = Some(Arc::clone(&bus));
         let ledger = Arc::new(std::sync::Mutex::new(AcousticLedger::new()));
         let mut emitter = PresentationEmitter::new_with_authority(
-            Arc::new(Mutex::new(String::new())), None, None,
-            Some(Arc::clone(&bus)), Some(Arc::clone(&ledger)), None,
+            Arc::new(Mutex::new(String::new())),
+            None,
+            None,
+            Some(Arc::clone(&bus)),
+            Some(Arc::clone(&ledger)),
+            None,
         );
         if words {
             let occurrence = OccurrenceIdentity::new(TAKE, 7, 0, 16_000);
             let calibration = EnergyCalibration {
                 version: "refusal-synthetic-test".into(),
-                min_energy_integral: 1.0, min_valley_samples: 1,
+                min_energy_integral: 1.0,
+                min_valley_samples: 1,
             };
             let evidence = AcousticEvidence {
-                occurrence: occurrence.clone(), duration_ms: 1_000.0,
-                energy_integral: 10.0, mean_rms_dbfs: -12.0, peak_dbfs: -3.0,
-                vad_open_sample: Some(0), vad_close_sample: Some(16_000),
+                occurrence: occurrence.clone(),
+                duration_ms: 1_000.0,
+                energy_integral: 10.0,
+                mean_rms_dbfs: -12.0,
+                peak_dbfs: -3.0,
+                vad_open_sample: Some(0),
+                vad_close_sample: Some(16_000),
                 evidence_calibration_version: calibration.version.clone(),
             };
-            let observation = ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence);
+            let observation =
+                ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence);
             let receipt = {
                 let mut ledger = ledger.lock().unwrap();
                 assert!(ledger.qualify(&evidence, &calibration).is_qualified());
                 ledger.admit(&observation, WORDS)
             };
             emitter.on_event(&EngineEvent::LedgerMutation {
-                observation, label: WORDS.into(), receipt,
+                observation,
+                label: WORDS.into(),
+                receipt,
             });
         }
         let receipt = {
             let mut ledger = ledger.lock().unwrap();
-            let coverage = ledger.assess_seal_coverage(TAKE, 7, &[TailSampleRange {
-                session: TAKE.into(), capture_epoch: 7, sample_start: 0, sample_end: 48_000,
-            }], 8_000);
+            let coverage = ledger.assess_seal_coverage(
+                TAKE,
+                7,
+                &[TailSampleRange {
+                    session: TAKE.into(),
+                    capture_epoch: 7,
+                    sample_start: 0,
+                    sample_end: 48_000,
+                }],
+                8_000,
+            );
             assert!(ledger.record_seal_coverage(coverage.clone()));
-            assert_eq!(ledger.seal_terminal(TAKE, 7), Err(SealRefusal::CoverageIncomplete));
+            assert_eq!(
+                ledger.seal_terminal(TAKE, 7),
+                Err(SealRefusal::CoverageIncomplete)
+            );
             coverage
         };
-        emitter.on_event(&EngineEvent::SealCoverage { receipt: receipt.clone(), comparison: None });
+        emitter.on_event(&EngineEvent::SealCoverage {
+            receipt: receipt.clone(),
+            comparison: None,
+        });
         emitter.finish().await;
         let audio = dir.path().join("refused.wav");
         std::fs::write(&audio, b"synthetic retained WAV witness").unwrap();
-        Take { controller, bus, emitter, events, dir, refusal: TerminalSealRefused {
-            receipt, audio_path: Some(audio), committed_text: if words { WORDS.into() } else { String::new() },
-        } }
+        Take {
+            controller,
+            bus,
+            emitter,
+            events,
+            dir,
+            refusal: TerminalSealRefused {
+                receipt,
+                audio_path: Some(audio),
+                committed_text: if words { WORDS.into() } else { String::new() },
+            },
+        }
     }
 
-    fn terminal_events(take: &mut Take) -> (Vec<TranscriptBusEvidenceEvent>, Vec<(String, String)>) {
+    fn terminal_events(
+        take: &mut Take,
+    ) -> (Vec<TranscriptBusEvidenceEvent>, Vec<(String, String)>) {
         let mut terminals = Vec::new();
         let mut warnings = Vec::new();
         while let Ok(event) = take.events.try_recv() {
             match event.payload {
                 IpcEventPayload::TranscriptProjection { json } => {
                     let event: TranscriptBusEvidenceEvent = serde_json::from_str(&json).unwrap();
-                    if event.lifecycle_terminal { terminals.push(event); }
+                    if event.lifecycle_terminal {
+                        terminals.push(event);
+                    }
                 }
-                IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) => warnings.push((code, message)),
+                IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) => {
+                    warnings.push((code, message))
+                }
                 _ => {}
             }
         }
@@ -4936,19 +5112,39 @@ mod refusal_recovery_tests {
     async fn hold_and_toggle_refusal_preserve_receipts_and_pending_receiver() {
         for state in [State::RecHold, State::RecToggle] {
             let mut take = take(state, true).await;
-            assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+            assert!(
+                take.bus
+                    .matches_refused_document(&take.refusal.receipt, WORDS)
+            );
             let controller = &take.controller;
-            let result = take.controller.process_terminal_stop_error(
-                anyhow::Error::new(take.refusal.clone()), |text| async move {
-                    controller.deliver_stop_transcript(
-                        Some(TAKE), &text, true, false, CaptureTurnIntent::SingleTurn, true,
-                    ).await
-                },
-            ).await;
+            let result = take
+                .controller
+                .process_terminal_stop_error(
+                    anyhow::Error::new(take.refusal.clone()),
+                    |text| async move {
+                        controller
+                            .deliver_stop_transcript(
+                                Some(TAKE),
+                                &text,
+                                true,
+                                false,
+                                CaptureTurnIntent::SingleTurn,
+                                true,
+                            )
+                            .await
+                    },
+                )
+                .await;
             assert!(result.as_ref().unwrap().refusal.is_some());
-            take.controller.reset_finished_recording_state(&result).await;
-            take.controller.handle_processed_recording_result(true, &result).await;
-            take.controller.reset_finished_recording_state(&result).await;
+            take.controller
+                .reset_finished_recording_state(&result)
+                .await;
+            take.controller
+                .handle_processed_recording_result(true, &result)
+                .await;
+            take.controller
+                .reset_finished_recording_state(&result)
+                .await;
             let (terminals, warnings) = terminal_events(&mut take);
             assert_eq!(terminals.len(), 1);
             let terminal = &terminals[0];
@@ -4957,14 +5153,33 @@ mod refusal_recovery_tests {
             assert_eq!(terminal.rendered_text, WORDS);
             assert_eq!(terminal.phase, TranscriptProjectionPhase::CoverageRefused);
             assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
-            assert_eq!(terminal.seal_coverage, Some(ProjectedSealCoverageReceipt::from(&take.refusal.receipt)));
-            assert!(terminal.acoustic_receipts.iter().all(|receipt| receipt.seal_receipt.is_none()));
+            assert_eq!(
+                terminal.seal_coverage,
+                Some(ProjectedSealCoverageReceipt::from(&take.refusal.receipt))
+            );
+            assert!(
+                terminal
+                    .acoustic_receipts
+                    .iter()
+                    .all(|receipt| receipt.seal_receipt.is_none())
+            );
             assert_eq!(warnings.len(), 1);
             assert_eq!(warnings[0].0, "terminal_coverage_refused");
-            assert_eq!(take.controller.paste_target_app_name().await.as_deref(), Some("original-editor"));
-            assert_eq!(std::fs::read(take.refusal.audio_path.as_ref().unwrap()).unwrap(), b"synthetic retained WAV witness");
+            assert_eq!(
+                take.controller.paste_target_app_name().await.as_deref(),
+                Some("original-editor")
+            );
+            assert_eq!(
+                std::fs::read(take.refusal.audio_path.as_ref().unwrap()).unwrap(),
+                b"synthetic retained WAV witness"
+            );
             let rows = std::fs::read_to_string(take.dir.path().join("bus.jsonl")).unwrap();
-            assert_eq!(rows.lines().filter(|line| line.contains("\"status\":\"session_ended\"")).count(), 1);
+            assert_eq!(
+                rows.lines()
+                    .filter(|line| line.contains("\"status\":\"session_ended\""))
+                    .count(),
+                1
+            );
             assert!(rows.contains("\"end_reason\":\"coverage_refused\""));
         }
     }
@@ -4973,21 +5188,35 @@ mod refusal_recovery_tests {
     async fn empty_and_string_refusals_never_call_delivery_and_remain_visible() {
         for typed in [false, true] {
             let mut take = take(State::RecHold, false).await;
-            let error = if typed { anyhow::Error::new(take.refusal.clone()) }
-                else { anyhow::anyhow!("terminal seal refused") };
-            let result = take.controller.process_terminal_stop_error(error, |_| async {
-                panic!("no authenticated words may reach a receiver")
-            }).await;
+            let error = if typed {
+                anyhow::Error::new(take.refusal.clone())
+            } else {
+                anyhow::anyhow!("terminal seal refused")
+            };
+            let result = take
+                .controller
+                .process_terminal_stop_error(error, |_| async {
+                    panic!("no authenticated words may reach a receiver")
+                })
+                .await;
             assert!(result.is_err());
-            take.controller.reset_finished_recording_state(&result).await;
-            take.controller.handle_processed_recording_result(false, &result).await;
+            take.controller
+                .reset_finished_recording_state(&result)
+                .await;
+            take.controller
+                .handle_processed_recording_result(false, &result)
+                .await;
             let (terminals, warnings) = terminal_events(&mut take);
             assert_eq!(terminals.len(), 1);
             assert_eq!(terminals[0].phase, TranscriptProjectionPhase::Error);
             assert_eq!(terminals[0].delivery, TranscriptDelivery::Unattempted);
             assert_eq!(warnings[0].0, "transcription_failed");
             let rows = std::fs::read_to_string(take.dir.path().join("bus.jsonl")).unwrap();
-            assert!(rows.contains(if typed { "coverage_refused_empty" } else { "transcription_failed" }));
+            assert!(rows.contains(if typed {
+                "coverage_refused_empty"
+            } else {
+                "transcription_failed"
+            }));
         }
     }
 
@@ -4995,16 +5224,29 @@ mod refusal_recovery_tests {
     async fn refused_sink_failure_is_retained_and_never_accepted() {
         let mut take = take(State::RecToggle, true).await;
         let controller = &take.controller;
-        let result = take.controller.process_terminal_stop_error(
-            anyhow::Error::new(take.refusal.clone()), |text| async move {
-                assert_eq!(text, WORDS);
-                assert_eq!(controller.paste_target_app_name().await.as_deref(), Some("original-editor"));
-                controller.finish_stop_delivery(Err(anyhow::anyhow!("receiver unavailable")), true).await
-            },
-        ).await;
+        let result = take
+            .controller
+            .process_terminal_stop_error(
+                anyhow::Error::new(take.refusal.clone()),
+                |text| async move {
+                    assert_eq!(text, WORDS);
+                    assert_eq!(
+                        controller.paste_target_app_name().await.as_deref(),
+                        Some("original-editor")
+                    );
+                    controller
+                        .finish_stop_delivery(Err(anyhow::anyhow!("receiver unavailable")), true)
+                        .await
+                },
+            )
+            .await;
         assert!(result.as_ref().unwrap_err().is::<StopDeliveryFailure>());
-        take.controller.reset_finished_recording_state(&result).await;
-        take.controller.handle_processed_recording_result(false, &result).await;
+        take.controller
+            .reset_finished_recording_state(&result)
+            .await;
+        take.controller
+            .handle_processed_recording_result(false, &result)
+            .await;
         let (terminals, warnings) = terminal_events(&mut take);
         assert_eq!(terminals[0].phase, TranscriptProjectionPhase::Error);
         assert_eq!(terminals[0].rendered_text, WORDS);
@@ -5018,8 +5260,14 @@ mod refusal_recovery_tests {
         let mut take = take(State::RecToggle, true).await;
         let mut forged = take.refusal.receipt.clone();
         forged.max_uncovered_samples += 1;
-        take.emitter.on_event(&EngineEvent::SealCoverage { receipt: forged.clone(), comparison: None });
-        assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+        take.emitter.on_event(&EngineEvent::SealCoverage {
+            receipt: forged.clone(),
+            comparison: None,
+        });
+        assert!(
+            take.bus
+                .matches_refused_document(&take.refusal.receipt, WORDS)
+        );
         assert!(!take.bus.matches_refused_document(&forged, WORDS));
         for mutation in 0..3 {
             let mut refusal = take.refusal.clone();
@@ -5028,12 +5276,18 @@ mod refusal_recovery_tests {
                 1 => refusal.receipt = forged.clone(),
                 _ => *take.controller.session_id.write().await = Some("successor-capture".into()),
             }
-            let result = take.controller.process_terminal_stop_error(anyhow::Error::new(refusal), |_| async {
-                panic!("foreign or unauthenticated text reached handoff")
-            }).await;
+            let result = take
+                .controller
+                .process_terminal_stop_error(anyhow::Error::new(refusal), |_| async {
+                    panic!("foreign or unauthenticated text reached handoff")
+                })
+                .await;
             assert!(result.is_err());
         }
-        assert_eq!(take.controller.session_id.read().await.as_deref(), Some("successor-capture"));
+        assert_eq!(
+            take.controller.session_id.read().await.as_deref(),
+            Some("successor-capture")
+        );
         assert!(terminal_events(&mut take).0.is_empty());
     }
 
@@ -5051,34 +5305,51 @@ mod refusal_recovery_tests {
             config.quick_notes_enabled = false;
             let calls = AtomicUsize::new(0);
             let call_count = &calls;
-            let result = controller.process_terminal_stop_error(
-                anyhow::Error::new(take.refusal.clone()), |text| async move {
-                    controller.deliver_stop_transcript_with_sink(
-                        Some(TAKE), &text, (false, false, CaptureTurnIntent::HandsFree, true),
-                        &config, |route, text, target| async move {
-                            call_count.fetch_add(1, Ordering::SeqCst);
-                            assert_eq!(route, DeliveryRoute::ClipboardPaste);
-                            assert_eq!(text, WORDS);
-                            assert_eq!(target.as_deref(), Some("original-editor"));
-                            Ok(OverlayPasteResult {
-                                delivery, target_app_name: target,
-                                frontmost_app_name: Some("original-editor".into()),
-                                deferred_insert_shortcut: None, deferred_insert_failure: None,
-                            })
-                        },
-                    ).await
-                },
-            ).await;
+            let result = controller
+                .process_terminal_stop_error(
+                    anyhow::Error::new(take.refusal.clone()),
+                    |text| async move {
+                        controller
+                            .deliver_stop_transcript_with_sink(
+                                Some(TAKE),
+                                &text,
+                                (false, false, CaptureTurnIntent::HandsFree, true),
+                                &config,
+                                |route, text, target| async move {
+                                    call_count.fetch_add(1, Ordering::SeqCst);
+                                    assert_eq!(route, DeliveryRoute::ClipboardPaste);
+                                    assert_eq!(text, WORDS);
+                                    assert_eq!(target.as_deref(), Some("original-editor"));
+                                    Ok(OverlayPasteResult {
+                                        delivery,
+                                        target_app_name: target,
+                                        frontmost_app_name: Some("original-editor".into()),
+                                        deferred_insert_shortcut: None,
+                                        deferred_insert_failure: None,
+                                    })
+                                },
+                            )
+                            .await
+                    },
+                )
+                .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(result.is_ok(), delivery == OverlayPasteDelivery::Pasted);
             controller.reset_finished_recording_state(&result).await;
-            controller.handle_processed_recording_result(false, &result).await;
+            controller
+                .handle_processed_recording_result(false, &result)
+                .await;
             let (terminals, _) = terminal_events(&mut take);
             assert_eq!(terminals.len(), 1);
             assert_eq!(terminals[0].rendered_text, WORDS);
-            assert_eq!(terminals[0].delivery, if delivery == OverlayPasteDelivery::Pasted {
-                TranscriptDelivery::SinkAccepted
-            } else { TranscriptDelivery::Retained });
+            assert_eq!(
+                terminals[0].delivery,
+                if delivery == OverlayPasteDelivery::Pasted {
+                    TranscriptDelivery::SinkAccepted
+                } else {
+                    TranscriptDelivery::Retained
+                }
+            );
         }
     }
 
@@ -5088,29 +5359,55 @@ mod refusal_recovery_tests {
         let root = take.dir.path().join("retention");
         let source = take.refusal.audio_path.as_ref().unwrap();
         let result = retain_session_audio_at(
-            Some("refusal-capture:stopping"), source,
+            Some("refusal-capture:stopping"),
+            source,
             codescribe_core::state::SessionTranscriptArchive::Unavailable("incomplete coverage"),
-            &root, |_, _| None,
+            &root,
+            |_, _| None,
         );
-        assert!(result.unwrap_err().to_string().contains("daily audio archive failed"));
-        assert_eq!(std::fs::read(source).unwrap(), b"synthetic retained WAV witness");
-        assert_eq!(std::fs::read(root.join("sessions/refusal-capture.wav")).unwrap(),
-            b"synthetic retained WAV witness");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("daily audio archive failed")
+        );
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"synthetic retained WAV witness"
+        );
+        assert_eq!(
+            std::fs::read(root.join("sessions/refusal-capture.wav")).unwrap(),
+            b"synthetic retained WAV witness"
+        );
         assert!(!root.join("sessions/refusal-capture:stopping.wav").exists());
-        assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+        assert!(
+            take.bus
+                .matches_refused_document(&take.refusal.receipt, WORDS)
+        );
     }
 
     #[tokio::test]
     async fn delivery_claim_rejects_repeat_and_admits_a_successor() {
         let controller = RecordingController::new_without_keychain();
-        for (id, allowed) in [(TAKE, true), ("refusal-capture:stopping", false), ("successor-capture", true)] {
-            let result = controller.deliver_stop_transcript_with_sink(
-                Some(id), WORDS, (true, false, CaptureTurnIntent::SingleTurn, true),
-                &controller.get_config().await,
-                |_, _, _| async { panic!("composer must not paste") },
-            ).await;
+        for (id, allowed) in [
+            (TAKE, true),
+            ("refusal-capture:stopping", false),
+            ("successor-capture", true),
+        ] {
+            let result = controller
+                .deliver_stop_transcript_with_sink(
+                    Some(id),
+                    WORDS,
+                    (true, false, CaptureTurnIntent::SingleTurn, true),
+                    &controller.get_config().await,
+                    |_, _, _| async { panic!("composer must not paste") },
+                )
+                .await;
             assert_eq!(result.is_ok(), allowed);
-            assert_eq!(*controller.delivery_disposition.read().await, TranscriptDelivery::ComposerPending);
+            assert_eq!(
+                *controller.delivery_disposition.read().await,
+                TranscriptDelivery::ComposerPending
+            );
         }
     }
 }
@@ -5122,20 +5419,34 @@ mod owned_capture_settlement_tests {
     use super::*;
     use crate::presentation::transcript_bus::CleanTranscriptEvent;
 
-    async fn fixture() -> (Arc<RecordingController>, mpsc::UnboundedReceiver<CaptureSettlementStage>, tempfile::TempDir) {
+    async fn fixture() -> (
+        Arc<RecordingController>,
+        mpsc::UnboundedReceiver<CaptureSettlementStage>,
+        tempfile::TempDir,
+    ) {
         let controller = Arc::new(RecordingController::new_without_keychain());
         controller.set_state(State::RecToggle).await;
         *controller.assistive_mode.write().await = true;
         *controller.session_id.write().await = Some("owned".to_string());
-        controller.recorder.lock().await.as_mut().expect("empty recorder fixture")
+        controller
+            .recorder
+            .lock()
+            .await
+            .as_mut()
+            .expect("empty recorder fixture")
             .set_capture_turn_intent(CaptureTurnIntent::SingleTurn);
         let dir = tempfile::tempdir().unwrap();
-        let bus = TranscriptBus::open_at(TranscriptSession {
-            session_id: "owned".to_string(),
-            mode: TranscriptMode::Agent,
-            has_latched_target: false,
-            latched_target_is_self: false,
-        }, dir.path().join("events.jsonl"), None).unwrap();
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "owned".to_string(),
+                mode: TranscriptMode::Agent,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            dir.path().join("events.jsonl"),
+            None,
+        )
+        .unwrap();
         bus.publish_started();
         *controller.active_transcript_bus.write().await = Some(Arc::new(bus));
         let (sender, stages) = mpsc::unbounded_channel();
@@ -5143,17 +5454,27 @@ mod owned_capture_settlement_tests {
         (controller, stages, dir)
     }
 
-    async fn stage(stages: &mut mpsc::UnboundedReceiver<CaptureSettlementStage>, expected: CaptureSettlementStage) {
+    async fn stage(
+        stages: &mut mpsc::UnboundedReceiver<CaptureSettlementStage>,
+        expected: CaptureSettlementStage,
+    ) {
         loop {
-            let observed = tokio::time::timeout(STOP_TIMEOUT * 2, stages.recv()).await
-                .expect("owner must acknowledge arrival").expect("observer remains installed");
-            if observed == expected { return; }
+            let observed = tokio::time::timeout(STOP_TIMEOUT * 2, stages.recv())
+                .await
+                .expect("owner must acknowledge arrival")
+                .expect("observer remains installed");
+            if observed == expected {
+                return;
+            }
         }
     }
 
     fn rows(dir: &tempfile::TempDir) -> Vec<CleanTranscriptEvent> {
-        std::fs::read_to_string(dir.path().join("events.jsonl")).unwrap().lines()
-            .map(|line| serde_json::from_str(line).unwrap()).collect()
+        std::fs::read_to_string(dir.path().join("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[tokio::test(start_paused = true)]
@@ -5169,30 +5490,74 @@ mod owned_capture_settlement_tests {
                 async move {
                     match route {
                         0 => controller.stop_recording_from_external_surface().await,
-                        1 => controller.handle_hotkey_event(HotkeyInput {
-                            key_type: HotkeyType::Hold, action: HotkeyAction::Up,
-                            assistive: true, hold_mode: HoldMode::Chat,
-                            force_raw: false, force_ai: false,
-                        }).await,
-                        2 | 3 => controller.handle_hotkey_event(HotkeyInput {
-                            key_type: HotkeyType::Toggle, action: HotkeyAction::Press,
-                            assistive: false, hold_mode: HoldMode::Raw,
-                            force_raw: true, force_ai: false,
-                        }).await,
+                        1 => {
+                            controller
+                                .handle_hotkey_event(HotkeyInput {
+                                    key_type: HotkeyType::Hold,
+                                    action: HotkeyAction::Up,
+                                    assistive: true,
+                                    hold_mode: HoldMode::Chat,
+                                    force_raw: false,
+                                    force_ai: false,
+                                })
+                                .await
+                        }
+                        2 | 3 => {
+                            controller
+                                .handle_hotkey_event(HotkeyInput {
+                                    key_type: HotkeyType::Toggle,
+                                    action: HotkeyAction::Press,
+                                    assistive: false,
+                                    hold_mode: HoldMode::Raw,
+                                    force_raw: true,
+                                    force_ai: false,
+                                })
+                                .await
+                        }
                         _ => controller.finish_recording().await,
                     }
                 }
             });
             stage(&mut stages, CaptureSettlementStage::Admitted).await;
-            let task_id = controller.capture_settlement.lock().unwrap().as_ref().unwrap().task.id();
-            assert!(caller.await.unwrap().unwrap_err().to_string().contains("Pending"));
+            let task_id = controller
+                .capture_settlement
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .task
+                .id();
+            assert!(
+                caller
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Pending")
+            );
             assert_eq!(controller.current_state().await, State::Busy);
             assert!(controller.serial_lock.try_lock().is_err());
             assert_eq!(rows(&dir).len(), 1);
-            assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Pending);
-            assert_eq!(controller.capture_settlement.lock().unwrap().as_ref().unwrap().task.id(), task_id);
+            assert_eq!(
+                controller.stop_capture_if_owned("owned").await.unwrap(),
+                CaptureStopOutcome::Pending
+            );
+            assert_eq!(
+                controller
+                    .capture_settlement
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .task
+                    .id(),
+                task_id
+            );
             drop(held);
-            assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
+            assert_eq!(
+                controller.stop_capture_if_owned("owned").await.unwrap(),
+                CaptureStopOutcome::Stopped
+            );
             assert_eq!(rows(&dir).len(), 2, "route {route}: exactly one terminal");
             assert_eq!(controller.current_state().await, State::Idle);
         }
@@ -5202,12 +5567,21 @@ mod owned_capture_settlement_tests {
     async fn stop_current_refuses_queued_admission_and_cannot_target_successor() {
         let (controller, _, dir) = fixture().await;
         let held = controller.serial_lock.lock().await;
-        assert_eq!(controller.stop_current_capture().await.unwrap(), CaptureStopOutcome::AdmissionUnavailable);
+        assert_eq!(
+            controller.stop_current_capture().await.unwrap(),
+            CaptureStopOutcome::AdmissionUnavailable
+        );
         assert!(controller.capture_settlement.lock().unwrap().is_none());
         *controller.session_id.write().await = Some("replacement".into());
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::ForeignCapture);
-        assert_eq!(controller.session_id.read().await.as_deref(), Some("replacement"));
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::ForeignCapture
+        );
+        assert_eq!(
+            controller.session_id.read().await.as_deref(),
+            Some("replacement")
+        );
         assert_eq!(rows(&dir).len(), 1);
     }
 
@@ -5222,10 +5596,16 @@ mod owned_capture_settlement_tests {
         stage(&mut stages, CaptureSettlementStage::Resetting).await;
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        assert_eq!(controller.stop_current_capture().await.unwrap(), CaptureStopOutcome::Pending);
+        assert_eq!(
+            controller.stop_current_capture().await.unwrap(),
+            CaptureStopOutcome::Pending
+        );
         assert_eq!(rows(&dir).len(), 1);
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
         assert_eq!(rows(&dir).len(), 2);
     }
 
@@ -5243,9 +5623,17 @@ mod owned_capture_settlement_tests {
         assert!(!controller.capture_shutdown_settled());
         assert_eq!(rows(&dir).len(), 1);
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
         // Observe the actual task exit, not merely its watch publication.
-        let operation = controller.capture_settlement.lock().unwrap().take().unwrap();
+        let operation = controller
+            .capture_settlement
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap();
         operation.task.await.unwrap();
         assert!(controller.capture_shutdown_settled());
         assert!(controller.start_composer_turn_recording().await.is_err());
@@ -5258,12 +5646,26 @@ mod owned_capture_settlement_tests {
     async fn external_failure_and_named_retry_share_one_failed_terminal() {
         let (controller, _, dir) = fixture().await;
         *controller.recorder.lock().await = None;
-        let failure = controller.stop_recording_from_external_surface().await.unwrap_err().to_string();
+        let failure = controller
+            .stop_recording_from_external_surface()
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(failure.contains("recorder unavailable"));
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap_err().to_string(), failure);
+        assert_eq!(
+            controller
+                .stop_capture_if_owned("owned")
+                .await
+                .unwrap_err()
+                .to_string(),
+            failure
+        );
         let events = rows(&dir);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].end_reason, Some(TranscriptSessionEndReason::TranscriptionFailed));
+        assert_eq!(
+            events[1].end_reason,
+            Some(TranscriptSessionEndReason::TranscriptionFailed)
+        );
         assert_eq!(controller.current_state().await, State::Idle);
     }
 
@@ -5271,11 +5673,23 @@ mod owned_capture_settlement_tests {
     async fn idle_stop_invalidates_only_unadmitted_hold_generation() {
         let controller = Arc::new(RecordingController::new_without_keychain());
         let generation = controller.hold_start_generation.load(Ordering::SeqCst);
-        assert_eq!(controller.stop_current_capture().await.unwrap(), CaptureStopOutcome::NoLiveCapture);
-        assert_ne!(controller.hold_start_generation.load(Ordering::SeqCst), generation);
+        assert_eq!(
+            controller.stop_current_capture().await.unwrap(),
+            CaptureStopOutcome::NoLiveCapture
+        );
+        assert_ne!(
+            controller.hold_start_generation.load(Ordering::SeqCst),
+            generation
+        );
         let generation = controller.hold_start_generation.load(Ordering::SeqCst);
-        assert_eq!(controller.stop_capture_if_owned("foreign").await.unwrap(), CaptureStopOutcome::NoLiveCapture);
-        assert_eq!(controller.hold_start_generation.load(Ordering::SeqCst), generation);
+        assert_eq!(
+            controller.stop_capture_if_owned("foreign").await.unwrap(),
+            CaptureStopOutcome::NoLiveCapture
+        );
+        assert_eq!(
+            controller.hold_start_generation.load(Ordering::SeqCst),
+            generation
+        );
     }
 
     #[tokio::test]
@@ -5283,7 +5697,10 @@ mod owned_capture_settlement_tests {
         let controller = Arc::new(RecordingController::new_without_keychain());
         controller.set_state(State::Busy).await;
         controller.request_capture_shutdown();
-        assert_eq!(controller.stop_current_capture().await.unwrap(), CaptureStopOutcome::AdmissionUnavailable);
+        assert_eq!(
+            controller.stop_current_capture().await.unwrap(),
+            CaptureStopOutcome::AdmissionUnavailable
+        );
         assert!(!controller.capture_shutdown_settled());
         assert_eq!(controller.current_state().await, State::Busy);
     }
@@ -5298,19 +5715,31 @@ mod owned_capture_settlement_tests {
         });
         stage(&mut stages, CaptureSettlementStage::Resetting).await;
         // The obstacle is STILL HELD during the independent outer deadline.
-        let outcome = tokio::time::timeout(STOP_TIMEOUT * 2, caller).await
-            .expect("public Stop must return while hold_mode stays locked").unwrap().unwrap();
+        let outcome = tokio::time::timeout(STOP_TIMEOUT * 2, caller)
+            .await
+            .expect("public Stop must return while hold_mode stays locked")
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome, CaptureStopOutcome::Pending);
         assert_eq!(controller.current_state().await, State::Busy);
         assert!(controller.serial_lock.try_lock().is_err());
         assert_eq!(rows(&dir).len(), 1, "pending is not a terminal receipt");
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
         assert_eq!(controller.current_state().await, State::Idle);
         let events = rows(&dir);
         assert_eq!(events.len(), 2, "one start and exactly one terminal");
-        assert_eq!(events[1].end_reason, Some(TranscriptSessionEndReason::Completed));
+        assert_eq!(
+            events[1].end_reason,
+            Some(TranscriptSessionEndReason::Completed)
+        );
         assert!(controller.active_transcript_bus.read().await.is_none());
     }
 
@@ -5323,11 +5752,31 @@ mod owned_capture_settlement_tests {
             async move { controller.stop_capture_if_owned("owned").await }
         });
         stage(&mut stages, CaptureSettlementStage::Resetting).await;
-        let task_id = controller.capture_settlement.lock().unwrap().as_ref().unwrap().task.id();
+        let task_id = controller
+            .capture_settlement
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .task
+            .id();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Pending);
-        assert_eq!(controller.capture_settlement.lock().unwrap().as_ref().unwrap().task.id(), task_id);
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Pending
+        );
+        assert_eq!(
+            controller
+                .capture_settlement
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .task
+                .id(),
+            task_id
+        );
         // A successor obeys the real start serialization boundary. It cannot
         // install new state until every predecessor terminal side effect ends.
         let (entered, mut successor_entered) = tokio::sync::oneshot::channel();
@@ -5344,8 +5793,14 @@ mod owned_capture_settlement_tests {
         drop(held);
         successor_entered.await.unwrap();
         successor.await.unwrap();
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
-        assert_eq!(controller.session_id.read().await.as_deref(), Some("successor"));
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
+        assert_eq!(
+            controller.session_id.read().await.as_deref(),
+            Some("successor")
+        );
         assert_eq!(controller.current_state().await, State::RecToggle);
         assert_eq!(rows(&dir).len(), 2);
     }
@@ -5359,13 +5814,23 @@ mod owned_capture_settlement_tests {
             async move { controller.stop_capture_if_owned("owned").await }
         });
         stage(&mut stages, CaptureSettlementStage::Registered).await;
-        let pending = tokio::time::timeout(STOP_TIMEOUT * 2, caller).await.unwrap().unwrap().unwrap();
+        let pending = tokio::time::timeout(STOP_TIMEOUT * 2, caller)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(pending, CaptureStopOutcome::Pending);
         assert_eq!(controller.current_state().await, State::RecToggle);
         *controller.session_id.write().await = Some("foreign".to_string());
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::ForeignCapture);
-        assert_eq!(controller.session_id.read().await.as_deref(), Some("foreign"));
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::ForeignCapture
+        );
+        assert_eq!(
+            controller.session_id.read().await.as_deref(),
+            Some("foreign")
+        );
         assert_eq!(rows(&dir).len(), 1, "foreign take and Bus untouched");
     }
 
@@ -5378,10 +5843,20 @@ mod owned_capture_settlement_tests {
             async move { controller.stop_capture_if_owned("owned").await }
         });
         stage(&mut stages, CaptureSettlementStage::Registered).await;
-        assert_eq!(tokio::time::timeout(STOP_TIMEOUT * 2, caller).await.unwrap().unwrap().unwrap(), CaptureStopOutcome::Pending);
+        assert_eq!(
+            tokio::time::timeout(STOP_TIMEOUT * 2, caller)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            CaptureStopOutcome::Pending
+        );
         assert_eq!(rows(&dir).len(), 1);
         drop(held);
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), CaptureStopOutcome::Stopped);
+        assert_eq!(
+            controller.stop_capture_if_owned("owned").await.unwrap(),
+            CaptureStopOutcome::Stopped
+        );
     }
 
     #[tokio::test]
@@ -5391,7 +5866,9 @@ mod owned_capture_settlement_tests {
             let held = controller.capture_settlement.lock().unwrap();
             let mut call = Box::pin(controller.stop_capture_if_owned("owned"));
             let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            let std::task::Poll::Ready(result) = std::future::Future::poll(call.as_mut(), &mut context) else {
+            let std::task::Poll::Ready(result) =
+                std::future::Future::poll(call.as_mut(), &mut context)
+            else {
                 panic!("registration contention must not suspend");
             };
             assert!(held.is_none());
@@ -5406,12 +5883,19 @@ mod owned_capture_settlement_tests {
     async fn absent_and_already_stopping_are_not_success() {
         for (identity, state, expected) in [
             (None, State::Idle, CaptureStopOutcome::NoLiveCapture),
-            (Some("owned:stopping"), State::Busy, CaptureStopOutcome::AlreadyStopping),
+            (
+                Some("owned:stopping"),
+                State::Busy,
+                CaptureStopOutcome::AlreadyStopping,
+            ),
         ] {
             let controller = Arc::new(RecordingController::new_without_keychain());
             *controller.session_id.write().await = identity.map(str::to_string);
             controller.set_state(state).await;
-            assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap(), expected);
+            assert_eq!(
+                controller.stop_capture_if_owned("owned").await.unwrap(),
+                expected
+            );
             assert_eq!(controller.current_state().await, state);
         }
     }
@@ -5420,18 +5904,46 @@ mod owned_capture_settlement_tests {
     async fn explicit_recorder_failure_is_retained_as_failure_with_one_terminal() {
         let (controller, _, dir) = fixture().await;
         *controller.recorder.lock().await = None;
-        let failure = controller.stop_capture_if_owned("owned").await.unwrap_err().to_string();
+        let failure = controller
+            .stop_capture_if_owned("owned")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(failure.contains("recorder unavailable"));
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap_err().to_string(), failure);
+        assert_eq!(
+            controller
+                .stop_capture_if_owned("owned")
+                .await
+                .unwrap_err()
+                .to_string(),
+            failure
+        );
         assert_eq!(controller.current_state().await, State::Idle);
         assert_eq!(rows(&dir).len(), 2);
-        assert_eq!(rows(&dir)[1].end_reason, Some(TranscriptSessionEndReason::TranscriptionFailed));
+        assert_eq!(
+            rows(&dir)[1].end_reason,
+            Some(TranscriptSessionEndReason::TranscriptionFailed)
+        );
         *controller.session_id.write().await = Some("successor".into());
         controller.set_state(State::RecToggle).await;
-        assert_eq!(controller.stop_capture_if_owned("owned").await.unwrap_err().to_string(), failure);
-        assert_eq!(controller.session_id.read().await.as_deref(), Some("successor"));
+        assert_eq!(
+            controller
+                .stop_capture_if_owned("owned")
+                .await
+                .unwrap_err()
+                .to_string(),
+            failure
+        );
+        assert_eq!(
+            controller.session_id.read().await.as_deref(),
+            Some("successor")
+        );
         assert_eq!(controller.current_state().await, State::RecToggle);
-        assert_eq!(rows(&dir).len(), 2, "duplicate failure cannot end the successor");
+        assert_eq!(
+            rows(&dir).len(),
+            2,
+            "duplicate failure cannot end the successor"
+        );
     }
 }
 
@@ -5970,7 +6482,11 @@ mod capture_failure_recovery_tests {
             session_id: Some("capture-owner".into()),
             capture_epoch: 7,
             audio_path: path,
-            cause: std::io::Error::new(std::io::ErrorKind::BrokenPipe, "original processing failure").into(),
+            cause: std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "original processing failure",
+            )
+            .into(),
             task_failure: None,
         })
     }
@@ -5983,25 +6499,41 @@ mod capture_failure_recovery_tests {
         std::fs::write(&source, bytes).unwrap();
         let root = dir.path().join("archive");
         let error = recover_capture_stop_failure(
-            failure(Some(source.clone())), Some("capture-owner:stopping"),
-            (Some("capture-owner"), 7), |id, path| {
-                retain_session_audio_at(Some(id), path,
-                    SessionTranscriptArchive::Unavailable("processing failed"), &root,
+            failure(Some(source.clone())),
+            Some("capture-owner:stopping"),
+            (Some("capture-owner"), 7),
+            |id, path| {
+                retain_session_audio_at(
+                    Some(id),
+                    path,
+                    SessionTranscriptArchive::Unavailable("processing failed"),
+                    &root,
                     |file, transcript| {
                         use std::io::Read;
-                        assert!(matches!(transcript, SessionTranscriptArchive::Unavailable(_)));
+                        assert!(matches!(
+                            transcript,
+                            SessionTranscriptArchive::Unavailable(_)
+                        ));
                         let mut archived = Vec::new();
                         file.read_to_end(&mut archived).unwrap();
                         assert_eq!(archived, bytes);
                         Some(source.clone())
-                    })
+                    },
+                )
             },
         );
         let typed = error.downcast_ref::<CaptureStopFailure>().unwrap();
         assert_eq!(typed.audio_path.as_deref(), Some(source.as_path()));
-        assert_eq!(typed.cause.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            typed.cause.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
         assert!(error.downcast_ref::<TerminalSealRefused>().is_none());
-        for path in [source, root.join("sessions/capture-owner.wav"), root.join("last_session.wav")] {
+        for path in [
+            source,
+            root.join("sessions/capture-owner.wav"),
+            root.join("last_session.wav"),
+        ] {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
     }
@@ -6017,7 +6549,9 @@ mod capture_failure_recovery_tests {
             (Some("../capture-owner"), Some("capture-owner"), 7),
         ] {
             let error = recover_capture_stop_failure(
-                failure(Some("unused.wav".into())), id, (session, epoch),
+                failure(Some("unused.wav".into())),
+                id,
+                (session, epoch),
                 |_, _| panic!("foreign evidence must not archive or deliver"),
             );
             assert!(error.to_string().contains("identity mismatch"));
@@ -6028,10 +6562,18 @@ mod capture_failure_recovery_tests {
     #[test]
     fn no_archive_receipt_never_invents_a_saved_file() {
         let error = recover_capture_stop_failure(
-            failure(None), Some("capture-owner"), (Some("capture-owner"), 7),
+            failure(None),
+            Some("capture-owner"),
+            (Some("capture-owner"), 7),
             |_, _| panic!("no path exists to retain"),
         );
-        assert!(error.downcast_ref::<CaptureStopFailure>().unwrap().audio_path.is_none());
+        assert!(
+            error
+                .downcast_ref::<CaptureStopFailure>()
+                .unwrap()
+                .audio_path
+                .is_none()
+        );
         assert!(error.to_string().contains("no finalized WAV receipt"));
         assert!(error.to_string().contains("committed text unavailable"));
     }
@@ -6044,9 +6586,18 @@ mod capture_failure_recovery_tests {
         let root = dir.path().join("not-a-directory");
         std::fs::write(&root, b"block copies").unwrap();
         let error = recover_capture_stop_failure(
-            failure(Some(source.clone())), Some("capture-owner"), (Some("capture-owner"), 7),
-            |id, path| retain_session_audio_at(Some(id), path,
-                SessionTranscriptArchive::Unavailable("processing failed"), &root, |_, _| None),
+            failure(Some(source.clone())),
+            Some("capture-owner"),
+            (Some("capture-owner"), 7),
+            |id, path| {
+                retain_session_audio_at(
+                    Some(id),
+                    path,
+                    SessionTranscriptArchive::Unavailable("processing failed"),
+                    &root,
+                    |_, _| None,
+                )
+            },
         );
         assert!(error.to_string().contains("daily audio archive failed"));
         assert!(error.to_string().contains("last_session.wav"));
@@ -6062,16 +6613,26 @@ mod capture_failure_recovery_tests {
         let source = dir.path().join("source.wav");
         std::fs::write(&source, b"retained despite daily bag failure").unwrap();
         let root = dir.path().join("copies");
-        let result = retain_session_audio_at(Some("capture-owner"), &source,
-            SessionTranscriptArchive::Unavailable("failure"), &root, |_, _| None);
+        let result = retain_session_audio_at(
+            Some("capture-owner"),
+            &source,
+            SessionTranscriptArchive::Unavailable("failure"),
+            &root,
+            |_, _| None,
+        );
         assert!(result.is_err());
-        assert_eq!(std::fs::read(root.join("sessions/capture-owner.wav")).unwrap(), std::fs::read(source).unwrap());
+        assert_eq!(
+            std::fs::read(root.join("sessions/capture-owner.wav")).unwrap(),
+            std::fs::read(source).unwrap()
+        );
     }
 
     fn retain_fixture(source: &std::path::Path, root: &std::path::Path) -> Result<()> {
         retain_session_audio_at(
-            Some("capture-owner"), source,
-            SessionTranscriptArchive::Unavailable("filesystem fixture"), root,
+            Some("capture-owner"),
+            source,
+            SessionTranscriptArchive::Unavailable("filesystem fixture"),
+            root,
             |_, _| Some(source.to_path_buf()),
         )
     }
@@ -6142,7 +6703,10 @@ mod capture_failure_recovery_tests {
         assert!(error.to_string().contains("sessions/capture-owner.wav"));
         assert_eq!(std::fs::read(unrelated).unwrap(), b"external bytes");
         assert_eq!(std::fs::read(source).unwrap(), b"take");
-        assert_eq!(std::fs::read(root.join("last_session.wav")).unwrap(), b"take");
+        assert_eq!(
+            std::fs::read(root.join("last_session.wav")).unwrap(),
+            b"take"
+        );
     }
 
     #[test]
@@ -6178,10 +6742,16 @@ mod capture_failure_recovery_tests {
         // SAFETY: a NUL-terminated path in this test's private temporary directory.
         assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
         for source in [link.as_path(), fifo.as_path(), dir.path()] {
-            assert!(retain_session_audio_at(
-                Some("capture-owner"), source, SessionTranscriptArchive::Unavailable("fixture"),
-                &dir.path().join("archive"), |_, _| panic!("unsafe source reached archive"),
-            ).is_err());
+            assert!(
+                retain_session_audio_at(
+                    Some("capture-owner"),
+                    source,
+                    SessionTranscriptArchive::Unavailable("fixture"),
+                    &dir.path().join("archive"),
+                    |_, _| panic!("unsafe source reached archive"),
+                )
+                .is_err()
+            );
         }
         assert!(!dir.path().join("archive").exists());
         assert_eq!(std::fs::read(regular).unwrap(), b"take");
@@ -6198,8 +6768,14 @@ mod capture_failure_recovery_tests {
         std::fs::write(&source, b"take").unwrap();
         assert!(retain_fixture(&source, &root).is_err());
         assert_eq!(std::fs::read(source).unwrap(), b"take");
-        assert_eq!(std::fs::read(blocked.join("unrelated")).unwrap(), b"keep directory bytes");
-        assert_eq!(std::fs::read(root.join("last_session.wav")).unwrap(), b"take");
+        assert_eq!(
+            std::fs::read(blocked.join("unrelated")).unwrap(),
+            b"keep directory bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.join("last_session.wav")).unwrap(),
+            b"take"
+        );
         assert_eq!(std::fs::read_dir(root.join("sessions")).unwrap().count(), 1);
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 2);
     }
@@ -6212,7 +6788,10 @@ mod capture_failure_recovery_tests {
         let root = dir.path().join("archive");
         std::fs::write(&source, b"opened take").unwrap();
         retain_session_audio_at(
-            Some("capture-owner"), &source, SessionTranscriptArchive::Unavailable("fixture"), &root,
+            Some("capture-owner"),
+            &source,
+            SessionTranscriptArchive::Unavailable("fixture"),
+            &root,
             |file, _| {
                 use std::io::Read;
                 std::fs::rename(&source, &original).unwrap();
@@ -6222,11 +6801,21 @@ mod capture_failure_recovery_tests {
                 assert_eq!(archived, b"opened take");
                 Some(source.clone())
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(std::fs::read(original).unwrap(), b"opened take");
-        assert_eq!(std::fs::read(source).unwrap(), b"replacement must not be copied");
-        assert_eq!(std::fs::read(root.join("sessions/capture-owner.wav")).unwrap(), b"opened take");
-        assert_eq!(std::fs::read(root.join("last_session.wav")).unwrap(), b"opened take");
+        assert_eq!(
+            std::fs::read(source).unwrap(),
+            b"replacement must not be copied"
+        );
+        assert_eq!(
+            std::fs::read(root.join("sessions/capture-owner.wav")).unwrap(),
+            b"opened take"
+        );
+        assert_eq!(
+            std::fs::read(root.join("last_session.wav")).unwrap(),
+            b"opened take"
+        );
     }
 
     #[test]
@@ -6243,7 +6832,10 @@ mod capture_failure_recovery_tests {
         let unrelated = external.join("capture-owner.wav");
         std::fs::write(&unrelated, b"external bytes").unwrap();
         retain_session_audio_at(
-            Some("capture-owner"), &source, SessionTranscriptArchive::Unavailable("fixture"), &root,
+            Some("capture-owner"),
+            &source,
+            SessionTranscriptArchive::Unavailable("fixture"),
+            &root,
             |_, _| {
                 std::fs::rename(root.join("sessions"), root.join("pinned-sessions")).unwrap();
                 symlink(&external, root.join("sessions")).unwrap();
@@ -6253,12 +6845,19 @@ mod capture_failure_recovery_tests {
                 symlink(&external, &root).unwrap();
                 Some(source.to_path_buf())
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"external bytes");
         assert_eq!(std::fs::read_dir(external).unwrap().count(), 1);
         assert_eq!(std::fs::read(source).unwrap(), b"opened take");
-        assert_eq!(std::fs::read(moved.join("pinned-sessions/capture-owner.wav")).unwrap(), b"opened take");
-        assert_eq!(std::fs::read(moved.join("last_session.wav")).unwrap(), b"opened take");
+        assert_eq!(
+            std::fs::read(moved.join("pinned-sessions/capture-owner.wav")).unwrap(),
+            b"opened take"
+        );
+        assert_eq!(
+            std::fs::read(moved.join("last_session.wav")).unwrap(),
+            b"opened take"
+        );
     }
 
     #[tokio::test]
@@ -6267,12 +6866,17 @@ mod capture_failure_recovery_tests {
         let controller = RecordingController::new_without_keychain();
         let mut events = controller.subscribe_events();
         let bus_path = dir.path().join("bus.jsonl");
-        let bus = TranscriptBus::open_at(TranscriptSession {
-            session_id: "capture-owner".into(),
-            mode: TranscriptMode::Dictation,
-            has_latched_target: false,
-            latched_target_is_self: false,
-        }, bus_path.clone(), None).unwrap();
+        let bus = TranscriptBus::open_at(
+            TranscriptSession {
+                session_id: "capture-owner".into(),
+                mode: TranscriptMode::Dictation,
+                has_latched_target: false,
+                latched_target_is_self: false,
+            },
+            bus_path.clone(),
+            None,
+        )
+        .unwrap();
         bus.publish_started();
         *controller.active_transcript_bus.write().await = Some(Arc::new(bus));
         let source = dir.path().join("take.wav");
@@ -6280,18 +6884,23 @@ mod capture_failure_recovery_tests {
         let root = dir.path().join("blocked-root");
         std::fs::write(&root, b"unrelated root bytes").unwrap();
         let error = recover_capture_stop_failure(
-            failure(Some(source.clone())), Some("capture-owner"),
-            (Some("capture-owner"), 7), |_, path| retain_fixture(path, &root),
+            failure(Some(source.clone())),
+            Some("capture-owner"),
+            (Some("capture-owner"), 7),
+            |_, path| retain_fixture(path, &root),
         );
         assert!(error.downcast_ref::<CaptureStopFailure>().is_some());
         assert_eq!(std::fs::read(source).unwrap(), b"failed take survives");
         assert_eq!(std::fs::read(root).unwrap(), b"unrelated root bytes");
         let result = Err(error);
         controller.reset_finished_recording_state(&result).await;
-        controller.handle_processed_recording_result(false, &result).await;
+        controller
+            .handle_processed_recording_result(false, &result)
+            .await;
         let mut visible = false;
         while let Ok(event) = events.try_recv() {
-            if let IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) = event.payload
+            if let IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) =
+                event.payload
                 && code == "transcription_failed"
             {
                 assert!(message.contains("audio retention failed"));
@@ -6301,10 +6910,16 @@ mod capture_failure_recovery_tests {
         }
         assert!(visible);
         let rows: Vec<crate::presentation::transcript_bus::CleanTranscriptEvent> =
-            std::fs::read_to_string(bus_path).unwrap().lines()
-                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            std::fs::read_to_string(bus_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].end_reason, Some(TranscriptSessionEndReason::TranscriptionFailed));
+        assert_eq!(
+            rows[1].end_reason,
+            Some(TranscriptSessionEndReason::TranscriptionFailed)
+        );
         assert_eq!(controller.current_state().await, State::Idle);
     }
 }

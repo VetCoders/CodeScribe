@@ -137,10 +137,22 @@ pub struct TranscriptRevision {
 
 impl TranscriptRevision {
     fn digest(&self) -> [u8; 32] {
-        Sha256::digest(format!("{:?}", (
-            &self.schema, self.revision, &self.action, &self.entries,
-            &self.rendered_text, &self.seal_coverage, &self.comparison,
-        )).as_bytes()).into()
+        Sha256::digest(
+            format!(
+                "{:?}",
+                (
+                    &self.schema,
+                    self.revision,
+                    &self.action,
+                    &self.entries,
+                    &self.rendered_text,
+                    &self.seal_coverage,
+                    &self.comparison,
+                )
+            )
+            .as_bytes(),
+        )
+        .into()
     }
 
     /// Validate the complete reducer-minted snapshot before any observer or
@@ -148,7 +160,10 @@ impl TranscriptRevision {
     pub(crate) fn authenticates_publication(&self, ledger: &AcousticLedger, session: &str) -> bool {
         if self.publication_digest != self.digest()
             || self.entries.is_empty()
-            || self.entries.windows(2).any(|pair| pair[0].occurrence >= pair[1].occurrence)
+            || self
+                .entries
+                .windows(2)
+                .any(|pair| pair[0].occurrence >= pair[1].occurrence)
         {
             return false;
         }
@@ -157,9 +172,10 @@ impl TranscriptRevision {
             if entry.occurrence.session != session
                 || ledger.serial_of(&entry.occurrence).is_none()
                 || ledger.text_of(&entry.occurrence) != Some(entry.label.as_str())
-                || entry.seal_receipt.as_ref().is_some_and(|id| {
-                    !ledger.authenticates_seal_reference(&entry.occurrence, id)
-                })
+                || entry
+                    .seal_receipt
+                    .as_ref()
+                    .is_some_and(|id| !ledger.authenticates_seal_reference(&entry.occurrence, id))
             {
                 return false;
             }
@@ -170,11 +186,12 @@ impl TranscriptRevision {
                     || receipt.revision > self.revision
                     || receipt.source_revision.checked_add(1) != Some(receipt.revision)
                     || receipt.left_context != left_context
-                    || receipt.left_context_sha256 != format!("{:x}", Sha256::digest(left_context.as_bytes()))
+                    || receipt.left_context_sha256
+                        != format!("{:x}", Sha256::digest(left_context.as_bytes()))
                     || !ledger.incremental_shapings().contains(receipt)
-                    || ledger.seal_of(&entry.occurrence).is_none_or(|seal| {
-                        seal.receipt_id != receipt.source_seal_receipt
-                    })
+                    || ledger
+                        .seal_of(&entry.occurrence)
+                        .is_none_or(|seal| seal.receipt_id != receipt.source_seal_receipt)
                 {
                     return false;
                 }
@@ -189,31 +206,41 @@ impl TranscriptRevision {
                 ledger.latest_seal_coverage() == Some(receipt)
                     && self.seal_coverage.as_ref() == Some(receipt)
                     && receipt.session_id == session
-                    && self.entries.iter().all(|entry| {
-                        entry.occurrence.capture_epoch == receipt.capture_epoch
-                    })
+                    && self
+                        .entries
+                        .iter()
+                        .all(|entry| entry.occurrence.capture_epoch == receipt.capture_epoch)
             }
-            ReducerAction::RecordLedgerSeal { occurrence, seal_receipt, terminal } => {
-                ledger.seal_receipt(seal_receipt).is_some_and(|seal| {
-                    seal.is_occurrence_seal() != *terminal
-                        && seal.sealed_occurrences.first() == Some(occurrence)
-                        && seal.sealed_occurrences.iter().all(|sealed| {
-                            self.entries.iter().any(|entry| &entry.occurrence == sealed)
-                        })
+            ReducerAction::RecordLedgerSeal {
+                occurrence,
+                seal_receipt,
+                terminal,
+            } => ledger.seal_receipt(seal_receipt).is_some_and(|seal| {
+                seal.is_occurrence_seal() != *terminal
+                    && seal.sealed_occurrences.first() == Some(occurrence)
+                    && seal
+                        .sealed_occurrences
+                        .iter()
+                        .all(|sealed| self.entries.iter().any(|entry| &entry.occurrence == sealed))
+            }),
+            ReducerAction::ApplyIncrementalShaping { receipt } => {
+                self.entries.iter().any(|entry| {
+                    entry.presentation_receipt.as_ref() == Some(receipt)
+                        && receipt.revision == self.revision
                 })
             }
-            ReducerAction::ApplyIncrementalShaping { receipt } => self.entries.iter().any(|entry| {
-                entry.presentation_receipt.as_ref() == Some(receipt)
-                    && receipt.revision == self.revision
-            }),
             ReducerAction::ApplyUserRevision { receipt } => {
                 ledger.manual_document_revisions().contains(receipt)
                     && receipt.session_id == session
                     && receipt.revision == self.revision
                     && receipt.source_revision.checked_add(1) == Some(self.revision)
                     && receipt.rendered_text == self.rendered_text
-                    && receipt.source_occurrences == self.entries.iter()
-                        .map(|entry| entry.occurrence.clone()).collect::<Vec<_>>()
+                    && receipt.source_occurrences
+                        == self
+                            .entries
+                            .iter()
+                            .map(|entry| entry.occurrence.clone())
+                            .collect::<Vec<_>>()
             }
             _ => true,
         }
@@ -391,7 +418,8 @@ pub struct TranscriptReducer {
 
 /// Preserve fragment bytes; only an absent inter-occurrence separator is added.
 fn append_exact_fragment(rendered: &mut String, fragment: &str) {
-    if !rendered.is_empty() && !fragment.is_empty()
+    if !rendered.is_empty()
+        && !fragment.is_empty()
         && !rendered.ends_with(char::is_whitespace)
         && !fragment.starts_with(char::is_whitespace)
     {
@@ -473,17 +501,22 @@ impl TranscriptReducer {
         observation: &ObservationIdentity,
         receipt: &MutationReceipt,
     ) -> Option<TranscriptRevision> {
-        if !receipt.grants_mutation() || !ledger.is_qualified(&observation.occurrence)
-            || self.document_by_occurrence.keys().next().is_some_and(|first| {
-                first.session != observation.occurrence.session
-            })
+        if !receipt.grants_mutation()
+            || !ledger.is_qualified(&observation.occurrence)
+            || self
+                .document_by_occurrence
+                .keys()
+                .next()
+                .is_some_and(|first| first.session != observation.occurrence.session)
         {
             return None;
         }
         if self.applied_observations.contains(observation)
-            || !ledger.layer_trail_for(&observation.occurrence).any(|decision| {
-                decision.observation == *observation && decision.decision == *receipt
-            })
+            || !ledger
+                .layer_trail_for(&observation.occurrence)
+                .any(|decision| {
+                    decision.observation == *observation && decision.decision == *receipt
+                })
         {
             return None;
         }
@@ -569,9 +602,10 @@ impl TranscriptReducer {
             return None;
         }
         if self.observed_seals.contains(&receipt.receipt_id)
-            || receipt.sealed_occurrences.iter().any(|occurrence| {
-                !self.document_by_occurrence.contains_key(occurrence)
-            })
+            || receipt
+                .sealed_occurrences
+                .iter()
+                .any(|occurrence| !self.document_by_occurrence.contains_key(occurrence))
         {
             return None;
         }
@@ -695,8 +729,11 @@ impl TranscriptReducer {
             .ok_or(IncrementalShapingRefusal::UnknownOccurrence)?
             .session
             .clone();
-        if occurrence.session != session_id || self.document_by_occurrence.keys()
-            .any(|entry| entry.session != session_id)
+        if occurrence.session != session_id
+            || self
+                .document_by_occurrence
+                .keys()
+                .any(|entry| entry.session != session_id)
         {
             return Err(IncrementalShapingRefusal::ForeignSession);
         }
@@ -709,10 +746,15 @@ impl TranscriptReducer {
         }
         // Do not shape against a known open predecessor: it can still change.
         // On every closure the emitter revisits the complete sealed prefix.
-        if self.document_by_occurrence.keys().take_while(|key| *key < occurrence)
+        if self
+            .document_by_occurrence
+            .keys()
+            .take_while(|key| *key < occurrence)
             .any(|key| !ledger.is_sealed(key))
         {
-            return Err(IncrementalShapingRefusal::LedgerRefusal("incremental_shaping_left_context_open"));
+            return Err(IncrementalShapingRefusal::LedgerRefusal(
+                "incremental_shaping_left_context_open",
+            ));
         }
         let left_context = self.rendered_occurrence_span(Some(occurrence));
         let shaped = codescribe_core::pipeline::light_plus::apply_with_left_context(
@@ -743,10 +785,8 @@ impl TranscriptReducer {
                 &shaped,
             )
             .map_err(IncrementalShapingRefusal::LedgerRefusal)?;
-        self.shaped_by_occurrence.insert(
-            occurrence.clone(),
-            receipt.clone(),
-        );
+        self.shaped_by_occurrence
+            .insert(occurrence.clone(), receipt.clone());
         self.invalidate_stale_shapes();
         Ok(self.revision_for_action(ReducerAction::ApplyIncrementalShaping { receipt }))
     }
@@ -962,13 +1002,20 @@ impl TranscriptReducer {
     fn invalidate_stale_shapes(&mut self) {
         let mut left = String::new();
         for (occurrence, entry) in &self.document_by_occurrence {
-            if self.shaped_by_occurrence.get(occurrence).is_some_and(|shape| {
-                shape.source_label != entry.label || shape.left_context != left
-            }) {
+            if self
+                .shaped_by_occurrence
+                .get(occurrence)
+                .is_some_and(|shape| {
+                    shape.source_label != entry.label || shape.left_context != left
+                })
+            {
                 self.shaped_by_occurrence.remove(occurrence);
             }
-            let text = self.shaped_by_occurrence.get(occurrence)
-                .map(|shape| shape.shaped_text.as_str()).unwrap_or(&entry.label);
+            let text = self
+                .shaped_by_occurrence
+                .get(occurrence)
+                .map(|shape| shape.shaped_text.as_str())
+                .unwrap_or(&entry.label);
             append_exact_fragment(&mut left, text);
         }
     }
@@ -1182,11 +1229,18 @@ impl PresentationEmitter {
         }
     }
 
-    fn authenticates_revision(&self, revision: &TranscriptRevision, ledger: &AcousticLedger) -> bool {
+    fn authenticates_revision(
+        &self,
+        revision: &TranscriptRevision,
+        ledger: &AcousticLedger,
+    ) -> bool {
         let Some(first) = revision.entries.first() else {
             return false;
         };
-        let session = self.transcript_bus.as_ref().map(|bus| bus.session_id())
+        let session = self
+            .transcript_bus
+            .as_ref()
+            .map(|bus| bus.session_id())
             .unwrap_or(&first.occurrence.session);
         revision.authenticates_publication(ledger, session)
     }
@@ -1244,12 +1298,16 @@ impl PresentationEmitter {
             .unwrap_or_else(|error| error.into_inner())
             .apply_user_revision(ledger, &intent)?;
         if !self.authenticates_revision(&revision, ledger) {
-            return Err(UserRevisionRefusal::LedgerRefusal("publication_authentication_failed"));
+            return Err(UserRevisionRefusal::LedgerRefusal(
+                "publication_authentication_failed",
+            ));
         }
         if let Some(bus) = &self.transcript_bus {
             let events = bus.publish_revision(&revision, ledger);
             if events.is_empty() {
-                return Err(UserRevisionRefusal::LedgerRefusal("bus_publication_refused"));
+                return Err(UserRevisionRefusal::LedgerRefusal(
+                    "bus_publication_refused",
+                ));
             }
             if let Some(callback) = &self.projection_callback {
                 for event in &events {
@@ -1323,8 +1381,14 @@ impl PresentationEmitter {
         if self.literal_delivery() {
             return;
         }
-        let occurrences = self.session_state.lock().unwrap_or_else(|error| error.into_inner())
-            .document_by_occurrence.keys().cloned().collect::<Vec<_>>();
+        let occurrences = self
+            .session_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .document_by_occurrence
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for occurrence in &occurrences {
             if !ledger.is_sealed(occurrence) {
                 break;
@@ -1357,8 +1421,7 @@ impl PresentationEmitter {
                 // A repeated seal observation and a shape that changes nothing
                 // are both healthy no-ops, not failures.
                 Err(
-                    IncrementalShapingRefusal::AlreadyShaped
-                    | IncrementalShapingRefusal::Unchanged,
+                    IncrementalShapingRefusal::AlreadyShaped | IncrementalShapingRefusal::Unchanged,
                 ) => {}
                 Err(refusal) => debug!(%refusal, "live Light+ shaping refused"),
             }
@@ -1608,7 +1671,10 @@ impl EventSink for PresentationEmitter {
                 // reducer refuses a still-open or already-shaped one, so this
                 // cannot mint a second presentation for the same words.
                 if ledger.is_sealed(&occurrence) {
-                    self.mint_incremental_light_plus(&mut ledger, std::slice::from_ref(&occurrence));
+                    self.mint_incremental_light_plus(
+                        &mut ledger,
+                        std::slice::from_ref(&occurrence),
+                    );
                 }
             }
             EngineEvent::VadStart { .. } | EngineEvent::VadEnd { .. } => {}
@@ -1729,8 +1795,8 @@ impl EventSink for PresentationEmitter {
 #[cfg(test)]
 mod tests {
     use super::{
-        IncrementalShapingRefusal, PresentationEmitter, TerminalFormatterRequest, TranscriptReducer,
-        UserRevisionCommit, UserRevisionIntent, UserRevisionRefusal,
+        IncrementalShapingRefusal, PresentationEmitter, TerminalFormatterRequest,
+        TranscriptReducer, UserRevisionCommit, UserRevisionIntent, UserRevisionRefusal,
     };
     use crate::presentation::transcript_bus::{
         TranscriptBus, TranscriptBusEvidenceEvent, TranscriptDelivery, TranscriptMode,
@@ -1747,10 +1813,10 @@ mod tests {
         AnnotationKind, DeltaSink, EngineEvent, EventSink, LayerSource, LayerSummary,
         TranscriptDelta,
     };
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
-    use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+    use tokio::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingDeltaSink {
@@ -1891,7 +1957,11 @@ use tokio::sync::Mutex;
         emitter.on_event(&mutation);
         emitter.finish().await;
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
             .expect("committed book must produce a terminal projection");
 
         assert_eq!(delivery.lock().await.as_str(), "Iwo");
@@ -2063,7 +2133,11 @@ use tokio::sync::Mutex;
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
             .expect("terminal projection");
 
         let commit = emitter
@@ -2209,7 +2283,11 @@ use tokio::sync::Mutex;
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
             .expect("terminal projection");
 
         let source = emitter
@@ -2379,7 +2457,11 @@ use tokio::sync::Mutex;
             layer_summary: LayerSummary::default(),
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -2424,10 +2506,9 @@ use tokio::sync::Mutex;
         assert_eq!(light_plus_projection.rendered_text, shaped);
         assert_eq!(light_plus_projection.label, tail_words);
         assert!(
-            projected
-                .iter()
-                .any(|event| event.reducer_action == "apply_manual_edit"
-                    && event.label == raw_words),
+            projected.iter().any(
+                |event| event.reducer_action == "apply_manual_edit" && event.label == raw_words
+            ),
             "every occurrence keeps its own spoken label in the revision"
         );
         assert!(light_plus_projection.terminal);
@@ -2511,7 +2592,11 @@ use tokio::sync::Mutex;
             receipt: terminal_seal,
         });
         let terminal = bus
-            .publish_ended(TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted)
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
             .expect("terminal projection");
         emitter.finish().await;
 
@@ -2898,7 +2983,10 @@ use tokio::sync::Mutex;
         /// Qualify and admit one Apple observation, then hand it to the emitter.
         fn admit(&self, occurrence: &OccurrenceIdentity, request: u64, label: &str) {
             let mutation = {
-                let mut ledger = self.ledger.lock().unwrap_or_else(|error| error.into_inner());
+                let mut ledger = self
+                    .ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 admitted_mutation(&mut ledger, occurrence.clone(), request, label)
             };
             self.emitter.on_event(&mutation);
@@ -2909,7 +2997,10 @@ use tokio::sync::Mutex;
         /// test can replay the exact same observation.
         fn seal(&self, occurrence: &OccurrenceIdentity) -> EngineEvent {
             let receipt = {
-                let mut ledger = self.ledger.lock().unwrap_or_else(|error| error.into_inner());
+                let mut ledger = self
+                    .ledger
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
                 assert!(ledger.note_frontier_return(occurrence, ObservationProducer::Apple));
                 ledger
@@ -3029,7 +3120,10 @@ use tokio::sync::Mutex;
         assert_eq!(shaping.revision, shaping.source_revision + 1);
 
         // The acoustic label is untouched: shaping is presentation, not words.
-        let ledger = take.ledger.lock().unwrap_or_else(|error| error.into_inner());
+        let ledger = take
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         assert_eq!(ledger.text_of(&occurrence), Some(spoken));
         assert!(
             ledger.manual_document_revisions().is_empty(),
@@ -3050,7 +3144,9 @@ use tokio::sync::Mutex;
         );
         assert_eq!(projection.delivery, TranscriptDelivery::Unattempted);
         assert!(
-            projection.acoustic_receipts[0].manual_edit_receipt.is_none(),
+            projection.acoustic_receipts[0]
+                .manual_edit_receipt
+                .is_none(),
             "a shape must not masquerade as a human correction"
         );
         assert_eq!(
@@ -3095,13 +3191,29 @@ use tokio::sync::Mutex;
             "shaped prefix preserved, open suffix byte-exact"
         );
 
-        let retained = take.projected.lock().unwrap().iter().rev()
-            .find(|event| event.reducer_revision == open_projection.reducer_revision && event.document_index == 0)
-            .unwrap().acoustic_receipts[0].presentation_receipt.clone().unwrap();
+        let retained = take
+            .projected
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|event| {
+                event.reducer_revision == open_projection.reducer_revision
+                    && event.document_index == 0
+            })
+            .unwrap()
+            .acoustic_receipts[0]
+            .presentation_receipt
+            .clone()
+            .unwrap();
         assert_eq!(retained.receipt_id, after_first[0].receipt_id);
         assert_eq!(retained.source_revision, after_first[0].source_revision);
         assert_eq!(retained.shaped_text, after_first[0].shaped_text);
-        assert!(open_projection.acoustic_receipts[0].presentation_receipt.is_none());
+        assert!(
+            open_projection.acoustic_receipts[0]
+                .presentation_receipt
+                .is_none()
+        );
         take.seal(&second);
         take.emitter.finish().await;
 
@@ -3156,7 +3268,10 @@ use tokio::sync::Mutex;
         assert!(rendered.starts_with("Pierwsza czesc juz zamknieta."));
 
         // The seal the shaping cites is still the one the ledger holds.
-        let ledger = take.ledger.lock().unwrap_or_else(|error| error.into_inner());
+        let ledger = take
+            .ledger
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         assert_eq!(
             ledger.seal_of(&closed).map(|seal| seal.receipt_id.as_str()),
             Some(shapings[0].source_seal_receipt.as_str())
@@ -3185,9 +3300,18 @@ use tokio::sync::Mutex;
         assert_eq!(shapings[1].occurrence, second);
         assert_ne!(shapings[0].receipt_id, shapings[1].receipt_id);
         let rows = take.shaping_projections();
-        assert_eq!(rows.len(), 3, "one first-entry row, then two document-entry rows");
-        assert_eq!(rows.iter().map(|row| row.reducer_revision)
-            .collect::<std::collections::BTreeSet<_>>().len(), 2);
+        assert_eq!(
+            rows.len(),
+            3,
+            "one first-entry row, then two document-entry rows"
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.reducer_revision)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
     }
 
     /// Acceptance: a duplicate seal observation mints no second revision and no
@@ -3207,7 +3331,10 @@ use tokio::sync::Mutex;
         take.emitter.on_event(&seal_event);
         take.emitter.finish().await;
 
-        assert_eq!(take.emitter.session_state.lock().unwrap().revision, revision_before);
+        assert_eq!(
+            take.emitter.session_state.lock().unwrap().revision,
+            revision_before
+        );
         assert_eq!(take.projected.lock().unwrap().len(), callbacks_before);
         assert_eq!(std::fs::read(&take.bus_path).unwrap(), bus_before);
         assert_eq!(take.shapings().len(), 1, "one occurrence, one shaping");
@@ -3279,7 +3406,10 @@ use tokio::sync::Mutex;
         assert_eq!(take.shapings().len(), 1);
 
         let manual = {
-            let mut ledger = take.ledger.lock().unwrap_or_else(|error| error.into_inner());
+            let mut ledger = take
+                .ledger
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let observation = ObservationIdentity::new(
                 ObservationProducer::ManualHuman,
                 9,
@@ -3320,27 +3450,56 @@ use tokio::sync::Mutex;
         let occurrence = OccurrenceIdentity::new("single-terminal", 19, 0, 16_000);
         take.admit(&occurrence, 1, "jedno zdanie");
         take.seal(&occurrence);
-        let seal = take.ledger.lock().unwrap().seal_terminal("single-terminal", 19).unwrap();
-        assert_ne!(seal.receipt_id, take.ledger.lock().unwrap().seal_of(&occurrence).unwrap().receipt_id);
-        take.emitter.on_event(&EngineEvent::LedgerSeal { receipt: seal.clone() });
+        let seal = take
+            .ledger
+            .lock()
+            .unwrap()
+            .seal_terminal("single-terminal", 19)
+            .unwrap();
+        assert_ne!(
+            seal.receipt_id,
+            take.ledger
+                .lock()
+                .unwrap()
+                .seal_of(&occurrence)
+                .unwrap()
+                .receipt_id
+        );
+        take.emitter.on_event(&EngineEvent::LedgerSeal {
+            receipt: seal.clone(),
+        });
         let revision = take.emitter.session_state.lock().unwrap().revision;
-        assert_eq!(take.emitter.terminal_revision_source("single-terminal", revision),
-            Ok("Jedno zdanie.".to_string()), "genuine terminal CAS opens before lifecycle end");
+        assert_eq!(
+            take.emitter
+                .terminal_revision_source("single-terminal", revision),
+            Ok("Jedno zdanie.".to_string()),
+            "genuine terminal CAS opens before lifecycle end"
+        );
         let callbacks = take.projected.lock().unwrap().len();
-        take.emitter.on_event(&EngineEvent::LedgerSeal { receipt: seal });
-        assert_eq!(take.emitter.session_state.lock().unwrap().revision, revision);
+        take.emitter
+            .on_event(&EngineEvent::LedgerSeal { receipt: seal });
+        assert_eq!(
+            take.emitter.session_state.lock().unwrap().revision,
+            revision
+        );
         assert_eq!(take.projected.lock().unwrap().len(), callbacks);
         take.emitter.on_event(&EngineEvent::SessionFinalised {
             session_id: "single-terminal".to_string(),
             layer_summary: LayerSummary::default(),
         });
-        let terminal = take.bus.publish_ended(
-            TranscriptSessionEndReason::Completed, true, TranscriptDelivery::Unattempted,
-        ).unwrap();
+        let terminal = take
+            .bus
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                true,
+                TranscriptDelivery::Unattempted,
+            )
+            .unwrap();
         take.emitter.finish().await;
         assert_eq!(take.delivery.lock().await.as_str(), "Jedno zdanie.");
         assert_eq!(
-            take.emitter.terminal_revision_source("single-terminal", terminal.reducer_revision),
+            take.emitter
+                .terminal_revision_source("single-terminal", terminal.reducer_revision),
             Ok("Jedno zdanie.".to_string()),
             "one occurrence must permit the same authenticated terminal CAS as two"
         );
@@ -3415,8 +3574,15 @@ use tokio::sync::Mutex;
                 .source_text,
             shaped
         );
-        assert!(take.bus.publish_ended(TranscriptSessionEndReason::Completed,
-            true, TranscriptDelivery::Unattempted).is_none());
+        assert!(
+            take.bus
+                .publish_ended(
+                    TranscriptSessionEndReason::Completed,
+                    true,
+                    TranscriptDelivery::Unattempted
+                )
+                .is_none()
+        );
         take.emitter.finish().await;
         assert_eq!(take.delivery.lock().await.as_str(), shaped);
         assert!(
@@ -3565,10 +3731,7 @@ use tokio::sync::Mutex;
                 },
             )
             .expect("a terminal document admits an authenticated user edit");
-        assert_eq!(
-            committed.rendered_text,
-            "Slowa poprawione przez czlowieka."
-        );
+        assert_eq!(committed.rendered_text, "Slowa poprawione przez czlowieka.");
 
         assert_eq!(
             reducer.apply_incremental_shaping(&mut ledger, &first),
@@ -3608,12 +3771,19 @@ use tokio::sync::Mutex;
             if occurrence == &native {
                 assert!(admitted.is_some());
             } else {
-                assert!(admitted.is_none(), "a qualified foreign entry is refused at reducer admission");
+                assert!(
+                    admitted.is_none(),
+                    "a qualified foreign entry is refused at reducer admission"
+                );
                 // Preserve the predecessor's contaminated-document falsifier
                 // explicitly, without weakening production session admission.
                 let mut foreign_reducer = TranscriptReducer::default();
-                let foreign_revision = foreign_reducer.apply_ledger_mutation(&ledger, observation, receipt).unwrap();
-                reducer.document_by_occurrence.insert(foreign.clone(), foreign_revision.entries[0].clone());
+                let foreign_revision = foreign_reducer
+                    .apply_ledger_mutation(&ledger, observation, receipt)
+                    .unwrap();
+                reducer
+                    .document_by_occurrence
+                    .insert(foreign.clone(), foreign_revision.entries[0].clone());
             }
             ledger.schedule_frontier(occurrence.clone(), [ObservationProducer::Apple]);
             assert!(ledger.note_frontier_return(occurrence, ObservationProducer::Apple));
@@ -3624,8 +3794,11 @@ use tokio::sync::Mutex;
             reducer.apply_incremental_shaping(&mut ledger, &foreign),
             Err(IncrementalShapingRefusal::ForeignSession)
         );
-        assert_eq!(reducer.apply_incremental_shaping(&mut ledger, &native),
-            Err(IncrementalShapingRefusal::ForeignSession), "the entire contaminated document refuses");
+        assert_eq!(
+            reducer.apply_incremental_shaping(&mut ledger, &native),
+            Err(IncrementalShapingRefusal::ForeignSession),
+            "the entire contaminated document refuses"
+        );
         reducer.document_by_occurrence.remove(&foreign);
         assert!(
             reducer
@@ -3645,7 +3818,10 @@ use tokio::sync::Mutex;
         take.admit(&first, 1, "pierwsze zdanie");
         take.admit(&second, 2, "drugie zdanie");
         take.seal(&second);
-        assert!(take.shapings().is_empty(), "known open left context cannot authorize casing");
+        assert!(
+            take.shapings().is_empty(),
+            "known open left context cannot authorize casing"
+        );
         take.seal(&first);
         take.emitter.finish().await;
         let receipts = take.shapings();
@@ -3653,9 +3829,14 @@ use tokio::sync::Mutex;
         assert_eq!(receipts[0].occurrence, first);
         assert_eq!(receipts[1].occurrence, second);
         assert_eq!(receipts[1].left_context, "Pierwsze zdanie.");
-        assert_eq!(receipts[1].left_context_sha256,
-            format!("{:x}", Sha256::digest(b"Pierwsze zdanie.")));
-        assert_eq!(take.delivery.lock().await.as_str(), "Pierwsze zdanie. Drugie zdanie.");
+        assert_eq!(
+            receipts[1].left_context_sha256,
+            format!("{:x}", Sha256::digest(b"Pierwsze zdanie."))
+        );
+        assert_eq!(
+            take.delivery.lock().await.as_str(),
+            "Pierwsze zdanie. Drugie zdanie."
+        );
     }
 
     #[tokio::test]
@@ -3672,13 +3853,20 @@ use tokio::sync::Mutex;
         assert!(revision.acoustic_receipts[0].presentation_receipt.is_none());
         take.seal(&first);
         take.emitter.finish().await;
-        assert_eq!(take.shapings()[0], original, "historical provenance never changes");
+        assert_eq!(
+            take.shapings()[0],
+            original,
+            "historical provenance never changes"
+        );
         let receipts = take.shapings();
         let current = receipts.last().unwrap();
         assert_eq!(current.occurrence, second);
         assert_ne!(current.receipt_id, original.receipt_id);
         assert_eq!(current.left_context, "Pierwsze zdanie.");
-        assert_eq!(take.delivery.lock().await.as_str(), "Pierwsze zdanie. Drugie zdanie.");
+        assert_eq!(
+            take.delivery.lock().await.as_str(),
+            "Pierwsze zdanie. Drugie zdanie."
+        );
     }
 
     #[tokio::test]
@@ -3692,13 +3880,16 @@ use tokio::sync::Mutex;
         let bytes = std::fs::read(&take.bus_path).unwrap();
         let (observation, receipt) = {
             let mut ledger = take.ledger.lock().unwrap();
-            let observation = ObservationIdentity::new(ObservationProducer::Whisper, 99, 0, occurrence);
+            let observation =
+                ObservationIdentity::new(ObservationProducer::Whisper, 99, 0, occurrence);
             let receipt = ledger.admit(&observation, "late rewrite");
             assert!(!receipt.grants_mutation());
             (observation, receipt)
         };
         take.emitter.on_event(&EngineEvent::LedgerMutation {
-            observation, receipt, label: "late rewrite".to_string(),
+            observation,
+            receipt,
+            label: "late rewrite".to_string(),
         });
         take.emitter.on_event(&seal);
         take.emitter.finish().await;
@@ -3715,8 +3906,13 @@ use tokio::sync::Mutex;
         let occurrence = OccurrenceIdentity::new("delivery-forgery", 1, 0, 16_000);
         take.admit(&occurrence, 1, "real words");
         take.seal(&occurrence);
-        let mut revision = take.emitter.session_state.lock().unwrap()
-            .record_context_marker(0, "context").unwrap();
+        let mut revision = take
+            .emitter
+            .session_state
+            .lock()
+            .unwrap()
+            .record_context_marker(0, "context")
+            .unwrap();
         revision.rendered_text = "forged delivery".to_string();
         let rows = take.projected.lock().unwrap().len();
         take.emitter.publish_revision(revision);
@@ -3731,15 +3927,24 @@ use tokio::sync::Mutex;
         let occurrence = OccurrenceIdentity::new("ended-publication", 1, 0, 16_000);
         take.admit(&occurrence, 1, "real words");
         take.seal(&occurrence);
-        take.bus.publish_ended(TranscriptSessionEndReason::Completed,
-            false, TranscriptDelivery::Unattempted).unwrap();
-        let revision = take.emitter.session_state.lock().unwrap()
-            .record_context_marker(0, "late context").unwrap();
+        take.bus
+            .publish_ended(
+                TranscriptSessionEndReason::Completed,
+                false,
+                TranscriptDelivery::Unattempted,
+            )
+            .unwrap();
+        let revision = take
+            .emitter
+            .session_state
+            .lock()
+            .unwrap()
+            .record_context_marker(0, "late context")
+            .unwrap();
         let callbacks = take.projected.lock().unwrap().len();
         take.emitter.publish_revision(revision);
         take.emitter.finish().await;
         assert_eq!(take.projected.lock().unwrap().len(), callbacks);
         assert_eq!(take.delivery.lock().await.as_str(), "Real words.");
     }
-
 }

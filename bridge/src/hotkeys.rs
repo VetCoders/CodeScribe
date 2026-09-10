@@ -29,8 +29,8 @@ use crate::agent_delivery::{
     CsAgentDeliveryListener, set_delivery_listener, spawn_delivery_forwarder,
 };
 use crate::recording::{
-    CsAdmissionReadiness, CsEnergyCalibrationReport, CsLayerSummary, CsPresentationStatusEvent,
-    CsCaptureHandle, CsConditionalStop, CsTranscriptProjectionEvent, CsTranscription,
+    CsAdmissionReadiness, CsCaptureHandle, CsConditionalStop, CsEnergyCalibrationReport,
+    CsLayerSummary, CsPresentationStatusEvent, CsTranscriptProjectionEvent, CsTranscription,
     CsTranscriptionListener,
 };
 use crate::{CsError, application_runtime};
@@ -239,7 +239,9 @@ where
 
 /// Shutdown observes the same Stop owner. Never remove the shared controller
 /// before settlement; failed/pending teardown must retain an address for retry.
-async fn settle_controller_for_shutdown(controller: &Arc<RecordingController>) -> Result<(), CsError> {
+async fn settle_controller_for_shutdown(
+    controller: &Arc<RecordingController>,
+) -> Result<(), CsError> {
     controller.request_capture_shutdown();
     let outcome = controller.stop_current_capture().await;
     require_shutdown_settlement(outcome, controller.capture_shutdown_settled())
@@ -250,8 +252,7 @@ fn require_shutdown_settlement(
     quiescent: bool,
 ) -> Result<(), CsError> {
     match outcome {
-        Ok(CaptureStopOutcome::Stopped | CaptureStopOutcome::NoLiveCapture)
-            if quiescent => Ok(()),
+        Ok(CaptureStopOutcome::Stopped | CaptureStopOutcome::NoLiveCapture) if quiescent => Ok(()),
         Ok(outcome) => Err(CsError::Recording {
             msg: format!("application shutdown refused: Stop remains {outcome:?}"),
         }),
@@ -928,7 +929,9 @@ impl CodescribeHotkeys {
                 })?;
                 slot.as_ref().map(Arc::clone)
             };
-            let Some(controller) = controller else { return Ok(()); };
+            let Some(controller) = controller else {
+                return Ok(());
+            };
             controller
                 .stop_recording_from_external_surface()
                 .await
@@ -1438,12 +1441,19 @@ mod application_shutdown_tests {
 
     #[test]
     fn shutdown_requires_terminal_outcome_and_resource_quiescence() {
-        for outcome in [CaptureStopOutcome::Pending, CaptureStopOutcome::AlreadyStopping,
-            CaptureStopOutcome::AdmissionUnavailable, CaptureStopOutcome::ForeignCapture] {
+        for outcome in [
+            CaptureStopOutcome::Pending,
+            CaptureStopOutcome::AlreadyStopping,
+            CaptureStopOutcome::AdmissionUnavailable,
+            CaptureStopOutcome::ForeignCapture,
+        ] {
             assert!(require_shutdown_settlement(Ok(outcome), false).is_err());
             assert!(require_shutdown_settlement(Ok(outcome), true).is_err());
         }
-        for outcome in [CaptureStopOutcome::Stopped, CaptureStopOutcome::NoLiveCapture] {
+        for outcome in [
+            CaptureStopOutcome::Stopped,
+            CaptureStopOutcome::NoLiveCapture,
+        ] {
             assert!(require_shutdown_settlement(Ok(outcome), false).is_err());
             assert!(require_shutdown_settlement(Ok(outcome), true).is_ok());
         }
@@ -1455,7 +1465,10 @@ mod application_shutdown_tests {
         let controller = Arc::new(RecordingController::new_without_keychain());
         let store = Arc::new(Mutex::new(Some(Arc::clone(&controller))));
         settle_controller_for_shutdown(&controller).await.unwrap();
-        assert!(Arc::ptr_eq(&current_controller(&store).unwrap(), &controller));
+        assert!(Arc::ptr_eq(
+            &current_controller(&store).unwrap(),
+            &controller
+        ));
         assert!(controller.capture_shutdown_settled());
         assert!(controller.start_composer_turn_recording().await.is_err());
     }
@@ -1924,9 +1937,13 @@ async fn stop_composer_capture(
     let Some(controller) = controller else {
         return Ok(CsConditionalStop::NoLiveCapture);
     };
-    controller.stop_capture_if_owned(&handle.capture_id).await
+    controller
+        .stop_capture_if_owned(&handle.capture_id)
+        .await
         .map(CsConditionalStop::from)
-        .map_err(|error| CsError::Recording { msg: error.to_string() })
+        .map_err(|error| CsError::Recording {
+            msg: error.to_string(),
+        })
 }
 
 impl From<CaptureStopOutcome> for CsConditionalStop {
@@ -1950,11 +1967,23 @@ mod composer_stop_bridge_tests {
     fn pending_and_unavailable_are_preserved_by_the_production_mapping() {
         for (source, target) in [
             (CaptureStopOutcome::Stopped, CsConditionalStop::Stopped),
-            (CaptureStopOutcome::ForeignCapture, CsConditionalStop::ForeignCapture),
-            (CaptureStopOutcome::NoLiveCapture, CsConditionalStop::NoLiveCapture),
-            (CaptureStopOutcome::AlreadyStopping, CsConditionalStop::AlreadyStopping),
+            (
+                CaptureStopOutcome::ForeignCapture,
+                CsConditionalStop::ForeignCapture,
+            ),
+            (
+                CaptureStopOutcome::NoLiveCapture,
+                CsConditionalStop::NoLiveCapture,
+            ),
+            (
+                CaptureStopOutcome::AlreadyStopping,
+                CsConditionalStop::AlreadyStopping,
+            ),
             (CaptureStopOutcome::Pending, CsConditionalStop::Pending),
-            (CaptureStopOutcome::AdmissionUnavailable, CsConditionalStop::AdmissionUnavailable),
+            (
+                CaptureStopOutcome::AdmissionUnavailable,
+                CsConditionalStop::AdmissionUnavailable,
+            ),
         ] {
             assert_eq!(CsConditionalStop::from(source), target);
         }
@@ -1964,7 +1993,12 @@ mod composer_stop_bridge_tests {
     fn held_controller_store_refuses_without_waiting_or_creating_a_controller() {
         let store: SharedController = Arc::new(Mutex::new(None));
         let held = store.lock().unwrap();
-        let mut call = Box::pin(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }));
+        let mut call = Box::pin(stop_composer_capture(
+            &store,
+            CsCaptureHandle {
+                capture_id: "mine".to_string(),
+            },
+        ));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let std::task::Poll::Ready(result) = call.as_mut().poll(&mut context) else {
             panic!("named bridge Stop must refuse before suspension on a held store");
@@ -1976,11 +2010,31 @@ mod composer_stop_bridge_tests {
     #[tokio::test]
     async fn absent_controller_and_idle_real_controller_report_no_live_capture() {
         let store: SharedController = Arc::new(Mutex::new(None));
-        assert_eq!(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }).await.unwrap(), CsConditionalStop::NoLiveCapture);
+        assert_eq!(
+            stop_composer_capture(
+                &store,
+                CsCaptureHandle {
+                    capture_id: "mine".to_string()
+                }
+            )
+            .await
+            .unwrap(),
+            CsConditionalStop::NoLiveCapture
+        );
         let controller = Arc::new(RecordingController::new_without_keychain());
         *store.lock().unwrap() = Some(Arc::clone(&controller));
         for _ in 0..2 {
-            assert_eq!(stop_composer_capture(&store, CsCaptureHandle { capture_id: "mine".to_string() }).await.unwrap(), CsConditionalStop::NoLiveCapture);
+            assert_eq!(
+                stop_composer_capture(
+                    &store,
+                    CsCaptureHandle {
+                        capture_id: "mine".to_string()
+                    }
+                )
+                .await
+                .unwrap(),
+                CsConditionalStop::NoLiveCapture
+            );
             assert_eq!(controller.current_state().await, State::Idle);
         }
     }

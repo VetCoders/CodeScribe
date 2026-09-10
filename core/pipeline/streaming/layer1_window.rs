@@ -168,10 +168,10 @@ fn build_flushes(pieces: Vec<CoalescedPiece>, neighbour_context: String) -> Vec<
     for piece in pieces {
         match runs.last_mut() {
             Some(run)
-                if run
-                    .last()
-                    .is_some_and(|previous| previous.sample_end == piece.sample_start
-                        && previous.occurrence.same_capture(&piece.occurrence)) =>
+                if run.last().is_some_and(|previous| {
+                    previous.sample_end == piece.sample_start
+                        && previous.occurrence.same_capture(&piece.occurrence)
+                }) =>
             {
                 run.push(piece);
             }
@@ -267,9 +267,20 @@ mod tests {
         let now = Instant::now();
         let mut buffer = Layer1Coalesce::default();
         buffer.set_neighbour("previous");
-        assert!(buffer.push_at(piece(1, "one", 0.0, 0.4, 1), 16_000, now).is_empty());
-        assert!(buffer.push_at(piece(2, "two", 0.4, 0.8, 1), 16_000,
-            now + Duration::from_millis(1_000)).is_empty());
+        assert!(
+            buffer
+                .push_at(piece(1, "one", 0.0, 0.4, 1), 16_000, now)
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .push_at(
+                    piece(2, "two", 0.4, 0.8, 1),
+                    16_000,
+                    now + Duration::from_millis(1_000)
+                )
+                .is_empty()
+        );
         let flushes = buffer.flush_due(now + Duration::from_millis(1_200));
         assert_eq!(flushes.len(), 1);
         assert_eq!(flushes[0].member_occurrences.len(), 2);
@@ -293,7 +304,10 @@ mod tests {
         assert_eq!(flushes[0].member_occurrences[0].1.capture_epoch, 1);
         assert_eq!(flushes[1].member_occurrences[0].1.capture_epoch, 2);
         for flush in flushes {
-            assert_eq!(flush.audio.len() as u64, flush.sample_end - flush.sample_start);
+            assert_eq!(
+                flush.audio.len() as u64,
+                flush.sample_end - flush.sample_start
+            );
         }
     }
 

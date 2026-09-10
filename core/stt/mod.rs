@@ -55,11 +55,15 @@ pub(crate) enum LocalExecutionBoundary {
 
 impl LocalExecutionControl {
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn limit_until(&self, deadline: std::time::Instant) -> std::time::Instant {
-        let mut current = self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut current = self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = current.map_or(deadline, |old| old.min(deadline));
         *current = Some(deadline);
         deadline
@@ -75,11 +79,17 @@ impl LocalExecutionControl {
 
     #[cfg(test)]
     pub(crate) fn cancelling_at(boundary: LocalExecutionBoundary) -> Self {
-        Self { cancel_at: Some(boundary), ..Self::default() }
+        Self {
+            cancel_at: Some(boundary),
+            ..Self::default()
+        }
     }
 
     pub(crate) fn check(&self) -> anyhow::Result<()> {
-        let deadline = *self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         anyhow::ensure!(
             !self.cancelled.load(std::sync::atomic::Ordering::Acquire)
                 && !deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
@@ -212,9 +222,7 @@ fn candle_transcribe_controlled(
     initial_prompt: Option<String>,
     control: &LocalExecutionControl,
 ) -> anyhow::Result<RawTranscript> {
-    whisper::singleton::transcribe_controlled(
-        audio, sample_rate, language, initial_prompt, control,
-    )
+    whisper::singleton::transcribe_controlled(audio, sample_rate, language, initial_prompt, control)
 }
 
 /// Non-blocking Candle long transcription: yields an error instead of waiting

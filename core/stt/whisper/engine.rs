@@ -359,8 +359,12 @@ impl LocalWhisperEngine {
         initial_prompt: Option<String>,
         work: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
-        let previous_prompt = std::mem::replace(&mut self.decoding_params.initial_prompt, initial_prompt);
-        let request = EngineRequest { engine: self, previous_prompt };
+        let previous_prompt =
+            std::mem::replace(&mut self.decoding_params.initial_prompt, initial_prompt);
+        let request = EngineRequest {
+            engine: self,
+            previous_prompt,
+        };
         work(&mut *request.engine)
     }
 
@@ -732,7 +736,10 @@ impl LocalWhisperEngine {
         };
 
         self.transcribe_samples_16k_raw(
-            &samples, language, debug_tokens, &crate::stt::LocalExecutionControl::default(),
+            &samples,
+            language,
+            debug_tokens,
+            &crate::stt::LocalExecutionControl::default(),
         )
     }
 
@@ -752,7 +759,10 @@ impl LocalWhisperEngine {
         language: Option<&str>,
     ) -> Result<RawTranscript> {
         self.transcribe_long_controlled(
-            audio, sample_rate, language, &crate::stt::LocalExecutionControl::default(),
+            audio,
+            sample_rate,
+            language,
+            &crate::stt::LocalExecutionControl::default(),
         )
     }
 
@@ -871,7 +881,8 @@ impl LocalWhisperEngine {
                 continue;
             }
             let chunk = &samples[start..end];
-            let mut transcript = self.transcribe_samples_16k_raw(chunk, language, debug_tokens, control)?;
+            let mut transcript =
+                self.transcribe_samples_16k_raw(chunk, language, debug_tokens, control)?;
 
             // `merge_chunk_transcripts` refuses words without timestamp
             // provenance by contract. That refusal is the WINDOW's verdict,
@@ -992,7 +1003,10 @@ impl LocalWhisperEngine {
     /// scoring language token, so detection costs one step rather than a full
     /// decode.
     fn detect_language_16k(&mut self, samples_16k: &[f32]) -> Result<String> {
-        self.detect_language_16k_controlled(samples_16k, &crate::stt::LocalExecutionControl::default())
+        self.detect_language_16k_controlled(
+            samples_16k,
+            &crate::stt::LocalExecutionControl::default(),
+        )
     }
 
     fn detect_language_16k_controlled(
@@ -2456,15 +2470,20 @@ mod local_execution_control_tests {
         let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
         let model = Model::load(&vb, config.clone()).unwrap();
         let wordlevel = tokenizers::models::wordlevel::WordLevel::builder()
-            .vocab([
-                ("hello".to_string(), 0),
-                ("<|startoftranscript|>".to_string(), 1),
-                ("<|endoftext|>".to_string(), 2),
-                ("<|transcribe|>".to_string(), 3),
-                ("unknown".to_string(), 4),
-            ].into_iter().collect())
+            .vocab(
+                [
+                    ("hello".to_string(), 0),
+                    ("<|startoftranscript|>".to_string(), 1),
+                    ("<|endoftext|>".to_string(), 2),
+                    ("<|transcribe|>".to_string(), 3),
+                    ("unknown".to_string(), 4),
+                ]
+                .into_iter()
+                .collect(),
+            )
             .unk_token("unknown".into())
-            .build().unwrap();
+            .build()
+            .unwrap();
         LocalWhisperEngine {
             model,
             tokenizer: Tokenizer::new(wordlevel),
@@ -2472,31 +2491,60 @@ mod local_execution_control_tests {
             config,
             mel_filters: vec![0.0; 80 * 201],
             ts_range: None,
-            engine_provenance: TranscriptionEngineVerdict::whisper(TranscriptionEngineMode::RuntimeFallback),
-            decoding_params: DecodingParams { initial_prompt: Some("previous".into()), ..DecodingParams::default() },
+            engine_provenance: TranscriptionEngineVerdict::whisper(
+                TranscriptionEngineMode::RuntimeFallback,
+            ),
+            decoding_params: DecodingParams {
+                initial_prompt: Some("previous".into()),
+                ..DecodingParams::default()
+            },
         }
     }
 
     #[test]
     fn production_window_and_token_cancellation_restore_request_state() {
-        for boundary in [LocalExecutionBoundary::Window, LocalExecutionBoundary::Token] {
+        for boundary in [
+            LocalExecutionBoundary::Window,
+            LocalExecutionBoundary::Token,
+        ] {
             let mut engine = engine();
             let control = LocalExecutionControl::cancelling_at(boundary);
             let result = engine.with_request(Some("hello".into()), |engine| {
                 engine.transcribe_long_with_language_segments_using_silences(
-                    &[0.25; 3200], 16_000, Some("en"), &[], &mut |_| Ok(()), &control,
+                    &[0.25; 3200],
+                    16_000,
+                    Some("en"),
+                    &[],
+                    &mut |_| Ok(()),
+                    &control,
                 )
             });
             assert!(result.unwrap_err().to_string().contains("cancelled"));
-            assert!(control.check().is_err(), "the requested production boundary was reached");
-            assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+            assert!(
+                control.check().is_err(),
+                "the requested production boundary was reached"
+            );
+            assert_eq!(
+                engine.decoding_params.initial_prompt.as_deref(),
+                Some("previous")
+            );
             // An independent successor still executes the same decoder. It
             // cannot inherit the prior request's cancellation or prompt.
-            let successor = engine.with_request(None, |engine| {
-                engine.transcribe_samples_16k_raw(&[0.25; 3200], Some("en"), false, &LocalExecutionControl::default())
-            }).unwrap();
+            let successor = engine
+                .with_request(None, |engine| {
+                    engine.transcribe_samples_16k_raw(
+                        &[0.25; 3200],
+                        Some("en"),
+                        false,
+                        &LocalExecutionControl::default(),
+                    )
+                })
+                .unwrap();
             assert!(!successor.text.is_empty());
-            assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+            assert_eq!(
+                engine.decoding_params.initial_prompt.as_deref(),
+                Some("previous")
+            );
         }
     }
 
@@ -2507,11 +2555,17 @@ mod local_execution_control_tests {
             Err(anyhow!("injected decoder failure"))
         });
         assert!(failed.is_err());
-        assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+        assert_eq!(
+            engine.decoding_params.initial_prompt.as_deref(),
+            Some("previous")
+        );
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _: Result<()> = engine.with_request(None, |_| panic!("native worker panic"));
         }));
         assert!(unwind.is_err());
-        assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+        assert_eq!(
+            engine.decoding_params.initial_prompt.as_deref(),
+            Some("previous")
+        );
     }
 }

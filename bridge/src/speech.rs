@@ -45,7 +45,8 @@ pub async fn speak_text(text: String) -> Result<CsSpeechResult, CsError> {
         let played = tokio::task::spawn_blocking(move || {
             speech::playback::play(audio.samples, audio.sample_rate, ticket)
         })
-        .await.map_err(anyhow::Error::from)??;
+        .await
+        .map_err(anyhow::Error::from)??;
         Ok(CsSpeechResult {
             outcome: if played { "played" } else { "stopped" }.into(),
             duration_ms,
@@ -90,9 +91,10 @@ mod rc_w1_tests {
         .expect("stop must settle pending synthesis")
         .expect("stop is not a provider failure");
         assert!(result.is_none());
-        let result = synthesize_until_stopped(ticket, async { Err(speech::SpeechError::Http(403)) })
-            .await
-            .expect("a stopped request must not publish its late refusal");
+        let result =
+            synthesize_until_stopped(ticket, async { Err(speech::SpeechError::Http(403)) })
+                .await
+                .expect("a stopped request must not publish its late refusal");
         assert!(result.is_none());
     }
 }

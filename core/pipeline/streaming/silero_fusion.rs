@@ -629,7 +629,9 @@ pub fn bound_context_range(
         let want = utterance.sample_start.saturating_sub(pad_samples);
         range.sample_start = want.max(last_long_silence_end);
         if let Some(previous_end) = bounds.previous_utterance_end {
-            range.sample_start = range.sample_start.max(previous_end.min(utterance.sample_start));
+            range.sample_start = range
+                .sample_start
+                .max(previous_end.min(utterance.sample_start));
         }
     }
     if range.sample_start < last_long_silence_end
@@ -923,12 +925,8 @@ mod tests {
             capture_end: 80_000,
             ..ContextBounds::default()
         };
-        let padded = bound_context_range(
-            &utterance,
-            FusionContextMode::LeftAudioPad,
-            16_000,
-            &bounds,
-        );
+        let padded =
+            bound_context_range(&utterance, FusionContextMode::LeftAudioPad, 16_000, &bounds);
         assert_eq!(padded.sample_start, bounds.long_silence_fence);
         assert_eq!(padded.sample_end, 64_000);
 
@@ -989,7 +987,10 @@ mod tests {
                 ..ContextBounds::default()
             },
         );
-        assert_eq!(fenced.sample_start, 44_000, "left context clips at the fence");
+        assert_eq!(
+            fenced.sample_start, 44_000,
+            "left context clips at the fence"
+        );
 
         let at_eof = bound_context_range(
             &utterance,
@@ -1016,8 +1017,14 @@ mod tests {
                 ..ContextBounds::default()
             },
         );
-        assert_eq!(crowded.sample_start, 45_000, "left context stops after the previous span");
-        assert_eq!(crowded.sample_end, 67_000, "right context stops before the next span");
+        assert_eq!(
+            crowded.sample_start, 45_000,
+            "left context stops after the previous span"
+        );
+        assert_eq!(
+            crowded.sample_end, 67_000,
+            "right context stops before the next span"
+        );
 
         // A capture cursor already behind the utterance end (EOF quantisation)
         // must not invert the window or shrink what the caller asked to decode.
@@ -1275,7 +1282,10 @@ mod tests {
             .map(|range| range.sample_end - range.sample_start)
             .sum();
 
-        assert_eq!(utterance_samples, 160_000, "ownership keeps its padded window");
+        assert_eq!(
+            utterance_samples, 160_000,
+            "ownership keeps its padded window"
+        );
         assert_eq!(acoustic_samples, 18_048, "coverage measures the crossings");
         assert!(
             acoustic_samples < utterance_samples,
@@ -1332,8 +1342,14 @@ mod tests {
     /// `utterance_only`; this test is what the registry entry now states.
     #[test]
     fn context_mode_parser_is_symmetric_pad_by_default_and_names_its_own_tokens() {
-        assert_eq!(FusionContextMode::from_env_value(None), FusionContextMode::SymmetricPad);
-        assert_eq!(FusionContextMode::default(), FusionContextMode::SymmetricPad);
+        assert_eq!(
+            FusionContextMode::from_env_value(None),
+            FusionContextMode::SymmetricPad
+        );
+        assert_eq!(
+            FusionContextMode::default(),
+            FusionContextMode::SymmetricPad
+        );
 
         for token in ["utterance_only", "utterance-only", "exact", "  EXACT  "] {
             assert_eq!(
@@ -1343,7 +1359,10 @@ mod tests {
             );
         }
         for token in ["left_pad", "left-pad", "pad", "Left_Pad"] {
-            assert_eq!(FusionContextMode::from_env_value(Some(token)), FusionContextMode::LeftAudioPad);
+            assert_eq!(
+                FusionContextMode::from_env_value(Some(token)),
+                FusionContextMode::LeftAudioPad
+            );
         }
         for token in ["stable_prompt", "stable-text", "prompt"] {
             assert_eq!(
@@ -1425,7 +1444,10 @@ mod tests {
             first_context.sample_end > second_context.sample_start,
             "this fixture must actually overlap, or it proves nothing"
         );
-        assert_eq!(first_context.sample_start, 0, "clamped at the session start");
+        assert_eq!(
+            first_context.sample_start, 0,
+            "clamped at the session start"
+        );
         assert_eq!(second_context.sample_end, 40_000, "clamped at captured PCM");
 
         // The owned ranges are separate values and were not touched.

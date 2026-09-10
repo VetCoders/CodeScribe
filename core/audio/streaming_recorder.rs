@@ -142,7 +142,11 @@ pub struct CaptureStopFailure {
 
 impl std::fmt::Display for CaptureStopFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "capture processing failed: {:#}; committed text unavailable", self.cause)?;
+        write!(
+            f,
+            "capture processing failed: {:#}; committed text unavailable",
+            self.cause
+        )?;
         if let Some(path) = &self.audio_path {
             write!(f, "; source WAV retained at {}", path.display())?;
         } else {
@@ -621,7 +625,10 @@ impl StreamingRecorder {
         // handle. Named controller Stop keeps this future alive across expiry.
         let task_failure = if let Some(handle) = self.transcription_handle.as_mut() {
             debug!("Waiting for transcription session task to finish...");
-            handle.await.context("Transcription session task failed").err()
+            handle
+                .await
+                .context("Transcription session task failed")
+                .err()
         } else {
             None
         };
@@ -1420,12 +1427,16 @@ mod capture_stop_failure_tests {
     }
 
     fn write_wav(path: &std::path::Path) -> Vec<u8> {
-        let mut writer = hound::WavWriter::create(path, hound::WavSpec {
-            channels: 1,
-            sample_rate: 16_000,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        }).unwrap();
+        let mut writer = hound::WavWriter::create(
+            path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
         for sample in [123_i16, -456, 789, -321] {
             writer.write_sample(sample).unwrap();
         }
@@ -1458,13 +1469,26 @@ mod capture_stop_failure_tests {
         recorder.transcription_handle = Some(tokio::spawn(async {
             panic!("controlled transcription failure");
         }));
-        let error = recorder.complete_stop(Ok(Some(path.clone()))).await.unwrap_err();
+        let error = recorder
+            .complete_stop(Ok(Some(path.clone())))
+            .await
+            .unwrap_err();
         let failure = error.downcast_ref::<CaptureStopFailure>().unwrap();
         assert_eq!(failure.session_id.as_deref(), Some("capture-owner"));
         assert_eq!(failure.capture_epoch, 7);
         assert_eq!(failure.audio_path.as_deref(), Some(path.as_path()));
-        assert!(failure.cause.downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
-        assert!(error.to_string().contains("controlled transcription failure"));
+        assert!(
+            failure
+                .cause
+                .downcast_ref::<tokio::task::JoinError>()
+                .unwrap()
+                .is_panic()
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("controlled transcription failure")
+        );
         assert!(!format!("{error:?}").contains("UNAUTHENTICATED PREVIEW"));
         assert!(error.downcast_ref::<TerminalSealRefused>().is_none());
         let archive = receiver.try_recv().unwrap().unwrap();
@@ -1480,20 +1504,48 @@ mod capture_stop_failure_tests {
     #[tokio::test(start_paused = true)]
     async fn archive_failure_reaps_worker_and_preserves_both_errors_without_a_path() {
         let mut recorder = recorder();
-        recorder.set_event_sink(Some(Arc::new(crate::pipeline::sinks::CollectorEventSink::new())));
+        recorder.set_event_sink(Some(Arc::new(
+            crate::pipeline::sinks::CollectorEventSink::new(),
+        )));
         let (sender, receiver) = std::sync::mpsc::channel();
         recorder.terminal_audio_sender = Some(sender);
         recorder.transcription_handle = Some(tokio::spawn(async {
             panic!("secondary worker failure");
         }));
-        let error = recorder.complete_stop(Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied, "archive denied",
-        ).into())).await.unwrap_err();
+        let error = recorder
+            .complete_stop(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "archive denied",
+            )
+            .into()))
+            .await
+            .unwrap_err();
         let failure = error.downcast_ref::<CaptureStopFailure>().unwrap();
-        assert_eq!(failure.cause.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(failure.task_failure.as_ref().unwrap().downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
+        assert_eq!(
+            failure
+                .cause
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            failure
+                .task_failure
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<tokio::task::JoinError>()
+                .unwrap()
+                .is_panic()
+        );
         assert!(failure.audio_path.is_none());
-        assert!(receiver.try_recv().unwrap().unwrap_err().contains("archive denied"));
+        assert!(
+            receiver
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("archive denied")
+        );
         assert_released(&recorder);
     }
 
@@ -1510,7 +1562,13 @@ mod capture_stop_failure_tests {
         assert!(failure.audio_path.is_none());
         assert_eq!(failure.session_id.as_deref(), Some("capture-owner"));
         assert_eq!(failure.capture_epoch, 7);
-        assert!(failure.cause.downcast_ref::<tokio::task::JoinError>().unwrap().is_panic());
+        assert!(
+            failure
+                .cause
+                .downcast_ref::<tokio::task::JoinError>()
+                .unwrap()
+                .is_panic()
+        );
         assert_released(&recorder);
     }
 
@@ -1522,9 +1580,18 @@ mod capture_stop_failure_tests {
         recorder.transcription_handle = Some(tokio::spawn(async move {
             completed.store(true, Ordering::SeqCst);
         }));
-        let error = recorder.complete_stop(Err(anyhow!("archive failed"))).await.unwrap_err();
+        let error = recorder
+            .complete_stop(Err(anyhow!("archive failed")))
+            .await
+            .unwrap_err();
         assert!(joined.load(Ordering::SeqCst));
-        assert!(error.downcast_ref::<CaptureStopFailure>().unwrap().task_failure.is_none());
+        assert!(
+            error
+                .downcast_ref::<CaptureStopFailure>()
+                .unwrap()
+                .task_failure
+                .is_none()
+        );
         assert_released(&recorder);
     }
 
@@ -1542,7 +1609,10 @@ mod capture_stop_failure_tests {
             speech_samples: 4,
             covered_samples: 0,
             uncovered_speech_ranges: vec![crate::stt::tail_provider::TailSampleRange {
-                session: "capture-owner".into(), capture_epoch: 7, sample_start: 0, sample_end: 4,
+                session: "capture-owner".into(),
+                capture_epoch: 7,
+                sample_start: 0,
+                sample_end: 4,
             }],
             max_uncovered_samples: 4,
             incomplete_threshold_samples: 1,
@@ -1553,24 +1623,37 @@ mod capture_stop_failure_tests {
         let execution = Arc::new(LocalExecutionOwner::default());
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let result = execution.spawn(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-            Ok("late label")
-        }).unwrap();
+        let result = execution
+            .spawn(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok("late label")
+            })
+            .unwrap();
         entered_rx.await.unwrap();
         drop(result); // closed ledger no longer consumes local labels
         recorder.transcription_handle = Some(tokio::spawn(async move {
             execution.close_and_join().await;
         }));
         let pending = tokio::time::timeout(
-            std::time::Duration::from_millis(20), recorder.complete_stop(Ok(Some(path.clone()))),
-        ).await;
+            std::time::Duration::from_millis(20),
+            recorder.complete_stop(Ok(Some(path.clone()))),
+        )
+        .await;
         let retained = recorder.transcription_handle.is_some();
         release_tx.send(()).unwrap();
-        let error = recorder.complete_stop(Ok(Some(path.clone()))).await.unwrap_err();
-        assert!(pending.is_err(), "Stop must await actual retained execution");
-        assert!(retained, "caller expiry must leave the session handle available for retry");
+        let error = recorder
+            .complete_stop(Ok(Some(path.clone())))
+            .await
+            .unwrap_err();
+        assert!(
+            pending.is_err(),
+            "Stop must await actual retained execution"
+        );
+        assert!(
+            retained,
+            "caller expiry must leave the session handle available for retry"
+        );
         let refused = error.downcast_ref::<TerminalSealRefused>().unwrap();
         assert_eq!(refused.receipt, receipt);
         assert_eq!(refused.audio_path.as_ref(), Some(&path));

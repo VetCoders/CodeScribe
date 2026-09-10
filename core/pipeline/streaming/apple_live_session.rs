@@ -67,15 +67,16 @@ use crate::pipeline::contracts::{EngineEvent, EventSink, TranscriptSegment};
 use crate::stt::apple_stt::{LiveStreamEvent, LiveStreamSession};
 use crate::stt::tail_patcher::{SkipReasonCode, TailPatchConfig, TailPatchOutcome};
 use crate::stt::tail_provider::{
-    InProcessTailProvider, TailProviderPayload, TailProviderRequest,
-    TailRequestIdentity, TailSampleRange, TimedTailSegment,
+    InProcessTailProvider, TailProviderPayload, TailProviderRequest, TailRequestIdentity,
+    TailSampleRange, TimedTailSegment,
 };
 
 use super::layer1_window::{CoalesceFlush, CoalescedPiece, Layer1Coalesce};
 use super::live_audio_buffer::{DEFAULT_RETENTION_SECS, LiveAudioBuffer, ResolvedAudioWindow};
 use super::session::{
-    LocalExecutionOwner, SessionConfig, TailPatchDrainDisposition, TailPatchJobResult, TailPatchSessionReceipt,
-    compute_tail_patch_job, emit_session_finalised, log_tail_patch_session_receipt,
+    LocalExecutionOwner, SessionConfig, TailPatchDrainDisposition, TailPatchJobResult,
+    TailPatchSessionReceipt, compute_tail_patch_job, emit_session_finalised,
+    log_tail_patch_session_receipt,
 };
 use super::silero_fusion::{
     ContextBounds, FusionContextMode, FusionWord, SileroIngress, bound_context_range,
@@ -1221,7 +1222,9 @@ impl AppleSealState {
         {
             return false;
         }
-        let mut ledger = self.acoustic_ledger.lock()
+        let mut ledger = self
+            .acoustic_ledger
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !ledger.is_qualified(&occurrence) || ledger.is_sealed(&occurrence) {
             return false;
@@ -1251,7 +1254,10 @@ impl AppleSealState {
             self.layer1_coalesce
                 .set_neighbour(self.sealed_prefix.clone());
         }
-        for flush in self.layer1_coalesce.push_at(piece, self.sample_rate, self.refinement_clock) {
+        for flush in self
+            .layer1_coalesce
+            .push_at(piece, self.sample_rate, self.refinement_clock)
+        {
             // A pause can flush A while B becomes the newly held member. A's
             // transport outcome must never revoke B's accepted ownership.
             let _ = self.queue_layer1_flush(ev_tx, flush);
@@ -1276,9 +1282,13 @@ impl AppleSealState {
         ev_tx: &mpsc::UnboundedSender<EngineEvent>,
         flush: CoalesceFlush,
     ) -> bool {
-        let identity = flush.member_occurrences.first().map(|(_, occurrence)| occurrence);
+        let identity = flush
+            .member_occurrences
+            .first()
+            .map(|(_, occurrence)| occurrence);
         let valid = identity.is_some_and(|first| {
-            first.session == self.session_id && first.capture_epoch == self.capture_epoch
+            first.session == self.session_id
+                && first.capture_epoch == self.capture_epoch
                 && flush.member_occurrences.iter().all(|(_, member)| {
                     member.same_capture(first)
                         && member.sample_start >= flush.sample_start
@@ -1314,12 +1324,17 @@ impl AppleSealState {
             member_occurrences: flush.member_occurrences,
         };
         self.retry_refinements(ev_tx);
-        let pending_samples: usize = self.refinement_pending.iter().map(|job| job.audio.len()).sum();
+        let pending_samples: usize = self
+            .refinement_pending
+            .iter()
+            .map(|job| job.audio.len())
+            .sum();
         if self.refinement_pending.len() >= LIVE_REFINEMENT_PENDING_CAP
             || pending_samples.saturating_add(request.audio.len())
                 > self.sample_rate.max(1) as usize * LIVE_REFINEMENT_PCM_SECS
         {
-            self.tail_patch_backpressure_drops = self.tail_patch_backpressure_drops.saturating_add(1);
+            self.tail_patch_backpressure_drops =
+                self.tail_patch_backpressure_drops.saturating_add(1);
             for (id, occurrence) in &request.member_occurrences {
                 self.fail_refinement(ev_tx, *id, occurrence, RefinementFailure::BacklogExhausted);
             }
@@ -1354,8 +1369,11 @@ impl AppleSealState {
             code: reason.code().into(),
             message: format!(
                 "session={} epoch={} occurrence={} samples={}..{} refinement_not_completed=true",
-                occurrence.session, occurrence.capture_epoch, id,
-                occurrence.sample_start, occurrence.sample_end,
+                occurrence.session,
+                occurrence.capture_epoch,
+                id,
+                occurrence.sample_start,
+                occurrence.sample_end,
             ),
         });
         self.return_whisper_without_label(ev_tx, id, occurrence);
@@ -1381,8 +1399,10 @@ impl AppleSealState {
                     for (_, occurrence) in &inflight.member_occurrences {
                         self.refinement_receipt(occurrence, "submitted");
                     }
-                    self.refinement_submitted.insert(inflight.utterance_id, inflight);
-                    self.tail_patch_awaiting_completion = self.tail_patch_awaiting_completion.saturating_add(1);
+                    self.refinement_submitted
+                        .insert(inflight.utterance_id, inflight);
+                    self.tail_patch_awaiting_completion =
+                        self.tail_patch_awaiting_completion.saturating_add(1);
                 }
                 Err(mpsc::error::TrySendError::Full(request)) => {
                     self.refinement_pending.push_front(request);
@@ -1461,10 +1481,13 @@ impl AppleSealState {
             payload,
             member_occurrences,
         } = completion;
-        let matched = self.refinement_submitted.get(&utterance_id).is_some_and(|job| {
-            request_identity.as_ref() == Some(&job.request_identity)
-                && member_occurrences == job.member_occurrences
-        });
+        let matched = self
+            .refinement_submitted
+            .get(&utterance_id)
+            .is_some_and(|job| {
+                request_identity.as_ref() == Some(&job.request_identity)
+                    && member_occurrences == job.member_occurrences
+            });
         if !matched {
             return;
         }
@@ -1539,22 +1562,26 @@ impl AppleSealState {
             });
             let no_label = label.is_none();
             match admit_ledger_label(
-                    self,
-                    ev_tx,
-                    LabelAdmission {
-                        observation: LedgerObservationIdentity::new(
-                            LedgerObservationProducer::Whisper,
-                            request_id,
-                            generation as u64,
-                            occurrence.clone(),
-                        ),
-                        label: label.as_deref().unwrap_or(""),
-                        energy: EnergyAdmission::RequireExistingQualification,
-                    },
-                ) {
+                self,
+                ev_tx,
+                LabelAdmission {
+                    observation: LedgerObservationIdentity::new(
+                        LedgerObservationProducer::Whisper,
+                        request_id,
+                        generation as u64,
+                        occurrence.clone(),
+                    ),
+                    label: label.as_deref().unwrap_or(""),
+                    energy: EnergyAdmission::RequireExistingQualification,
+                },
+            ) {
                 Some(receipt) => {
                     mutation_admitted |= receipt.grants_mutation();
-                    if matches!(receipt, MutationReceipt::Refuse { .. } | MutationReceipt::KeepVisibleUnanchored { .. }) {
+                    if matches!(
+                        receipt,
+                        MutationReceipt::Refuse { .. }
+                            | MutationReceipt::KeepVisibleUnanchored { .. }
+                    ) {
                         let reason = if no_label {
                             RefinementFailure::NoLabel
                         } else {
@@ -1564,9 +1591,12 @@ impl AppleSealState {
                     } else {
                         // The reducer's committed label also supplies final telemetry;
                         // a Whisper-first occurrence has no earlier Apple baseline.
-                        let label = self.acoustic_ledger.lock()
+                        let label = self
+                            .acoustic_ledger
+                            .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .text_of(occurrence).map(str::to_owned);
+                            .text_of(occurrence)
+                            .map(str::to_owned);
                         if let Some(label) = label
                             && let Some(pending) = self.pending_events.get_mut(member_id)
                         {
@@ -1575,7 +1605,9 @@ impl AppleSealState {
                         self.refinement_receipt(occurrence, "completed");
                     }
                 }
-                None => self.fail_refinement(ev_tx, *member_id, occurrence, RefinementFailure::NoLabel),
+                None => {
+                    self.fail_refinement(ev_tx, *member_id, occurrence, RefinementFailure::NoLabel)
+                }
             }
             self.emit_pending_seal(ev_tx, *member_id);
         }
@@ -1600,16 +1632,23 @@ impl AppleSealState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !ledger.frontier_of(occurrence).is_some_and(|frontier| {
-            frontier.open_producers().contains(&LedgerObservationProducer::Whisper)
+            frontier
+                .open_producers()
+                .contains(&LedgerObservationProducer::Whisper)
         }) {
             return;
         }
         let observation = LedgerObservationIdentity::new(
-            LedgerObservationProducer::Whisper, utterance_id, 0, occurrence.clone(),
+            LedgerObservationProducer::Whisper,
+            utterance_id,
+            0,
+            occurrence.clone(),
         );
         let receipt = ledger.admit(&observation, "");
         let _ = ev_tx.send(EngineEvent::LedgerMutation {
-            observation, label: String::new(), receipt,
+            observation,
+            label: String::new(),
+            receipt,
         });
         let formatter_scheduled = schedule_formatter_after_terminal_label(
             &mut ledger,
@@ -1705,7 +1744,9 @@ impl AppleSealState {
                 .collect::<Vec<_>>()
         };
         for occurrence in occurrences {
-            let id = self.pending_events.iter()
+            let id = self
+                .pending_events
+                .iter()
                 .find_map(|(id, pending)| (pending.occurrence == occurrence).then_some(*id))
                 .unwrap_or(0);
             self.fail_refinement(ev_tx, id, &occurrence, RefinementFailure::StopDeadline);
@@ -2228,7 +2269,8 @@ fn reconcile_silero_ledger(
     }) {
         let _ = ev_tx.send(EngineEvent::Warning {
             code: RefinementFailure::InvalidIdentity.code().into(),
-            message: "Silero evidence belongs to another capture; current occurrence unchanged".into(),
+            message: "Silero evidence belongs to another capture; current occurrence unchanged"
+                .into(),
         });
         return false;
     }
@@ -2288,7 +2330,10 @@ fn reconcile_silero_ledger(
         if state.reconciled_silero.contains(&utterance_id) {
             continue;
         }
-        let candidates = state.pending_silero_words.remove(&utterance_id).unwrap_or_default();
+        let candidates = state
+            .pending_silero_words
+            .remove(&utterance_id)
+            .unwrap_or_default();
         // Replayed exact word coordinates revise that word, not a second
         // acoustic occurrence. Disjoint equal words survive independently.
         let mut by_range = BTreeMap::new();
@@ -2341,14 +2386,20 @@ fn reconcile_silero_ledger(
         // Lexicon reports a no-change observation for the same exact label and
         // range. Callback-wide text is never copied across sliced occurrences.
         let occurrence = OccurrenceIdentity::from(&silero.range);
-        let first_attempt = state.acoustic_ledger.lock()
+        let first_attempt = state
+            .acoustic_ledger
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frontier_of(&occurrence).is_none();
+            .frontier_of(&occurrence)
+            .is_none();
         if first_attempt {
             state.refinement_receipt(&occurrence, "closed");
         }
         if !qualify_owned_occurrence(state, &occurrence) {
-            let reason = if state.window_by_samples(occurrence.sample_start, occurrence.sample_end).is_none() {
+            let reason = if state
+                .window_by_samples(occurrence.sample_start, occurrence.sample_end)
+                .is_none()
+            {
                 RefinementFailure::PcmUnavailable
             } else {
                 RefinementFailure::QualificationRefused
@@ -2358,16 +2409,23 @@ fn reconcile_silero_ledger(
             continue;
         }
         if has_apple_label {
-            let mut ledger = state.acoustic_ledger.lock()
+            let mut ledger = state
+                .acoustic_ledger
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if ledger.is_sealed(&occurrence) {
                 // Successful seals stay immutable; retain the refusal evidence.
                 let observation = LedgerObservationIdentity::new(
-                    LedgerObservationProducer::Apple, utterance_id, 0, occurrence.clone(),
+                    LedgerObservationProducer::Apple,
+                    utterance_id,
+                    0,
+                    occurrence.clone(),
                 );
                 let receipt = ledger.admit(&observation, &text);
                 let _ = ev_tx.send(EngineEvent::LedgerMutation {
-                    observation, label: text.clone(), receipt,
+                    observation,
+                    label: text.clone(),
+                    receipt,
                 });
                 drop(ledger);
                 state.reconciled_silero.insert(utterance_id);
@@ -2377,7 +2435,10 @@ fn reconcile_silero_ledger(
             // truth. Extend its accounting only with the real words now held;
             // the ledger preserves prior returns and rejects producer replay.
             let observation = LedgerObservationIdentity::new(
-                LedgerObservationProducer::Apple, utterance_id, 0, occurrence.clone(),
+                LedgerObservationProducer::Apple,
+                utterance_id,
+                0,
+                occurrence.clone(),
             );
             if !ledger.schedule_late_apple_label(&observation, &text)
                 && ledger.frontier_of(&occurrence).is_some()
@@ -2387,20 +2448,24 @@ fn reconcile_silero_ledger(
             }
             state.reconciled_silero.insert(utterance_id);
         }
-        let apple_admitted = if has_apple_label { admit_ledger_label(
-            state,
-            ev_tx,
-            LabelAdmission {
-                observation: LedgerObservationIdentity::new(
-                    LedgerObservationProducer::Apple,
-                    utterance_id,
-                    0,
-                    occurrence.clone(),
-                ),
-                label: &text,
-                energy: EnergyAdmission::RequireExistingQualification,
-            },
-        ) } else { None };
+        let apple_admitted = if has_apple_label {
+            admit_ledger_label(
+                state,
+                ev_tx,
+                LabelAdmission {
+                    observation: LedgerObservationIdentity::new(
+                        LedgerObservationProducer::Apple,
+                        utterance_id,
+                        0,
+                        occurrence.clone(),
+                    ),
+                    label: &text,
+                    energy: EnergyAdmission::RequireExistingQualification,
+                },
+            )
+        } else {
+            None
+        };
         if !has_apple_label && !first_attempt {
             continue;
         }
@@ -2457,23 +2522,28 @@ fn reconcile_silero_ledger(
                 state.window_by_samples(silero.range.sample_start, silero.range.sample_end)
             });
         let _current_piece_owned = if let Some(window) = window {
-                let committed_text = text.clone();
-                state.enqueue_layer1_piece(
-                    ev_tx,
-                    CoalescedPiece {
-                        utterance_id,
-                        occurrence: occurrence.clone(),
-                        committed_text,
-                        audio: window.samples,
-                        sample_start: window.sample_start,
-                        sample_end: window.sample_end,
-                        start_ts: span_start,
-                        covered_through_secs: span_end,
-                        segment_count: disjoint.len().max(1),
-                    },
-                )
+            let committed_text = text.clone();
+            state.enqueue_layer1_piece(
+                ev_tx,
+                CoalescedPiece {
+                    utterance_id,
+                    occurrence: occurrence.clone(),
+                    committed_text,
+                    audio: window.samples,
+                    sample_start: window.sample_start,
+                    sample_end: window.sample_end,
+                    start_ts: span_start,
+                    covered_through_secs: span_end,
+                    segment_count: disjoint.len().max(1),
+                },
+            )
         } else {
-            state.fail_refinement(ev_tx, utterance_id, &occurrence, RefinementFailure::PcmUnavailable);
+            state.fail_refinement(
+                ev_tx,
+                utterance_id,
+                &occurrence,
+                RefinementFailure::PcmUnavailable,
+            );
             false
         };
         if apple_admitted.is_some() {
@@ -2539,12 +2609,15 @@ fn qualify_owned_occurrence(state: &AppleSealState, occurrence: &OccurrenceIdent
     let Some(calibration) = state.energy_calibration.as_ref() else {
         return false;
     };
-    let mut ledger = state.acoustic_ledger.lock()
+    let mut ledger = state
+        .acoustic_ledger
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if ledger.is_qualified(occurrence) {
         return true;
     }
-    let Some(window) = state.window_by_samples(occurrence.sample_start, occurrence.sample_end) else {
+    let Some(window) = state.window_by_samples(occurrence.sample_start, occurrence.sample_end)
+    else {
         return false;
     };
     if window.samples.is_empty() {
@@ -2599,13 +2672,17 @@ fn admit_ledger_label(
     if occurrence.session != state.session_id || occurrence.capture_epoch != state.capture_epoch {
         return None;
     }
-    if matches!(energy, EnergyAdmission::QualifyFromOwnedPcm | EnergyAdmission::QualifyFinalPassGap)
-        && !qualify_owned_occurrence(state, &occurrence)
+    if matches!(
+        energy,
+        EnergyAdmission::QualifyFromOwnedPcm | EnergyAdmission::QualifyFinalPassGap
+    ) && !qualify_owned_occurrence(state, &occurrence)
     {
         return None;
     }
     let formatter = state.formatter.clone();
-    let mut ledger = state.acoustic_ledger.lock()
+    let mut ledger = state
+        .acoustic_ledger
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !ledger.is_qualified(&occurrence) {
         return None;
@@ -2818,7 +2895,9 @@ fn coverage_speech_ranges_with_source(
     let acoustic = fusion.acoustic_speech_ranges(samples_seen);
     let utterances = fusion_utterance_ranges(state);
     match select_coverage_speech_source(!acoustic.is_empty(), !utterances.is_empty()) {
-        CoverageSpeechSource::SileroBoundaries => (acoustic, CoverageSpeechSource::SileroBoundaries),
+        CoverageSpeechSource::SileroBoundaries => {
+            (acoustic, CoverageSpeechSource::SileroBoundaries)
+        }
         CoverageSpeechSource::FusionUtterances => {
             (utterances, CoverageSpeechSource::FusionUtterances)
         }
@@ -2914,9 +2993,13 @@ fn repair_terminal_seal_coverage(
     language: Option<&str>,
     execution: &LocalExecutionOwner,
 ) -> SealCoverageReceipt {
-    repair_terminal_seal_coverage_with(state, ev_tx, language, execution, |request, pcm, control| {
-        InProcessTailProvider.transcribe_controlled(request, pcm, control)
-    })
+    repair_terminal_seal_coverage_with(
+        state,
+        ev_tx,
+        language,
+        execution,
+        |request, pcm, control| InProcessTailProvider.transcribe_controlled(request, pcm, control),
+    )
 }
 
 fn repair_terminal_seal_coverage_with<F>(
@@ -2927,8 +3010,14 @@ fn repair_terminal_seal_coverage_with<F>(
     transcribe: F,
 ) -> SealCoverageReceipt
 where
-    F: Fn(&TailProviderRequest, &[f32], &crate::stt::LocalExecutionControl)
-        -> Result<TailProviderPayload> + Clone + Send + 'static,
+    F: Fn(
+            &TailProviderRequest,
+            &[f32],
+            &crate::stt::LocalExecutionControl,
+        ) -> Result<TailProviderPayload>
+        + Clone
+        + Send
+        + 'static,
 {
     // Idempotent: this cannot extend the live drain deadline. All gaps share
     // its remaining budget, including time spent waiting for a foreign holder.
@@ -2988,13 +3077,13 @@ where
         };
         let job_request = request.clone();
         let transcribe = transcribe.clone();
-        let result = execution.spawn(move |control| {
-            transcribe(&job_request, &window.samples, control)
-        }).and_then(|receiver| {
-            // This is the existing blocking Apple worker, not a Tokio worker.
-            // Native work remains retained even if the result channel fails.
-            receiver.blocking_recv().map_err(anyhow::Error::from)?
-        });
+        let result = execution
+            .spawn(move |control| transcribe(&job_request, &window.samples, control))
+            .and_then(|receiver| {
+                // This is the existing blocking Apple worker, not a Tokio worker.
+                // Native work remains retained even if the result channel fails.
+                receiver.blocking_recv().map_err(anyhow::Error::from)?
+            });
         let result = execution.check().and(result);
         if !initial_published {
             let _ = ev_tx.send(EngineEvent::SealCoverage {
@@ -5117,7 +5206,6 @@ mod tests {
         assert!(patched.contains("powkurwiać się razem"));
     }
 
-
     fn count_iwo(text: &str) -> usize {
         text.split_whitespace()
             .filter(|word| {
@@ -5146,11 +5234,6 @@ mod tests {
             state.audio.push(chunk);
         }
     }
-
-
-
-
-
 
     /// A trailing cumulative callback can assert novel text after capture has
     /// already reached EOF. The text still belongs on the append-only canvas,
@@ -5235,17 +5318,6 @@ mod tests {
             "the later EOF suffix must remain on the canvas: {landed:?}"
         );
     }
-
-
-
-
-
-
-
-
-
-
-
 
     // ── W2-A · Layer 1 tail-patch on the Apple progressive path ──────────────
 
@@ -5656,8 +5728,6 @@ mod tests {
         assert!(!lane.forward_completion_to_worker(&done_tx, rejected));
     }
 
-
-
     /// SFSpeech may report a word end a few milliseconds past PCM capture.
     /// Ingestion clamps it once onto the integer sample clock; later stages do
     /// not compare the two floating clocks as if they were identical.
@@ -5744,9 +5814,6 @@ mod tests {
             "yet a span is still pending: waiting on this queue would hang on nothing"
         );
     }
-
-
-
 
     /// Compatibility parser semantics remain strict. Product-mode defaults are
     /// resolved at recording bootstrap, not by this parser alone.
@@ -6237,8 +6304,6 @@ mod tests {
         ]
     }
 
-
-
     /// (a) Utterance identity comes from the spectrum, and the seal carries it.
     ///
     /// Two Apple finals landing inside two Silero-bounded utterances must seal
@@ -6441,8 +6506,6 @@ mod tests {
         assert_eq!(sealed[0].range.sample_start, at(0.5));
         assert_eq!(sealed[0].range.sample_end, at(2.0));
     }
-
-
 }
 
 /// Conservation falsifiers from the acoustic-identity cut. These encode the
@@ -6750,10 +6813,7 @@ mod rc_w1_live_ledger_tests {
             SileroBoundaries,
             "crossings outrank the padded ownership windows"
         );
-        assert_eq!(
-            select_coverage_speech_source(true, false),
-            SileroBoundaries
-        );
+        assert_eq!(select_coverage_speech_source(true, false), SileroBoundaries);
         assert_eq!(
             select_coverage_speech_source(false, true),
             FusionUtterances,
@@ -6872,10 +6932,7 @@ mod rc_w1_live_ledger_tests {
         // change ratio, and every one of those payloads still reached the
         // ledger and persisted to the Bus.
         let skipped = legacy_char_diff_receipt(
-            &TailPatchOutcome::skipped(
-                SkipReasonCode::ChangeRatio,
-                "ratio 1.31 exceeds max 0.50",
-            ),
+            &TailPatchOutcome::skipped(SkipReasonCode::ChangeRatio, "ratio 1.31 exceeds max 0.50"),
             true,
         );
         assert_eq!(skipped.verdict, "skipped");
@@ -6992,11 +7049,17 @@ mod rc_w2_acoustic_tests {
     }
 
     fn gap_payload(request: &TailProviderRequest) -> TailProviderPayload {
-        use crate::stt::tail_provider::{TailEvidenceSource, TailEvidenceStability, TailProviderEvidence, TailProviderId, TailTimingQuality};
+        use crate::stt::tail_provider::{
+            TailEvidenceSource, TailEvidenceStability, TailProviderEvidence, TailProviderId,
+            TailTimingQuality,
+        };
         TailProviderPayload {
             identity: request.identity.clone(),
             text: "Iwo".into(),
-            segments: vec![TimedTailSegment { text: "Iwo".into(), range: request.identity.range.clone() }],
+            segments: vec![TimedTailSegment {
+                text: "Iwo".into(),
+                range: request.identity.range.clone(),
+            }],
             avg_logprob: None,
             compression_ratio: None,
             provider_id: TailProviderId::Fake,
@@ -7021,7 +7084,10 @@ mod rc_w2_acoustic_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let execution = LocalExecutionOwner::default();
         let receipt = repair_terminal_seal_coverage_with(
-            &mut state, &tx, Some("pl"), &execution,
+            &mut state,
+            &tx,
+            Some("pl"),
+            &execution,
             move |request, pcm, control| {
                 control.check()?;
                 request.validate_pcm(pcm)?;
@@ -7034,10 +7100,21 @@ mod rc_w2_acoustic_tests {
         assert_eq!(calls.len(), 2);
         for (call, range) in calls.iter().zip(&ranges) {
             assert_eq!(&call.range, range);
-            assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(&OccurrenceIdentity::from(range)), Some("Iwo"));
+            assert_eq!(
+                state
+                    .acoustic_ledger
+                    .lock()
+                    .unwrap()
+                    .text_of(&OccurrenceIdentity::from(range)),
+                Some("Iwo")
+            );
         }
         assert_ne!(calls[0].request_id, calls[1].request_id);
-        assert!(!warning_codes(&mut rx).iter().any(|code| code == "seal_coverage_gap_inference_failed"));
+        assert!(
+            !warning_codes(&mut rx)
+                .iter()
+                .any(|code| code == "seal_coverage_gap_inference_failed")
+        );
     }
 
     #[test]
@@ -7049,7 +7126,10 @@ mod rc_w2_acoustic_tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let execution = LocalExecutionOwner::default();
         let receipt = repair_terminal_seal_coverage_with(
-            &mut state, &tx, None, &execution,
+            &mut state,
+            &tx,
+            None,
+            &execution,
             move |request, pcm, control| {
                 request.validate_pcm(pcm)?;
                 observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7065,7 +7145,10 @@ mod rc_w2_acoustic_tests {
         assert_eq!(receipt.session_id, "expired-repair");
         assert_eq!(receipt.capture_epoch, 0);
         while let Ok(event) = rx.try_recv() {
-            assert!(!matches!(event, EngineEvent::LedgerMutation { .. } | EngineEvent::LedgerSeal { .. }));
+            assert!(!matches!(
+                event,
+                EngineEvent::LedgerMutation { .. } | EngineEvent::LedgerSeal { .. }
+            ));
         }
     }
 
@@ -7077,7 +7160,10 @@ mod rc_w2_acoustic_tests {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let execution = LocalExecutionOwner::default();
             let receipt = repair_terminal_seal_coverage_with(
-                &mut state, &tx, None, &execution,
+                &mut state,
+                &tx,
+                None,
+                &execution,
                 move |request, _, _| {
                     if !foreign {
                         anyhow::bail!("injected local failure");
@@ -7091,11 +7177,12 @@ mod rc_w2_acoustic_tests {
             assert_eq!(receipt.uncovered_speech_ranges, expected_ranges);
             assert_eq!(receipt.covered_samples, 0);
             let codes = warning_codes(&mut rx);
-            assert!(codes.iter().any(|code| code == if foreign {
-                "seal_coverage_gap_identity_mismatch"
-            } else {
-                "seal_coverage_gap_inference_failed"
-            }));
+            assert!(codes.iter().any(|code| code
+                == if foreign {
+                    "seal_coverage_gap_identity_mismatch"
+                } else {
+                    "seal_coverage_gap_inference_failed"
+                }));
         }
     }
 
@@ -7142,7 +7229,9 @@ mod rc_w2_acoustic_tests {
         codes
     }
 
-    fn coverage_receipts(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<SealCoverageReceipt> {
+    fn coverage_receipts(
+        rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
+    ) -> Vec<SealCoverageReceipt> {
         let mut receipts = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let EngineEvent::SealCoverage { receipt, .. } = event {
@@ -7182,7 +7271,12 @@ mod rc_w2_acoustic_tests {
         );
         assert_eq!(padded_answer.speech_samples, at(10.0));
 
-        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
+        let receipt = repair_terminal_seal_coverage(
+            &mut state,
+            &tx,
+            Some("pl"),
+            &LocalExecutionOwner::default(),
+        );
 
         assert_eq!(receipt.status, SealCoverageStatus::Complete);
         assert!(receipt.uncovered_speech_ranges.is_empty());
@@ -7249,7 +7343,12 @@ mod rc_w2_acoustic_tests {
         let _ = coverage_receipts(&mut rx);
 
         let published_before = publish_terminal_coverage(&state, &tx);
-        let repaired = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
+        let repaired = repair_terminal_seal_coverage(
+            &mut state,
+            &tx,
+            Some("pl"),
+            &LocalExecutionOwner::default(),
+        );
         let published_after = publish_terminal_coverage(&state, &tx);
 
         for other in [&repaired, &published_after] {
@@ -7282,14 +7381,18 @@ mod rc_w2_acoustic_tests {
         assert!(state.fusion.is_none());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
+        let receipt = repair_terminal_seal_coverage(
+            &mut state,
+            &tx,
+            Some("pl"),
+            &LocalExecutionOwner::default(),
+        );
 
         assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
         assert_eq!(receipt.speech_samples, at(3.0));
         assert_eq!(receipt.covered_samples, 0);
         assert!(
-            warning_codes(&mut rx)
-                .contains(&"seal_coverage_gap_pcm_unavailable".to_string()),
+            warning_codes(&mut rx).contains(&"seal_coverage_gap_pcm_unavailable".to_string()),
             "an unresolvable gap is a stated refusal, not a silent skip"
         );
         let ledger = state.acoustic_ledger.lock().unwrap();
@@ -7370,7 +7473,10 @@ mod rc_w2_acoustic_tests {
             12_000,
             "the immutable ledger threshold at 48 kHz"
         );
-        assert_eq!(u64::from(RATE) * SEAL_COVERAGE_INCOMPLETE_MS / 1_000, THRESHOLD);
+        assert_eq!(
+            u64::from(RATE) * SEAL_COVERAGE_INCOMPLETE_MS / 1_000,
+            THRESHOLD
+        );
 
         let mut state = one_burst_in_a_ten_second_take("rc-w2-threshold");
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -7380,7 +7486,8 @@ mod rc_w2_acoustic_tests {
             THRESHOLD
         );
         assert_eq!(
-            repair_terminal_seal_coverage(&mut state, &tx, None, &LocalExecutionOwner::default()).incomplete_threshold_samples,
+            repair_terminal_seal_coverage(&mut state, &tx, None, &LocalExecutionOwner::default())
+                .incomplete_threshold_samples,
             THRESHOLD
         );
     }
@@ -7447,12 +7554,8 @@ mod rc_w2_acoustic_tests {
     fn a_legacy_skip_verdict_still_reaches_ledger_admission() {
         let mut state = state_for("rc-w2-legacy-skip", 2.0);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let occurrence = OccurrenceIdentity::new(
-            state.session_id.clone(),
-            state.capture_epoch,
-            0,
-            at(1.0),
-        );
+        let occurrence =
+            OccurrenceIdentity::new(state.session_id.clone(), state.capture_epoch, 0, at(1.0));
         let range = TailSampleRange {
             session: state.session_id.clone(),
             capture_epoch: state.capture_epoch,
@@ -7492,10 +7595,7 @@ mod rc_w2_acoustic_tests {
                     )
                     .is_qualified()
             );
-            ledger.schedule_frontier(
-                occurrence.clone(),
-                vec![LedgerObservationProducer::Whisper],
-            );
+            ledger.schedule_frontier(occurrence.clone(), vec![LedgerObservationProducer::Whisper]);
         }
         state.pending_events.insert(
             9,
@@ -7530,11 +7630,8 @@ mod rc_w2_acoustic_tests {
             },
         };
 
-        let mut lane = AppleTailPatchLane::new(
-            RATE,
-            None,
-            crate::stt::tail_provider::TailProviderId::Fake,
-        );
+        let mut lane =
+            AppleTailPatchLane::new(RATE, None, crate::stt::tail_provider::TailProviderId::Fake);
         let completion = lane.finish_for_worker(
             Some(TailPatchInFlight {
                 utterance_id: 9,
@@ -7674,7 +7771,9 @@ mod rc_w2_acoustic_tests {
             speech.first()
         );
         assert!(
-            speech[1..].iter().all(|(_, d)| *d == EpochDecision::Forward),
+            speech[1..]
+                .iter()
+                .all(|(_, d)| *d == EpochDecision::Forward),
             "speech after the wake must forward, got {:?}",
             &speech[1..]
         );
@@ -7780,7 +7879,10 @@ mod rc_w2_acoustic_tests {
             100.0,
         );
         let LiveStreamEvent::PhraseFinal { segments, .. } = &shifted[0] else {
-            panic!("the shim must preserve the event kind, got {:?}", shifted[0]);
+            panic!(
+                "the shim must preserve the event kind, got {:?}",
+                shifted[0]
+            );
         };
         // Both sums are exact in binary32, so this is equality, not tolerance.
         assert_eq!(segments[0].start_ts, 100.5);
@@ -7821,11 +7923,17 @@ mod rc_w2_acoustic_tests {
             0.0,
         );
         let LiveStreamEvent::Partial { segments, .. } = &shifted[0] else {
-            panic!("the shim must preserve the event kind, got {:?}", shifted[0]);
+            panic!(
+                "the shim must preserve the event kind, got {:?}",
+                shifted[0]
+            );
         };
         assert_eq!((segments[0].start_ts, segments[0].end_ts), (0.5, 2.0));
         let LiveStreamEvent::Summary { segments, .. } = &shifted[1] else {
-            panic!("the shim must preserve the event kind, got {:?}", shifted[1]);
+            panic!(
+                "the shim must preserve the event kind, got {:?}",
+                shifted[1]
+            );
         };
         assert_eq!((segments[0].start_ts, segments[0].end_ts), (0.5, 4.0));
     }
@@ -7876,7 +7984,8 @@ mod rc_w2_acoustic_tests {
                 assert_eq!(fields[3].chars().count(), 20);
             }
             assert_eq!(
-                actual, expected,
+                actual,
+                expected,
                 "phrase restart vector {} diverged: prev_chars={} next_chars={}",
                 fields[0],
                 fields[2].chars().count(),
@@ -8047,7 +8156,11 @@ mod rc_w2_test_rehab {
     }
 
     fn segment(text: &str, start_ts: f32, end_ts: f32) -> TranscriptSegment {
-        TranscriptSegment { text: text.into(), start_ts, end_ts }
+        TranscriptSegment {
+            text: text.into(),
+            start_ts,
+            end_ts,
+        }
     }
 
     fn state(session: &str, secs: f32) -> AppleSealState {
@@ -8064,11 +8177,19 @@ mod rc_w2_test_rehab {
     // label or manufacturing a terminal coverage receipt.
     fn qualify(state: &mut AppleSealState, start: f32, end: f32) -> OccurrenceIdentity {
         let occurrence = OccurrenceIdentity::new(
-            &state.session_id, state.capture_epoch, sample(start), sample(end),
+            &state.session_id,
+            state.capture_epoch,
+            sample(start),
+            sample(end),
         );
-        let window = state.window_by_samples(sample(start), sample(end)).expect("fixture PCM");
+        let window = state
+            .window_by_samples(sample(start), sample(end))
+            .expect("fixture PCM");
         assert!(window.samples.iter().all(|value| *value == 0.25));
-        let calibration = state.energy_calibration.as_ref().expect("fixture calibration");
+        let calibration = state
+            .energy_calibration
+            .as_ref()
+            .expect("fixture calibration");
         let evidence = AcousticEvidence {
             occurrence: occurrence.clone(),
             duration_ms: f64::from(end - start) * 1_000.0,
@@ -8079,7 +8200,14 @@ mod rc_w2_test_rehab {
             vad_close_sample: Some(sample(end)),
             evidence_calibration_version: calibration.version.clone(),
         };
-        assert!(state.acoustic_ledger.lock().unwrap().qualify(&evidence, calibration).is_qualified());
+        assert!(
+            state
+                .acoustic_ledger
+                .lock()
+                .unwrap()
+                .qualify(&evidence, calibration)
+                .is_qualified()
+        );
         occurrence
     }
 
@@ -8096,10 +8224,26 @@ mod rc_w2_test_rehab {
         state
     }
 
-    fn emit(state: &mut AppleSealState, tx: &mpsc::UnboundedSender<EngineEvent>, words: Vec<TranscriptSegment>) {
-        let text = words.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
+    fn emit(
+        state: &mut AppleSealState,
+        tx: &mpsc::UnboundedSender<EngineEvent>,
+        words: Vec<TranscriptSegment>,
+    ) {
+        let text = words
+            .iter()
+            .map(|word| word.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         let secs = state.audio.session_sample_end() as f32 / RATE as f32;
-        emit_stream_events(vec![LiveStreamEvent::PhraseFinal { text, segments: words }], tx, state, secs);
+        emit_stream_events(
+            vec![LiveStreamEvent::PhraseFinal {
+                text,
+                segments: words,
+            }],
+            tx,
+            state,
+            secs,
+        );
     }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<EngineEvent>) -> Vec<EngineEvent> {
@@ -8111,32 +8255,46 @@ mod rc_w2_test_rehab {
     }
 
     fn raw_finals(events: &[EngineEvent]) -> Vec<&str> {
-        events.iter().filter_map(|event| match event {
-            EngineEvent::UtteranceFinal { raw_text, .. } => Some(raw_text.as_str()),
-            _ => None,
-        }).collect()
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::UtteranceFinal { raw_text, .. } => Some(raw_text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn count_iwo(text: &str) -> usize {
-        text.split_whitespace().filter(|word| word.eq_ignore_ascii_case("iwo")).count()
+        text.split_whitespace()
+            .filter(|word| word.eq_ignore_ascii_case("iwo"))
+            .count()
     }
 
     #[test]
     fn emit_maps_partial_and_two_phrase_finals() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("two-finals", 2.0, &[(0.0, 1.0), (1.0, 2.0)]);
-        emit_stream_events(vec![LiveStreamEvent::Partial {
-            text: "hello".into(), segments: vec![segment("hello", 0.0, 0.5)],
-        }], &tx, &mut state, 0.5);
+        emit_stream_events(
+            vec![LiveStreamEvent::Partial {
+                text: "hello".into(),
+                segments: vec![segment("hello", 0.0, 0.5)],
+            }],
+            &tx,
+            &mut state,
+            0.5,
+        );
         assert!(document(&state).is_empty(), "preview cannot admit words");
         emit(&mut state, &tx, vec![segment("hello world", 0.0, 1.0)]);
         emit(&mut state, &tx, vec![segment("second", 1.0, 2.0)]);
         let events = drain(&mut rx);
         assert!(matches!(&events[0], EngineEvent::Preview { rev: 1, text } if text == "hello"));
-        let ids = events.iter().filter_map(|event| match event {
-            EngineEvent::UtteranceFinal { utterance_id, .. } => Some(*utterance_id),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let ids = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::UtteranceFinal { utterance_id, .. } => Some(*utterance_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(ids, vec![1, 2]);
         assert_eq!(state.sealed_count, 2);
         assert_eq!(document(&state), "hello world second");
@@ -8156,7 +8314,10 @@ mod rc_w2_test_rehab {
         assert!(raw_finals(&drain(&mut rx)).is_empty());
         emit(&mut state, &tx, vec![segment("novel phrase", 2.0, 3.0)]);
         assert_eq!(document(&state), "prior novel phrase");
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            2
+        );
     }
 
     /// Untimed preview cannot be promoted into committed speech. Preserve the
@@ -8166,10 +8327,21 @@ mod rc_w2_test_rehab {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("untimed-freeze", 3.0, &[(0.0, 2.0)]);
         let prior = "whole prior utterance retained for exact observation";
-        emit_stream_events(vec![
-            LiveStreamEvent::Partial { text: prior.into(), segments: Vec::new() },
-            LiveStreamEvent::Partial { text: "Next".into(), segments: Vec::new() },
-        ], &tx, &mut state, 2.0);
+        emit_stream_events(
+            vec![
+                LiveStreamEvent::Partial {
+                    text: prior.into(),
+                    segments: Vec::new(),
+                },
+                LiveStreamEvent::Partial {
+                    text: "Next".into(),
+                    segments: Vec::new(),
+                },
+            ],
+            &tx,
+            &mut state,
+            2.0,
+        );
         let events = drain(&mut rx);
         assert!(events.iter().any(|event| matches!(event,
             EngineEvent::Warning { code, .. } if code == "apple_final_without_pcm_timing"
@@ -8194,7 +8366,10 @@ mod rc_w2_test_rehab {
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["first", "second"]);
         assert_eq!(state.unresolved_windows, 0);
         assert_eq!(state.last_sealed_end, 4.0);
-        assert_eq!(state.audio.window(0.0, 1.0).unwrap(), vec![0.25; RATE as usize]);
+        assert_eq!(
+            state.audio.window(0.0, 1.0).unwrap(),
+            vec![0.25; RATE as usize]
+        );
         assert!(state.audio.window(2.5, 4.0).is_some());
     }
 
@@ -8204,18 +8379,47 @@ mod rc_w2_test_rehab {
         let mut state = state("cumulative-segments", 4.0);
         qualify(&mut state, 0.0, 2.0);
         qualify(&mut state, 2.0, 3.0);
-        emit(&mut state, &tx, vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0)]);
-        emit(&mut state, &tx, vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0), segment("gamma", 2.0, 3.0)]);
+        emit(
+            &mut state,
+            &tx,
+            vec![segment("alpha", 0.0, 1.0), segment("beta", 1.0, 2.0)],
+        );
+        emit(
+            &mut state,
+            &tx,
+            vec![
+                segment("alpha", 0.0, 1.0),
+                segment("beta", 1.0, 2.0),
+                segment("gamma", 2.0, 3.0),
+            ],
+        );
         let events = drain(&mut rx);
-        let finals = events.iter().filter_map(|event| match event {
-            EngineEvent::UtteranceFinal { raw_text, start_ts, end_ts, .. } => Some((raw_text.as_str(), *start_ts, *end_ts)),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let finals = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::UtteranceFinal {
+                    raw_text,
+                    start_ts,
+                    end_ts,
+                    ..
+                } => Some((raw_text.as_str(), *start_ts, *end_ts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(finals, vec![("alpha beta", 0.0, 2.0), ("gamma", 2.0, 3.0)]);
-        assert_eq!(events.iter().filter(|event| matches!(event,
-            EngineEvent::Warning { code, .. } if code == APPLE_FINAL_OVERLAP_WARNING_CODE
-        )).count(), 1);
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event,
+                    EngineEvent::Warning { code, .. } if code == APPLE_FINAL_OVERLAP_WARNING_CODE
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            2
+        );
     }
 
     #[test]
@@ -8223,9 +8427,24 @@ mod rc_w2_test_rehab {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("novel-suffix", 3.0, &[(0.0, 2.0), (2.0, 3.0)]);
         emit(&mut state, &tx, vec![segment("alpha beta", 0.0, 2.0)]);
-        emit(&mut state, &tx, vec![segment("alpha beta revised", 0.0, 2.0)]);
-        assert_eq!(document(&state), "alpha beta", "stale span cannot authenticate a suffix");
-        emit(&mut state, &tx, vec![segment("alpha beta", 0.0, 2.0), segment("revised", 2.0, 3.0)]);
+        emit(
+            &mut state,
+            &tx,
+            vec![segment("alpha beta revised", 0.0, 2.0)],
+        );
+        assert_eq!(
+            document(&state),
+            "alpha beta",
+            "stale span cannot authenticate a suffix"
+        );
+        emit(
+            &mut state,
+            &tx,
+            vec![
+                segment("alpha beta", 0.0, 2.0),
+                segment("revised", 2.0, 3.0),
+            ],
+        );
         assert_eq!(document(&state), "alpha beta revised");
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["alpha beta", "revised"]);
     }
@@ -8233,15 +8452,23 @@ mod rc_w2_test_rehab {
     #[test]
     fn five_spoken_occurrences_survive_a_cumulative_restatement_end_to_end() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let ranges = (0..5).map(|i| (i as f32, (i + 1) as f32)).collect::<Vec<_>>();
+        let ranges = (0..5)
+            .map(|i| (i as f32, (i + 1) as f32))
+            .collect::<Vec<_>>();
         let mut state = physical_state("five-restated", 5.0, &ranges);
-        let words = ranges.iter().map(|&(start, end)| segment("Iwo", start, end)).collect::<Vec<_>>();
+        let words = ranges
+            .iter()
+            .map(|&(start, end)| segment("Iwo", start, end))
+            .collect::<Vec<_>>();
         emit(&mut state, &tx, words[..4].to_vec());
         assert_eq!(count_iwo(&document(&state)), 4);
         emit(&mut state, &tx, words);
         assert_eq!(count_iwo(&document(&state)), 5);
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["Iwo"; 5]);
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 5);
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            5
+        );
     }
 
     /// Prefix identity is acoustic even after Lexicon changes its spelling.
@@ -8249,25 +8476,43 @@ mod rc_w2_test_rehab {
     /// prefix: no text matcher is permitted to mint another occurrence.
     #[test]
     fn cumulative_final_prefix_survives_words_the_lexicon_rewrites() {
-        with_lexicon_fixture("cumulative_final_prefix_survives_words_the_lexicon_rewrites", || {
-            let (tx, mut rx) = mpsc::unbounded_channel();
-            let mut state = state("rewritten-prefix", 3.0);
-            let occurrence = qualify(&mut state, 0.0, 2.0);
-            emit(&mut state, &tx, vec![segment("uruchom doker", 0.0, 2.0)]);
-            assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
-            assert_eq!(document(&state), "uruchom Docker");
-            state.fusion_seal_armed = true;
-            let mut fusion = SileroIngress::new(RATE, state.session_id.clone(), state.capture_epoch);
-            fusion.observe(Some((0, sample(2.0))), true, sample(2.0));
-            fusion.observe(Some((sample(2.0), sample(3.0))), true, sample(3.0));
-            state.fusion = Some(fusion);
-            emit(&mut state, &tx, vec![segment("uruchom doker", 0.0, 2.0), segment("i restart", 2.0, 3.0)]);
-            assert_eq!(document(&state), "uruchom Docker i restart");
-            assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
-            assert!(drain(&mut rx).iter().any(|event| matches!(event,
-                EngineEvent::LedgerMutation { receipt: MutationReceipt::Refuse { .. }, .. }
-            )));
-        });
+        with_lexicon_fixture(
+            "cumulative_final_prefix_survives_words_the_lexicon_rewrites",
+            || {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut state = state("rewritten-prefix", 3.0);
+                let occurrence = qualify(&mut state, 0.0, 2.0);
+                emit(&mut state, &tx, vec![segment("uruchom doker", 0.0, 2.0)]);
+                assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
+                assert_eq!(document(&state), "uruchom Docker");
+                state.fusion_seal_armed = true;
+                let mut fusion =
+                    SileroIngress::new(RATE, state.session_id.clone(), state.capture_epoch);
+                fusion.observe(Some((0, sample(2.0))), true, sample(2.0));
+                fusion.observe(Some((sample(2.0), sample(3.0))), true, sample(3.0));
+                state.fusion = Some(fusion);
+                emit(
+                    &mut state,
+                    &tx,
+                    vec![
+                        segment("uruchom doker", 0.0, 2.0),
+                        segment("i restart", 2.0, 3.0),
+                    ],
+                );
+                assert_eq!(document(&state), "uruchom Docker i restart");
+                assert_eq!(
+                    state.acoustic_ledger.lock().unwrap().occurrences().count(),
+                    2
+                );
+                assert!(drain(&mut rx).iter().any(|event| matches!(
+                    event,
+                    EngineEvent::LedgerMutation {
+                        receipt: MutationReceipt::Refuse { .. },
+                        ..
+                    }
+                )));
+            },
+        );
     }
 
     /// The old explicit empty Preview event belongs to presentation. Here the
@@ -8278,9 +8523,15 @@ mod rc_w2_test_rehab {
         let mut state = physical_state("reheard", 3.0, &[(0.0, 2.0)]);
         emit(&mut state, &tx, vec![segment("heard phrase", 0.0, 2.0)]);
         drain(&mut rx);
-        emit_stream_events(vec![LiveStreamEvent::Partial {
-            text: "heard phrase".into(), segments: vec![segment("heard phrase", 0.0, 2.0)],
-        }], &tx, &mut state, 3.0);
+        emit_stream_events(
+            vec![LiveStreamEvent::Partial {
+                text: "heard phrase".into(),
+                segments: vec![segment("heard phrase", 0.0, 2.0)],
+            }],
+            &tx,
+            &mut state,
+            3.0,
+        );
         assert_eq!(state.open_partial, "heard phrase");
         drain(&mut rx);
         emit(&mut state, &tx, vec![segment("heard phrase", 0.0, 2.0)]);
@@ -8288,7 +8539,11 @@ mod rc_w2_test_rehab {
         assert!(state.open_partial.is_empty());
         assert!(state.open_partial_segments.is_empty());
         assert!(raw_finals(&events).is_empty());
-        assert!(!events.iter().any(|event| matches!(event, EngineEvent::Preview { text, .. } if !text.is_empty())));
+        assert!(
+            !events.iter().any(
+                |event| matches!(event, EngineEvent::Preview { text, .. } if !text.is_empty())
+            )
+        );
         assert_eq!(document(&state), "heard phrase");
     }
 
@@ -8300,7 +8555,10 @@ mod rc_w2_test_rehab {
         emit(&mut state, &tx, vec![segment("tak", 1.0, 2.0)]);
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["tak", "tak"]);
         assert_eq!(document(&state), "tak tak");
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            2
+        );
     }
 
     /// Out-of-capture text cannot seal without a nonempty qualified occurrence.
@@ -8314,7 +8572,10 @@ mod rc_w2_test_rehab {
         assert_eq!(state.sealed_count, 0);
         assert!(raw_finals(&drain(&mut rx)).is_empty());
         assert!(document(&state).is_empty());
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 0);
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            0
+        );
     }
 
     /// Real event producer and real channel, with sender still open at assert.
@@ -8324,14 +8585,24 @@ mod rc_w2_test_rehab {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = state("preview-before-eof", 1.0);
         for text in ["a", "ab"] {
-            emit_stream_events(vec![LiveStreamEvent::Partial {
-                text: text.into(), segments: vec![segment(text, 0.0, 0.5)],
-            }], &tx, &mut state, 0.5);
+            emit_stream_events(
+                vec![LiveStreamEvent::Partial {
+                    text: text.into(),
+                    segments: vec![segment(text, 0.0, 0.5)],
+                }],
+                &tx,
+                &mut state,
+                0.5,
+            );
         }
         for (expected_rev, expected) in [(1, "a"), (2, "ab")] {
-            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await
-                .expect("preview before EOF").expect("producer stays open");
-            assert!(matches!(event, EngineEvent::Preview { rev, text } if rev == expected_rev && text == expected));
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("preview before EOF")
+                .expect("producer stays open");
+            assert!(
+                matches!(event, EngineEvent::Preview { rev, text } if rev == expected_rev && text == expected)
+            );
         }
         assert!(!rx.is_closed());
         assert!(document(&state).is_empty());
@@ -8345,10 +8616,15 @@ mod rc_w2_test_rehab {
     fn with_lexicon_fixture(name: &str, check: impl FnOnce()) {
         if let Some(root) = std::env::var_os("CODESCRIBE_DATA_DIR") {
             let root = std::path::PathBuf::from(root);
-            if std::fs::read(root.join("rc-w2-lexicon-case")).ok().as_deref()
+            if std::fs::read(root.join("rc-w2-lexicon-case"))
+                .ok()
+                .as_deref()
                 == Some(name.as_bytes())
             {
-                assert_eq!(crate::config::Config::config_dir(), root.canonicalize().unwrap());
+                assert_eq!(
+                    crate::config::Config::config_dir(),
+                    root.canonicalize().unwrap()
+                );
                 assert_eq!(
                     crate::quality::overlay_quality::apply_custom_lexicon("doker"),
                     "Docker",
@@ -8364,19 +8640,32 @@ mod rc_w2_test_rehab {
         std::fs::write(
             directory.path().join("lexicon.custom.jsonl"),
             "{\"term\":\"Docker\",\"mispronunciations\":[\"doker\"],\"source\":\"manual\"}\n",
-        ).expect("deterministic custom rule");
+        )
+        .expect("deterministic custom rule");
         let output = std::process::Command::new(std::env::current_exe().expect("unit test binary"))
             .arg("--exact")
-            .arg(format!("{}::{name}", module_path!().split_once("::").unwrap().1))
+            .arg(format!(
+                "{}::{name}",
+                module_path!().split_once("::").unwrap().1
+            ))
             .arg("--nocapture")
             .env("CODESCRIBE_DATA_DIR", directory.path())
             .output()
             .expect("isolated lexicon test process");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "child test failed: {stdout}\n{stderr}");
-        assert!(stdout.contains("running 1 test\n"), "exact test must exist: {stdout}");
-        assert!(stdout.contains("1 passed; 0 failed"), "no skipped execution: {stdout}");
+        assert!(
+            output.status.success(),
+            "child test failed: {stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("running 1 test\n"),
+            "exact test must exist: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed"),
+            "no skipped execution: {stdout}"
+        );
     }
 
     /// Positive configured rewrite through the real PhraseFinal consumer.
@@ -8388,22 +8677,34 @@ mod rc_w2_test_rehab {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut state = state("lexicon-phrase", 1.0);
             let occurrence = qualify(&mut state, 0.0, 1.0);
-            emit(&mut state, &tx, vec![segment("uruchom doker teraz", 0.0, 1.0)]);
+            emit(
+                &mut state,
+                &tx,
+                vec![segment("uruchom doker teraz", 0.0, 1.0)],
+            );
             let events = drain(&mut rx);
             assert_eq!(raw_finals(&events), vec!["uruchom doker teraz"]);
             assert_eq!(document(&state), "uruchom Docker teraz");
             assert_eq!(state.sealed_count, 1);
-            let observations = events.iter().filter_map(|event| match event {
-                EngineEvent::LedgerMutation { observation, label, .. } => {
-                    assert_eq!(observation.occurrence, occurrence);
-                    Some((observation.producer, label.as_str()))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
-            assert_eq!(observations, vec![
-                (LedgerObservationProducer::Apple, "uruchom doker teraz"),
-                (LedgerObservationProducer::Lexicon, "uruchom Docker teraz"),
-            ]);
+            let observations = events
+                .iter()
+                .filter_map(|event| match event {
+                    EngineEvent::LedgerMutation {
+                        observation, label, ..
+                    } => {
+                        assert_eq!(observation.occurrence, occurrence);
+                        Some((observation.producer, label.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                observations,
+                vec![
+                    (LedgerObservationProducer::Apple, "uruchom doker teraz"),
+                    (LedgerObservationProducer::Lexicon, "uruchom Docker teraz"),
+                ]
+            );
             assert!(events.iter().any(|event| matches!(event,
                 EngineEvent::UtteranceFinal { text, .. } if text == "uruchom Docker teraz"
             )));
@@ -8416,10 +8717,18 @@ mod rc_w2_test_rehab {
         with_lexicon_fixture("apple_seal_lexicon_leaves_previews_raw", || {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let mut state = state("raw-lexicon-preview", 1.0);
-            emit_stream_events(vec![LiveStreamEvent::Partial {
-                text: "uruchom doker".into(), segments: vec![segment("uruchom doker", 0.0, 1.0)],
-            }], &tx, &mut state, 1.0);
-            assert!(matches!(rx.try_recv().unwrap(), EngineEvent::Preview { text, .. } if text == "uruchom doker"));
+            emit_stream_events(
+                vec![LiveStreamEvent::Partial {
+                    text: "uruchom doker".into(),
+                    segments: vec![segment("uruchom doker", 0.0, 1.0)],
+                }],
+                &tx,
+                &mut state,
+                1.0,
+            );
+            assert!(
+                matches!(rx.try_recv().unwrap(), EngineEvent::Preview { text, .. } if text == "uruchom doker")
+            );
             assert!(rx.try_recv().is_err());
             assert!(document(&state).is_empty());
             assert_eq!(state.sealed_count, 0);
@@ -8462,17 +8771,25 @@ mod rc_w2_test_rehab {
             };
             emit_stream_events(vec![summary.clone()], &tx, &mut state, 2.0);
             let events = drain(&mut rx);
-            let producers = events.iter().filter_map(|event| match event {
-                EngineEvent::LedgerMutation { observation, label, .. } => {
-                    assert_eq!(observation.occurrence, occurrence);
-                    Some((observation.producer, label.as_str()))
-                }
-                _ => None,
-            }).collect::<Vec<_>>();
-            assert_eq!(producers, vec![
-                (LedgerObservationProducer::Apple, "zbuduj obraz doker"),
-                (LedgerObservationProducer::Lexicon, "zbuduj obraz Docker"),
-            ]);
+            let producers = events
+                .iter()
+                .filter_map(|event| match event {
+                    EngineEvent::LedgerMutation {
+                        observation, label, ..
+                    } => {
+                        assert_eq!(observation.occurrence, occurrence);
+                        Some((observation.producer, label.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                producers,
+                vec![
+                    (LedgerObservationProducer::Apple, "zbuduj obraz doker"),
+                    (LedgerObservationProducer::Lexicon, "zbuduj obraz Docker"),
+                ]
+            );
             assert_eq!(document(&state), "zbuduj obraz Docker");
             assert_eq!(raw_finals(&events), vec!["zbuduj obraz doker"]);
             assert!(state.acoustic_ledger.lock().unwrap().is_sealed(&occurrence));
@@ -8487,15 +8804,36 @@ mod rc_w2_test_rehab {
     fn apple_seal_preserves_observed_text_until_ledger_repair() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("apple-raw", 1.0, &[(0.0, 1.0)]);
-        emit(&mut state, &tx, vec![segment("uruchom doker teraz", 0.0, 1.0)]);
+        emit(
+            &mut state,
+            &tx,
+            vec![segment("uruchom doker teraz", 0.0, 1.0)],
+        );
         assert_eq!(document(&state), "uruchom doker teraz");
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["uruchom doker teraz"]);
         let occurrence = OccurrenceIdentity::new("apple-raw", 7, 0, sample(1.0));
-        let late = admit_ledger_label(&mut state, &tx, LabelAdmission {
-            observation: LedgerObservationIdentity::new(LedgerObservationProducer::Lexicon, 99, 0, occurrence),
-            label: "uruchom Docker teraz", energy: EnergyAdmission::RequireExistingQualification,
-        }).unwrap();
-        assert!(matches!(late, MutationReceipt::Refuse { reason: RefuseReason::SealedReplay, .. }));
+        let late = admit_ledger_label(
+            &mut state,
+            &tx,
+            LabelAdmission {
+                observation: LedgerObservationIdentity::new(
+                    LedgerObservationProducer::Lexicon,
+                    99,
+                    0,
+                    occurrence,
+                ),
+                label: "uruchom Docker teraz",
+                energy: EnergyAdmission::RequireExistingQualification,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            late,
+            MutationReceipt::Refuse {
+                reason: RefuseReason::SealedReplay,
+                ..
+            }
+        ));
         assert_eq!(document(&state), "uruchom doker teraz");
     }
 
@@ -8507,23 +8845,48 @@ mod rc_w2_test_rehab {
         state.fusion_context = FusionContextMode::SymmetricPad;
         state.tail_patch = Some(tail_tx);
         emit(&mut state, &tx, vec![segment("uruchom doker", 0.5, 2.0)]);
-        assert!(raw_finals(&drain(&mut rx)).is_empty(), "Whisper still owns an open frontier");
+        assert!(
+            raw_finals(&drain(&mut rx)).is_empty(),
+            "Whisper still owns an open frontier"
+        );
         assert!(state.flush_layer1_coalesce(&tx));
         let request = tail_rx.try_recv().expect("owned PCM request");
         assert_eq!(request.utterance_id, 1);
-        assert_eq!(request.committed_text, "uruchom doker", "sliced lane preserves raw observed baseline");
-        assert_eq!(request.provider_request.identity.range.sample_start, sample(0.1));
-        assert_eq!(request.provider_request.identity.range.sample_end, sample(2.4));
+        assert_eq!(
+            request.committed_text, "uruchom doker",
+            "sliced lane preserves raw observed baseline"
+        );
+        assert_eq!(
+            request.provider_request.identity.range.sample_start,
+            sample(0.1)
+        );
+        assert_eq!(
+            request.provider_request.identity.range.sample_end,
+            sample(2.4)
+        );
         assert_eq!(request.audio, vec![0.25; sample(2.3) as usize]);
-        assert_eq!(request.provider_request.identity.request_id, request.utterance_id);
-        assert_eq!(request.member_occurrences, vec![(1, OccurrenceIdentity::new("exact-tail", 7, sample(0.5), sample(2.0)))]);
+        assert_eq!(
+            request.provider_request.identity.request_id,
+            request.utterance_id
+        );
+        assert_eq!(
+            request.member_occurrences,
+            vec![(
+                1,
+                OccurrenceIdentity::new("exact-tail", 7, sample(0.5), sample(2.0))
+            )]
+        );
         assert_eq!(state.tail_patch_awaiting_completion, 1);
-        state.complete_whisper_window(&tx, TailPatchCompletion {
-            utterance_id: request.utterance_id,
-            request_identity: Some(request.provider_request.identity),
-            member_occurrences: request.member_occurrences,
-            payload: None,
-        }, 6.0);
+        state.complete_whisper_window(
+            &tx,
+            TailPatchCompletion {
+                utterance_id: request.utterance_id,
+                request_identity: Some(request.provider_request.identity),
+                member_occurrences: request.member_occurrences,
+                payload: None,
+            },
+            6.0,
+        );
         assert_eq!(state.tail_patch_awaiting_completion, 0);
         assert_eq!(state.tail_patch_jobs_skipped, 1);
         assert_eq!(raw_finals(&drain(&mut rx)), vec!["uruchom doker"]);
@@ -8535,7 +8898,10 @@ mod rc_w2_test_rehab {
         let retained_start = state.audio.retained_start_secs();
         assert!(retained_start > 0.0);
         let window = resolve_sealed_audio_window(&mut state, 150.0).expect("retained window");
-        assert_eq!(window.sample_start, (f64::from(retained_start) * f64::from(RATE)) as u64);
+        assert_eq!(
+            window.sample_start,
+            (f64::from(retained_start) * f64::from(RATE)) as u64
+        );
         assert_eq!(window.sample_end, sample(150.0));
         let next = resolve_sealed_audio_window(&mut state, 180.0).expect("next retained window");
         assert_eq!(next.sample_start, sample(150.0));
@@ -8564,7 +8930,10 @@ mod rc_w2_test_rehab {
     fn apple_tail_patch_off_by_default_enqueues_no_jobs() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("tail-off", 4.0, &[(0.5, 2.0)]);
-        assert!(state.tail_patch.is_none(), "arming is injected by session owner");
+        assert!(
+            state.tail_patch.is_none(),
+            "arming is injected by session owner"
+        );
         emit(&mut state, &tx, vec![segment("uruchom doker", 0.5, 2.0)]);
         assert!(!state.flush_layer1_coalesce(&tx));
         assert_eq!(state.tail_patch_awaiting_completion, 0);
@@ -8577,11 +8946,17 @@ mod rc_w2_test_rehab {
     fn apple_tail_patch_backpressure_retains_until_capacity_without_stalling_capture() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (tail_tx, mut tail_rx) = mpsc::channel(1);
-        let ranges = (0..10).map(|i| (i as f32 * 0.5, i as f32 * 0.5 + 0.4)).collect::<Vec<_>>();
+        let ranges = (0..10)
+            .map(|i| (i as f32 * 0.5, i as f32 * 0.5 + 0.4))
+            .collect::<Vec<_>>();
         let mut state = physical_state("full-tail", 10.0, &ranges);
         state.tail_patch = Some(tail_tx);
         for (i, &(start, end)) in ranges.iter().enumerate() {
-            emit(&mut state, &tx, vec![segment(&format!("segment {i}"), start, end)]);
+            emit(
+                &mut state,
+                &tx,
+                vec![segment(&format!("segment {i}"), start, end)],
+            );
         }
         state.flush_layer1_coalesce(&tx);
         assert_eq!(state.tail_patch_awaiting_completion, 1);
@@ -8590,17 +8965,29 @@ mod rc_w2_test_rehab {
         // nine-drop policy is replaced, not excused with a weaker assertion.
         assert_eq!(state.refinement_pending.len(), 8);
         assert_eq!(state.tail_patch_backpressure_drops, 1);
-        assert_eq!(state.sealed_count, 1, "only exhausted capacity returns ownership");
+        assert_eq!(
+            state.sealed_count, 1,
+            "only exhausted capacity returns ownership"
+        );
         let mut submitted = BTreeSet::new();
         for _ in 0..9 {
             let request = tail_rx.try_recv().expect("retained exact request");
             assert!(submitted.insert(request.utterance_id), "never submit twice");
             assert!(tail_rx.try_recv().is_err());
-            request.provider_request.validate_pcm(&request.audio).unwrap();
-            state.complete_whisper_window(&tx, TailPatchCompletion {
-                utterance_id: request.utterance_id, request_identity: Some(request.provider_request.identity),
-                member_occurrences: request.member_occurrences, payload: None,
-            }, 10.0);
+            request
+                .provider_request
+                .validate_pcm(&request.audio)
+                .unwrap();
+            state.complete_whisper_window(
+                &tx,
+                TailPatchCompletion {
+                    utterance_id: request.utterance_id,
+                    request_identity: Some(request.provider_request.identity),
+                    member_occurrences: request.member_occurrences,
+                    payload: None,
+                },
+                10.0,
+            );
             state.retry_refinements(&tx);
         }
         assert_eq!(submitted.len(), 9);
@@ -8617,7 +9004,11 @@ mod rc_w2_test_rehab {
     fn fusion_slices_admit_disjoint_ledger_occurrences_before_raw_finals() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("slice-order", 4.0, &[(0.0, 1.0), (2.0, 3.0)]);
-        emit(&mut state, &tx, vec![segment("Iwo", 0.0, 1.0), segment("Iwo", 2.0, 3.0)]);
+        emit(
+            &mut state,
+            &tx,
+            vec![segment("Iwo", 0.0, 1.0), segment("Iwo", 2.0, 3.0)],
+        );
         let events = drain(&mut rx);
         assert_eq!(raw_finals(&events), vec!["Iwo", "Iwo"]);
         for (id, start, end) in [(1, 0.0, 1.0), (2, 2.0, 3.0)] {
@@ -8627,12 +9018,22 @@ mod rc_w2_test_rehab {
                     if observation.producer == LedgerObservationProducer::Apple
                         && observation.occurrence == occurrence && receipt.grants_mutation() && label == "Iwo"
             )).expect("accepted slice-local Apple observation");
-            let seal = events.iter().position(|event| matches!(event,
-                EngineEvent::LedgerSeal { receipt } if receipt.coverage == occurrence
-            )).expect("same occurrence seal");
-            let final_index = events.iter().position(|event| matches!(event,
-                EngineEvent::UtteranceFinal { utterance_id, .. } if *utterance_id == id
-            )).expect("raw final");
+            let seal = events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                        EngineEvent::LedgerSeal { receipt } if receipt.coverage == occurrence
+                    )
+                })
+                .expect("same occurrence seal");
+            let final_index = events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                        EngineEvent::UtteranceFinal { utterance_id, .. } if *utterance_id == id
+                    )
+                })
+                .expect("raw final");
             assert!(admission < seal && seal < final_index);
         }
         assert_eq!(document(&state), "Iwo Iwo");
@@ -8648,30 +9049,56 @@ mod rc_w2_test_rehab {
         emit(&mut state, &tx, words.clone());
         drain(&mut rx);
         emit(&mut state, &tx, words);
-        assert!(drain(&mut rx).is_empty(), "reconciled slice must not re-emit events");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "reconciled slice must not re-emit events"
+        );
         for (id, start, end) in [(1, 0.0, 1.0), (2, 2.0, 3.0)] {
-            let receipt = admit_ledger_label(&mut state, &tx, LabelAdmission {
-                observation: LedgerObservationIdentity::new(LedgerObservationProducer::Apple, id, 0,
-                    OccurrenceIdentity::new("slice-replay", 7, sample(start), sample(end))),
-                label: "changed replay", energy: EnergyAdmission::RequireExistingQualification,
-            }).unwrap();
+            let receipt = admit_ledger_label(
+                &mut state,
+                &tx,
+                LabelAdmission {
+                    observation: LedgerObservationIdentity::new(
+                        LedgerObservationProducer::Apple,
+                        id,
+                        0,
+                        OccurrenceIdentity::new("slice-replay", 7, sample(start), sample(end)),
+                    ),
+                    label: "changed replay",
+                    energy: EnergyAdmission::RequireExistingQualification,
+                },
+            )
+            .unwrap();
             assert!(!receipt.grants_mutation());
         }
         assert_eq!(document(&state), "Iwo Iwo");
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            2
+        );
     }
 
     #[test]
     fn five_disjoint_iwo_segments_all_reach_the_final() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("five-words", 3.0, &[(0.0, 2.0)]);
-        emit(&mut state, &tx, (0..5).map(|i| {
-            let start = i as f32 * 0.4;
-            segment("Iwo", start, start + 0.3)
-        }).collect());
+        emit(
+            &mut state,
+            &tx,
+            (0..5)
+                .map(|i| {
+                    let start = i as f32 * 0.4;
+                    segment("Iwo", start, start + 0.3)
+                })
+                .collect(),
+        );
         let events = drain(&mut rx);
         let finals = raw_finals(&events);
-        assert_eq!(finals.len(), 1, "one physical occurrence contains five words");
+        assert_eq!(
+            finals.len(),
+            1,
+            "one physical occurrence contains five words"
+        );
         assert_eq!(count_iwo(finals[0]), 5);
         assert_eq!(count_iwo(&document(&state)), 5);
     }
@@ -8680,18 +9107,29 @@ mod rc_w2_test_rehab {
     fn cumulative_fifth_iwo_is_not_absorbed_as_a_revision() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = physical_state("fifth-iwo", 3.0, &[(0.0, 1.5), (1.6, 1.9)]);
-        let first = (0..4).map(|i| {
-            let start = i as f32 * 0.4;
-            segment("Iwo", start, start + 0.3)
-        }).collect::<Vec<_>>();
+        let first = (0..4)
+            .map(|i| {
+                let start = i as f32 * 0.4;
+                segment("Iwo", start, start + 0.3)
+            })
+            .collect::<Vec<_>>();
         emit(&mut state, &tx, first.clone());
         assert_eq!(count_iwo(&document(&state)), 4);
         let mut cumulative = first;
         cumulative.push(segment("Iwo", 1.6, 1.9));
         emit(&mut state, &tx, cumulative);
         assert_eq!(count_iwo(&document(&state)), 5);
-        assert_eq!(raw_finals(&drain(&mut rx)).iter().map(|text| count_iwo(text)).sum::<usize>(), 5);
-        assert_eq!(state.acoustic_ledger.lock().unwrap().occurrences().count(), 2);
+        assert_eq!(
+            raw_finals(&drain(&mut rx))
+                .iter()
+                .map(|text| count_iwo(text))
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().occurrences().count(),
+            2
+        );
     }
 }
 
@@ -8711,7 +9149,12 @@ mod composer_turn_formatter_arming_tests {
     fn a_one_turn_take_never_arms_the_live_formatter_lane() {
         let (enabled, policy, available) = FULLY_ARMED;
         assert!(
-            !live_formatter_lane_is_armed(CaptureTurnIntent::SingleTurn, enabled, policy, available),
+            !live_formatter_lane_is_armed(
+                CaptureTurnIntent::SingleTurn,
+                enabled,
+                policy,
+                available
+            ),
             "a composer turn must not open paid provider slots per sealed fragment, \
              even with formatting fully enabled, a non-Off policy and a live lane"
         );
@@ -8751,12 +9194,14 @@ mod composer_turn_formatter_arming_tests {
 /// W2 contracts: virtual time, owned synthetic PCM, no audio/model invocation.
 #[cfg(test)]
 mod live_refinement_admission_tests {
-    use super::*;
     use super::super::silero_fusion::UtteranceLedger;
+    use super::*;
 
     const RATE: u32 = 1_000;
 
-    fn fixture(capacity: usize) -> (
+    fn fixture(
+        capacity: usize,
+    ) -> (
         AppleSealState,
         mpsc::UnboundedSender<EngineEvent>,
         mpsc::UnboundedReceiver<EngineEvent>,
@@ -8765,7 +9210,10 @@ mod live_refinement_admission_tests {
         let (events, receiver) = mpsc::unbounded_channel();
         let (sender, requests) = mpsc::channel(capacity);
         let mut state = AppleSealState::new_with_tail_patch_for_session(
-            RATE, "live-admission".into(), 7, sender,
+            RATE,
+            "live-admission".into(),
+            7,
+            sender,
             Arc::new(Mutex::new(AcousticLedger::new())),
             Some(EnergyCalibration {
                 version: "owned-fixture".into(),
@@ -8797,7 +9245,9 @@ mod live_refinement_admission_tests {
 
     fn warnings(receiver: &mut mpsc::UnboundedReceiver<EngineEvent>, code: &str) -> usize {
         std::iter::from_fn(|| receiver.try_recv().ok())
-            .filter(|event| matches!(event, EngineEvent::Warning { code: found, .. } if found == code))
+            .filter(
+                |event| matches!(event, EngineEvent::Warning { code: found, .. } if found == code),
+            )
             .count()
     }
 
@@ -8814,15 +9264,31 @@ mod live_refinement_admission_tests {
             assert!(requests.try_recv().is_err());
             state.audio.push(&[0.0; 40]); // capture continues, no Apple piece or Stop
             state.tick_refinements(&events, now + Duration::from_millis(1_200));
-            let request = requests.try_recv().expect("closed physical span must be submitted");
-            assert_eq!(request.member_occurrences, vec![(1,
-                OccurrenceIdentity::new("live-admission", 7, 0, 400))]);
-            request.provider_request.validate_pcm(&request.audio).expect("exact PCM");
-            assert!(request.committed_text.is_empty(), "never manufacture Apple words");
+            let request = requests
+                .try_recv()
+                .expect("closed physical span must be submitted");
+            assert_eq!(
+                request.member_occurrences,
+                vec![(1, OccurrenceIdentity::new("live-admission", 7, 0, 400))]
+            );
+            request
+                .provider_request
+                .validate_pcm(&request.audio)
+                .expect("exact PCM");
+            assert!(
+                request.committed_text.is_empty(),
+                "never manufacture Apple words"
+            );
             for quantum in 1..10 {
-                state.tick_refinements(&events, now + Duration::from_millis(1_200) + LIVE_WORKER_QUANTUM * quantum);
+                state.tick_refinements(
+                    &events,
+                    now + Duration::from_millis(1_200) + LIVE_WORKER_QUANTUM * quantum,
+                );
             }
-            assert!(requests.try_recv().is_err(), "idle ticks cannot replay admission");
+            assert!(
+                requests.try_recv().is_err(),
+                "idle ticks cannot replay admission"
+            );
             assert_eq!(state.refinement_submitted.len(), 1);
         }
     }
@@ -8831,20 +9297,37 @@ mod live_refinement_admission_tests {
     fn blank_then_nonblank_apple_evidence_keeps_one_refinement_owner() {
         let (mut state, events, mut receiver, mut requests) = fixture(2);
         let ledger = closed(1);
-        reconcile_silero_ledger(&mut state, &events, &ledger, &[TranscriptSegment {
-            text: " ".into(), start_ts: 0.0, end_ts: 0.4,
-        }]);
+        reconcile_silero_ledger(
+            &mut state,
+            &events,
+            &ledger,
+            &[TranscriptSegment {
+                text: " ".into(),
+                start_ts: 0.0,
+                end_ts: 0.4,
+            }],
+        );
         assert!(!state.reconciled_silero.contains(&1));
-        reconcile_silero_ledger(&mut state, &events, &ledger, &[TranscriptSegment {
-            text: "hello".into(), start_ts: 0.0, end_ts: 0.4,
-        }]);
+        reconcile_silero_ledger(
+            &mut state,
+            &events,
+            &ledger,
+            &[TranscriptSegment {
+                text: "hello".into(),
+                start_ts: 0.0,
+                end_ts: 0.4,
+            }],
+        );
         assert!(state.reconciled_silero.contains(&1));
         state.flush_layer1_coalesce(&events);
         let request = requests.try_recv().expect("one physical job");
         assert!(requests.try_recv().is_err());
         assert_eq!(request.member_occurrences.len(), 1);
         let occurrence = &request.member_occurrences[0].1;
-        assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(occurrence), Some("hello"));
+        assert_eq!(
+            state.acoustic_ledger.lock().unwrap().text_of(occurrence),
+            Some("hello")
+        );
         state.complete_whisper_window(&events, finish(&request), 20.0);
         assert!(state.acoustic_ledger.lock().unwrap().is_sealed(occurrence));
         let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
@@ -8861,8 +9344,8 @@ mod live_refinement_admission_tests {
     #[test]
     fn whisper_first_completion_admits_owned_label_without_apple_words() {
         use crate::stt::tail_provider::{
-            TailEvidenceSource, TailEvidenceStability, TailProviderEvidence,
-            TailProviderId, TailTimingQuality,
+            TailEvidenceSource, TailEvidenceStability, TailProviderEvidence, TailProviderId,
+            TailTimingQuality,
         };
         let (mut state, events, mut receiver, mut requests) = fixture(1);
         reconcile_silero_ledger(&mut state, &events, &closed(1), &[]);
@@ -8901,12 +9384,25 @@ mod live_refinement_admission_tests {
             EngineEvent::LedgerMutation { observation, label, receipt: MutationReceipt::Insert { .. } }
                 if observation.producer == LedgerObservationProducer::Whisper && label == "hello"
         )).count(), 1);
-        assert_eq!(emitted.iter().filter(|event| matches!(event,
-            EngineEvent::UtteranceFinal { text, .. } if text == "hello"
-        )).count(), 1);
-        reconcile_silero_ledger(&mut state, &events, &closed(1), &[TranscriptSegment {
-            text: "late replacement".into(), start_ts: 0.0, end_ts: 0.4,
-        }]);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event,
+                    EngineEvent::UtteranceFinal { text, .. } if text == "hello"
+                ))
+                .count(),
+            1
+        );
+        reconcile_silero_ledger(
+            &mut state,
+            &events,
+            &closed(1),
+            &[TranscriptSegment {
+                text: "late replacement".into(),
+                start_ts: 0.0,
+                end_ts: 0.4,
+            }],
+        );
         let ledger = state.acoustic_ledger.lock().unwrap();
         assert_eq!(ledger.text_of(&occurrence), Some("hello"));
         assert_eq!(ledger.seal_of(&occurrence), Some(&seal));
@@ -8918,7 +9414,9 @@ mod live_refinement_admission_tests {
     fn apple_first_emits_once_only_reducer_receipts_before_stop() {
         let (mut state, events, mut receiver, mut requests) = fixture(1);
         let words = [TranscriptSegment {
-            text: "hello".into(), start_ts: 0.0, end_ts: 0.4,
+            text: "hello".into(),
+            start_ts: 0.0,
+            end_ts: 0.4,
         }];
         reconcile_silero_ledger(&mut state, &events, &closed(1), &words);
         reconcile_silero_ledger(&mut state, &events, &closed(1), &words);
@@ -8935,7 +9433,13 @@ mod live_refinement_admission_tests {
             EngineEvent::LedgerMutation { observation, receipt: MutationReceipt::Preserve { .. }, .. }
                 if observation.producer == LedgerObservationProducer::Lexicon
         )).count(), 1);
-        assert_eq!(emitted.iter().filter(|event| matches!(event, EngineEvent::LedgerSeal { .. })).count(), 1);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                .count(),
+            1
+        );
         assert_eq!(state.sealed_count, 1);
         assert_eq!(state.tail_patch_awaiting_completion, 0);
         assert!(requests.try_recv().is_err());
@@ -8951,7 +9455,13 @@ mod live_refinement_admission_tests {
         state.flush_layer1_coalesce(&events);
         let request = requests.try_recv().unwrap();
         let occurrence = request.member_occurrences[0].1.clone();
-        let serial = state.acoustic_ledger.lock().unwrap().serial_of(&occurrence).unwrap().clone();
+        let serial = state
+            .acoustic_ledger
+            .lock()
+            .unwrap()
+            .serial_of(&occurrence)
+            .unwrap()
+            .clone();
         state.complete_whisper_window(&events, finish(&request), 20.0);
         state.complete_whisper_window(&events, finish(&request), 20.0);
         {
@@ -8961,16 +9471,36 @@ mod live_refinement_admission_tests {
             assert_eq!(ledger.layer_trail_for(&occurrence).count(), 1);
         }
         assert_eq!(state.sealed_count, 0);
-        reconcile_silero_ledger(&mut state, &events, &physical, &[TranscriptSegment {
-            text: "late real words".into(), start_ts: 0.0, end_ts: 0.4,
-        }]);
+        reconcile_silero_ledger(
+            &mut state,
+            &events,
+            &physical,
+            &[TranscriptSegment {
+                text: "late real words".into(),
+                start_ts: 0.0,
+                end_ts: 0.4,
+            }],
+        );
         {
             let ledger = state.acoustic_ledger.lock().unwrap();
-            assert_eq!(ledger.text_of(&occurrence), Some("late real words"),
-                "a failed refinement must not consume the only later real label");
+            assert_eq!(
+                ledger.text_of(&occurrence),
+                Some("late real words"),
+                "a failed refinement must not consume the only later real label"
+            );
             assert_eq!(ledger.serial_of(&occurrence), Some(&serial));
-            assert_eq!(ledger.qualified_occurrences().cloned().collect::<Vec<_>>(), vec![occurrence.clone()]);
-            assert_eq!(ledger.seal_of(&occurrence).unwrap().layer_trail_ordinals.len(), 3);
+            assert_eq!(
+                ledger.qualified_occurrences().cloned().collect::<Vec<_>>(),
+                vec![occurrence.clone()]
+            );
+            assert_eq!(
+                ledger
+                    .seal_of(&occurrence)
+                    .unwrap()
+                    .layer_trail_ordinals
+                    .len(),
+                3
+            );
             assert!(ledger.frontier_of(&occurrence).unwrap().is_closed());
         }
         let emitted = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
@@ -8984,16 +9514,34 @@ mod live_refinement_admission_tests {
             EngineEvent::LedgerMutation { observation, receipt: MutationReceipt::Preserve { .. }, .. }
                 if observation.producer == LedgerObservationProducer::Lexicon
         )).count(), 1);
-        assert_eq!(emitted.iter().filter(|event| matches!(event, EngineEvent::LedgerSeal { .. })).count(), 1);
-        assert_eq!(emitted.iter().filter(|event| matches!(event,
-            EngineEvent::UtteranceFinal { text, .. } if text == "late real words"
-        )).count(), 1);
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, EngineEvent::LedgerSeal { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event,
+                    EngineEvent::UtteranceFinal { text, .. } if text == "late real words"
+                ))
+                .count(),
+            1
+        );
         let later = state.refinement_clock + Duration::from_secs(3);
         state.tick_refinements(&events, later);
-        assert!(requests.try_recv().is_err(), "same occurrence never decodes twice");
+        assert!(
+            requests.try_recv().is_err(),
+            "same occurrence never decodes twice"
+        );
         assert_eq!(state.tail_patch_jobs_skipped, 1);
         assert_eq!(state.tail_patch_awaiting_completion, 0);
-        assert_eq!(state.window_by_samples(0, 400).unwrap().samples, vec![0.25; 400]);
+        assert_eq!(
+            state.window_by_samples(0, 400).unwrap().samples,
+            vec![0.25; 400]
+        );
     }
 
     #[test]
@@ -9007,20 +9555,45 @@ mod live_refinement_admission_tests {
             let mut stale = UtteranceLedger::new();
             stale.open_or_extend(session, epoch, 0, 400);
             stale.close_open(400);
-            reconcile_silero_ledger(&mut state, &events, &stale, &[TranscriptSegment {
-                text: "foreign".into(), start_ts: 0.0, end_ts: 0.4,
-            }]);
+            reconcile_silero_ledger(
+                &mut state,
+                &events,
+                &stale,
+                &[TranscriptSegment {
+                    text: "foreign".into(),
+                    start_ts: 0.0,
+                    end_ts: 0.4,
+                }],
+            );
             let ledger = state.acoustic_ledger.lock().unwrap();
-            assert_eq!(ledger.qualified_occurrences().cloned().collect::<Vec<_>>(),
-                vec![request.member_occurrences[0].1.clone()]);
+            assert_eq!(
+                ledger.qualified_occurrences().cloned().collect::<Vec<_>>(),
+                vec![request.member_occurrences[0].1.clone()]
+            );
             assert!(ledger.is_empty());
             drop(ledger);
-            reconcile_silero_ledger(&mut state, &events, &closed(1), &[TranscriptSegment {
-                text: "current".into(), start_ts: 0.0, end_ts: 0.4,
-            }]);
-            assert_eq!(state.acoustic_ledger.lock().unwrap()
-                .text_of(&request.member_occurrences[0].1), Some("current"));
-            assert_eq!(state.window_by_samples(0, 400).unwrap().samples, vec![0.25; 400]);
+            reconcile_silero_ledger(
+                &mut state,
+                &events,
+                &closed(1),
+                &[TranscriptSegment {
+                    text: "current".into(),
+                    start_ts: 0.0,
+                    end_ts: 0.4,
+                }],
+            );
+            assert_eq!(
+                state
+                    .acoustic_ledger
+                    .lock()
+                    .unwrap()
+                    .text_of(&request.member_occurrences[0].1),
+                Some("current")
+            );
+            assert_eq!(
+                state.window_by_samples(0, 400).unwrap().samples,
+                vec![0.25; 400]
+            );
         }
     }
 
@@ -9032,7 +9605,10 @@ mod live_refinement_admission_tests {
         ledger.open_or_extend("live-admission", 7, 0, 40_000);
         ledger.close_open(40_000);
         reconcile_silero_ledger(&mut state, &events, &ledger, &[]);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::BacklogExhausted.code()), 1);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::BacklogExhausted.code()),
+            1
+        );
         assert!(state.refinement_pending.is_empty());
         assert!(state.layer1_coalesce.is_empty());
         assert!(requests.try_recv().is_err());
@@ -9050,16 +9626,27 @@ mod live_refinement_admission_tests {
         for _ in 0..3 {
             let request = requests.try_recv().expect("next exact request");
             assert!(ids.insert(request.utterance_id));
-            request.provider_request.validate_pcm(&request.audio).unwrap();
+            request
+                .provider_request
+                .validate_pcm(&request.audio)
+                .unwrap();
             let completion = finish(&request);
             state.complete_whisper_window(&events, completion, 20.0);
             state.retry_refinements(&events);
         }
         for id in 0..3 {
-            reconcile_silero_ledger(&mut state, &events, &closed(3), &[TranscriptSegment {
-                text: "recovered".into(), start_ts: id as f32, end_ts: id as f32 + 0.4,
-            }]);
-            let occurrence = OccurrenceIdentity::new("live-admission", 7, id * 1_000, id * 1_000 + 400);
+            reconcile_silero_ledger(
+                &mut state,
+                &events,
+                &closed(3),
+                &[TranscriptSegment {
+                    text: "recovered".into(),
+                    start_ts: id as f32,
+                    end_ts: id as f32 + 0.4,
+                }],
+            );
+            let occurrence =
+                OccurrenceIdentity::new("live-admission", 7, id * 1_000, id * 1_000 + 400);
             let ledger = state.acoustic_ledger.lock().unwrap();
             assert_eq!(ledger.text_of(&occurrence), Some("recovered"));
             assert!(ledger.is_sealed(&occurrence));
@@ -9078,20 +9665,37 @@ mod live_refinement_admission_tests {
         drop(requests);
         reconcile_silero_ledger(&mut state, &events, &closed(3), &[]);
         state.flush_layer1_coalesce(&events);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::LaneGone.code()), 3);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::LaneGone.code()),
+            3
+        );
         state.retry_refinements(&events);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::LaneGone.code()), 0);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::LaneGone.code()),
+            0
+        );
         for id in 0..3 {
-            reconcile_silero_ledger(&mut state, &events, &closed(3), &[TranscriptSegment {
-                text: "recovered".into(), start_ts: id as f32, end_ts: id as f32 + 0.4,
-            }]);
-            let occurrence = OccurrenceIdentity::new("live-admission", 7, id * 1_000, id * 1_000 + 400);
+            reconcile_silero_ledger(
+                &mut state,
+                &events,
+                &closed(3),
+                &[TranscriptSegment {
+                    text: "recovered".into(),
+                    start_ts: id as f32,
+                    end_ts: id as f32 + 0.4,
+                }],
+            );
+            let occurrence =
+                OccurrenceIdentity::new("live-admission", 7, id * 1_000, id * 1_000 + 400);
             let ledger = state.acoustic_ledger.lock().unwrap();
             assert_eq!(ledger.text_of(&occurrence), Some("recovered"));
             assert!(ledger.is_sealed(&occurrence));
             assert_eq!(ledger.layer_trail_for(&occurrence).count(), 3);
         }
-        assert_eq!(warnings(&mut receiver, RefinementFailure::LaneGone.code()), 0);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::LaneGone.code()),
+            0
+        );
         assert!(state.refinement_pending.is_empty());
         assert_eq!(state.tail_patch_awaiting_completion, 0);
     }
@@ -9103,12 +9707,21 @@ mod live_refinement_admission_tests {
         state.audio.push(&vec![0.25; 2_000]);
         let ledger = closed(1);
         reconcile_silero_ledger(&mut state, &events, &ledger, &[]);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::PcmUnavailable.code()), 1);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::PcmUnavailable.code()),
+            1
+        );
         reconcile_silero_ledger(&mut state, &events, &ledger, &[]);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::PcmUnavailable.code()), 0);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::PcmUnavailable.code()),
+            0
+        );
         assert!(requests.try_recv().is_err());
         assert_eq!(state.audio.session_sample_end(), 2_000);
-        assert_eq!(state.window_by_samples(1_000, 2_000).unwrap().samples, vec![0.25; 1_000]);
+        assert_eq!(
+            state.window_by_samples(1_000, 2_000).unwrap().samples,
+            vec![0.25; 1_000]
+        );
     }
 
     #[test]
@@ -9118,10 +9731,17 @@ mod live_refinement_admission_tests {
         state.flush_layer1_coalesce(&events);
         assert_eq!(state.refinement_submitted.len(), 1);
         assert_eq!(state.refinement_pending.len(), LIVE_REFINEMENT_PENDING_CAP);
-        assert_eq!(warnings(&mut receiver, RefinementFailure::BacklogExhausted.code()), 3);
+        assert_eq!(
+            warnings(&mut receiver, RefinementFailure::BacklogExhausted.code()),
+            3
+        );
         assert_eq!(state.tail_patch_backpressure_drops, 3);
-        assert_eq!(state.refinement_submitted.len() + state.refinement_pending.len()
-            + state.tail_patch_backpressure_drops as usize, 12);
+        assert_eq!(
+            state.refinement_submitted.len()
+                + state.refinement_pending.len()
+                + state.tail_patch_backpressure_drops as usize,
+            12
+        );
     }
 
     #[test]
@@ -9157,16 +9777,24 @@ mod live_refinement_admission_tests {
             assert_eq!(failures, if completion_first { 2 } else { 3 });
             state.complete_whisper_window(&events, finish(&request), 20.0);
             assert!(!state.stop_refinements_tick(&events, deadline, deadline));
-            assert_eq!(warnings(&mut receiver, RefinementFailure::StopDeadline.code()), 0);
+            assert_eq!(
+                warnings(&mut receiver, RefinementFailure::StopDeadline.code()),
+                0
+            );
             assert!(state.refinement_pending.is_empty());
             assert!(state.refinement_submitted.is_empty());
             assert_eq!(state.tail_patch_awaiting_completion, 0);
             state.seal_remaining_at_session_end(&events);
             let mut ledger = state.acoustic_ledger.lock().unwrap();
-            let refusal = ledger.seal_terminal("live-admission", 7).expect_err("no label at Stop");
+            let refusal = ledger
+                .seal_terminal("live-admission", 7)
+                .expect_err("no label at Stop");
             assert_eq!(refusal, SealRefusal::LabelMissing);
             report_terminal_seal_refusal(&events, refusal);
-            assert_eq!(warnings(&mut receiver, LEDGER_TERMINAL_SEAL_REFUSED_WARNING_CODE), 1);
+            assert_eq!(
+                warnings(&mut receiver, LEDGER_TERMINAL_SEAL_REFUSED_WARNING_CODE),
+                1
+            );
             assert_eq!(ledger.qualified_occurrences().count(), 3);
             assert_eq!(ledger.layer_trail().len(), 3);
             for occurrence in ledger.qualified_occurrences() {
@@ -9174,15 +9802,29 @@ mod live_refinement_admission_tests {
                 assert!(!ledger.is_sealed(occurrence));
                 assert!(ledger.text_of(occurrence).is_none());
             }
-            let speech = closed(3).utterances().iter().map(|u| u.range.clone()).collect::<Vec<_>>();
+            let speech = closed(3)
+                .utterances()
+                .iter()
+                .map(|u| u.range.clone())
+                .collect::<Vec<_>>();
             let coverage = ledger.assess_seal_coverage("live-admission", 7, &speech, 250);
             assert_eq!(coverage.covered_samples, 0);
             assert_eq!(coverage.status, SealCoverageStatus::Incomplete);
             assert!(ledger.record_seal_coverage(coverage));
-            assert_eq!(ledger.seal_terminal("live-admission", 7), Err(SealRefusal::CoverageIncomplete));
+            assert_eq!(
+                ledger.seal_terminal("live-admission", 7),
+                Err(SealRefusal::CoverageIncomplete)
+            );
             assert_eq!(state.sealed_count, 0);
-            assert_eq!(state.pending_events.len(), 3, "retain unresolved evidence for recovery");
-            assert_eq!(state.window_by_samples(0, 2_400).unwrap().samples, vec![0.25; 2_400]);
+            assert_eq!(
+                state.pending_events.len(),
+                3,
+                "retain unresolved evidence for recovery"
+            );
+            assert_eq!(
+                state.window_by_samples(0, 2_400).unwrap().samples,
+                vec![0.25; 2_400]
+            );
         }
     }
 }
