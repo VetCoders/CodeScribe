@@ -706,7 +706,24 @@ struct ProcessRecordingOutcome {
     no_speech_reason: Option<String>,
     commit_trigger: Option<String>,
     transcript_present: bool,
+    /// Capture settled, but acoustic completeness was refused. Never a seal.
+    refusal: Option<TerminalSealRefused>,
 }
+
+/// A selected sink failed after capture settled; the words remain recoverable.
+#[derive(Debug)]
+struct StopDeliveryFailure {
+    cause: anyhow::Error,
+    refusal: Option<TerminalSealRefused>,
+}
+
+impl std::fmt::Display for StopDeliveryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Transcript retained; destination handoff failed: {:#}", self.cause)
+    }
+}
+
+impl std::error::Error for StopDeliveryFailure {}
 
 /// Recording controller managing state machine and lifecycle
 pub struct RecordingController {
@@ -1770,8 +1787,41 @@ impl RecordingController {
         force_ai: bool,
         capture_turn: CaptureTurnIntent,
         seal_refused: bool,
-    ) {
+    ) -> Result<TranscriptDelivery> {
+        let config = self.get_config().await;
+        self.deliver_stop_transcript_with_sink(
+            take_id, text, (assistive, force_ai, capture_turn, seal_refused),
+            &config,
+            |route, text, target| async move {
+                if route == DeliveryRoute::DeferredInsert {
+                    self.arm_overlay_text(&text, target, Some("Codescribe".to_string())).await
+                } else {
+                    self.execute_clipboard_paste(text, target, "Stop-path paste").await
+                }
+            },
+        ).await
+    }
+
+    async fn deliver_stop_transcript_with_sink<F, Fut>(
+        &self,
+        take_id: Option<&str>,
+        text: &str,
+        intent: (bool, bool, CaptureTurnIntent, bool),
+        config: &Config,
+        sink: F,
+    ) -> Result<TranscriptDelivery>
+    where
+        F: FnOnce(DeliveryRoute, String, Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Result<OverlayPasteResult>>,
+    {
+        let (assistive, force_ai, capture_turn, seal_refused) = intent;
         let trimmed = text.trim();
+        {
+            let mut delivered = self.delivered_take.lock().await;
+            if !claim_take_delivery(&mut delivered, take_id) {
+                return Err(anyhow::anyhow!("stop-path handoff already attempted for this take"));
+            }
+        }
         // A one-turn take has exactly one destination: the Agent composer draft
         // of the thread that owned the capture. It must not also post a
         // synthetic paste into whatever app happens to be frontmost — two
@@ -1791,9 +1841,8 @@ impl RecordingController {
                 pending = !trimmed.is_empty(),
                 "delivery_route: intent=agent_composer route=ComposerDraft"
             );
-            return;
+            return Ok(disposition);
         }
-        let config = self.get_config().await;
         let notes_save_only = config.quick_notes_enabled && config.quick_notes_save_only;
         let intent = delivery_intent_from_session(assistive, force_ai, notes_save_only);
         let latched_target = self.pre_overlay_frontmost_app.read().await.clone();
@@ -1822,32 +1871,26 @@ impl RecordingController {
             // overlay and the session archive, so this is retained, not lost.
             self.record_delivery_disposition(TranscriptDelivery::Retained)
                 .await;
-            return;
+            return Ok(TranscriptDelivery::Retained);
         }
-        if cfg!(test) {
-            info!("stop-path paste skipped in tests");
-            self.record_delivery_disposition(TranscriptDelivery::Retained)
-                .await;
-            return;
-        }
-        {
-            let mut delivered = self.delivered_take.lock().await;
-            if !claim_take_delivery(&mut delivered, take_id) {
-                info!(take_id = ?take_id, "stop-path delivery skipped: take already delivered");
-                return;
-            }
-        }
-        let outcome = if decision.route == DeliveryRoute::DeferredInsert {
-            self.arm_overlay_text(trimmed, latched_target, Some("Codescribe".to_string()))
-                .await
-        } else {
-            self.execute_clipboard_paste(trimmed.to_string(), latched_target, "Stop-path paste")
-                .await
-        };
+        let outcome = sink(decision.route, trimmed.to_string(), latched_target).await;
+        self.finish_stop_delivery(outcome, seal_refused).await
+    }
+
+    /// The real transport result enters here; tests may inject this boundary
+    /// without opening a clipboard, microphone, or a second delivery owner.
+    async fn finish_stop_delivery(
+        &self,
+        outcome: Result<OverlayPasteResult>,
+        seal_refused: bool,
+    ) -> Result<TranscriptDelivery> {
         match outcome {
             Ok(result) => {
-                // `Noop` is the sink declining the payload, not accepting it.
-                let disposition = if matches!(result.delivery, OverlayPasteDelivery::Noop) {
+                // A declined payload or missing permission is not acceptance.
+                let disposition = if matches!(
+                    result.delivery,
+                    OverlayPasteDelivery::Noop | OverlayPasteDelivery::AccessibilityPermissionNeeded
+                ) {
                     TranscriptDelivery::Retained
                 } else {
                     TranscriptDelivery::SinkAccepted
@@ -1863,6 +1906,13 @@ impl RecordingController {
                     ?disposition,
                     "stop-path delivery finished"
                 );
+                if disposition == TranscriptDelivery::Retained {
+                    return Err(anyhow::Error::new(StopDeliveryFailure {
+                        cause: anyhow::anyhow!("selected sink declined the transcript"),
+                        refusal: None,
+                    }));
+                }
+                Ok(disposition)
             }
             Err(err) => {
                 // A failed sink keeps the text recoverable; it never becomes an
@@ -1870,7 +1920,54 @@ impl RecordingController {
                 self.record_delivery_disposition(TranscriptDelivery::Retained)
                     .await;
                 warn!(seal_refused, "stop-path delivery failed: {err:#}");
+                Err(anyhow::Error::new(StopDeliveryFailure {
+                    cause: err,
+                    refusal: None,
+                }))
             }
+        }
+    }
+
+    /// One refusal decision for hold and toggle, after the recorder's terminal
+    /// tail and WAV retention. Only the typed producer refusal grants access
+    /// to committed words. The injected boundary is destination handoff, not
+    /// an alternate transcription or lifecycle implementation.
+    async fn process_terminal_stop_error<F, Fut>(
+        &self,
+        error: anyhow::Error,
+        deliver: F,
+    ) -> Result<ProcessRecordingOutcome>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<TranscriptDelivery>>,
+    {
+        let refusal = error.downcast::<TerminalSealRefused>()?;
+        let take_id = self.session_id.read().await.clone();
+        if retainable_session_id(take_id.as_deref()) != Some(refusal.receipt.session_id.as_str())
+            || refusal.receipt.status
+                != codescribe_core::pipeline::acoustic_ledger::SealCoverageStatus::Incomplete
+        {
+            return Err(anyhow::anyhow!("terminal refusal does not match the active capture"));
+        }
+        if refusal.committed_text.trim().is_empty() {
+            return Err(anyhow::Error::new(refusal));
+        }
+        let bus = self.active_transcript_bus.read().await.clone();
+        if bus.as_ref().is_none_or(|bus| {
+            !bus.matches_refused_document(&refusal.receipt, &refusal.committed_text)
+        }) {
+            return Err(anyhow::anyhow!("terminal refusal has no matching authenticated Bus document"));
+        }
+        match deliver(refusal.committed_text.clone()).await {
+            Ok(_) => Ok(ProcessRecordingOutcome {
+                transcript_present: true,
+                refusal: Some(refusal),
+                ..ProcessRecordingOutcome::default()
+            }),
+            Err(cause) => Err(anyhow::Error::new(StopDeliveryFailure {
+                cause,
+                refusal: Some(refusal),
+            })),
         }
     }
 
@@ -2184,7 +2281,14 @@ impl RecordingController {
         #[cfg(test)]
         self.observe_capture_settlement(CaptureSettlementStage::Resetting);
         let reason = match result {
+            Ok(outcome) if outcome.refusal.is_some() => TranscriptSessionEndReason::CoverageRefused,
             Ok(_) => TranscriptSessionEndReason::Completed,
+            Err(error) if error.is::<TerminalSealRefused>() => {
+                TranscriptSessionEndReason::CoverageRefusedEmpty
+            }
+            Err(error) if error.is::<StopDeliveryFailure>() => {
+                TranscriptSessionEndReason::DeliveryFailed
+            }
             Err(_) => TranscriptSessionEndReason::TranscriptionFailed,
         };
         self.reset_session_fields(reason).await;
@@ -2205,6 +2309,12 @@ impl RecordingController {
         result: &Result<ProcessRecordingOutcome>,
     ) {
         match result {
+            Ok(outcome) if outcome.refusal.is_some() => {
+                self.publish_stop_warning(
+                    "terminal_coverage_refused",
+                    "Recording stopped. Available words are retained; speech coverage is incomplete. Destination acceptance is reported separately.".to_string(),
+                );
+            }
             Ok(outcome) => {
                 info!("Processing finished successfully. State reset to IDLE.");
 
@@ -2237,6 +2347,24 @@ impl RecordingController {
             }
             Err(e) => {
                 error!("Processing failed: {}", e);
+                if let Some(failure) = e.downcast_ref::<StopDeliveryFailure>() {
+                    let message = if failure.refusal.is_some() {
+                        format!("Speech coverage is incomplete. {failure}")
+                    } else {
+                        failure.to_string()
+                    };
+                    // Preserve the existing bridge's terminal-error allowlist.
+                    // The Bus reason identifies delivery failure independently.
+                    self.publish_stop_warning("transcription_failed", message);
+                    return;
+                }
+                if e.is::<TerminalSealRefused>() {
+                    self.publish_stop_warning(
+                        "transcription_failed",
+                        "Recording stopped with incomplete speech coverage and no committed words. Retained audio may be used for recovery.".to_string(),
+                    );
+                    return;
+                }
                 // Surface the failure to the user instead of leaving it as a
                 // log-only event. Reuse the existing engine `Warning` channel:
                 // the bridge forwarder (forward_event_to_listener) turns it into
@@ -2252,6 +2380,17 @@ impl RecordingController {
                 });
             }
         }
+    }
+
+    fn publish_stop_warning(&self, code: &str, message: String) {
+        let _ = self.event_broadcast.send(IpcEvent {
+            timestamp: chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            payload: IpcEventPayload::Engine(EngineEventWire::Warning {
+                code: code.to_string(),
+                message,
+            }),
+        });
     }
 
     /// Recognize the recorder's "already in progress" refusal, which is the one
@@ -3854,21 +3993,17 @@ impl RecordingController {
             let (streaming_text, raw_audio_path_opt) = match stopped {
                 Ok(stopped) => stopped,
                 Err(err) => {
-                    if let Some(refusal) = err.downcast_ref::<TerminalSealRefused>() {
-                        // A refused seal still has committed words. They keep the
-                        // take's own destination; refusal degrades the claim, not
-                        // the route.
+                    return self.process_terminal_stop_error(err, |text| async move {
                         self.deliver_stop_transcript(
                             session_id_snapshot.as_deref(),
-                            &refusal.committed_text,
+                            &text,
                             assistive,
                             force_ai,
                             capture_turn,
                             true,
                         )
-                        .await;
-                    }
-                    return Err(err);
+                        .await
+                    }).await;
                 }
             };
             info!(
@@ -3903,7 +4038,7 @@ impl RecordingController {
                 capture_turn,
                 false,
             )
-            .await;
+            .await?;
             phase3_secs = phase3.elapsed().as_secs_f64();
             info!(
                 "stop_toggle_inner: PHASE 3 — reducer handoff completed in {:?}",
@@ -4325,10 +4460,10 @@ impl RecordingController {
         let (streaming_text, raw_audio_path_opt) = match stopped {
             Ok(stopped) => stopped,
             Err(err) => {
-                if let Some(refusal) = err.downcast_ref::<TerminalSealRefused>() {
+                return self.process_terminal_stop_error(err, |text| async move {
                     self.deliver_stop_transcript(
                         take_id.as_deref(),
-                        &refusal.committed_text,
+                        &text,
                         assistive,
                         force_ai,
                         // The hold path has no composer surface: no caller here
@@ -4336,9 +4471,8 @@ impl RecordingController {
                         CaptureTurnIntent::HandsFree,
                         true,
                     )
-                    .await;
-                }
-                return Err(err);
+                    .await
+                }).await;
             }
         };
 
@@ -4363,7 +4497,7 @@ impl RecordingController {
             CaptureTurnIntent::HandsFree,
             false,
         )
-        .await;
+        .await?;
         Ok(ProcessRecordingOutcome {
             transcript_present: !streaming_text.trim().is_empty(),
             ..ProcessRecordingOutcome::default()
@@ -4549,7 +4683,7 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 false,
             )
-            .await;
+            .await.unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4572,7 +4706,7 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 false,
             )
-            .await;
+            .await.unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4595,7 +4729,7 @@ mod terminal_delivery_target_falsifiers {
                 CaptureTurnIntent::SingleTurn,
                 true,
             )
-            .await;
+            .await.unwrap();
 
         assert_eq!(
             *controller.delivery_disposition.read().await,
@@ -4609,16 +4743,19 @@ mod terminal_delivery_target_falsifiers {
     async fn a_hands_free_take_is_never_owed_to_the_composer() {
         let controller = RecordingController::new_without_keychain();
 
-        controller
-            .deliver_stop_transcript(
+        let result = controller
+            .deliver_stop_transcript_with_sink(
                 Some("take-hands-free"),
                 "dictated words",
-                false,
-                false,
-                CaptureTurnIntent::HandsFree,
-                false,
+                (false, false, CaptureTurnIntent::HandsFree, false),
+                &controller.get_config().await,
+                |_, _, _| async { Err(anyhow::anyhow!("injected sink refusal")) },
             )
             .await;
+
+        if let Err(error) = result {
+            assert!(error.is::<StopDeliveryFailure>());
+        }
 
         assert_ne!(
             *controller.delivery_disposition.read().await,
@@ -4690,6 +4827,291 @@ mod terminal_delivery_target_falsifiers {
             Some("theirs"),
             "the foreign take's identity is untouched"
         );
+    }
+}
+
+/// Authored W2 falsifiers, UNRUN. The ledger/emitter/Bus/reset are real; only
+/// capture input and receiver responses are synthetic. No process_recording
+/// test shortcut is evidence for these terminal decisions.
+#[cfg(test)]
+mod refusal_recovery_tests {
+    use super::*;
+    use crate::presentation::transcript_bus::{
+        ProjectedSealCoverageReceipt, TranscriptBusEvidenceEvent, TranscriptProjectionPhase,
+    };
+    use codescribe_core::pipeline::acoustic_ledger::{
+        AcousticEvidence, AcousticLedger, EnergyCalibration, ObservationIdentity,
+        ObservationProducer, OccurrenceIdentity, SealRefusal,
+    };
+    use codescribe_core::pipeline::contracts::EventSink;
+    use codescribe_core::stt::tail_provider::TailSampleRange;
+
+    const TAKE: &str = "refusal-capture";
+    const WORDS: &str = "Te słowa zostały.";
+
+    struct Take {
+        controller: RecordingController,
+        bus: Arc<TranscriptBus>,
+        emitter: PresentationEmitter,
+        refusal: TerminalSealRefused,
+        events: broadcast::Receiver<IpcEvent>,
+        dir: tempfile::TempDir,
+    }
+
+    async fn take(state: State, words: bool) -> Take {
+        let controller = RecordingController::new_without_keychain();
+        controller.set_state(state).await;
+        *controller.session_id.write().await = Some(format!("{TAKE}:stopping"));
+        *controller.pre_overlay_frontmost_app.write().await = Some("original-editor".into());
+        let events = controller.subscribe_events();
+        let dir = tempfile::tempdir().unwrap();
+        let bus = Arc::new(TranscriptBus::open_at(TranscriptSession {
+            session_id: TAKE.into(), mode: TranscriptMode::Agent,
+            has_latched_target: true, latched_target_is_self: false,
+        }, dir.path().join("bus.jsonl"), None).unwrap());
+        bus.publish_started();
+        *controller.active_transcript_bus.write().await = Some(Arc::clone(&bus));
+        let ledger = Arc::new(std::sync::Mutex::new(AcousticLedger::new()));
+        let mut emitter = PresentationEmitter::new_with_authority(
+            Arc::new(Mutex::new(String::new())), None, None,
+            Some(Arc::clone(&bus)), Some(Arc::clone(&ledger)), None,
+        );
+        if words {
+            let occurrence = OccurrenceIdentity::new(TAKE, 7, 0, 16_000);
+            let calibration = EnergyCalibration {
+                version: "refusal-synthetic-test".into(),
+                min_energy_integral: 1.0, min_valley_samples: 1,
+            };
+            let evidence = AcousticEvidence {
+                occurrence: occurrence.clone(), duration_ms: 1_000.0,
+                energy_integral: 10.0, mean_rms_dbfs: -12.0, peak_dbfs: -3.0,
+                vad_open_sample: Some(0), vad_close_sample: Some(16_000),
+                evidence_calibration_version: calibration.version.clone(),
+            };
+            let observation = ObservationIdentity::new(ObservationProducer::Apple, 1, 0, occurrence);
+            let receipt = {
+                let mut ledger = ledger.lock().unwrap();
+                assert!(ledger.qualify(&evidence, &calibration).is_qualified());
+                ledger.admit(&observation, WORDS)
+            };
+            emitter.on_event(&EngineEvent::LedgerMutation {
+                observation, label: WORDS.into(), receipt,
+            });
+        }
+        let receipt = {
+            let mut ledger = ledger.lock().unwrap();
+            let coverage = ledger.assess_seal_coverage(TAKE, 7, &[TailSampleRange {
+                session: TAKE.into(), capture_epoch: 7, sample_start: 0, sample_end: 48_000,
+            }], 8_000);
+            assert!(ledger.record_seal_coverage(coverage.clone()));
+            assert_eq!(ledger.seal_terminal(TAKE, 7), Err(SealRefusal::CoverageIncomplete));
+            coverage
+        };
+        emitter.on_event(&EngineEvent::SealCoverage { receipt: receipt.clone(), comparison: None });
+        emitter.finish().await;
+        let audio = dir.path().join("refused.wav");
+        std::fs::write(&audio, b"synthetic retained WAV witness").unwrap();
+        Take { controller, bus, emitter, events, dir, refusal: TerminalSealRefused {
+            receipt, audio_path: Some(audio), committed_text: if words { WORDS.into() } else { String::new() },
+        } }
+    }
+
+    fn terminal_events(take: &mut Take) -> (Vec<TranscriptBusEvidenceEvent>, Vec<(String, String)>) {
+        let mut terminals = Vec::new();
+        let mut warnings = Vec::new();
+        while let Ok(event) = take.events.try_recv() {
+            match event.payload {
+                IpcEventPayload::TranscriptProjection { json } => {
+                    let event: TranscriptBusEvidenceEvent = serde_json::from_str(&json).unwrap();
+                    if event.lifecycle_terminal { terminals.push(event); }
+                }
+                IpcEventPayload::Engine(EngineEventWire::Warning { code, message }) => warnings.push((code, message)),
+                _ => {}
+            }
+        }
+        (terminals, warnings)
+    }
+
+    #[tokio::test]
+    async fn hold_and_toggle_refusal_preserve_receipts_and_pending_receiver() {
+        for state in [State::RecHold, State::RecToggle] {
+            let mut take = take(state, true).await;
+            assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+            let controller = &take.controller;
+            let result = take.controller.process_terminal_stop_error(
+                anyhow::Error::new(take.refusal.clone()), |text| async move {
+                    controller.deliver_stop_transcript(
+                        Some(TAKE), &text, true, false, CaptureTurnIntent::SingleTurn, true,
+                    ).await
+                },
+            ).await;
+            assert!(result.as_ref().unwrap().refusal.is_some());
+            take.controller.reset_finished_recording_state(&result).await;
+            take.controller.handle_processed_recording_result(true, &result).await;
+            take.controller.reset_finished_recording_state(&result).await;
+            let (terminals, warnings) = terminal_events(&mut take);
+            assert_eq!(terminals.len(), 1);
+            let terminal = &terminals[0];
+            assert_eq!(terminal.session_id, TAKE);
+            assert_eq!(terminal.capture_epoch, 7);
+            assert_eq!(terminal.rendered_text, WORDS);
+            assert_eq!(terminal.phase, TranscriptProjectionPhase::CoverageRefused);
+            assert_eq!(terminal.delivery, TranscriptDelivery::ComposerPending);
+            assert_eq!(terminal.seal_coverage, Some(ProjectedSealCoverageReceipt::from(&take.refusal.receipt)));
+            assert!(terminal.acoustic_receipts.iter().all(|receipt| receipt.seal_receipt.is_none()));
+            assert_eq!(warnings.len(), 1);
+            assert_eq!(warnings[0].0, "terminal_coverage_refused");
+            assert_eq!(take.controller.paste_target_app_name().await.as_deref(), Some("original-editor"));
+            assert_eq!(std::fs::read(take.refusal.audio_path.as_ref().unwrap()).unwrap(), b"synthetic retained WAV witness");
+            let rows = std::fs::read_to_string(take.dir.path().join("bus.jsonl")).unwrap();
+            assert_eq!(rows.lines().filter(|line| line.contains("\"status\":\"session_ended\"")).count(), 1);
+            assert!(rows.contains("\"end_reason\":\"coverage_refused\""));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_and_string_refusals_never_call_delivery_and_remain_visible() {
+        for typed in [false, true] {
+            let mut take = take(State::RecHold, false).await;
+            let error = if typed { anyhow::Error::new(take.refusal.clone()) }
+                else { anyhow::anyhow!("terminal seal refused") };
+            let result = take.controller.process_terminal_stop_error(error, |_| async {
+                panic!("no authenticated words may reach a receiver")
+            }).await;
+            assert!(result.is_err());
+            take.controller.reset_finished_recording_state(&result).await;
+            take.controller.handle_processed_recording_result(false, &result).await;
+            let (terminals, warnings) = terminal_events(&mut take);
+            assert_eq!(terminals.len(), 1);
+            assert_eq!(terminals[0].phase, TranscriptProjectionPhase::Error);
+            assert_eq!(terminals[0].delivery, TranscriptDelivery::Unattempted);
+            assert_eq!(warnings[0].0, "transcription_failed");
+            let rows = std::fs::read_to_string(take.dir.path().join("bus.jsonl")).unwrap();
+            assert!(rows.contains(if typed { "coverage_refused_empty" } else { "transcription_failed" }));
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_sink_failure_is_retained_and_never_accepted() {
+        let mut take = take(State::RecToggle, true).await;
+        let controller = &take.controller;
+        let result = take.controller.process_terminal_stop_error(
+            anyhow::Error::new(take.refusal.clone()), |text| async move {
+                assert_eq!(text, WORDS);
+                assert_eq!(controller.paste_target_app_name().await.as_deref(), Some("original-editor"));
+                controller.finish_stop_delivery(Err(anyhow::anyhow!("receiver unavailable")), true).await
+            },
+        ).await;
+        assert!(result.as_ref().unwrap_err().is::<StopDeliveryFailure>());
+        take.controller.reset_finished_recording_state(&result).await;
+        take.controller.handle_processed_recording_result(false, &result).await;
+        let (terminals, warnings) = terminal_events(&mut take);
+        assert_eq!(terminals[0].phase, TranscriptProjectionPhase::Error);
+        assert_eq!(terminals[0].rendered_text, WORDS);
+        assert_eq!(terminals[0].delivery, TranscriptDelivery::Retained);
+        assert!(warnings[0].1.contains("receiver unavailable"));
+        assert_eq!(warnings[0].0, "transcription_failed");
+    }
+
+    #[tokio::test]
+    async fn forged_coverage_text_and_successor_identity_cannot_authorize_handoff() {
+        let mut take = take(State::RecToggle, true).await;
+        let mut forged = take.refusal.receipt.clone();
+        forged.max_uncovered_samples += 1;
+        take.emitter.on_event(&EngineEvent::SealCoverage { receipt: forged.clone(), comparison: None });
+        assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+        assert!(!take.bus.matches_refused_document(&forged, WORDS));
+        for mutation in 0..3 {
+            let mut refusal = take.refusal.clone();
+            match mutation {
+                0 => refusal.committed_text = "preview is not committed".into(),
+                1 => refusal.receipt = forged.clone(),
+                _ => *take.controller.session_id.write().await = Some("successor-capture".into()),
+            }
+            let result = take.controller.process_terminal_stop_error(anyhow::Error::new(refusal), |_| async {
+                panic!("foreign or unauthenticated text reached handoff")
+            }).await;
+            assert!(result.is_err());
+        }
+        assert_eq!(take.controller.session_id.read().await.as_deref(), Some("successor-capture"));
+        assert!(terminal_events(&mut take).0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hold_refusal_routes_once_to_original_sink_with_exact_disposition() {
+        for delivery in [
+            OverlayPasteDelivery::Pasted,
+            OverlayPasteDelivery::Noop,
+            OverlayPasteDelivery::AccessibilityPermissionNeeded,
+        ] {
+            let mut take = take(State::RecHold, true).await;
+            let controller = &take.controller;
+            let mut config = controller.get_config().await;
+            config.auto_paste_enabled = true;
+            config.quick_notes_enabled = false;
+            let calls = AtomicUsize::new(0);
+            let call_count = &calls;
+            let result = controller.process_terminal_stop_error(
+                anyhow::Error::new(take.refusal.clone()), |text| async move {
+                    controller.deliver_stop_transcript_with_sink(
+                        Some(TAKE), &text, (false, false, CaptureTurnIntent::HandsFree, true),
+                        &config, |route, text, target| async move {
+                            call_count.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(route, DeliveryRoute::ClipboardPaste);
+                            assert_eq!(text, WORDS);
+                            assert_eq!(target.as_deref(), Some("original-editor"));
+                            Ok(OverlayPasteResult {
+                                delivery, target_app_name: target,
+                                frontmost_app_name: Some("original-editor".into()),
+                                deferred_insert_shortcut: None, deferred_insert_failure: None,
+                            })
+                        },
+                    ).await
+                },
+            ).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(result.is_ok(), delivery == OverlayPasteDelivery::Pasted);
+            controller.reset_finished_recording_state(&result).await;
+            controller.handle_processed_recording_result(false, &result).await;
+            let (terminals, _) = terminal_events(&mut take);
+            assert_eq!(terminals.len(), 1);
+            assert_eq!(terminals[0].rendered_text, WORDS);
+            assert_eq!(terminals[0].delivery, if delivery == OverlayPasteDelivery::Pasted {
+                TranscriptDelivery::SinkAccepted
+            } else { TranscriptDelivery::Retained });
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_wav_uses_original_capture_name_without_claiming_archive_success() {
+        let take = take(State::RecToggle, true).await;
+        let root = take.dir.path().join("retention");
+        let source = take.refusal.audio_path.as_ref().unwrap();
+        let result = retain_session_audio_at(
+            Some("refusal-capture:stopping"), source,
+            codescribe_core::state::SessionTranscriptArchive::Unavailable("incomplete coverage"),
+            &root, |_, _| None,
+        );
+        assert!(result.unwrap_err().to_string().contains("daily audio archive failed"));
+        assert_eq!(std::fs::read(source).unwrap(), b"synthetic retained WAV witness");
+        assert_eq!(std::fs::read(root.join("sessions/refusal-capture.wav")).unwrap(),
+            b"synthetic retained WAV witness");
+        assert!(!root.join("sessions/refusal-capture:stopping.wav").exists());
+        assert!(take.bus.matches_refused_document(&take.refusal.receipt, WORDS));
+    }
+
+    #[tokio::test]
+    async fn delivery_claim_rejects_repeat_and_admits_a_successor() {
+        let controller = RecordingController::new_without_keychain();
+        for (id, allowed) in [(TAKE, true), ("refusal-capture:stopping", false), ("successor-capture", true)] {
+            let result = controller.deliver_stop_transcript_with_sink(
+                Some(id), WORDS, (true, false, CaptureTurnIntent::SingleTurn, true),
+                &controller.get_config().await,
+                |_, _, _| async { panic!("composer must not paste") },
+            ).await;
+            assert_eq!(result.is_ok(), allowed);
+            assert_eq!(*controller.delivery_disposition.read().await, TranscriptDelivery::ComposerPending);
+        }
     }
 }
 

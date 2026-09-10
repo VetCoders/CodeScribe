@@ -58,16 +58,16 @@ Finish and hold release):
   that confirmed neither never yields to whoever happens to be frontmost
   (`clipboard_paste_may_post`); only an Insert with no latch may follow the
   external frontmost app.
-- Exactly once per take (`claim_take_delivery`): a second stop of the same
-  take id archives only.
+- Exactly once per take (`claim_take_delivery`): the shared Stop operation
+  returns its retained result on repeat. A duplicate direct handoff is refused.
 - **Seal refused (degraded delivery).** When the ledger refuses the terminal
   seal, `TerminalSealRefused` carries the committed live document and the
   controller still delivers it with `seal_refused=true` on the same
   `delivery_route:` line. History keeps its `failed` verdict, the ledger and
   the coverage threshold are untouched, and no witness is minted: the user
-  gets the words the overlay already shows. Claude's call 2026-09-08, not a
-  Founder decision — revert is one match arm in `process_recording` and
-  `stop_toggle_and_adjudicate_inner`.
+  gets the words the overlay already shows. The original degraded-delivery
+  choice was Claude's call on 2026-09-08. The shared refusal decision and its
+  remaining receiver boundaries are recorded below.
 
 Explicit overlay clicks do **not** inherit the live-stream or quality-commit
 vetoes. The user asked to insert now. Any Codescribe caret still refuses Cmd+V
@@ -343,6 +343,79 @@ then run the actual controller/bridge suites, Swift ownership/delivery suites,
 and full `make check`, `make verify`, `make test-swift`. All newly authored tests
 are UNRUN. Installed Stop latency, retained audio and exact real delivery remain
 W4 obligations.
+
+## Refusal recovery (rc-w2-refusal-recovery, W2 source checkpoint)
+
+Both `process_recording` (hold/generic) and `stop_toggle_and_adjudicate_inner`
+consume `process_terminal_stop_error` after the existing recorder terminal tail
+and audio retention. A string mentioning "seal refused" is still an ordinary
+failure. Only `TerminalSealRefused` with incomplete coverage for the current
+capture can reach degraded handoff. Nonempty text must exactly match the
+already published unsealed Bus document, capture epoch and coverage diagnostics.
+The emitter accepts `SealCoverage` only when it matches the ledger's current
+receipt. No preview, raw final, synthetic seal or changed coverage threshold
+can satisfy these checks. Missing/mismatched Bus evidence fails closed; this
+cut adds no replay or reconstruction path for a missing projection.
+
+Three facts remain separate:
+
+- Capture settlement releases resources through the existing serialized Stop.
+  `Stopped` does not acknowledge a receiver or certify a ledger seal.
+- Usable refused words end with `end_reason=coverage_refused` and
+  `phase=coverage_refused`. The Bus clones the authenticated projection and
+  retains the incomplete coverage receipt; its `sealed` latch remains false.
+- Delivery remains `ComposerPending`, `SinkAccepted`, `Retained` or
+  `Unattempted`. ComposerPending requires the original capture/thread receiver
+  to acknowledge it. Retained can mean an intentional archive/canvas route;
+  it is not automatically a failed transcription or an accepted receiver.
+
+The destination helper now returns a result. A selected sink's error, Noop or
+missing accessibility permission
+produces `StopDeliveryFailure`, `end_reason=delivery_failed`, Error phase and
+Retained disposition. This also keeps clean-stop sink errors visible. Empty
+typed refusal stays an error with `end_reason=coverage_refused_empty`, Error
+phase and no delivery attempt. Actual errors continue using the existing
+`transcription_failed` warning allowlist, with accurate recovery messages.
+Usable refusal emits `terminal_coverage_refused` without claiming total loss.
+Audio remains under the existing producer/controller retention owners; this
+handoff never removes or rearchives the original refused WAV.
+
+The existing shared Stop slot still owns duplicate callers, terminal reset and
+successor exclusion. The delivery claim now covers every route before side
+effects. Tests inject only capture evidence and receiver results into the real
+ledger/emitter/Bus, refusal decision, delivery resolver and terminal reset.
+They author assertions for unsealed diagnostics, original target, pending
+composer, sink success/error/Noop, empty/string refusal, replay and successor
+identity. Existing shared-operation barrier tests remain separate evidence;
+their generic hold test shortcut is not proof of an actual refused recorder
+Stop. Refusal-bearing Stop through the full recorder/shared-task chain and real
+receiver acknowledgment remain unverified. All tests are **UNRUN**.
+
+**BOUNDARY — receiver presentation and acceptance.**
+`bridge/src/recording.rs::CsTranscriptProjectionEvent::from_bus_event` forwards
+phase as a string and delivery as the existing enum; no FFI shape is changed.
+`bridge/src/hotkeys.rs` and the recording event forwarder use
+`core/pipeline/contracts.rs::warning_is_user_terminal`, which recognizes only
+`transcription_failed`: the new usable-refusal warning is currently log-only.
+`macos/Codescribe/Screens/Overlay/OverlayState.swift::applyTranscriptProjection`
+does not recognize `coverage_refused` in `OverlayMode`, so its old phase may
+remain on screen. Its success callback and Agent final-text hint currently
+require `formatted`. The separately admitted overlay donor and
+`macos/Codescribe/Core/ComposerDictation.swift` / `AgentChatStore.swift` must
+reconcile that phase, a visible recovery notice, and receiver-owned acceptance
+without changing auto-send policy or treating Stopped as delivery. No complete
+user-visible recovery is claimed here.
+
+Rust `transcript_projection.rs` carries the typed phase from lifecycle rows;
+`cli_transcript_lane.rs` only produces Completed/TranscriptionFailed today.
+Any future CLI use of the new reasons must replace that lane's binary phase
+classification. `bin/codescribe.rs`, `scripts/bus-demux.py` and Swift consumers
+need joined replay/receiver tests; generated bindings remain read-only until
+the integrator reconciles the other admitted API changes.
+
+BUILD/TEST/RUNTIME=NOT_ASSESSED. Security and hygiene checks alone do not close
+W2. Astra admits this isolated checkpoint and restores the Rust/bridge/Swift
+gates when the terminal consumer seams and generated bindings are reconciled.
 
 ## Telemetry
 

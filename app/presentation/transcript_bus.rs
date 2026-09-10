@@ -46,6 +46,8 @@ pub enum TranscriptProjectionPhase {
     Listening,
     Finalizing,
     Formatted,
+    /// Lifecycle settled with usable words but refused acoustic completeness.
+    CoverageRefused,
     NoSpeech,
     Error,
 }
@@ -56,6 +58,7 @@ impl TranscriptProjectionPhase {
             Self::Listening => "listening",
             Self::Finalizing => "finalizing",
             Self::Formatted => "formatted",
+            Self::CoverageRefused => "coverage_refused",
             Self::NoSpeech => "no_speech",
             Self::Error => "error",
         }
@@ -345,6 +348,12 @@ pub enum TranscriptDelivery {
 pub enum TranscriptSessionEndReason {
     /// The take went through the serialized stop path (sealed or zero-seal).
     Completed,
+    /// Committed words survived a refused terminal seal; delivery is separate.
+    CoverageRefused,
+    /// Capture settled with refused coverage and no committed words.
+    CoverageRefusedEmpty,
+    /// A selected destination failed or declined the committed text.
+    DeliveryFailed,
     /// A newer hold generation (key-up / reschedule) superseded this start
     /// after `session_started` and before the take became an active recording.
     StartSuperseded,
@@ -447,6 +456,24 @@ impl TranscriptBus {
 
     pub(crate) fn session_id(&self) -> &str {
         &self.session.session_id
+    }
+
+    /// Match a stopped producer's refused document to the already published
+    /// reducer receipt. This reads evidence; it cannot publish or repair text.
+    pub(crate) fn matches_refused_document(
+        &self,
+        receipt: &SealCoverageReceipt,
+        text: &str,
+    ) -> bool {
+        let writer = self.writer.lock().unwrap_or_else(|error| error.into_inner());
+        writer.started && !writer.ended && !writer.sealed
+            && receipt.session_id == self.session.session_id
+            && writer.last_projection.as_ref().is_some_and(|last| {
+                last.capture_epoch == receipt.capture_epoch
+                    && last.rendered_text == text
+                    && last.seal_coverage.as_ref()
+                        == Some(&ProjectedSealCoverageReceipt::from(receipt))
+            })
     }
 
     fn project_serial(
@@ -750,7 +777,13 @@ impl TranscriptBus {
                 TranscriptProjectionPhase::Formatted
             }
             TranscriptSessionEndReason::Completed => TranscriptProjectionPhase::NoSpeech,
-            TranscriptSessionEndReason::StartSuperseded
+            TranscriptSessionEndReason::CoverageRefused if has_text => {
+                TranscriptProjectionPhase::CoverageRefused
+            }
+            TranscriptSessionEndReason::CoverageRefused
+            | TranscriptSessionEndReason::CoverageRefusedEmpty
+            | TranscriptSessionEndReason::DeliveryFailed
+            | TranscriptSessionEndReason::StartSuperseded
             | TranscriptSessionEndReason::StartFailed
             | TranscriptSessionEndReason::TranscriptionFailed => TranscriptProjectionPhase::Error,
         };
@@ -1045,6 +1078,44 @@ mod tests {
             fault: Arc::clone(&fault),
         }));
         fault
+    }
+
+    /// UNRUN W2: a lifecycle end preserves the real coverage receipt and never
+    /// sets the ledger-seal latch, even when an external sink accepted words.
+    #[test]
+    fn coverage_refusal_ends_once_without_sealing_the_book() {
+        use codescribe_core::stt::tail_provider::TailSampleRange;
+        let dir = tempfile::tempdir().unwrap();
+        let bus = TranscriptBus::open_at(session("refused-book"), dir.path().join("bus.jsonl"), None).unwrap();
+        bus.publish_started();
+        let (mut ledger, mut reducer, _) = committed_fixture("refused-book");
+        let receipt = ledger.assess_seal_coverage("refused-book", 7, &[TailSampleRange {
+            session: "refused-book".into(), capture_epoch: 7, sample_start: 0, sample_end: 64_000,
+        }], 8_000);
+        assert!(ledger.record_seal_coverage(receipt.clone()));
+        let revision = reducer.apply_seal_coverage(&receipt, None);
+        let published = bus.publish_revision(&revision, &ledger);
+        assert_eq!(published.len(), 2);
+        assert!(bus.matches_refused_document(&receipt, &revision.rendered_text));
+        let mut forged = receipt.clone();
+        forged.max_uncovered_samples += 1;
+        let forged_revision = reducer.apply_seal_coverage(&forged, None);
+        assert!(bus.publish_revision(&forged_revision, &ledger).is_empty());
+        assert!(bus.matches_refused_document(&receipt, &revision.rendered_text));
+        let terminal = bus.publish_ended(
+            TranscriptSessionEndReason::CoverageRefused, true, TranscriptDelivery::SinkAccepted,
+        ).unwrap();
+        assert!(!bus.writer.lock().unwrap().sealed);
+        assert_eq!(terminal.phase, TranscriptProjectionPhase::CoverageRefused);
+        assert_eq!(terminal.delivery, TranscriptDelivery::SinkAccepted);
+        assert_eq!(terminal.rendered_text, revision.rendered_text);
+        assert_eq!(terminal.seal_coverage, Some(ProjectedSealCoverageReceipt::from(&receipt)));
+        assert!(terminal.lifecycle_terminal);
+        assert!(terminal.can_retranscribe);
+        assert!(bus.publish_ended(
+            TranscriptSessionEndReason::Completed, true, TranscriptDelivery::SinkAccepted,
+        ).is_none());
+        assert!(!bus.matches_refused_document(&receipt, &revision.rendered_text));
     }
 
     /// Synthetic calibrated evidence admitted by the actual ledger and reducer.

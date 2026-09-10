@@ -185,6 +185,14 @@ impl TranscriptRevision {
             append_exact_fragment(&mut left_context, presentation);
         }
         match &self.action {
+            ReducerAction::RecordSealCoverage { receipt, .. } => {
+                ledger.latest_seal_coverage() == Some(receipt)
+                    && self.seal_coverage.as_ref() == Some(receipt)
+                    && receipt.session_id == session
+                    && self.entries.iter().all(|entry| {
+                        entry.occurrence.capture_epoch == receipt.capture_epoch
+                    })
+            }
             ReducerAction::RecordLedgerSeal { occurrence, seal_receipt, terminal } => {
                 ledger.seal_receipt(seal_receipt).is_some_and(|seal| {
                     seal.is_occurrence_seal() != *terminal
@@ -1527,6 +1535,11 @@ impl EventSink for PresentationEmitter {
                     return;
                 };
                 let ledger = ledger.lock().unwrap_or_else(|error| error.into_inner());
+                // Coverage is ledger evidence, never an unauthenticated event
+                // payload that may overwrite the reducer's refusal diagnostics.
+                if ledger.latest_seal_coverage() != Some(receipt) {
+                    return;
+                }
                 let revision = self
                     .session_state
                     .lock()
