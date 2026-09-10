@@ -1906,6 +1906,144 @@ class NeutralTargetTests(unittest.TestCase):
                       "/target/", "/a/\x00target", "/$HOME/target", "/~/target", "/a/C:target"):
             self.assertIsNone(re.search(pattern, value), repr(value))
 
+    # --- build lease (CARGO_BUILD_JOBS / CARGO_INCREMENTAL) -----------------
+    # A Fleet Worktree holding an exclusive shared target must be able to state
+    # its own budget. These witnesses intercept the child, so they prove the
+    # exact argument environment without ever letting Cargo run.
+
+    def lease_child(self, overrides):
+        """Run one fully intercepted invocation and return what the child got."""
+        from subprocess import CompletedProcess
+        from unittest.mock import patch
+        evidence = {
+            "identity": VERIFIER.AST_IDENTITY,
+            "schema": "codescribe.structural-ast-evidence.v1",
+            "accepted": True, "failures": [],
+            "contracts": [{"symbol": symbol, "accepted": True, "failures": [], "events": []}
+                          for symbol in VERIFIER.AST_BODIES],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            with patch.dict(VERIFIER.os.environ, overrides, clear=True), \
+                 patch.object(VERIFIER, "ast_tool_digest", return_value="a" * 64), \
+                 patch.object(VERIFIER.subprocess, "run", return_value=CompletedProcess(
+                     [], 0, json.dumps(evidence), "")) as run:
+                receipt = VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+            run.assert_called_once()
+            return run.call_args.kwargs, receipt["invocation"]
+
+    def test_supplied_lease_reaches_the_real_child_environment(self):
+        # (jobs, incremental) as supplied -> (effective jobs, forwarded incremental)
+        for supplied_jobs, supplied_incremental, jobs, incremental in (
+            (None, None, "4", None),     # absent: shipped default, Cargo's own policy
+            ("2", "0", "2", "0"),        # the lease this cut actually runs under
+            ("1", "1", "1", "1"),
+            ("16", None, "16", None),
+            (None, "0", "4", "0"),
+            (str(VERIFIER.AST_MAX_BUILD_JOBS), "1", str(VERIFIER.AST_MAX_BUILD_JOBS), "1"),
+        ):
+            overrides = {}
+            if supplied_jobs is not None:
+                overrides["CARGO_BUILD_JOBS"] = supplied_jobs
+            if supplied_incremental is not None:
+                overrides["CARGO_INCREMENTAL"] = supplied_incremental
+            with self.subTest(overrides=overrides):
+                kwargs, invocation = self.lease_child(overrides)
+                env = kwargs["env"]
+                self.assertEqual(env["CARGO_BUILD_JOBS"], jobs)
+                self.assertEqual(env.get("CARGO_INCREMENTAL"), incremental)
+                # The receipt states the same policy the child received.
+                self.assertEqual(invocation["jobs"], int(jobs))
+                self.assertEqual(invocation["incremental"],
+                                 None if incremental is None else int(incremental))
+                # Nothing beyond the validated target and lease is configurable,
+                # and no invocation is ever routed through a shell.
+                self.assertEqual(set(env) - {"CARGO_INCREMENTAL"},
+                                 {"CARGO_TARGET_DIR", "CARGO_BUILD_JOBS"})
+                self.assertFalse(kwargs.get("shell", False))
+
+    def test_malformed_lease_is_refused_before_any_child(self):
+        from unittest.mock import patch
+        for overrides in (
+            {"CARGO_BUILD_JOBS": "0"}, {"CARGO_BUILD_JOBS": "-1"}, {"CARGO_BUILD_JOBS": "+2"},
+            {"CARGO_BUILD_JOBS": ""}, {"CARGO_BUILD_JOBS": " 2"}, {"CARGO_BUILD_JOBS": "2 "},
+            {"CARGO_BUILD_JOBS": "2.0"}, {"CARGO_BUILD_JOBS": "two"}, {"CARGO_BUILD_JOBS": "0x2"},
+            {"CARGO_BUILD_JOBS": "02"}, {"CARGO_BUILD_JOBS": "١٢"},
+            {"CARGO_BUILD_JOBS": str(VERIFIER.AST_MAX_BUILD_JOBS + 1)},
+            {"CARGO_BUILD_JOBS": "2;rm -rf /"}, {"CARGO_BUILD_JOBS": "$(nproc)"},
+            {"CARGO_BUILD_JOBS": "2\n4"}, {"CARGO_BUILD_JOBS": "1_0"},
+            {"CARGO_INCREMENTAL": "2"}, {"CARGO_INCREMENTAL": ""},
+            {"CARGO_INCREMENTAL": "true"}, {"CARGO_INCREMENTAL": "0 "},
+            {"CARGO_INCREMENTAL": "-0"}, {"CARGO_INCREMENTAL": "00"},
+            {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "yes"},
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory).resolve()
+                with self.subTest(overrides=overrides), \
+                     patch.dict(VERIFIER.os.environ, overrides, clear=True), \
+                     patch.object(VERIFIER.subprocess, "run") as run, \
+                     self.assertRaises(RuntimeError):
+                    try:
+                        VERIFIER.run_ast_json(repo, list(VERIFIER.AST_COMMAND), {})
+                    finally:
+                        run.assert_not_called()
+
+    def test_invocation_schema_rejects_a_forged_effective_budget(self):
+        def admits(schema, value):
+            if "oneOf" in schema:
+                return any(admits(branch, value) for branch in schema["oneOf"])
+            if schema["type"] == "null":
+                return value is None
+            if schema["type"] != "integer" or type(value) is not int:
+                return False
+            if "enum" in schema and value not in schema["enum"]:
+                return False
+            return (schema.get("minimum", value) <= value
+                    and value <= schema.get("maximum", value))
+
+        invocation = json.loads((SCRIPT.parents[1] / VERIFIER.DEFAULT_MANIFEST).read_text())[
+            "tool_contract"]["receipt_schema"]["$defs"]["neutralInvocation"]
+        self.assertEqual(set(invocation["required"]), {
+            "command", "cwd", "source_sha256", "input_sha256",
+            "build_policy", "target_dir", "jobs", "incremental"})
+        jobs = invocation["properties"]["jobs"]
+        # The forced budget is gone; a bounded validated integer replaces it.
+        self.assertNotIn("const", jobs)
+        self.assertEqual((jobs["type"], jobs["minimum"], jobs["maximum"]),
+                         ("integer", 1, VERIFIER.AST_MAX_BUILD_JOBS))
+        for forged in (0, -1, 4.5, "2", "4", True, None,
+                       VERIFIER.AST_MAX_BUILD_JOBS + 1):
+            self.assertFalse(admits(jobs, forged), repr(forged))
+        for honest in (1, 2, 4, 16, VERIFIER.AST_MAX_BUILD_JOBS):
+            self.assertTrue(admits(jobs, honest), repr(honest))
+        incremental = invocation["properties"]["incremental"]
+        for forged in (2, -1, "0", "1", True, 0.0, 1.0):
+            self.assertFalse(admits(incremental, forged), repr(forged))
+        for honest in (None, 0, 1):
+            self.assertTrue(admits(incremental, honest), repr(honest))
+        # The producer cannot emit anything the declared schema refuses.
+        for overrides in ({}, {"CARGO_BUILD_JOBS": "2", "CARGO_INCREMENTAL": "0"},
+                          {"CARGO_BUILD_JOBS": "1", "CARGO_INCREMENTAL": "1"}):
+            with self.subTest(overrides=overrides):
+                _, observed = self.lease_child(overrides)
+                self.assertTrue(admits(jobs, observed["jobs"]), observed)
+                self.assertTrue(admits(incremental, observed["incremental"]), observed)
+
+    def test_receipt_generation_is_declared_not_silently_reused(self):
+        contract = json.loads(
+            (SCRIPT.parents[1] / VERIFIER.DEFAULT_MANIFEST).read_text())["tool_contract"]
+        # The invocation contract gained a required key and dropped a const, so
+        # the generation is bumped instead of v2 being redefined underneath the
+        # receipts already written against it.
+        self.assertEqual(VERIFIER.RECEIPT_SCHEMA, "codescribe.acoustic-structure-receipt.v3")
+        self.assertEqual(contract["receipt_version"], VERIFIER.RECEIPT_SCHEMA)
+        self.assertIn("codescribe.acoustic-structure-receipt.v2",
+                      contract["superseded_versions"])
+        self.assertNotIn(VERIFIER.RECEIPT_SCHEMA, contract["superseded_versions"])
+        schema = contract["receipt_schema"]
+        self.assertTrue(schema["$id"].endswith("acoustic-structure-receipt.v3.json"), schema["$id"])
+        self.assertEqual(schema["properties"]["schema"]["const"], VERIFIER.RECEIPT_SCHEMA)
+
 
 class NeutralAstTests(unittest.TestCase):
     """Actual neutral executable on fresh Loctree data; never import product code."""
@@ -1962,6 +2100,42 @@ class NeutralAstTests(unittest.TestCase):
                 evidence = self.run_payload(self.mutate(symbol, old, new))
                 self.assertFalse(evidence["accepted"], name)
                 self.assertTrue(any(not row["accepted"] for row in evidence["contracts"]))
+
+    def test_coverage_refusal_predicate_mutants_rejected(self):
+        """The terminal filter must refuse every non-complete verdict.
+
+        `== SealCoverageStatus::Incomplete` was the previous grammar and the
+        previous product shape. It lets an `Unavailable` receipt — "nothing was
+        measured" — fall through to the terminal success, which is the exact
+        silence/absence ambiguity the ledger now keeps apart.
+        """
+        mutations = [
+            # The stale grammar's own predicate, restored in the product body.
+            ("incomplete_only_restored",
+             "!receipt.status.is_complete()",
+             "receipt.status == SealCoverageStatus::Incomplete"),
+            # Refuse complete receipts and admit the broken ones.
+            ("predicate_reversed",
+             "!receipt.status.is_complete()",
+             "receipt.status.is_complete()"),
+            # No adjudication at all: the latest receipt always refuses.
+            ("filter_dropped",
+             ".filter(|receipt| !receipt.status.is_complete())",
+             ""),
+            # Absence silently treated as completeness.
+            ("unavailable_admitted_as_complete",
+             "!receipt.status.is_complete()",
+             "!receipt.status.is_complete() && receipt.status.unavailable_reason().is_none()"),
+        ]
+        for name, old, new in mutations:
+            with self.subTest(mutation=name):
+                evidence = self.run_payload(self.mutate("complete_stop", old, new))
+                self.assertFalse(evidence["accepted"], name)
+                contract = next(row for row in evidence["contracts"]
+                                if row["symbol"] == "complete_stop")
+                self.assertFalse(contract["accepted"], name)
+                self.assertTrue(any("non-complete receipt" in failure
+                                    for failure in contract["failures"]), contract)
 
     def test_control_scope_and_unknown_syntax_counterexamples(self):
         cases = [
@@ -2076,7 +2250,15 @@ class NeutralAstTests(unittest.TestCase):
                         "CARGO_BUILD_TARGET", "DYLD_INSERT_LIBRARIES"):
                 self.assertNotIn(key, env)
             self.assertEqual(env["CARGO_TARGET_DIR"], evidence["invocation"]["target_dir"])
-            self.assertEqual(env["CARGO_BUILD_JOBS"], "4")
+            # The forbidden settings above are stripped while the declared
+            # build lease survives: the receipt and the real child argument
+            # environment must state the same effective policy, whatever the
+            # caller leased. A hardcoded "4" here would re-assert the old
+            # forced budget and hide a lease the fleet actually supplied.
+            leased_jobs, leased_incremental = VERIFIER.resolve_ast_build_policy()
+            self.assertEqual(env["CARGO_BUILD_JOBS"], str(leased_jobs))
+            self.assertEqual(run.call_args.kwargs["env"].get("CARGO_INCREMENTAL"),
+                             None if leased_incremental is None else str(leased_incremental))
             self.assertFalse(run.call_args.kwargs.get("shell", False))
         verifier = StubVerifier(Path("/repo"))
         receipt, _ = VERIFIER.verify_stage(verifier, wired_manifest(), "wired", None, None)
@@ -2205,6 +2387,172 @@ class RustModuleResolutionTests(unittest.TestCase):
         )
 
         self.assertEqual(unresolved, [])
+
+
+class CurrentChainMutantTests(unittest.TestCase):
+    """Counterexamples pushed through the same proof boundary as the positive run.
+
+    Bodies come from live Loctree and are mutated inside the verifier's own
+    cache, so every bypass is judged by the real shipped manifest against the
+    real current product source. A synthetic fixture would only prove the
+    corridor engine; these prove the corridor *contract*.
+
+    The AST hops are excluded here: they own their own neutral-binary contract
+    and are falsified separately in NeutralAstTests.
+    """
+
+    CORRIDORS = ("settings_to_capture_admission", "speech_coverage_to_terminal_truth")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repo = SCRIPT.parents[1]
+        manifest = json.loads((cls.repo / VERIFIER.DEFAULT_MANIFEST).read_text())
+        cls.contracts = []
+        for corridor in manifest["stages"]["wired"]["required_corridors"]:
+            if corridor["name"] not in cls.CORRIDORS:
+                continue
+            row = copy.deepcopy(corridor)
+            row["hops"] = [hop for hop in row["hops"] if not hop.get("ast_contract")]
+            row.pop("ordering", None)
+            cls.contracts.append(row)
+        if len(cls.contracts) != len(cls.CORRIDORS):
+            raise AssertionError(f"corridors missing from manifest: {cls.CORRIDORS}")
+        # One warmed evidence cache; every mutant below reuses it offline.
+        cls.seed = VERIFIER.StructuralVerifier(cls.repo)
+        cls.seed.context()
+        _, cls.positive_failures = VERIFIER.verify_code_corridors(cls.seed, cls.contracts)
+
+    def run_mutated(self, symbol, file, old, new):
+        clone = VERIFIER.StructuralVerifier(self.repo)
+        clone._occurrences = dict(self.seed._occurrences)
+        clone._literal_occurrences = dict(self.seed._literal_occurrences)
+        clone._bodies = copy.deepcopy(self.seed._bodies)
+        row = next(item for item in clone._bodies[(symbol, file)]["bodies"]
+                   if item["symbol"] == symbol)
+        self.assertIn(old, row["source"], f"{symbol}: stale mutation anchor")
+        row["source"] = row["source"].replace(old, new, 1)
+        row["total_lines"] = len(row["source"].splitlines())
+        row["end_line"] = row["start_line"] + row["total_lines"] - 1
+        _, failures = VERIFIER.verify_code_corridors(clone, self.contracts)
+        return failures
+
+    def test_positive_current_chains_pass(self):
+        self.assertEqual(self.positive_failures, [])
+
+    def test_captured_input_chain_bypasses_are_rejected(self):
+        cases = [
+            # Capture is disconnected from the resolver: the snapshot is sealed
+            # from facts nobody captured on this launch.
+            ("capture_disconnected_from_resolver",
+             "load_runtime_snapshot_with_keychain_population", "core/config/loader.rs",
+             "let snapshot = Self::resolve_runtime_snapshot_with_capture(|| input);",
+             "let snapshot = Self::runtime_snapshot_from_captured(Default::default());",
+             "load_runtime_snapshot_with_keychain_population"),
+            # A different input is substituted for the captured one.
+            ("substituted_input",
+             "load_runtime_snapshot_with_keychain_population", "core/config/loader.rs",
+             "Self::resolve_runtime_snapshot_with_capture(|| input)",
+             "Self::resolve_runtime_snapshot_with_capture(|| CapturedRuntimeInputs::default())",
+             "load_runtime_snapshot_with_keychain_population"),
+            # Calibration is never acquired, so the sealed snapshot carries none.
+            ("calibration_omitted_at_capture",
+             "capture_runtime_inputs", "core/config/loader.rs",
+             "let energy_calibration = SealedEnergyCalibration::load(&energy_calibration_path);",
+             "",
+             "capture_runtime_inputs"),
+            # Calibration is acquired but never reaches the digest.
+            ("calibration_dropped_from_digest",
+             "runtime_snapshot_from_captured", "core/config/loader.rs",
+             "input.energy_calibration.digest_material()",
+             "String::new()",
+             "runtime_snapshot_from_captured"),
+            # Calibration is acquired but never reaches the sealed parts.
+            ("calibration_dropped_from_seal",
+             "runtime_snapshot_from_captured", "core/config/loader.rs",
+             "energy_calibration: input.energy_calibration,",
+             "energy_calibration: SealedEnergyCalibration::default(),",
+             "runtime_snapshot_from_captured"),
+            # The resolver stops handing the captured value to the sealer.
+            ("resolver_stops_calling_the_sealer",
+             "resolve_runtime_snapshot_with_capture", "core/config/loader.rs",
+             "Self::runtime_snapshot_from_captured(capture())",
+             "RuntimeSettingsSnapshot::default()",
+             "resolve_runtime_snapshot_with_capture"),
+        ]
+        for name, symbol, file, old, new, obligation in cases:
+            with self.subTest(mutation=name):
+                failures = self.run_mutated(symbol, file, old, new)
+                self.assertTrue(failures, name)
+                self.assertTrue(
+                    any("settings_to_capture_admission" in failure and obligation in failure
+                        for failure in failures), (name, failures))
+
+    def test_acoustic_chain_bypasses_are_rejected(self):
+        cases = [
+            # Invalid capture measurement no longer wins over Silero speech, so
+            # unreadable PCM can be certified by a later observer.
+            ("invalid_capture_precedence_bypassed",
+             "coverage_speech_evidence", "core/pipeline/streaming/apple_live_session.rs",
+             "return capture_energy;\n    }\n    if let Some(fusion)",
+             "()\n    }\n    if let Some(fusion)",
+             "coverage_speech_evidence"),
+            # The Silero branch stops being held against the captured extent.
+            ("extent_check_removed_from_silero_branch",
+             "coverage_speech_evidence", "core/pipeline/streaming/apple_live_session.rs",
+             "return within_capture(acoustic, captured_samples);",
+             "return acoustic;",
+             "coverage_speech_evidence"),
+            # The capture-energy branch stops being held against the extent.
+            ("extent_check_removed_from_capture_branch",
+             "coverage_speech_evidence", "core/pipeline/streaming/apple_live_session.rs",
+             "within_capture(capture_energy, captured_samples)\n}",
+             "capture_energy\n}",
+             "coverage_speech_evidence"),
+            # A short observation is promoted instead of downgraded.
+            ("short_observation_promoted",
+             "within_capture", "core/pipeline/streaming/apple_live_session.rs",
+             "AcousticAvailability::Discontinuous { observed_samples }",
+             "AcousticAvailability::Observed { observed_samples }",
+             "within_capture"),
+            # The extent comparison itself disappears.
+            ("extent_comparison_dropped",
+             "within_capture", "core/pipeline/streaming/apple_live_session.rs",
+             "if observed_samples >= captured_samples {",
+             "if true {",
+             "within_capture"),
+            # The ledger goes back to assessing bare ranges without availability.
+            ("ranges_only_assessment_restored",
+             "assess_seal_coverage", "core/pipeline/acoustic_ledger.rs",
+             "speech: &AcousticSpeechEvidence,",
+             "speech_ranges: &[TailSampleRange],",
+             "assess_seal_coverage"),
+            # Absence of measurement stops refusing the terminal seal.
+            ("unavailable_stops_refusing_the_seal",
+             "seal_terminal", "core/pipeline/acoustic_ledger.rs",
+             "|| coverage.status.unavailable_reason().is_some()",
+             "",
+             "seal_terminal"),
+        ]
+        for name, symbol, file, old, new, obligation in cases:
+            with self.subTest(mutation=name):
+                failures = self.run_mutated(symbol, file, old, new)
+                self.assertTrue(failures, name)
+                self.assertTrue(
+                    any("speech_coverage_to_terminal_truth" in failure and obligation in failure
+                        for failure in failures), (name, failures))
+
+    def test_retired_acoustic_names_are_absent_from_the_manifest(self):
+        """The stale corridor named symbols the product no longer defines.
+
+        Loctree resolves them to zero bodies, so the verifier died before any
+        receipt existed. Naming a retired symbol again must be caught here, not
+        by a fail-closed run that reports no failures at all.
+        """
+        manifest = (self.repo / VERIFIER.DEFAULT_MANIFEST).read_text()
+        for retired in ("coverage_speech_ranges_with_source",
+                        "select_coverage_speech_source",
+                        "coverage_speech_ranges"):
+            self.assertNotIn(f'"{retired}"', manifest, retired)
 
 
 if __name__ == "__main__":

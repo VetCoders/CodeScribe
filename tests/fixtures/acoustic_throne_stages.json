@@ -318,15 +318,48 @@
               "file": "core/config/loader.rs",
               "signature_contains": "fn load_runtime_snapshot_with_keychain_population(",
               "required_code": [
+                "let input = Self::capture_runtime_inputs(populate_keychain)",
+                "let snapshot = Self::resolve_runtime_snapshot_with_capture(|| input)"
+              ]
+            },
+            {
+              "symbol": "capture_runtime_inputs",
+              "file": "core/config/loader.rs",
+              "signature_contains": "fn capture_runtime_inputs(",
+              "required_code": [
                 "let values = Self::load_with_keychain_population(populate_keychain)",
                 "let energy_calibration_path = energy_calibration_path()",
                 "let energy_calibration = SealedEnergyCalibration::load(&energy_calibration_path)",
-                "energy_calibration_sha256: energy_calibration.sha256().map(str::to_owned)",
-                "energy_calibration.digest_material()",
+                "let mut input = CapturedRuntimeInputs {",
+                "values,",
+                "energy_calibration_path,",
+                "energy_calibration,"
+              ]
+            },
+            {
+              "symbol": "resolve_runtime_snapshot_with_capture",
+              "file": "core/config/loader.rs",
+              "signature_contains": "fn resolve_runtime_snapshot_with_capture(",
+              "required_code": [
+                "capture: impl FnOnce() -> CapturedRuntimeInputs",
+                "Self::runtime_snapshot_from_captured(capture())"
+              ]
+            },
+            {
+              "symbol": "runtime_snapshot_from_captured",
+              "file": "core/config/loader.rs",
+              "signature_contains": "pub fn runtime_snapshot_from_captured(",
+              "required_code": [
+                "mut input: CapturedRuntimeInputs",
+                "energy_calibration_path: input.energy_calibration_path.clone()",
+                "energy_calibration_sha256: input.energy_calibration.sha256().map(str::to_owned)",
+                "input.energy_calibration.digest_material()",
+                "let digest = SettingsSnapshotDigest::from_hex(sha256_hex(digest_material.as_bytes()))",
+                "energy_calibration: input.energy_calibration",
                 "RuntimeSettingsSnapshot::seal_loaded(RuntimeSnapshotParts {",
-                "provenance",
-                "digest",
-                "energy_calibration"
+                "provenance: parts.provenance",
+                "digest: parts.digest",
+                "energy_calibration: parts.energy_calibration"
               ]
             },
             {
@@ -436,9 +469,30 @@
           ],
           "required_invocations": [
             {
+              "callee": "capture_runtime_inputs",
+              "callee_file": "core/config/loader.rs",
+              "caller": "load_runtime_snapshot_with_keychain_population",
+              "caller_file": "core/config/loader.rs",
+              "min_calls": 1
+            },
+            {
+              "callee": "resolve_runtime_snapshot_with_capture",
+              "callee_file": "core/config/loader.rs",
+              "caller": "load_runtime_snapshot_with_keychain_population",
+              "caller_file": "core/config/loader.rs",
+              "min_calls": 1
+            },
+            {
+              "callee": "runtime_snapshot_from_captured",
+              "callee_file": "core/config/loader.rs",
+              "caller": "resolve_runtime_snapshot_with_capture",
+              "caller_file": "core/config/loader.rs",
+              "min_calls": 1
+            },
+            {
               "callee": "seal_loaded",
               "callee_file": "core/config/settings.rs",
-              "caller": "load_runtime_snapshot_with_keychain_population",
+              "caller": "runtime_snapshot_from_captured",
               "caller_file": "core/config/loader.rs",
               "min_calls": 1
             },
@@ -1335,31 +1389,48 @@
               "symbol": "repair_terminal_seal_coverage",
               "file": "core/pipeline/streaming/apple_live_session.rs",
               "required_code": [
-                "let speech_ranges = coverage_speech_ranges(state);",
-                "ledger.assess_seal_coverage(",
-                "InProcessTailProvider.transcribe(&request, &window.samples)",
-                "EngineEvent::SealCoverage {",
-                "EnergyAdmission::QualifyFinalPassGap",
-                "record_seal_coverage(final_receipt.clone())"
+                "repair_terminal_seal_coverage_with(",
+                "|request, pcm, control| InProcessTailProvider.transcribe_controlled(request, pcm, control)"
               ]
             },
             {
-              "symbol": "coverage_speech_ranges_with_source",
+              "symbol": "coverage_speech_evidence",
               "file": "core/pipeline/streaming/apple_live_session.rs",
+              "signature_contains": "fn coverage_speech_evidence(",
               "required_code": [
-                "let samples_seen = state.audio.session_sample_end();",
-                "session_active_speech_ranges(&state.session_id, state.capture_epoch, state.sample_rate)",
-                "let acoustic = fusion.acoustic_speech_ranges(samples_seen);",
-                "select_coverage_speech_source(!acoustic.is_empty(), !utterances.is_empty())",
-                "CoverageSpeechSource::CaptureEnergy"
+                "let captured_samples = state.audio.session_sample_end();",
+                "state.capture_energy.session_active_speech_ranges(",
+                "AcousticAvailability::InvalidMeasurement { .. }",
+                "return capture_energy;",
+                "let acoustic = fusion.acoustic_speech_evidence();",
+                "if acoustic.observed_speech()",
+                "return within_capture(acoustic, captured_samples);",
+                "within_capture(capture_energy, captured_samples)"
+              ]
+            },
+            {
+              "symbol": "within_capture",
+              "file": "core/pipeline/streaming/apple_live_session.rs",
+              "signature_contains": "fn within_capture(",
+              "required_code": [
+                "let Some(observed_samples) = evidence.availability().observed_samples() else",
+                "return evidence;",
+                "if observed_samples >= captured_samples",
+                "return evidence;",
+                "AcousticSpeechEvidence::unavailable(",
+                "AcousticAvailability::Discontinuous { observed_samples }"
               ]
             },
             {
               "symbol": "assess_seal_coverage",
               "file": "core/pipeline/acoustic_ledger.rs",
               "required_code": [
-                "speech_ranges: &[TailSampleRange]",
+                "speech: &AcousticSpeechEvidence",
+                "SealCoverageStatus::Unavailable(gap)",
+                "if !speech.identity().matches(session, capture_epoch)",
+                "let Some(observed_samples) = speech.availability().observed_samples() else",
                 "self.committed.keys()",
+                "refuse(AcousticEvidenceGap::PartialObservation)",
                 "SealCoverageStatus::Incomplete",
                 "speech_samples.saturating_sub(uncovered_samples)",
                 "uncovered_speech_ranges: uncovered"
@@ -1370,6 +1441,7 @@
               "file": "core/pipeline/acoustic_ledger.rs",
               "required_code": [
                 "coverage.status == SealCoverageStatus::Incomplete",
+                "coverage.status.unavailable_reason().is_some()",
                 "return Err(SealRefusal::CoverageIncomplete)",
                 "self.seal(occurrence)?"
               ]
@@ -1422,19 +1494,19 @@
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
             },
             {
-              "callee": "coverage_speech_ranges",
+              "callee": "repair_terminal_seal_coverage_with",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "repair_terminal_seal_coverage",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
             },
             {
-              "callee": "coverage_speech_ranges_with_source",
+              "callee": "coverage_speech_evidence",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
-              "caller": "coverage_speech_ranges",
+              "caller": "repair_terminal_seal_coverage_with",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
             },
             {
-              "callee": "coverage_speech_ranges_with_source",
+              "callee": "coverage_speech_evidence",
               "callee_file": "core/pipeline/streaming/apple_live_session.rs",
               "caller": "publish_terminal_coverage",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
@@ -1442,14 +1514,40 @@
             {
               "callee": "session_active_speech_ranges",
               "callee_file": "core/audio/capture_receipt.rs",
-              "caller": "coverage_speech_ranges_with_source",
+              "caller": "coverage_speech_evidence",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "within_capture",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "coverage_speech_evidence",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs",
               "minimum_count": 2
             },
             {
               "callee": "assess_seal_coverage",
               "callee_file": "core/pipeline/acoustic_ledger.rs",
-              "caller": "repair_terminal_seal_coverage",
+              "caller": "repair_terminal_seal_coverage_with",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 2
+            },
+            {
+              "callee": "record_seal_coverage",
+              "callee_file": "core/pipeline/acoustic_ledger.rs",
+              "caller": "repair_terminal_seal_coverage_with",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs",
+              "minimum_count": 2
+            },
+            {
+              "callee": "admit_full_pass_gap_segments",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "repair_terminal_seal_coverage_with",
+              "caller_file": "core/pipeline/streaming/apple_live_session.rs"
+            },
+            {
+              "callee": "window_by_samples",
+              "callee_file": "core/pipeline/streaming/apple_live_session.rs",
+              "caller": "repair_terminal_seal_coverage_with",
               "caller_file": "core/pipeline/streaming/apple_live_session.rs"
             },
             {
@@ -1603,7 +1701,8 @@
     }
   },
   "tool_contract": {
-    "receipt_version": "codescribe.acoustic-structure-receipt.v2",
+    "receipt_version": "codescribe.acoustic-structure-receipt.v3",
+    "superseded_versions": ["codescribe.acoustic-structure-receipt.v2"],
     "legacy_schema": "tests/fixtures/acoustic_structure_receipt.schema.json",
     "neutral_ast_command": [
       "cargo",
@@ -1618,7 +1717,7 @@
     ],
     "receipt_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "$id": "https://vetcoders.io/schemas/codescribe/acoustic-structure-receipt.v2.json",
+      "$id": "https://vetcoders.io/schemas/codescribe/acoustic-structure-receipt.v3.json",
       "title": "Codescribe acoustic structure receipt with neutral AST evidence",
       "type": "object",
       "additionalProperties": false,
@@ -1880,7 +1979,8 @@
             "input_sha256",
             "build_policy",
             "target_dir",
-            "jobs"
+            "jobs",
+            "incremental"
           ],
           "properties": {
             "command": {
@@ -1916,7 +2016,20 @@
               "pattern": "^/(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\u0000-\\u001f\\u007f~$\\\\:])[^/\\s](?:[^/]*[^/\\s])?(?:/[^/\\s](?:[^/]*[^/\\s])?)*$"
             },
             "jobs": {
-              "const": 4
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1024
+            },
+            "incremental": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "integer",
+                  "enum": [0, 1]
+                }
+              ]
             }
           }
         },
@@ -2010,7 +2123,7 @@
           "const": "tests/fixtures/acoustic_throne_stages.json#/tool_contract/receipt_schema"
         },
         "schema": {
-          "const": "codescribe.acoustic-structure-receipt.v2"
+          "const": "codescribe.acoustic-structure-receipt.v3"
         },
         "stage": {
           "enum": ["demolished", "assembled", "wired"]

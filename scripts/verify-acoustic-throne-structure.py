@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 
-RECEIPT_SCHEMA = "codescribe.acoustic-structure-receipt.v2"
+RECEIPT_SCHEMA = "codescribe.acoustic-structure-receipt.v3"
 DEFAULT_MANIFEST = "tests/fixtures/acoustic_throne_stages.json"
 ALLOWED_EXECUTABLE = "loct"
 AST_COMMAND = (
@@ -38,6 +38,15 @@ AST_BODIES = {
     "stop": "core/audio/streaming_recorder.rs",
     "complete_stop": "core/audio/streaming_recorder.rs",
 }
+# The shipped default when no lease is supplied. A fleet worktree that owns a
+# shared target must be able to state its own budget instead of having this
+# value forced on it; nothing else about the child environment is negotiable.
+AST_DEFAULT_BUILD_JOBS = 4
+AST_MAX_BUILD_JOBS = 1024
+# Decimal, no sign, no leading zero, no separators. `int()` alone would accept
+# "+2", " 2" and non-ASCII digits, so the spelling is validated before parsing.
+AST_BUILD_JOBS_PATTERN = re.compile(r"[1-9][0-9]*")
+AST_INCREMENTAL_VALUES = {"0", "1"}
 
 
 def resolve_ast_target(repo: Path) -> Path:
@@ -71,6 +80,35 @@ def resolve_ast_target(repo: Path) -> Path:
         return target
     except (OSError, ValueError) as error:
         raise RuntimeError(f"neutral AST target unavailable: {error}") from error
+
+
+def resolve_ast_build_policy() -> tuple[int, int | None]:
+    """Admit an explicitly supplied compiler lease; refuse malformed spellings.
+
+    Absent values keep the shipped default: `jobs=4` and Cargo's own
+    incremental policy. A supplied `CARGO_BUILD_JOBS` must be a positive
+    decimal integer and `CARGO_INCREMENTAL` exactly `0` or `1`. Both are
+    validated here, before any filesystem work or child process, so a
+    malformed lease can never reach Cargo. Returning `None` for incremental
+    records "not supplied" rather than inventing a policy the caller never
+    stated.
+    """
+    supplied_jobs = os.environ.get("CARGO_BUILD_JOBS")
+    if supplied_jobs is None:
+        jobs = AST_DEFAULT_BUILD_JOBS
+    elif AST_BUILD_JOBS_PATTERN.fullmatch(supplied_jobs) and int(supplied_jobs) <= AST_MAX_BUILD_JOBS:
+        jobs = int(supplied_jobs)
+    else:
+        raise RuntimeError(
+            f"neutral AST CARGO_BUILD_JOBS is not a validated positive integer: {supplied_jobs!r}"
+        )
+    supplied_incremental = os.environ.get("CARGO_INCREMENTAL")
+    if supplied_incremental is not None and supplied_incremental not in AST_INCREMENTAL_VALUES:
+        raise RuntimeError(
+            f"neutral AST CARGO_INCREMENTAL must be 0 or 1 when supplied: {supplied_incremental!r}"
+        )
+    incremental = None if supplied_incremental is None else int(supplied_incremental)
+    return jobs, incremental
 
 
 def command_allowed(command: list[str] | tuple[str, ...]) -> bool:
@@ -112,12 +150,18 @@ def ast_tool_digest(repo: Path) -> str:
 def run_ast_json(repo: Path, command: list[str], payload: dict[str, Any]) -> dict[str, Any]:
     if tuple(command) != AST_COMMAND:
         raise RuntimeError(f"refused non-neutral AST command: {command}")
+    # Validate the lease first: a malformed budget must be refused before the
+    # target is resolved and long before a child process could exist.
+    jobs, incremental = resolve_ast_build_policy()
     target = str(resolve_ast_target(repo))
     before = ast_tool_digest(repo)
     # Do not inherit compiler wrappers, Cargo overrides, injected Rust flags or
-    # dynamic-library preload settings. Only the validated target is configurable.
+    # dynamic-library preload settings. Only the validated target and the
+    # validated build lease are configurable.
     env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "SYSTEMROOT") if key in os.environ}
-    env.update(CARGO_TARGET_DIR=target, CARGO_BUILD_JOBS="4")
+    env.update(CARGO_TARGET_DIR=target, CARGO_BUILD_JOBS=str(jobs))
+    if incremental is not None:
+        env["CARGO_INCREMENTAL"] = str(incremental)
     serialized = json.dumps(payload)
     try:
         completed = subprocess.run(command, cwd=repo, env=env, input=serialized,
@@ -150,7 +194,8 @@ def run_ast_json(repo: Path, command: list[str], payload: dict[str, Any]) -> dic
         raise RuntimeError("neutral AST contradictory overall result")
     evidence["invocation"] = {"command": command, "cwd": str(repo.resolve()),
         "source_sha256": before, "input_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
-        "build_policy": "cargo-run-current-sources-offline-locked", "target_dir": target, "jobs": 4}
+        "build_policy": "cargo-run-current-sources-offline-locked", "target_dir": target,
+        "jobs": jobs, "incremental": incremental}
     return evidence
 
 

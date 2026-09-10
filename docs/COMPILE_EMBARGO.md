@@ -472,11 +472,30 @@ repository roots and ancestors of the repository or home are refused, as are
 non-directory components and symlinks anywhere in the target path (including
 before `..` normalization). The selected repository itself is canonicalized first.
 Validation creates, deletes and cleans nothing; Cargo may create a missing default
-`target`. Only the resolved validated target and `CARGO_BUILD_JOBS=4` enter the
-sanitized child environment, and the receipt records that exact target. Fleet
-leases belong in run artifacts, never shipped defaults. The v2 schema requires a
-canonical absolute target spelling; filesystem and ownership checks belong to
-Python's pre-execution validation, not JSON Schema.
+`target`. Only the resolved validated target and the validated build lease enter
+the sanitized child environment, and the receipt records that exact target. The
+schema requires a canonical absolute target spelling; filesystem and ownership
+checks belong to Python's pre-execution validation, not JSON Schema.
+
+The build lease is `CARGO_BUILD_JOBS` and `CARGO_INCREMENTAL`. Absent values keep
+the shipped defaults: `jobs=4` and Cargo's own incremental policy; fleet leases
+stay in run artifacts and are never shipped defaults. When supplied explicitly,
+`CARGO_BUILD_JOBS` must be a positive decimal integer (no sign, no leading zero,
+no separators, at most 1024) and `CARGO_INCREMENTAL` exactly `0` or `1`. Both are
+validated before the target is resolved and therefore before any child process
+could exist; a malformed value is refused and never reaches Cargo. No other
+compiler setting is negotiable: wrappers, Rust flags, encoded flags, target
+triples and dynamic-library preloads are still dropped, and no invocation uses a
+shell. The receipt's `invocation` reports the effective `jobs` and an explicit
+`incremental` policy, where `null` means "not supplied, Cargo's own default"
+rather than a value the caller never stated.
+
+Adding a required `incremental` key and replacing the previous forced `jobs`
+constant is a breaking change to the invocation contract, so the receipt
+generation is `codescribe.acoustic-structure-receipt.v3`; `v2` is recorded in
+`superseded_versions` and its already-written receipts remain valid under their
+own declared generation rather than being retroactively invalidated. Consumers
+select on the receipt's declared generation, as below.
 
 Active gates for this tool are package-selected offline tests and Clippy,
 package formatting, Python instrument tests, the complete wired verifier,
@@ -532,10 +551,44 @@ Synthetic bypasses test the instrument; they are not discovered product exploits
 The eight other unresolved corridor obligations remain independent and red.
 
 The neutral command changes the receipt format to
-`codescribe.acoustic-structure-receipt.v2`. Its complete JSON Schema is embedded
+`codescribe.acoustic-structure-receipt.v3`. Its complete JSON Schema is embedded
 at `tests/fixtures/acoustic_throne_stages.json#/tool_contract/receipt_schema`,
 inside this cut's admitted tool-contract domain. The frozen external v1 schema
-remains a legacy artifact; v2 receipts no longer claim to conform to it. The v2
-schema includes existing ordering observations as well as neutral evidence;
+remains a legacy artifact; v2 and v3 receipts no longer claim to conform to it.
+The schema includes existing ordering observations as well as neutral evidence;
 ordering verdicts and all unrelated corridor obligations retain their existing
 Python checks. Schema consumers must select the receipt's declared generation.
+
+## 14. Instrument staleness is not product truth (2026-09-10)
+
+A structural instrument names product symbols. When the product renames or
+re-owns one, the instrument's claim about it stops being a measurement, and the
+verifier's verdict about that hop carries no information about the product. Two
+shapes of this were observed and must be read apart from real defects.
+
+**Fail-closed yields no failure list.** `loct body <retired-symbol>` resolves to
+zero bodies and exits non-zero, so the verifier aborts before writing a receipt:
+exit 2, empty stdout, one stderr line. That is _not_ "zero failures", and it is
+not a passing run either. A run with no receipt may never be reported as a count.
+
+**A delegation refactor silently moves every body obligation.** When a function
+is split into a thin delegator plus a generic `_with` implementation, body-level
+`required_code` still resolves the delegator — now a few lines long — and every
+obligation reads as missing, while the callsite edges move to the new owner.
+Observed twice in the same file: `repair_terminal_seal_coverage` →
+`repair_terminal_seal_coverage_with`, and `seal_sliced_by_silero` →
+`reconcile_silero_ledger`. The corridor must follow the owner that actually
+executes the code; re-pointing it is an instrument repair, never a product fix.
+
+Two evidence-provider limits bound what a corridor may assert, and neither may be
+worked around by flipping metadata, raising a line cap or reading raw product
+source as an unauthenticated fallback:
+
+- a generic function whose `where` clause spans lines can return a truncated
+  `window` extent instead of `brace`, identically at every line cap. No body
+  obligation can be placed on such an owner; its contract has to be carried by
+  callsite edges, and the gap recorded as an explicit `BOUNDARY`.
+- `enclosing_symbol` can resolve to a function-local `const` rather than the
+  enclosing function, so a caller-attribution proof observes zero callsites for
+  calls that genuinely exist. That is an `INSTRUMENT_FALSE_NEGATIVE` and must be
+  classified as one before anyone repairs product code to satisfy it.

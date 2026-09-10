@@ -177,12 +177,15 @@ pub(super) fn complete(g: &mut Grammar, body: &Block) {
             "typed capture failure only after shutdown",
         ),
         (
+            // Every non-complete verdict refuses, including the ones that say
+            // no measurement exists. An `== Incomplete` comparison would let an
+            // `Unavailable` receipt reach the terminal success below.
             parse_quote!(let incomplete_coverage = self.acoustic_ledger.as_ref().and_then(|ledger| {
             ledger.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
                 .latest_seal_coverage()
-                .filter(|receipt| receipt.status == SealCoverageStatus::Incomplete).cloned()
+                .filter(|receipt| !receipt.status.is_complete()).cloned()
         });),
-            "read and filter latest incomplete receipt",
+            "read and filter latest non-complete receipt",
         ),
         (
             parse_quote!(if let Some(receipt) = incomplete_coverage {
