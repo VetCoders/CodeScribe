@@ -50,7 +50,7 @@ final class AppModel: ObservableObject {
       mcpAdmin: RealMCPAdminEngine()
     )
     self.chat = chat
-    self.overlay = OverlayController(engine: ControllerDictationEngine())
+    self.overlay = OverlayController(engine: ControllerDictationEngine(), composer: chat)
     self.tray = TrayViewModel(engine: RealTrayEngine())
     // The composer is a gesture-only adapter over RecordingController. Right
     // Option, composer mic, Dictation, and Formatting share one recorder/STT.
@@ -107,6 +107,7 @@ final class OverlayController: ObservableObject {
   init(
     state: OverlayState? = nil,
     engine: DictationEngine? = nil,
+    composer: AgentChatStore? = nil,
     overlayEnabledProvider: @escaping () -> Bool = {
       DictationOverlayGate.shouldShowOverlay(
         trayEnabled: CodescribeConfig().trayToggles().transcriptionOverlayEnabled
@@ -181,8 +182,11 @@ final class OverlayController: ObservableObject {
       AppModel.shared.tray.isStartingDictation = false
       AppModel.shared.chat.dictationBlocked = true
     }
-    // Both delivery and ownership release use the producer's session identity.
-    state.connectComposer(to: AppModel.shared.chat)
+    // The composition root supplies its existing chat before the listener is
+    // attached. Looking up AppModel.shared here re-enters its once initializer.
+    // Standalone overlays have no implicit global composer; delivery and
+    // ownership release still use connectComposer's authenticated session path.
+    if let composer { state.connectComposer(to: composer) }
     state.onRecordingStopped = { [weak self] in
       guard let self else { return }
       // A pending/newer composer request cannot be released by identity-less
