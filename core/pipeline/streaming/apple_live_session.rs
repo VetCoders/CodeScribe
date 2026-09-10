@@ -74,8 +74,8 @@ use crate::stt::tail_provider::{
 use super::layer1_window::{CoalesceFlush, CoalescedPiece, Layer1Coalesce};
 use super::live_audio_buffer::{DEFAULT_RETENTION_SECS, LiveAudioBuffer, ResolvedAudioWindow};
 use super::session::{
-    LocalExecutionOwner, SessionConfig, TailPatchDrainDisposition, TailPatchJobResult,
-    TailPatchSessionReceipt, compute_tail_patch_job, emit_session_finalised,
+    LocalExecutionOwner, SessionConfig, TailPatchDrainDisposition, TailPatchJobInput,
+    TailPatchJobResult, TailPatchSessionReceipt, compute_tail_patch_job, emit_session_finalised,
     log_tail_patch_session_receipt,
 };
 use super::silero_fusion::{
@@ -336,12 +336,14 @@ impl AppleTailPatchLane {
         req.provider_request.language = self.language.clone();
         let job = compute_tail_patch_job(
             &self.execution,
-            req.utterance_id,
-            req.committed_text,
-            req.neighbour_context,
-            req.audio,
-            req.provider_request,
-            self.config,
+            TailPatchJobInput {
+                utterance_id: req.utterance_id,
+                committed_text: req.committed_text,
+                neighbour_context: req.neighbour_context,
+                audio: req.audio,
+                request: req.provider_request,
+                config: self.config,
+            },
             self.provider,
         );
         self.push_job(job);

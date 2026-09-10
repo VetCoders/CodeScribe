@@ -349,40 +349,29 @@ pub(super) struct TailPatchJobResult {
     pub payload: TailProviderPayload,
 }
 
+/// Owned data for one tail job; execution control remains with the session owner.
+pub(super) struct TailPatchJobInput {
+    pub utterance_id: u64,
+    pub committed_text: String,
+    pub neighbour_context: String,
+    pub audio: Vec<f32>,
+    pub request: TailProviderRequest,
+    pub config: TailPatchConfig,
+}
+
 pub(super) fn compute_tail_patch_job(
     owner: &LocalExecutionOwner,
-    utterance_id: u64,
-    committed_text: String,
-    neighbour_context: String,
-    audio: Vec<f32>,
-    request: TailProviderRequest,
-    config: TailPatchConfig,
+    input: TailPatchJobInput,
     provider: crate::stt::tail_provider::TailProviderId,
 ) -> futures_util::future::BoxFuture<'static, Result<TailPatchJobResult>> {
-    compute_tail_patch_job_with(
-        owner,
-        utterance_id,
-        committed_text,
-        neighbour_context,
-        audio,
-        request,
-        config,
-        move |request, pcm, control| {
-            crate::stt::tail_provider::transcribe_selected_controlled(
-                provider, request, pcm, control,
-            )
-        },
-    )
+    compute_tail_patch_job_with(owner, input, move |request, pcm, control| {
+        crate::stt::tail_provider::transcribe_selected_controlled(provider, request, pcm, control)
+    })
 }
 
 fn compute_tail_patch_job_with<F>(
     owner: &LocalExecutionOwner,
-    utterance_id: u64,
-    committed_text: String,
-    neighbour_context: String,
-    audio: Vec<f32>,
-    request: TailProviderRequest,
-    config: TailPatchConfig,
+    input: TailPatchJobInput,
     transcribe: F,
 ) -> futures_util::future::BoxFuture<'static, Result<TailPatchJobResult>>
 where
@@ -394,6 +383,14 @@ where
         + Send
         + 'static,
 {
+    let TailPatchJobInput {
+        utterance_id,
+        committed_text,
+        neighbour_context,
+        audio,
+        request,
+        config,
+    } = input;
     debug_assert_eq!(
         committed_text.trim(),
         committed_text,
@@ -725,12 +722,14 @@ mod session_tests {
         let owner = LocalExecutionOwner::default();
         let job = compute_tail_patch_job_with(
             &owner,
-            73,
-            "ala ma kota".to_string(),
-            String::new(),
-            vec![0.0; 320],
-            request,
-            TailPatchConfig::default(),
+            TailPatchJobInput {
+                utterance_id: 73,
+                committed_text: "ala ma kota".to_string(),
+                neighbour_context: String::new(),
+                audio: vec![0.0; 320],
+                request,
+                config: TailPatchConfig::default(),
+            },
             move |request, pcm, control| {
                 control.check()?;
                 request.validate_pcm(pcm)?;
@@ -740,6 +739,8 @@ mod session_tests {
         .await
         .expect("typed fake tail job");
 
+        assert_eq!(job.utterance_id, 73);
+        assert_eq!(job.payload.identity.request_id, 73);
         assert!(matches!(job.outcome, TailPatchOutcome::NoChange));
         assert_eq!(job.payload.identity.range, range);
         assert_eq!(job.payload.segments[0].range.sample_start, 48_160);
@@ -914,6 +915,15 @@ mod local_execution_tests {
 
     #[tokio::test]
     async fn production_tail_job_starts_owned_before_poll_and_rejects_cancelled_completion() {
+        tail_job_rejects_late_completion(false).await;
+    }
+
+    #[tokio::test]
+    async fn production_tail_job_rejects_completion_after_shared_deadline() {
+        tail_job_rejects_late_completion(true).await;
+    }
+
+    async fn tail_job_rejects_late_completion(expire: bool) {
         let owner = LocalExecutionOwner::default();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -932,12 +942,14 @@ mod local_execution_tests {
         };
         let job = compute_tail_patch_job_with(
             &owner,
-            42,
-            "Iwo".into(),
-            String::new(),
-            vec![0.25; 4],
-            request,
-            TailPatchConfig::default(),
+            TailPatchJobInput {
+                utterance_id: 42,
+                committed_text: "Iwo".into(),
+                neighbour_context: String::new(),
+                audio: vec![0.25; 4],
+                request,
+                config: TailPatchConfig::default(),
+            },
             move |request, pcm, _| {
                 request.validate_pcm(pcm)?;
                 entered_tx.send(()).unwrap();
@@ -966,14 +978,58 @@ mod local_execution_tests {
         // No poll of the result future was needed to start and retain work.
         entered_rx.await.unwrap();
         assert_eq!(owner.handles.lock().unwrap().len(), 1);
-        owner.control.cancel();
+        if expire {
+            let deadline = owner.begin_drain(Duration::ZERO);
+            assert_eq!(owner.begin_drain(Duration::from_secs(5)), deadline);
+        } else {
+            owner.control.cancel();
+        }
         release_tx.send(()).unwrap();
         assert!(
             job.await.is_err(),
-            "cancelled native success cannot become a tail completion"
+            "cancelled or expired native success cannot become a tail completion"
         );
         owner.close_and_join().await;
         assert!(owner.handles.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tail_job_rejects_cancelled_or_expired_admission_without_transcribing() {
+        for expire in [false, true] {
+            let owner = LocalExecutionOwner::default();
+            if expire {
+                owner.begin_drain(Duration::ZERO);
+            } else {
+                owner.control.cancel();
+            }
+            let result = compute_tail_patch_job_with(
+                &owner,
+                TailPatchJobInput {
+                    utterance_id: 91,
+                    committed_text: "Iwo".into(),
+                    neighbour_context: String::new(),
+                    audio: vec![0.25; 4],
+                    request: TailProviderRequest {
+                        identity: TailRequestIdentity {
+                            request_id: 91,
+                            range: TailSampleRange {
+                                session: "refused-tail-input".into(),
+                                capture_epoch: 8,
+                                sample_start: 100,
+                                sample_end: 104,
+                            },
+                        },
+                        sample_rate: 16_000,
+                        language: None,
+                    },
+                    config: TailPatchConfig::default(),
+                },
+                |_, _, _| panic!("closed owner must not invoke transcription"),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(owner.handles.lock().unwrap().is_empty());
+        }
     }
 
     #[test]

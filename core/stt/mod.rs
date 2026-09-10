@@ -92,7 +92,7 @@ impl LocalExecutionControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         anyhow::ensure!(
             !self.cancelled.load(std::sync::atomic::Ordering::Acquire)
-                && !deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+                && deadline.is_none_or(|deadline| std::time::Instant::now() < deadline),
             "local execution cancelled or drain deadline expired"
         );
         Ok(())
