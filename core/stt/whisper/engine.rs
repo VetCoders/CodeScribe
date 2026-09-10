@@ -339,7 +339,31 @@ pub struct LocalWhisperEngine {
     pub decoding_params: DecodingParams,
 }
 
+struct EngineRequest<'a> {
+    engine: &'a mut LocalWhisperEngine,
+    previous_prompt: Option<String>,
+}
+
+impl Drop for EngineRequest<'_> {
+    fn drop(&mut self) {
+        self.engine.decoding_params.initial_prompt = self.previous_prompt.take();
+        self.engine.clear_execution_cache();
+    }
+}
+
 impl LocalWhisperEngine {
+    /// One cleanup corridor for public file calls and controlled local repair.
+    /// Restores prompt and cache on success, cancellation, error, and unwind.
+    pub(crate) fn with_request<R>(
+        &mut self,
+        initial_prompt: Option<String>,
+        work: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let previous_prompt = std::mem::replace(&mut self.decoding_params.initial_prompt, initial_prompt);
+        let request = EngineRequest { engine: self, previous_prompt };
+        work(&mut *request.engine)
+    }
+
     /// Load a model from a directory (development / external models).
     ///
     /// Expects `config.json` plus `weights.safetensors` or `model.safetensors`.
@@ -621,6 +645,7 @@ impl LocalWhisperEngine {
             language,
             &silence_spans,
             on_segments,
+            &crate::stt::LocalExecutionControl::default(),
         )?;
         super::timing::record_inference_ms(inference_started.elapsed().as_millis() as u64);
         let raw_for_final_pass = raw;
@@ -706,7 +731,9 @@ impl LocalWhisperEngine {
             }
         };
 
-        self.transcribe_samples_16k_raw(&samples, language, debug_tokens)
+        self.transcribe_samples_16k_raw(
+            &samples, language, debug_tokens, &crate::stt::LocalExecutionControl::default(),
+        )
     }
 
     /// Transcribe arbitrarily long audio in VAD-aligned, overlapping windows.
@@ -724,7 +751,38 @@ impl LocalWhisperEngine {
         sample_rate: u32,
         language: Option<&str>,
     ) -> Result<RawTranscript> {
+        self.transcribe_long_controlled(
+            audio, sample_rate, language, &crate::stt::LocalExecutionControl::default(),
+        )
+    }
+
+    pub(crate) fn clear_execution_cache(&mut self) {
+        self.model.reset_kv_cache();
+    }
+
+    pub(crate) fn transcribe_long_controlled(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        control: &crate::stt::LocalExecutionControl,
+    ) -> Result<RawTranscript> {
+        let result = self.transcribe_long_inner(audio, sample_rate, language, control);
+        self.clear_execution_cache();
+        control.check()?;
+        result
+    }
+
+    fn transcribe_long_inner(
+        &mut self,
+        audio: &[f32],
+        sample_rate: u32,
+        language: Option<&str>,
+        control: &crate::stt::LocalExecutionControl,
+    ) -> Result<RawTranscript> {
+        control.check()?;
         let (_, stats) = crate::vad::extract_speech(audio, sample_rate);
+        control.check()?;
         let silence_spans = silence_spans_from_vad_probabilities(
             &stats.probabilities,
             crate::vad::VadConfig::default().threshold,
@@ -740,6 +798,7 @@ impl LocalWhisperEngine {
             language,
             &silence_spans,
             &mut |_| Ok(()),
+            control,
         )
     }
 
@@ -758,7 +817,9 @@ impl LocalWhisperEngine {
         language: Option<&str>,
         silence_spans: &[(f32, f32)],
         on_segments: &mut dyn FnMut(&[crate::pipeline::contracts::TranscriptSegment]) -> Result<()>,
+        control: &crate::stt::LocalExecutionControl,
     ) -> Result<RawTranscript> {
+        control.check()?;
         let samples = audio_loader::resample_to_16k(audio, sample_rate);
         if samples.is_empty() {
             tracing::debug!("Skipping long transcription: empty audio after resampling");
@@ -772,7 +833,7 @@ impl LocalWhisperEngine {
         let language = match language {
             Some(l) => Some(l),
             None => {
-                detected_lang = self.detect_language_16k(&samples)?;
+                detected_lang = self.detect_language_16k_controlled(&samples, control)?;
                 tracing::info!("Detected language: {}", detected_lang);
                 Some(detected_lang.as_str())
             }
@@ -803,13 +864,14 @@ impl LocalWhisperEngine {
             .collect();
 
         while let Some((start_sec, end_sec, splits)) = pending.pop() {
+            control.checkpoint(crate::stt::LocalExecutionBoundary::Window)?;
             let start = ((start_sec * 16_000.0).round() as usize).min(samples.len());
             let end = ((end_sec * 16_000.0).round() as usize).min(samples.len());
             if end <= start {
                 continue;
             }
             let chunk = &samples[start..end];
-            let mut transcript = self.transcribe_samples_16k_raw(chunk, language, debug_tokens)?;
+            let mut transcript = self.transcribe_samples_16k_raw(chunk, language, debug_tokens, control)?;
 
             // `merge_chunk_transcripts` refuses words without timestamp
             // provenance by contract. That refusal is the WINDOW's verdict,
@@ -930,6 +992,15 @@ impl LocalWhisperEngine {
     /// scoring language token, so detection costs one step rather than a full
     /// decode.
     fn detect_language_16k(&mut self, samples_16k: &[f32]) -> Result<String> {
+        self.detect_language_16k_controlled(samples_16k, &crate::stt::LocalExecutionControl::default())
+    }
+
+    fn detect_language_16k_controlled(
+        &mut self,
+        samples_16k: &[f32],
+        control: &crate::stt::LocalExecutionControl,
+    ) -> Result<String> {
+        control.check()?;
         let max_samples = 16_000usize * 30;
         let samples = &samples_16k[..samples_16k.len().min(max_samples)];
         ensure!(!samples.is_empty(), "audio is empty");
@@ -948,7 +1019,9 @@ impl LocalWhisperEngine {
             &self.device,
         )?;
 
+        control.check()?;
         let encoder_output = self.model.encoder.forward(&mel, true)?;
+        control.check()?;
 
         let start_token = self
             .tokenizer
@@ -964,6 +1037,7 @@ impl LocalWhisperEngine {
         let (_b, seq_len, _vocab) = logits.dims3()?;
         let last_logits = logits.i((.., seq_len - 1, ..))?.squeeze(0)?;
         let logits_vec = last_logits.to_vec1::<f32>()?;
+        control.check()?;
 
         let candidates =
             crate::whisper_weights::language_token_candidates(&self.tokenizer, logits_vec.len());
@@ -1004,7 +1078,9 @@ impl LocalWhisperEngine {
         samples_16k: &[f32],
         language: Option<&str>,
         debug_tokens: bool,
+        control: &crate::stt::LocalExecutionControl,
     ) -> Result<RawTranscript> {
+        control.check()?;
         ensure!(!samples_16k.is_empty(), "audio is empty");
 
         self.model.reset_kv_cache();
@@ -1089,7 +1165,9 @@ impl LocalWhisperEngine {
         let mut all_tokens = Vec::new();
 
         // Run encoder once
+        control.check()?;
         let encoder_output = self.model.encoder.forward(&mel, true)?;
+        control.check()?;
 
         // Decoder loop – allow up to the configured maximum target positions minus initial tokens
         let max_new_tokens = self
@@ -1106,6 +1184,7 @@ impl LocalWhisperEngine {
         let mut token_count = 0usize;
 
         for step in 0..max_new_tokens {
+            control.checkpoint(crate::stt::LocalExecutionBoundary::Token)?;
             if all_tokens.len() >= runaway_budget {
                 tracing::warn!(
                     "Runaway watchdog tripped: {} tokens for {:.2}s audio (budget {})",
@@ -1126,6 +1205,7 @@ impl LocalWhisperEngine {
             let (_b, seq_len, _vocab) = logits.dims3()?;
             let last_logits = logits.i((.., seq_len - 1, ..))?.squeeze(0)?;
             let mut logits_vec = last_logits.to_vec1::<f32>()?;
+            control.check()?;
 
             // 2. Suppress Blank (suppress_blank)
             if self.decoding_params.suppress_blank && all_tokens.len() < 4 {
@@ -2349,5 +2429,89 @@ mod stt_live_first_v2_red {
         assert_eq!(out.segments[0].text, "one two");
         assert_eq!(out.segments[1].text, "four five");
         assert!(!out.text.contains("middle"));
+    }
+}
+
+#[cfg(test)]
+mod local_execution_control_tests {
+    use super::*;
+    use crate::stt::{LocalExecutionBoundary, LocalExecutionControl};
+
+    /// Tiny CPU weights exercise the real encoder/decoder without a model
+    /// download, Metal, VAD runtime or process-global engine mutation.
+    fn engine() -> LocalWhisperEngine {
+        let config = Config {
+            num_mel_bins: 80,
+            max_source_positions: 1500,
+            d_model: 4,
+            encoder_attention_heads: 1,
+            encoder_layers: 1,
+            vocab_size: 5,
+            max_target_positions: 16,
+            decoder_attention_heads: 1,
+            decoder_layers: 1,
+            suppress_tokens: Vec::new(),
+        };
+        let device = Device::Cpu;
+        let vb = candle_nn::VarBuilder::zeros(candle_core::DType::F32, &device);
+        let model = Model::load(&vb, config.clone()).unwrap();
+        let wordlevel = tokenizers::models::wordlevel::WordLevel::builder()
+            .vocab([
+                ("hello".to_string(), 0),
+                ("<|startoftranscript|>".to_string(), 1),
+                ("<|endoftext|>".to_string(), 2),
+                ("<|transcribe|>".to_string(), 3),
+                ("unknown".to_string(), 4),
+            ].into_iter().collect())
+            .unk_token("unknown".into())
+            .build().unwrap();
+        LocalWhisperEngine {
+            model,
+            tokenizer: Tokenizer::new(wordlevel),
+            device,
+            config,
+            mel_filters: vec![0.0; 80 * 201],
+            ts_range: None,
+            engine_provenance: TranscriptionEngineVerdict::whisper(TranscriptionEngineMode::RuntimeFallback),
+            decoding_params: DecodingParams { initial_prompt: Some("previous".into()), ..DecodingParams::default() },
+        }
+    }
+
+    #[test]
+    fn production_window_and_token_cancellation_restore_request_state() {
+        for boundary in [LocalExecutionBoundary::Window, LocalExecutionBoundary::Token] {
+            let mut engine = engine();
+            let control = LocalExecutionControl::cancelling_at(boundary);
+            let result = engine.with_request(Some("hello".into()), |engine| {
+                engine.transcribe_long_with_language_segments_using_silences(
+                    &[0.25; 3200], 16_000, Some("en"), &[], &mut |_| Ok(()), &control,
+                )
+            });
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+            assert!(control.check().is_err(), "the requested production boundary was reached");
+            assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+            // An independent successor still executes the same decoder. It
+            // cannot inherit the prior request's cancellation or prompt.
+            let successor = engine.with_request(None, |engine| {
+                engine.transcribe_samples_16k_raw(&[0.25; 3200], Some("en"), false, &LocalExecutionControl::default())
+            }).unwrap();
+            assert!(!successor.text.is_empty());
+            assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+        }
+    }
+
+    #[test]
+    fn request_scope_restores_prompt_after_error_and_unwind() {
+        let mut engine = engine();
+        let failed: Result<()> = engine.with_request(Some("temporary".into()), |_| {
+            Err(anyhow!("injected decoder failure"))
+        });
+        assert!(failed.is_err());
+        assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = engine.with_request(None, |_| panic!("native worker panic"));
+        }));
+        assert!(unwind.is_err());
+        assert_eq!(engine.decoding_params.initial_prompt.as_deref(), Some("previous"));
     }
 }

@@ -67,14 +67,14 @@ use crate::pipeline::contracts::{EngineEvent, EventSink, TranscriptSegment};
 use crate::stt::apple_stt::{LiveStreamEvent, LiveStreamSession};
 use crate::stt::tail_patcher::{SkipReasonCode, TailPatchConfig, TailPatchOutcome};
 use crate::stt::tail_provider::{
-    InProcessTailProvider, TailProvider, TailProviderPayload, TailProviderRequest,
+    InProcessTailProvider, TailProviderPayload, TailProviderRequest,
     TailRequestIdentity, TailSampleRange, TimedTailSegment,
 };
 
 use super::layer1_window::{CoalesceFlush, CoalescedPiece, Layer1Coalesce};
 use super::live_audio_buffer::{DEFAULT_RETENTION_SECS, LiveAudioBuffer, ResolvedAudioWindow};
 use super::session::{
-    SessionConfig, TailPatchDrainDisposition, TailPatchJobResult, TailPatchSessionReceipt,
+    LocalExecutionOwner, SessionConfig, TailPatchDrainDisposition, TailPatchJobResult, TailPatchSessionReceipt,
     compute_tail_patch_job, emit_session_finalised, log_tail_patch_session_receipt,
 };
 use super::silero_fusion::{
@@ -302,6 +302,7 @@ impl FormatterCompletion {
 /// `SessionFinalised.layer_summary` reports. Jobs are boxed so the lane can be
 /// driven by a stub future in tests without a model on disk.
 struct AppleTailPatchLane {
+    execution: Arc<LocalExecutionOwner>,
     jobs: FuturesOrdered<BoxFuture<'static, Result<TailPatchJobResult>>>,
     language: Option<String>,
     config: TailPatchConfig,
@@ -318,6 +319,7 @@ impl AppleTailPatchLane {
         provider: crate::stt::tail_provider::TailProviderId,
     ) -> Self {
         Self {
+            execution: Arc::new(LocalExecutionOwner::default()),
             jobs: FuturesOrdered::new(),
             language,
             // F2: thresholds stay exactly where the shared primitive puts them.
@@ -327,11 +329,12 @@ impl AppleTailPatchLane {
     }
 
     /// Turn a sealed utterance into a Whisper gap-fill job and queue it. The job
-    /// is only constructed — inference happens inside it on `spawn_blocking`, so
+    /// is only constructed — inference runs on a retained native worker, so
     /// this call never sits on the event-drain path.
     fn push_request(&mut self, mut req: TailPatchRequest) {
         req.provider_request.language = self.language.clone();
         let job = compute_tail_patch_job(
+            &self.execution,
             req.utterance_id,
             req.committed_text,
             req.neighbour_context,
@@ -340,7 +343,7 @@ impl AppleTailPatchLane {
             self.config,
             self.provider,
         );
-        self.push_job(Box::pin(job));
+        self.push_job(job);
     }
 
     /// Queue an already-built job. Boxed and separate from `push_request` so
@@ -693,6 +696,7 @@ pub(crate) async fn apple_stream_transcription_session(
     let worker_formatter_tx = formatter_on.then_some(formatter_tx);
 
     let worker_session_id = session_id.clone();
+    let worker_execution = Arc::clone(&tail_patch_lane.execution);
     let worker = thread::spawn(move || {
         apple_stream_worker(
             pcm_rx,
@@ -702,6 +706,7 @@ pub(crate) async fn apple_stream_transcription_session(
             worker_formatter_tx,
             formatter_done_rx,
             AppleWorkerConfig {
+                local_execution: worker_execution,
                 sample_rate,
                 capture_device_name,
                 language: language.as_deref(),
@@ -779,7 +784,7 @@ pub(crate) async fn apple_stream_transcription_session(
                 }
             }
             // Admit one sealed utterance into Layer 1 at a time. The Whisper
-            // call itself runs on `spawn_blocking` inside the job, so this loop
+            // call itself runs on a retained native worker, so this loop
             // only ever schedules and collects — inference never sits on the
             // event-drain path (F1).
             Some(req) = tp_rx.recv(), if !tail_patch_in_flight => {
@@ -899,8 +904,8 @@ pub(crate) async fn apple_stream_transcription_session(
 
     // `ev_rx` closes only after the worker's bounded closure loop has assigned
     // every accepted request still awaiting completion to its timeout bucket.
-    // Running those Whisper jobs now cannot change canvas; drain and drop the
-    // async work, but do not mint a second terminal bucket for it here.
+    // Their results cannot change the closed ledger. Cancel admission and join
+    // actual executions before SessionFinalised; accounting is not execution.
     let mut outstanding_tail_patch_jobs = u64::from(tail_patch_in_flight);
     while tp_rx.try_recv().is_ok() {
         tail_patch_submitted = tail_patch_submitted.saturating_add(1);
@@ -909,9 +914,10 @@ pub(crate) async fn apple_stream_transcription_session(
     if outstanding_tail_patch_jobs > 0 {
         warn!(
             outstanding_tail_patch_jobs,
-            "Layer 1 tail-patch async work dropped after worker terminal accounting closed"
+            "Layer 1 results discarded after terminal accounting; joining retained execution"
         );
     }
+    tail_patch_lane.execution.close_and_join().await;
     // C1 stop-drain: close the Layer 1 lane with its bounded drain. Whatever
     // happened inside (clean close, disconnect, incomplete drain), the method
     // returns and the recording finishes on Apple + lexicon. The outcome's
@@ -2906,7 +2912,27 @@ fn repair_terminal_seal_coverage(
     state: &mut AppleSealState,
     ev_tx: &mpsc::UnboundedSender<EngineEvent>,
     language: Option<&str>,
+    execution: &LocalExecutionOwner,
 ) -> SealCoverageReceipt {
+    repair_terminal_seal_coverage_with(state, ev_tx, language, execution, |request, pcm, control| {
+        InProcessTailProvider.transcribe_controlled(request, pcm, control)
+    })
+}
+
+fn repair_terminal_seal_coverage_with<F>(
+    state: &mut AppleSealState,
+    ev_tx: &mpsc::UnboundedSender<EngineEvent>,
+    language: Option<&str>,
+    execution: &LocalExecutionOwner,
+    transcribe: F,
+) -> SealCoverageReceipt
+where
+    F: Fn(&TailProviderRequest, &[f32], &crate::stt::LocalExecutionControl)
+        -> Result<TailProviderPayload> + Clone + Send + 'static,
+{
+    // Idempotent: this cannot extend the live drain deadline. All gaps share
+    // its remaining budget, including time spent waiting for a foreign holder.
+    execution.begin_drain(TAIL_PATCH_CLOSURE_TIMEOUT);
     let threshold_samples =
         u64::from(state.sample_rate).saturating_mul(SEAL_COVERAGE_INCOMPLETE_MS) / 1_000;
     // One speech set for the whole terminal path. Repairing against a wider set
@@ -2960,7 +2986,16 @@ fn repair_terminal_seal_coverage(
             sample_rate: state.sample_rate,
             language: language.map(str::to_owned),
         };
-        let result = InProcessTailProvider.transcribe(&request, &window.samples);
+        let job_request = request.clone();
+        let transcribe = transcribe.clone();
+        let result = execution.spawn(move |control| {
+            transcribe(&job_request, &window.samples, control)
+        }).and_then(|receiver| {
+            // This is the existing blocking Apple worker, not a Tokio worker.
+            // Native work remains retained even if the result channel fails.
+            receiver.blocking_recv().map_err(anyhow::Error::from)?
+        });
+        let result = execution.check().and(result);
         if !initial_published {
             let _ = ev_tx.send(EngineEvent::SealCoverage {
                 receipt: initial.clone(),
@@ -3523,6 +3558,7 @@ fn seal_open_partial(
 
 /// Everything the blocking worker needs that is not a channel.
 struct AppleWorkerConfig<'a> {
+    local_execution: Arc<LocalExecutionOwner>,
     sample_rate: u32,
     /// Device the recorder opened; selects the measured calibration profile.
     capture_device_name: Option<String>,
@@ -3550,6 +3586,7 @@ fn apple_stream_worker(
     config: AppleWorkerConfig<'_>,
 ) -> anyhow::Result<AppleStreamOutcome> {
     let AppleWorkerConfig {
+        local_execution,
         sample_rate,
         capture_device_name,
         language,
@@ -3846,7 +3883,7 @@ fn apple_stream_worker(
     // measured 2026-08-12, `rec_stop=36.701s` of which 30.005s was this loop
     // waiting for a completion that had already arrived for every job it sent.
     let mut tail_patch_timeout_residue = 0;
-    let stop_deadline = Instant::now() + TAIL_PATCH_CLOSURE_TIMEOUT;
+    let stop_deadline = local_execution.begin_drain(TAIL_PATCH_CLOSURE_TIMEOUT);
     while state.tail_patch_awaiting_completion > 0 || !state.refinement_pending.is_empty() {
         let outstanding = state.tail_patch_awaiting_completion;
         if !state.stop_refinements_tick(&ev_tx, Instant::now(), stop_deadline) {
@@ -3877,7 +3914,7 @@ fn apple_stream_worker(
     // path — the machine's own span timestamps are the clock, because the audio
     // clock is frozen at EOF and can sit milliseconds behind them.
     state.seal_remaining_at_session_end(&ev_tx);
-    repair_terminal_seal_coverage(&mut state, &ev_tx, language);
+    repair_terminal_seal_coverage(&mut state, &ev_tx, language, &local_execution);
     drain_formatter_observers(&mut state, &ev_tx, &formatter_done)?;
     let seal_coverage = publish_terminal_coverage(&state, &ev_tx);
     info!(
@@ -6940,6 +6977,128 @@ mod rc_w2_acoustic_tests {
         state
     }
 
+    fn two_bursts(session: &str) -> AppleSealState {
+        let mut state = state_for(session, 10.0);
+        let mut ingress = SileroIngress::new(RATE, session, 0);
+        ingress.observe_boundaries(&[
+            crossing(VadBoundaryKind::SpeechStart, at(1.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(2.0)),
+            crossing(VadBoundaryKind::SpeechStart, at(4.0)),
+            crossing(VadBoundaryKind::SpeechEnd, at(5.0)),
+        ]);
+        ingress.observe(Some((0, at(10.0))), true, at(10.0));
+        state.fusion = Some(ingress);
+        state
+    }
+
+    fn gap_payload(request: &TailProviderRequest) -> TailProviderPayload {
+        use crate::stt::tail_provider::{TailEvidenceSource, TailEvidenceStability, TailProviderEvidence, TailProviderId, TailTimingQuality};
+        TailProviderPayload {
+            identity: request.identity.clone(),
+            text: "Iwo".into(),
+            segments: vec![TimedTailSegment { text: "Iwo".into(), range: request.identity.range.clone() }],
+            avg_logprob: None,
+            compression_ratio: None,
+            provider_id: TailProviderId::Fake,
+            elapsed_ms: 0,
+            evidence: TailProviderEvidence {
+                source: TailEvidenceSource::Whisper,
+                revision: None,
+                stability: TailEvidenceStability::Final,
+                timing_quality: TailTimingQuality::ExactSampleRange,
+                avg_logprob: None,
+            },
+        }
+    }
+
+    #[test]
+    fn owned_terminal_repair_still_admits_both_exact_gaps() {
+        let mut state = two_bursts("owned-repair");
+        let ranges = coverage_speech_ranges(&state);
+        assert_eq!(ranges.len(), 2);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&calls);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = LocalExecutionOwner::default();
+        let receipt = repair_terminal_seal_coverage_with(
+            &mut state, &tx, Some("pl"), &execution,
+            move |request, pcm, control| {
+                control.check()?;
+                request.validate_pcm(pcm)?;
+                observed.lock().unwrap().push(request.identity.clone());
+                Ok(gap_payload(request))
+            },
+        );
+        assert_eq!(receipt.status, SealCoverageStatus::Complete);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (call, range) in calls.iter().zip(&ranges) {
+            assert_eq!(&call.range, range);
+            assert_eq!(state.acoustic_ledger.lock().unwrap().text_of(&OccurrenceIdentity::from(range)), Some("Iwo"));
+        }
+        assert_ne!(calls[0].request_id, calls[1].request_id);
+        assert!(!warning_codes(&mut rx).iter().any(|code| code == "seal_coverage_gap_inference_failed"));
+    }
+
+    #[test]
+    fn multigap_expiry_uses_one_budget_and_cannot_publish_late_native_success() {
+        let mut state = two_bursts("expired-repair");
+        let expected_ranges = coverage_speech_ranges(&state);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = LocalExecutionOwner::default();
+        let receipt = repair_terminal_seal_coverage_with(
+            &mut state, &tx, None, &execution,
+            move |request, pcm, control| {
+                request.validate_pcm(pcm)?;
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A native decode returned after the shared budget expired.
+                control.limit_until(Instant::now());
+                Ok(gap_payload(request))
+            },
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
+        assert_eq!(receipt.uncovered_speech_ranges, expected_ranges);
+        assert_eq!(receipt.covered_samples, 0);
+        assert_eq!(receipt.session_id, "expired-repair");
+        assert_eq!(receipt.capture_epoch, 0);
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(event, EngineEvent::LedgerMutation { .. } | EngineEvent::LedgerSeal { .. }));
+        }
+    }
+
+    #[test]
+    fn terminal_failure_and_foreign_identity_preserve_uncovered_pcm() {
+        for foreign in [false, true] {
+            let mut state = two_bursts("original-repair");
+            let expected_ranges = coverage_speech_ranges(&state);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let execution = LocalExecutionOwner::default();
+            let receipt = repair_terminal_seal_coverage_with(
+                &mut state, &tx, None, &execution,
+                move |request, _, _| {
+                    if !foreign {
+                        anyhow::bail!("injected local failure");
+                    }
+                    let mut payload = gap_payload(request);
+                    payload.identity.range.session = "successor".into();
+                    Ok(payload)
+                },
+            );
+            assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
+            assert_eq!(receipt.uncovered_speech_ranges, expected_ranges);
+            assert_eq!(receipt.covered_samples, 0);
+            let codes = warning_codes(&mut rx);
+            assert!(codes.iter().any(|code| code == if foreign {
+                "seal_coverage_gap_identity_mismatch"
+            } else {
+                "seal_coverage_gap_inference_failed"
+            }));
+        }
+    }
+
     /// Commit the exact acoustic range as an occurrence, through the same
     /// admission path the terminal gap repair uses.
     fn commit_the_burst(
@@ -7023,7 +7182,7 @@ mod rc_w2_acoustic_tests {
         );
         assert_eq!(padded_answer.speech_samples, at(10.0));
 
-        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
 
         assert_eq!(receipt.status, SealCoverageStatus::Complete);
         assert!(receipt.uncovered_speech_ranges.is_empty());
@@ -7090,7 +7249,7 @@ mod rc_w2_acoustic_tests {
         let _ = coverage_receipts(&mut rx);
 
         let published_before = publish_terminal_coverage(&state, &tx);
-        let repaired = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+        let repaired = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
         let published_after = publish_terminal_coverage(&state, &tx);
 
         for other in [&repaired, &published_after] {
@@ -7123,7 +7282,7 @@ mod rc_w2_acoustic_tests {
         assert!(state.fusion.is_none());
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"));
+        let receipt = repair_terminal_seal_coverage(&mut state, &tx, Some("pl"), &LocalExecutionOwner::default());
 
         assert_eq!(receipt.status, SealCoverageStatus::Incomplete);
         assert_eq!(receipt.speech_samples, at(3.0));
@@ -7221,7 +7380,7 @@ mod rc_w2_acoustic_tests {
             THRESHOLD
         );
         assert_eq!(
-            repair_terminal_seal_coverage(&mut state, &tx, None).incomplete_threshold_samples,
+            repair_terminal_seal_coverage(&mut state, &tx, None, &LocalExecutionOwner::default()).incomplete_threshold_samples,
             THRESHOLD
         );
     }

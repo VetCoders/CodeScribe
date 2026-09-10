@@ -383,18 +383,32 @@ impl TailProvider for InProcessTailProvider {
         request: &TailProviderRequest,
         pcm: &[f32],
     ) -> Result<TailProviderPayload> {
+        self.transcribe_controlled(request, pcm, &super::LocalExecutionControl::default())
+    }
+}
+
+impl InProcessTailProvider {
+    pub(crate) fn transcribe_controlled(
+        &self,
+        request: &TailProviderRequest,
+        pcm: &[f32],
+        control: &super::LocalExecutionControl,
+    ) -> Result<TailProviderPayload> {
+        control.check()?;
         request.validate_pcm(pcm)?;
         let started = Instant::now();
         let (speech, _, speech_index) =
             crate::vad::extract_speech_indexed(pcm, request.sample_rate);
+        control.check()?;
         let raw = if speech.is_empty() {
             RawTranscript::default()
         } else {
-            super::candle_transcribe_long_with_segments_with_initial_prompt(
+            super::candle_transcribe_controlled(
                 &speech,
                 request.sample_rate,
                 request.language.as_deref(),
                 None,
+                control,
             )?
         };
         let request_range = &request.identity.range;
@@ -446,6 +460,7 @@ impl TailProvider for InProcessTailProvider {
             },
         };
         payload.validate()?;
+        control.check()?;
         Ok(payload)
     }
 }
@@ -1058,7 +1073,7 @@ impl TailProvider for RemoteTailProvider {
         );
         let vendor = crate::llm::speech::vendor_for_endpoint(&self.endpoint);
         // This provider is synchronous (including reqwest::blocking below).
-        // Production enters through compute_tail_patch_job_with's spawn_blocking
+        // Production enters through compute_tail_patch_job_with's owned native worker
         // in pipeline/streaming/session.rs, never the async session executor.
         // The local runtime therefore refreshes OAuth without nesting block_on.
         let auth = if let Some(vendor) = vendor {
@@ -1242,7 +1257,29 @@ pub(crate) fn transcribe_selected(
     request: &TailProviderRequest,
     pcm: &[f32],
 ) -> Result<TailProviderPayload> {
-    let inprocess = InProcessTailProvider;
+    transcribe_selected_controlled(provider_id, request, pcm, &super::LocalExecutionControl::default())
+}
+
+struct ControlledInProcess<'a>(&'a super::LocalExecutionControl);
+
+impl TailProvider for ControlledInProcess<'_> {
+    fn provider_id(&self) -> TailProviderId {
+        TailProviderId::InProcess
+    }
+
+    fn transcribe(&self, request: &TailProviderRequest, pcm: &[f32]) -> Result<TailProviderPayload> {
+        InProcessTailProvider.transcribe_controlled(request, pcm, self.0)
+    }
+}
+
+pub(crate) fn transcribe_selected_controlled(
+    provider_id: TailProviderId,
+    request: &TailProviderRequest,
+    pcm: &[f32],
+    control: &super::LocalExecutionControl,
+) -> Result<TailProviderPayload> {
+    control.check()?;
+    let inprocess = ControlledInProcess(control);
     let outcome = match provider_id {
         TailProviderId::InProcess => {
             let started = Instant::now();
@@ -1287,6 +1324,7 @@ pub(crate) fn transcribe_selected(
         },
         TailProviderId::Fake => unreachable!("fake is injectable, never selected from config"),
     };
+    control.check()?;
     let payload = outcome.payload;
     tracing::info!(
         requested_provider = outcome.receipt.requested_provider.as_str(),

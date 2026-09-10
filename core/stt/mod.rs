@@ -36,6 +36,59 @@ mod fleet_red_contracts;
 use crate::pipeline::contracts::RawTranscript;
 use tracing::warn;
 
+/// Cooperative control belongs to an execution request/session, never to the
+/// singleton. Clones share cancellation and the earliest terminal deadline.
+/// Default controls keep ordinary public file callers unlimited.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalExecutionControl {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    #[cfg(test)]
+    cancel_at: Option<LocalExecutionBoundary>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalExecutionBoundary {
+    Window,
+    Token,
+}
+
+impl LocalExecutionControl {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn limit_until(&self, deadline: std::time::Instant) -> std::time::Instant {
+        let mut current = self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = current.map_or(deadline, |old| old.min(deadline));
+        *current = Some(deadline);
+        deadline
+    }
+
+    pub(crate) fn checkpoint(&self, _boundary: LocalExecutionBoundary) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.cancel_at == Some(_boundary) {
+            self.cancel();
+        }
+        self.check()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancelling_at(boundary: LocalExecutionBoundary) -> Self {
+        Self { cancel_at: Some(boundary), ..Self::default() }
+    }
+
+    pub(crate) fn check(&self) -> anyhow::Result<()> {
+        let deadline = *self.deadline.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        anyhow::ensure!(
+            !self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+                && !deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline),
+            "local execution cancelled or drain deadline expired"
+        );
+        Ok(())
+    }
+}
+
 /// Which STT backend the router dispatches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SttEngine {
@@ -152,18 +205,15 @@ fn candle_transcribe_long_with_segments(
     whisper::singleton::transcribe_with_segments(audio, sample_rate, language)
 }
 
-/// Candle long-audio transcription seeded with a per-call domain vocabulary.
-fn candle_transcribe_long_with_segments_with_initial_prompt(
+fn candle_transcribe_controlled(
     audio: &[f32],
     sample_rate: u32,
     language: Option<&str>,
     initial_prompt: Option<String>,
+    control: &LocalExecutionControl,
 ) -> anyhow::Result<RawTranscript> {
-    whisper::singleton::transcribe_with_segments_with_initial_prompt(
-        audio,
-        sample_rate,
-        language,
-        initial_prompt,
+    whisper::singleton::transcribe_controlled(
+        audio, sample_rate, language, initial_prompt, control,
     )
 }
 
