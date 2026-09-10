@@ -1529,6 +1529,56 @@ mod capture_stop_failure_tests {
     }
 
     #[tokio::test]
+    async fn local_execution_join_survives_stop_retry_and_preserves_refused_wav() {
+        use crate::pipeline::streaming::session::LocalExecutionOwner;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owned-local.wav");
+        let bytes = write_wav(&path);
+        let mut recorder = recorder();
+        let mut ledger = AcousticLedger::new();
+        let receipt = SealCoverageReceipt {
+            session_id: "capture-owner".into(),
+            capture_epoch: 7,
+            speech_samples: 4,
+            covered_samples: 0,
+            uncovered_speech_ranges: vec![crate::stt::tail_provider::TailSampleRange {
+                session: "capture-owner".into(), capture_epoch: 7, sample_start: 0, sample_end: 4,
+            }],
+            max_uncovered_samples: 4,
+            incomplete_threshold_samples: 1,
+            status: SealCoverageStatus::Incomplete,
+        };
+        assert!(ledger.record_seal_coverage(receipt.clone()));
+        recorder.acoustic_ledger = Some(Arc::new(StdMutex::new(ledger)));
+        let execution = Arc::new(LocalExecutionOwner::default());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let result = execution.spawn(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok("late label")
+        }).unwrap();
+        entered_rx.await.unwrap();
+        drop(result); // closed ledger no longer consumes local labels
+        recorder.transcription_handle = Some(tokio::spawn(async move {
+            execution.close_and_join().await;
+        }));
+        let pending = tokio::time::timeout(
+            std::time::Duration::from_millis(20), recorder.complete_stop(Ok(Some(path.clone()))),
+        ).await;
+        let retained = recorder.transcription_handle.is_some();
+        release_tx.send(()).unwrap();
+        let error = recorder.complete_stop(Ok(Some(path.clone()))).await.unwrap_err();
+        assert!(pending.is_err(), "Stop must await actual retained execution");
+        assert!(retained, "caller expiry must leave the session handle available for retry");
+        let refused = error.downcast_ref::<TerminalSealRefused>().unwrap();
+        assert_eq!(refused.receipt, receipt);
+        assert_eq!(refused.audio_path.as_ref(), Some(&path));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_released(&recorder);
+    }
+
+    #[tokio::test]
     async fn clean_stop_and_seal_refusal_keep_their_existing_outcomes() {
         let mut recorder = recorder();
         let stopped = recorder.complete_stop(Ok(None)).await.unwrap();

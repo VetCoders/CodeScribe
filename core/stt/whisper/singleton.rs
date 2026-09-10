@@ -41,6 +41,7 @@ use tracing::{info, warn};
 use crate::config::models::resolve_runtime_whisper_model_path;
 use crate::config::{Config, UserSettings};
 use crate::pipeline::contracts::{FileTranscriptionOptions, RawTranscript, TranscriptionVerdict};
+use crate::stt::LocalExecutionControl;
 
 use super::engine::LocalWhisperEngine;
 use super::params::DecodingParams;
@@ -311,20 +312,52 @@ fn reaper_loop() {
 
 /// Run `f` with the engine, loading it on demand and refreshing the idle clock.
 fn with_engine<R>(f: impl FnOnce(&mut LocalWhisperEngine) -> Result<R>) -> Result<R> {
+    with_engine_controlled(&LocalExecutionControl::default(), f)
+}
+
+/// Poll only our own admission. A waiter must not acquire a foreign holder's
+/// engine after its deadline, nor install cancellation on that holder.
+fn acquire_controlled<'a, T>(
+    mutex: &'a Mutex<T>,
+    control: &LocalExecutionControl,
+) -> Result<std::sync::MutexGuard<'a, T>> {
+    loop {
+        control.check()?;
+        match mutex.try_lock() {
+            Ok(guard) => {
+                control.check()?;
+                return Ok(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(anyhow!("Failed to lock poisoned Whisper engine"));
+            }
+        }
+    }
+}
+
+fn with_engine_controlled<R>(
+    control: &LocalExecutionControl,
+    f: impl FnOnce(&mut LocalWhisperEngine) -> Result<R>,
+) -> Result<R> {
     let lock_started = Instant::now();
-    let mut guard = slot()
-        .lock()
-        .map_err(|e| anyhow!("Failed to lock engine: {}", e))?;
+    let mut guard = acquire_controlled(slot(), control)?;
     let lock_wait_ms = lock_started.elapsed().as_millis() as u64;
     let mut model_load_ms = 0u64;
     let cold_load = guard.engine.is_none();
     if cold_load {
+        control.check()?;
         let load_started = Instant::now();
         guard.engine = Some(load_engine()?);
         model_load_ms = load_started.elapsed().as_millis() as u64;
         ensure_reaper();
         record_residency_load(model_load_ms);
     }
+    // Loading/native Metal calls cannot be preempted. Ownership stays here
+    // until they return; expiry then prevents entering the decoder.
+    control.check()?;
     super::timing::record_engine_acquire(lock_wait_ms, model_load_ms, cold_load);
     let engine = guard
         .engine
@@ -348,11 +381,7 @@ fn with_engine_initial_prompt<R>(
     f: impl FnOnce(&mut LocalWhisperEngine) -> Result<R>,
 ) -> Result<R> {
     with_engine(|engine| {
-        let previous = engine.decoding_params.initial_prompt.clone();
-        engine.decoding_params.initial_prompt = initial_prompt;
-        let result = f(engine);
-        engine.decoding_params.initial_prompt = previous;
-        result
+        engine.with_request(initial_prompt, f)
     })
 }
 
@@ -443,8 +472,22 @@ pub fn transcribe_with_segments_with_initial_prompt(
     language: Option<&str>,
     initial_prompt: Option<String>,
 ) -> Result<RawTranscript> {
-    with_engine_initial_prompt(initial_prompt, |engine| {
-        engine.transcribe_long_with_language_segments(samples, sample_rate, language)
+    transcribe_controlled(
+        samples, sample_rate, language, initial_prompt, &LocalExecutionControl::default(),
+    )
+}
+
+pub(crate) fn transcribe_controlled(
+    samples: &[f32],
+    sample_rate: u32,
+    language: Option<&str>,
+    initial_prompt: Option<String>,
+    control: &LocalExecutionControl,
+) -> Result<RawTranscript> {
+    with_engine_controlled(control, |engine| {
+        engine.with_request(initial_prompt, |engine| {
+            engine.transcribe_long_controlled(samples, sample_rate, language, control)
+        })
     })
 }
 
@@ -676,5 +719,55 @@ mod tests {
             text.is_empty(),
             "empty input should stay empty after no-op load"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_execution_contention_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_and_expired_waiters_exit_before_foreign_holder_release() {
+        for expire in [false, true] {
+            // The exact acquisition helper used by the singleton, with a
+            // separately held slot. No process-global engine/model fixture.
+            let held = std::sync::Arc::new(Mutex::new("foreign prompt/cache"));
+            let holder_slot = std::sync::Arc::clone(&held);
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let guard = holder_slot.lock().unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                assert_eq!(*guard, "foreign prompt/cache");
+            });
+            held_rx.recv().unwrap();
+            let control = LocalExecutionControl::default();
+            let waiter_control = control.clone();
+            let waiter_slot = std::sync::Arc::clone(&held);
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = acquire_controlled(&waiter_slot, &waiter_control);
+                done_tx.send(result.is_err()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            if expire {
+                control.limit_until(Instant::now());
+            } else {
+                control.cancel();
+            }
+            // Release even on failure so the falsifier itself cannot strand a
+            // native thread when an assertion fails.
+            let result = done_rx.recv_timeout(Duration::from_secs(1));
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            waiter.join().unwrap();
+            assert!(result.unwrap());
+            assert_eq!(*held.lock().unwrap(), "foreign prompt/cache");
+            assert!(acquire_controlled(&held, &control).is_err());
+            assert!(acquire_controlled(&held, &LocalExecutionControl::default()).is_ok());
+        }
     }
 }

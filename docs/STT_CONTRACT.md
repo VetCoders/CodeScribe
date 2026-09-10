@@ -591,3 +591,47 @@ unless you accept Apple lottery on every session.
 ---
 
 _Vibecrafted. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI_
+
+## Local Whisper execution settlement (W2 source checkpoint)
+
+Live tail refinement and terminal uncovered-PCM repair share one
+`LocalExecutionOwner` per Apple transcription session. It starts native workers
+and retains their actual join handles separately from result receivers. Closing
+ledger accounting or dropping a result receiver cannot detach inference.
+Finished workers are reaped during capture; after the Apple worker closes,
+admission is cancelled and all remaining executions are joined before
+`SessionFinalised`. The recorder retains its transcription task across a
+cancelled Stop caller and still returns the original typed coverage refusal and
+WAV when speech could not be authenticated.
+
+The existing five-second useful-refinement drain starts at the worker's local
+closure phase. Live requests and every terminal gap share that same absolute
+deadline; neither another gap nor a local fallback renews it. This is not a
+five-second bound on all of Stop. Key-up does not cancel all refinement, and
+ordinary useful terminal repair remains admitted while budget remains.
+
+`LocalExecutionControl` travels through provider selection (including local
+fallback), singleton acquisition, VAD boundaries, decoding windows and token
+steps. Each independent public file call gets an unlimited control and uses the
+same engine implementation. An expired/cancelled waiter polls only its own
+control and exits without acquiring or cancelling a foreign engine holder.
+The request scope restores the prior prompt and clears model KV caches on
+success, error, cancellation and unwind. Cancellation after a native result
+returns discards that result as an error; it is not observer success. Existing
+session, epoch, request and exact source-PCM containment checks remain the only
+route to ledger admission. No text seal or fabricated timing is introduced.
+
+Model resolution/loading, device initialization, native VAD extraction,
+resampling/mel construction, individual Candle/Metal encoder/decoder/tensor
+operations, cache cleanup and filesystem/native teardown are not preemptible.
+The owner waits for a running call to return. Its normal async join retains
+handles across awaits; the final Drop fallback cancels and synchronously joins,
+which can block the dropping thread. There is no hard release bound, unsafe
+thread termination or claim that a timed-out result means released resources.
+Native microphone/VAD/archive settlement, Apple-worker lifetime, cloud transport
+and formatter acknowledgements remain separate RC obligations.
+
+This is source-level wiring with authored, UNRUN barrier, contention, decoder,
+terminal repair and WAV preservation tests. BUILD/TEST/RUNTIME=NOT_ASSESSED
+under the Grade B W2 compile embargo. Admission, returning compiler/test gates
+and installed real-audio evidence belong to the integrator.

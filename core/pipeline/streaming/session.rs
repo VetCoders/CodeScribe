@@ -24,6 +24,93 @@ use crate::stt::tail_provider::{
 };
 use crate::stt::tail_provider::{TailProviderPayload, TailProviderRequest};
 
+/// Actual execution handles outlive result receivers and ledger accounting.
+/// Both live requests and terminal gaps use this session-owned spawn seam.
+/// No closure captures the owner itself: the last owner may safely join in Drop.
+#[derive(Default)]
+pub(crate) struct LocalExecutionOwner {
+    control: crate::stt::LocalExecutionControl,
+    handles: StdMutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl LocalExecutionOwner {
+    pub(super) fn check(&self) -> Result<()> {
+        self.control.check()
+    }
+
+    pub(super) fn begin_drain(&self, budget: std::time::Duration) -> std::time::Instant {
+        let deadline = std::time::Instant::now() + budget;
+        self.control.limit_until(deadline)
+    }
+
+    pub(crate) fn spawn<T, F>(&self, work: F) -> Result<tokio::sync::oneshot::Receiver<Result<T>>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&crate::stt::LocalExecutionControl) -> Result<T> + Send + 'static,
+    {
+        let mut handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.control.check()?;
+        // Reap finished requests during long captures; never accumulate one
+        // native handle per utterance until Stop.
+        let mut index = 0;
+        while index < handles.len() {
+            if handles[index].is_finished() {
+                if handles.swap_remove(index).join().is_err() {
+                    warn!("local execution worker panicked");
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let control = self.control.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let handle = std::thread::Builder::new().name("local-stt".into()).spawn(move || {
+            let result = control.check().and_then(|()| work(&control));
+            // A native call may return after cancellation. Its label is never
+            // a successful completion, even if the provider ignored control.
+            let result = control.check().and(result);
+            let _ = sender.send(result);
+        })?;
+        handles.push(handle);
+        Ok(receiver)
+    }
+
+    pub(crate) async fn close_and_join(&self) {
+        self.control.cancel();
+        loop {
+            let finished = {
+                let handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                handles.iter().all(std::thread::JoinHandle::is_finished)
+            };
+            if finished {
+                break;
+            }
+            // Retain handles inside self across every await, including caller
+            // cancellation. Native calls can exceed the useful-work budget.
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        self.join_retained();
+    }
+
+    fn join_retained(&self) {
+        let mut handles = self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for handle in handles.drain(..) {
+            if handle.join().is_err() {
+                warn!("local execution worker panicked while joining");
+            }
+        }
+    }
+}
+
+impl Drop for LocalExecutionOwner {
+    fn drop(&mut self) {
+        self.control.cancel();
+        // Cancellation/panic fallback: blocking is honest here. Dropping a
+        // handle would detach native work; no hard release bound is claimed.
+        self.join_retained();
+    }
+}
+
 // ── Unified session config ───────────────────────────────────────────────────
 
 /// Configuration for a transcription session.
@@ -239,7 +326,7 @@ impl TailPatchSessionReceipt {
 /// Re-transcribe a sealed utterance's audio and diff it against the text
 /// already committed, producing Layer 1 patch events.
 ///
-/// Runs the Whisper pass on a blocking worker so the session loop keeps
+/// Runs the Whisper pass on an owned worker so the session loop keeps
 /// draining. `committed_text` must be the exact string that was emitted as
 /// `UtteranceFinal.text`: the resulting `ReplaceRange` offsets are computed
 /// against it, so a differently-trimmed copy would produce patches that land at
@@ -251,7 +338,8 @@ pub(super) struct TailPatchJobResult {
     pub payload: TailProviderPayload,
 }
 
-pub(super) async fn compute_tail_patch_job(
+pub(super) fn compute_tail_patch_job(
+    owner: &LocalExecutionOwner,
     utterance_id: u64,
     committed_text: String,
     neighbour_context: String,
@@ -259,20 +347,23 @@ pub(super) async fn compute_tail_patch_job(
     request: TailProviderRequest,
     config: TailPatchConfig,
     provider: crate::stt::tail_provider::TailProviderId,
-) -> Result<TailPatchJobResult> {
+) -> futures_util::future::BoxFuture<'static, Result<TailPatchJobResult>> {
     compute_tail_patch_job_with(
+        owner,
         utterance_id,
         committed_text,
         neighbour_context,
         audio,
         request,
         config,
-        move |request, pcm| crate::stt::tail_provider::transcribe_selected(provider, request, pcm),
+        move |request, pcm, control| {
+            crate::stt::tail_provider::transcribe_selected_controlled(provider, request, pcm, control)
+        },
     )
-    .await
 }
 
-async fn compute_tail_patch_job_with<F>(
+fn compute_tail_patch_job_with<F>(
+    owner: &LocalExecutionOwner,
     utterance_id: u64,
     committed_text: String,
     neighbour_context: String,
@@ -280,9 +371,10 @@ async fn compute_tail_patch_job_with<F>(
     request: TailProviderRequest,
     config: TailPatchConfig,
     transcribe: F,
-) -> Result<TailPatchJobResult>
+) -> futures_util::future::BoxFuture<'static, Result<TailPatchJobResult>>
 where
-    F: FnOnce(&TailProviderRequest, &[f32]) -> Result<TailProviderPayload> + Send + 'static,
+    F: FnOnce(&TailProviderRequest, &[f32], &crate::stt::LocalExecutionControl)
+        -> Result<TailProviderPayload> + Send + 'static,
 {
     debug_assert_eq!(
         committed_text.trim(),
@@ -290,8 +382,9 @@ where
         "tail-patch committed_text must be the exact, pre-trimmed UtteranceFinal text \
          (single trim owner: final_text at the emit site)"
     );
-    tokio::task::spawn_blocking(move || {
-        let payload = transcribe(&request, &audio)?;
+    let receiver = owner.spawn(move |control| {
+        let payload = transcribe(&request, &audio, control)?;
+        control.check()?;
         let outcome = compute_tail_patch_with_context(
             &committed_text,
             &payload.text,
@@ -304,9 +397,13 @@ where
             outcome,
             payload,
         })
+    });
+    let control = owner.control.clone();
+    Box::pin(async move {
+        let result = receiver?.await.map_err(|e| anyhow!("tail patch worker task failed: {e}"))?;
+        control.check()?;
+        result
     })
-    .await
-    .map_err(|e| anyhow!("tail patch worker task failed: {e}"))?
 }
 
 /// Emit the session's closing event with its layer accounting.
@@ -605,14 +702,17 @@ mod session_tests {
             language: Some("pl-PL".to_string()),
         };
 
+        let owner = LocalExecutionOwner::default();
         let job = compute_tail_patch_job_with(
+            &owner,
             73,
             "ala ma kota".to_string(),
             String::new(),
             vec![0.0; 320],
             request,
             TailPatchConfig::default(),
-            move |request, pcm| {
+            move |request, pcm, control| {
+                control.check()?;
                 request.validate_pcm(pcm)?;
                 Ok(payload)
             },
@@ -697,5 +797,124 @@ mod session_tests {
             !tail_patch_lane_starved(0, 0),
             "an idle lane is not starved"
         );
+    }
+}
+
+/// Source-authored W2 falsifiers. These use the production native spawn seam;
+/// result-channel disposal is deliberately separate from actual worker exit.
+#[cfg(test)]
+mod local_execution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dropped_result_after_accounting_keeps_actual_execution_until_join() {
+        let owner = LocalExecutionOwner::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receiver = owner.spawn(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok("late label")
+        }).unwrap();
+        entered_rx.await.unwrap();
+        // The ledger's accounting may now close and discard its receiver.
+        drop(receiver);
+        let mut join = Box::pin(owner.close_and_join());
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut join).await.is_err());
+        assert_eq!(owner.handles.lock().unwrap().len(), 1);
+        release_tx.send(()).unwrap();
+        join.await;
+        assert!(owner.handles.lock().unwrap().is_empty());
+        assert!(owner.spawn(|_| Ok(())).is_err(), "closed admission cannot restart");
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_success_is_error_and_successor_has_independent_control() {
+        let owner = LocalExecutionOwner::default();
+        let successor = LocalExecutionOwner::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receiver = owner.spawn(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok("old-session label")
+        }).unwrap();
+        entered_rx.await.unwrap();
+        owner.control.cancel();
+        release_tx.send(()).unwrap();
+        assert!(receiver.await.unwrap().is_err());
+        assert_eq!(successor.spawn(|_| Ok("new-session label")).unwrap().await.unwrap().unwrap(), "new-session label");
+        owner.close_and_join().await;
+        successor.close_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn join_caller_cancellation_retains_handle_for_retry() {
+        let owner = LocalExecutionOwner::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let receiver = owner.spawn(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(())
+        }).unwrap();
+        entered_rx.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), owner.close_and_join()).await.is_err());
+        assert_eq!(owner.handles.lock().unwrap().len(), 1);
+        release_tx.send(()).unwrap();
+        owner.close_and_join().await;
+        assert!(receiver.await.unwrap().is_err());
+        assert!(owner.handles.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn production_tail_job_starts_owned_before_poll_and_rejects_cancelled_completion() {
+        let owner = LocalExecutionOwner::default();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let request = TailProviderRequest {
+            identity: TailRequestIdentity {
+                request_id: 42,
+                range: TailSampleRange { session: "original".into(), capture_epoch: 7, sample_start: 100, sample_end: 104 },
+            },
+            sample_rate: 16_000,
+            language: None,
+        };
+        let job = compute_tail_patch_job_with(
+            &owner, 42, "Iwo".into(), String::new(), vec![0.25; 4], request,
+            TailPatchConfig::default(),
+            move |request, pcm, _| {
+                request.validate_pcm(pcm)?;
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(TailProviderPayload {
+                    identity: request.identity.clone(), text: "Iwo".into(),
+                    segments: vec![TimedTailSegment { text: "Iwo".into(), range: request.identity.range.clone() }],
+                    avg_logprob: None, compression_ratio: None,
+                    provider_id: TailProviderId::Fake, elapsed_ms: 0,
+                    evidence: crate::stt::tail_provider::TailProviderEvidence {
+                        source: TailEvidenceSource::Whisper, revision: None,
+                        stability: TailEvidenceStability::Final,
+                        timing_quality: TailTimingQuality::ExactSampleRange, avg_logprob: None,
+                    },
+                })
+            },
+        );
+        // No poll of the result future was needed to start and retain work.
+        entered_rx.await.unwrap();
+        assert_eq!(owner.handles.lock().unwrap().len(), 1);
+        owner.control.cancel();
+        release_tx.send(()).unwrap();
+        assert!(job.await.is_err(), "cancelled native success cannot become a tail completion");
+        owner.close_and_join().await;
+        assert!(owner.handles.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repeated_drain_cannot_reset_deadline_or_admit_another_gap() {
+        let owner = LocalExecutionOwner::default();
+        let first = owner.begin_drain(Duration::ZERO);
+        assert_eq!(owner.begin_drain(Duration::from_secs(5)), first);
+        assert!(owner.spawn(|_| Ok(())).is_err());
     }
 }
