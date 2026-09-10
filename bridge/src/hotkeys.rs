@@ -195,11 +195,15 @@ fn ensure_controller(
     handle: Handle,
 ) -> Arc<RecordingController> {
     let mut guard = controller_store.lock().unwrap_or_else(|e| e.into_inner());
-    Arc::clone(guard.get_or_insert_with(|| {
+    let controller = guard.get_or_insert_with(|| {
         let controller = Arc::new(RecordingController::new_without_keychain());
         spawn_event_forwarder(Arc::clone(&controller), handle);
         controller
-    }))
+    });
+    if CAPTURE_SHUTDOWN.load(Ordering::SeqCst) {
+        controller.request_capture_shutdown();
+    }
+    Arc::clone(controller)
 }
 
 /// Snapshot the shared controller WITHOUT creating one. Query surfaces use this
@@ -211,6 +215,9 @@ fn current_controller(controller_store: &SharedController) -> Option<Arc<Recordi
         .as_ref()
         .map(Arc::clone)
 }
+
+/// Process shutdown is irreversible here; retries settle the same closed root.
+static CAPTURE_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn release_capture_ownership_for_shutdown() {
     CAPTURE_OWNER.store(CAPTURE_OWNER_NONE, Ordering::SeqCst);
@@ -230,37 +237,44 @@ where
         })?
 }
 
-/// Stop accepting gestures, finish an active microphone take on the app-owned
-/// runtime, and drop the process-global controller slot before worker teardown.
+/// Shutdown observes the same Stop owner. Never remove the shared controller
+/// before settlement; failed/pending teardown must retain an address for retry.
+async fn settle_controller_for_shutdown(controller: &Arc<RecordingController>) -> Result<(), CsError> {
+    controller.request_capture_shutdown();
+    let outcome = controller.stop_current_capture().await;
+    require_shutdown_settlement(outcome, controller.capture_shutdown_settled())
+}
+
+fn require_shutdown_settlement(
+    outcome: anyhow::Result<CaptureStopOutcome>,
+    quiescent: bool,
+) -> Result<(), CsError> {
+    match outcome {
+        Ok(CaptureStopOutcome::Stopped | CaptureStopOutcome::NoLiveCapture)
+            if quiescent => Ok(()),
+        Ok(outcome) => Err(CsError::Recording {
+            msg: format!("application shutdown refused: Stop remains {outcome:?}"),
+        }),
+        Err(error) => Err(CsError::Recording {
+            msg: format!("application shutdown could not settle recording: {error:#}"),
+        }),
+    }
+}
+
 pub(crate) fn shutdown_application_controller() -> Result<(), CsError> {
+    CAPTURE_SHUTDOWN.store(true, Ordering::SeqCst);
     hotkeys::shutdown_global_hotkey_manager();
-    let controller = shared_controller()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take();
-    let stop_result = match controller {
-        Some(controller) => application_runtime::block_on(await_recording_shutdown(
-            async move {
-                if matches!(
-                    controller.current_state().await,
-                    State::RecHold | State::RecToggle | State::Conversation
-                ) {
-                    controller
-                        .stop_recording_from_external_surface()
-                        .await
-                        .map_err(|error| CsError::Recording {
-                            msg: format!("application shutdown could not stop recording: {error}"),
-                        })?;
-                }
-                Ok(())
-            },
+    let controller = current_controller(&shared_controller());
+    if let Some(controller) = controller {
+        application_runtime::block_on(await_recording_shutdown(
+            async move { settle_controller_for_shutdown(&controller).await },
             RECORDING_SHUTDOWN_TIMEOUT,
-        ))
-        .and_then(|result| result),
-        None => Ok(()),
-    };
+        ))??;
+        // Retain the closed root until runtime teardown. Lazy construction must
+        // not reopen admission in the gap between settlement and runtime drop.
+    }
     release_capture_ownership_for_shutdown();
-    stop_result
+    Ok(())
 }
 
 /// Collapse a latched paste-target app name to `None` when it carries no
@@ -907,9 +921,14 @@ impl CodescribeHotkeys {
     /// Stop the active legacy-controller recording flow, if one is live.
     pub async fn stop_recording(&self) -> Result<(), CsError> {
         application_runtime::run(async move {
-            let Some(controller) = current_controller(&shared_controller()) else {
-                return Ok(());
+            let controller = {
+                let store = shared_controller();
+                let slot = store.try_lock().map_err(|_| CsError::Recording {
+                    msg: "Stop admission unavailable: controller slot is occupied".to_string(),
+                })?;
+                slot.as_ref().map(Arc::clone)
             };
+            let Some(controller) = controller else { return Ok(()); };
             controller
                 .stop_recording_from_external_surface()
                 .await
@@ -1415,6 +1434,30 @@ mod application_shutdown_tests {
             CAPTURE_OWNER_NONE,
             "application shutdown must never leave microphone ownership latched"
         );
+    }
+
+    #[test]
+    fn shutdown_requires_terminal_outcome_and_resource_quiescence() {
+        for outcome in [CaptureStopOutcome::Pending, CaptureStopOutcome::AlreadyStopping,
+            CaptureStopOutcome::AdmissionUnavailable, CaptureStopOutcome::ForeignCapture] {
+            assert!(require_shutdown_settlement(Ok(outcome), false).is_err());
+            assert!(require_shutdown_settlement(Ok(outcome), true).is_err());
+        }
+        for outcome in [CaptureStopOutcome::Stopped, CaptureStopOutcome::NoLiveCapture] {
+            assert!(require_shutdown_settlement(Ok(outcome), false).is_err());
+            assert!(require_shutdown_settlement(Ok(outcome), true).is_ok());
+        }
+        assert!(require_shutdown_settlement(Err(anyhow::anyhow!("archive failed")), true).is_err());
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_helper_closes_same_controller_without_removing_it() {
+        let controller = Arc::new(RecordingController::new_without_keychain());
+        let store = Arc::new(Mutex::new(Some(Arc::clone(&controller))));
+        settle_controller_for_shutdown(&controller).await.unwrap();
+        assert!(Arc::ptr_eq(&current_controller(&store).unwrap(), &controller));
+        assert!(controller.capture_shutdown_settled());
+        assert!(controller.start_composer_turn_recording().await.is_err());
     }
 
     #[tokio::test]

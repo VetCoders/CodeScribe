@@ -51,9 +51,9 @@ final class RealComposerDictation: ComposerDictating {
     guard let store, !transitioning else { return }
     // Pending settlement is still ownership. Neither another press nor a false
     // recording query can acknowledge delivery or replace its destination.
-    guard !store.hasComposerCaptureRequest || store.ownsLiveDictation
+    guard !store.hasComposerCaptureRequest || store.ownsLiveDictation || store.composerStopRetryAvailable
     else { return }
-    let ownedHandle = store.ownsLiveDictation ? store.composerCaptureHandle : nil
+    let ownedHandle = store.composerCaptureHandle
     let request = store.currentComposerCaptureRequestID
     let destination = store.selectedThreadID
     transitioning = true
