@@ -557,14 +557,41 @@ struct OpenAiToolDefinition {
 }
 
 /// Project the registry's tool definitions onto the Responses wire shape.
+///
+/// MCP-origin schemas are adapted for the OpenAI JSON Schema subset here, on
+/// the provider copy only. The registry `ToolDefinition.input_schema` is left
+/// intact so upstream MCP `validateToolInput` still sees the original.
 fn build_tool_payload(tools: &[ToolDefinition]) -> Vec<OpenAiToolDefinition> {
     tools
         .iter()
-        .map(|tool| OpenAiToolDefinition {
-            tool_type: "function",
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters: tool.input_schema.clone(),
+        .map(|tool| {
+            let adapted = super::openai_schema::adapt_json_schema_for_openai(&tool.input_schema);
+            if !adapted.changes.is_empty() {
+                let pointers: Vec<&str> = adapted
+                    .changes
+                    .iter()
+                    .map(|change| change.pointer.as_str())
+                    .collect();
+                let actions: Vec<&str> = adapted
+                    .changes
+                    .iter()
+                    .map(|change| change.action.as_str())
+                    .collect();
+                info!(
+                    tool = %tool.name,
+                    change_count = adapted.changes.len(),
+                    pointers = ?pointers,
+                    actions = ?actions,
+                    kind = super::openai_schema::SchemaChangeKind::RegexLookaround.as_str(),
+                    "adapted tool JSON Schema for OpenAI: dropped unsupported regex lookaround; original registry schema unchanged"
+                );
+            }
+            OpenAiToolDefinition {
+                tool_type: "function",
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: adapted.schema,
+            }
         })
         .collect()
 }
@@ -902,7 +929,7 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
 mod tests {
     use super::{
         AuthRoute, OpenAiProvider, ProviderKind, account_auth, auth_route, build_request_input,
-        build_request_input_items, chained_instructions, format_tool_output,
+        build_request_input_items, build_tool_payload, chained_instructions, format_tool_output,
         forward_events_and_track_chain, reasoning_summary_request, request_messages, to_data_uri,
     };
     use std::sync::Arc;
@@ -910,6 +937,7 @@ mod tests {
 
     use codescribe_core::agent::{
         AgentAssetStore, AgentEvent, AgentProvider, ContentBlock, Message, Role, StreamOptions,
+        ToolDefinition,
     };
     use reqwest::Client;
     use serde_json::json;
@@ -1311,6 +1339,73 @@ mod tests {
         assert_eq!(auth_route(false, None), AuthRoute::ApiKey);
     }
 
+    /// `build_tool_payload` is the Responses wire mapper. Porkbun nested email
+    /// lookaround is dropped on the provider copy; the registry schema and a
+    /// supported sibling pattern stay intact.
+    #[test]
+    fn build_tool_payload_adapts_nested_porkbun_schema_and_preserves_registry_copy() {
+        let porkbun = crate::agent::openai_schema::porkbun_update_contacts_input_schema();
+        let ordinary = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "pattern": r"^[a-z]+$" }
+            },
+            "required": ["name"]
+        });
+        let porkbun_tool = ToolDefinition {
+            name: "mcp__porkbun__update_contacts".to_string(),
+            description: "Edit a domain's contacts".to_string(),
+            input_schema: porkbun.clone(),
+        };
+        let ordinary_tool = ToolDefinition {
+            name: "native_echo".to_string(),
+            description: "echo".to_string(),
+            input_schema: ordinary.clone(),
+        };
+
+        let payload = build_tool_payload(&[porkbun_tool.clone(), ordinary_tool.clone()]);
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0].name, "mcp__porkbun__update_contacts");
+        assert_eq!(payload[1].name, "native_echo");
+        assert_eq!(porkbun_tool.input_schema, porkbun);
+        assert_eq!(ordinary_tool.input_schema, ordinary);
+        assert_eq!(
+            porkbun
+                .pointer("/properties/contact/properties/email/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(crate::agent::openai_schema::ZOD_EMAIL_LOOKAROUND_PATTERN)
+        );
+
+        let wire = serde_json::to_value(&payload).expect("serialize tool payload");
+        assert_eq!(wire[0]["type"], "function");
+        assert_eq!(wire.as_array().map(Vec::len), Some(2));
+        assert!(
+            wire[0]["parameters"]
+                .pointer("/properties/contact/properties/email/pattern")
+                .is_none()
+        );
+        assert_eq!(
+            wire[0]["parameters"]
+                .pointer("/properties/contact/properties/email/format")
+                .and_then(serde_json::Value::as_str),
+            Some("email")
+        );
+        for role in ["registrant", "admin", "tech", "billing"] {
+            let pointer =
+                format!("/properties/contacts/properties/{role}/properties/email/pattern");
+            assert!(
+                wire[0]["parameters"].pointer(&pointer).is_none(),
+                "adapted payload must drop lookaround at {pointer}"
+            );
+        }
+        assert_eq!(
+            wire[1]["parameters"]
+                .pointer("/properties/name/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(r"^[a-z]+$")
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn agent_provider_fetches_the_key_after_construction_before_sending() {
@@ -1470,6 +1565,158 @@ mod tests {
             "the codex backend keeps no chain: {sent}"
         );
         assert!(sent.get("max_output_tokens").is_none());
+    }
+
+    /// Account/Codex-backend HTTP body uses the adapted schema from
+    /// `build_tool_payload`, not an unused helper. Tool count/names stay.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn signed_in_codex_backend_request_sends_adapted_porkbun_schema() {
+        use base64::Engine;
+        const TEST_KEY_ACCOUNT: &str = "CODESCRIBE_TEST_OPENAI_CODEX_SCHEMA_KEY";
+        let mut server = mockito::Server::new_async().await;
+        let mut env = ScopedEnv::new();
+        env.set(TEST_KEY_ACCOUNT, "synthetic-key-must-not-be-sent");
+        let id_token = format!(
+            "h.{}.s",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                r#"{"email":"u@example.com","https://api.openai.com/auth":{"chatgpt_account_id":"acct_schema_123"}}"#
+            )
+        );
+        let tokens = account_auth::AccountTokens::new(
+            ProviderKind::OpenAiResponses,
+            "account-access".to_string(),
+            Some("account-refresh".to_string()),
+            Some(id_token),
+            None,
+            None,
+        );
+        env.set(
+            account_auth::OPENAI_ACCOUNT_TOKENS_ACCOUNT,
+            serde_json::to_string(&tokens).expect("tokens json"),
+        );
+        env.set(
+            super::CODEX_BACKEND_ENDPOINT_ENV,
+            format!("{}/backend-api/codex/responses", server.url()),
+        );
+        let provider = OpenAiProvider {
+            client: Client::new(),
+            endpoint: format!("{}/v1/responses", server.url()),
+            api_key: String::new(),
+            api_key_account: Some(TEST_KEY_ACCOUNT.to_string()),
+            default_model: "gpt-6-astra".to_string(),
+            use_previous_response_id: true,
+            previous_response_id: Arc::new(Mutex::new(Some("resp_old_chain".to_string()))),
+            initial_response_timeout: Duration::from_secs(2),
+            inter_chunk_timeout: Duration::from_secs(2),
+            use_account_auth: true,
+            provider: ProviderKind::OpenAiResponses,
+        };
+        let body = [
+            r#"data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_codex_schema"}}"#,
+            "",
+            r#"data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_codex_schema","status":"failed","error":{"code":"synthetic_end","message":"done"}}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let captured = Arc::new(std::sync::Mutex::new(String::new()));
+        let capture = Arc::clone(&captured);
+        let codex = server
+            .mock("POST", "/backend-api/codex/responses")
+            .match_header("authorization", "Bearer account-access")
+            .match_header("chatgpt-account-id", "acct_schema_123")
+            .match_header("originator", "codescribe")
+            .match_header("x-api-key", mockito::Matcher::Missing)
+            .expect(1)
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body_from_request(move |request| {
+                let raw = request.body().cloned().unwrap_or_default();
+                *capture.lock().unwrap() = String::from_utf8_lossy(&raw).into_owned();
+                body.clone().into_bytes()
+            })
+            .create_async()
+            .await;
+        let public = server
+            .mock("POST", "/v1/responses")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let porkbun = crate::agent::openai_schema::porkbun_update_contacts_input_schema();
+        let tools = vec![
+            ToolDefinition {
+                name: "mcp__porkbun__update_contacts".to_string(),
+                description: "Edit a domain's contacts".to_string(),
+                input_schema: porkbun.clone(),
+            },
+            ToolDefinition {
+                name: "native_echo".to_string(),
+                description: "echo".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "pattern": r"^[a-z]+$" }
+                    }
+                }),
+            },
+        ];
+        let messages = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Text("via the account".to_string())],
+        )];
+        let mut rx = provider
+            .stream(&messages, &tools, &StreamOptions::default())
+            .await
+            .expect("account lane must stream through the codex backend");
+        while rx.recv().await.is_some() {}
+        codex.assert_async().await;
+        public.assert_async().await;
+
+        let sent: serde_json::Value =
+            serde_json::from_str(&captured.lock().unwrap()).expect("request body is json");
+        assert_eq!(sent["model"], "gpt-6-astra");
+        let wire_tools = sent["tools"].as_array().expect("tools array");
+        assert_eq!(wire_tools.len(), 2);
+        assert_eq!(wire_tools[0]["name"], "mcp__porkbun__update_contacts");
+        assert_eq!(wire_tools[1]["name"], "native_echo");
+        assert!(
+            wire_tools[0]["parameters"]
+                .pointer("/properties/contact/properties/email/pattern")
+                .is_none(),
+            "Codex-backend body must not carry lookaround: {sent}"
+        );
+        assert_eq!(
+            wire_tools[0]["parameters"]
+                .pointer("/properties/contact/properties/email/format")
+                .and_then(serde_json::Value::as_str),
+            Some("email")
+        );
+        for role in ["registrant", "admin", "tech", "billing"] {
+            let pointer =
+                format!("/properties/contacts/properties/{role}/properties/email/pattern");
+            assert!(
+                wire_tools[0]["parameters"].pointer(&pointer).is_none(),
+                "{pointer} still present in Codex-backend body"
+            );
+        }
+        assert_eq!(
+            wire_tools[1]["parameters"]
+                .pointer("/properties/name/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(r"^[a-z]+$")
+        );
+        assert_eq!(
+            tools[0]
+                .input_schema
+                .pointer("/properties/contact/properties/email/pattern")
+                .and_then(serde_json::Value::as_str),
+            Some(crate::agent::openai_schema::ZOD_EMAIL_LOOKAROUND_PATTERN),
+            "registry schema must keep the original lookaround"
+        );
+        assert_eq!(porkbun, tools[0].input_schema);
     }
 
     /// SSE `error` events surface as specific AgentEvent::Error, not session noise.

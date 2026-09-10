@@ -15,6 +15,8 @@ pub mod anthropic_provider;
 pub mod monitor;
 /// OpenAI Responses-family client (also carries xAI and other Responses vendors).
 pub mod openai_provider;
+/// OpenAI / Codex-backend JSON Schema subset adapter for tool parameters.
+mod openai_schema;
 /// macOS-only native tool surface (filesystem, process, MCP, guards).
 #[cfg(target_os = "macos")]
 pub mod tools;

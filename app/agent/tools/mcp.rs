@@ -1225,7 +1225,7 @@ mod tests {
 
     use super::{
         McpRowTone, desktop_commander_validator, execution_policy, prepare_upstream_input,
-        probe_agentic_readiness_at, probe_mcp_status_at, public_tool_name,
+        probe_agentic_readiness_at, probe_mcp_status_at, public_input_schema, public_tool_name,
         redact_command_for_approval, register_mcp_tools_from_config_path,
     };
     use codescribe_core::agent::{ToolRegistry, ToolResultContent, ToolRisk};
@@ -1350,6 +1350,46 @@ mod tests {
 
         let (policy, _) = execution_policy("Desktop-Commander", "list_directory");
         assert_eq!(policy.risk, ToolRisk::ReadOnly);
+    }
+
+    /// Porkbun-like nested email lookaround stays on the registry/upstream
+    /// schema. OpenAI adaptation is a provider-copy concern; MCP
+    /// `validateToolInput` still sees the original pattern.
+    #[test]
+    fn porkbun_lookaround_schema_stays_on_the_mcp_registry_boundary() {
+        let upstream = crate::agent::openai_schema::porkbun_update_contacts_input_schema();
+        let public = public_input_schema("porkbun", "update_contacts", &upstream);
+        assert_eq!(public, upstream);
+        for pointer in [
+            "/properties/contact/properties/email/pattern",
+            "/properties/contacts/properties/registrant/properties/email/pattern",
+            "/properties/contacts/properties/admin/properties/email/pattern",
+            "/properties/contacts/properties/tech/properties/email/pattern",
+            "/properties/contacts/properties/billing/properties/email/pattern",
+        ] {
+            assert_eq!(
+                public.pointer(pointer).and_then(serde_json::Value::as_str),
+                Some(crate::agent::openai_schema::ZOD_EMAIL_LOOKAROUND_PATTERN),
+                "{pointer}"
+            );
+        }
+
+        let arguments = json!({
+            "domain": "example.com",
+            "contact": {
+                "firstName": "Ada",
+                "country": "US",
+                "email": ".u@example.com"
+            }
+        });
+        let prepared = prepare_upstream_input("porkbun", "update_contacts", arguments.clone())
+            .expect("non-Desktop-Commander input is forwarded untouched");
+        assert_eq!(prepared, arguments);
+        assert_eq!(
+            prepared["contact"]["email"],
+            json!(".u@example.com"),
+            "Codescribe must not strip or rewrite MCP arguments; upstream Zod still rejects leading-dot and double-dot emails"
+        );
     }
 
     /// Missing `mcp.json` is a single neutral/optional row — never a hard error —
