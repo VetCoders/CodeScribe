@@ -16,19 +16,19 @@ request builder reaches it through `WireFamily::OpenAiResponses`.
 
 ## Constants
 
-| Constant | Value | Source |
-|---|---|---|
-| `CANONICAL` | `libraxis-responses` | Codescribe registry spelling |
-| `ALIASES` | `libraxis`, `lbrx`, `libraxis_responses` | Codescribe registry spelling |
-| `DISPLAY_NAME` | `Libraxis` | picker label |
-| `DOCS_URL` | https://github.com/LibraxisAI/lbrx-services (branch `feat/vista-brain-revival`) | gateway source; no public REST docs |
-| `ENDPOINT` | `https://api.libraxis.com/v1/responses` | live probe 2026-09-07 |
-| `MODELS_ENDPOINT` | `https://api.libraxis.com/v1/models` | verified live 2026-09-07 with a key (HTTP 200); 401 without |
-| `API_KEY_ACCOUNT` | `LLM_LIBRAXIS_API_KEY` | Codescribe Keychain bundle account |
-| `AUTH_HEADER` / `AUTH_VALUE_PREFIX` | `authorization` / `Bearer ` | OpenAI-style bearer |
-| `EXTRA_HEADERS` | none | — |
-| `DEFAULT_FORMATTING_MODEL` / `DEFAULT_ASSISTIVE_MODEL` | `buddy` / `buddy` | gateway profiles: `buddy`, `programmer`, `soap`, `chat`, `suggestions` |
-| `HOSTS` | `api.libraxis.com`, `api.libraxis.cloud` | both hosts migrate to this vendor row |
+| Constant                                               | Value                                                                           | Source                                                                 |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `CANONICAL`                                            | `libraxis-responses`                                                            | Codescribe registry spelling                                           |
+| `ALIASES`                                              | `libraxis`, `lbrx`, `libraxis_responses`                                        | Codescribe registry spelling                                           |
+| `DISPLAY_NAME`                                         | `Libraxis`                                                                      | picker label                                                           |
+| `DOCS_URL`                                             | https://github.com/LibraxisAI/lbrx-services (branch `feat/vista-brain-revival`) | gateway source; no public REST docs                                    |
+| `ENDPOINT`                                             | `https://api.libraxis.com/v1/responses`                                         | live probe 2026-09-07                                                  |
+| `MODELS_ENDPOINT`                                      | `https://api.libraxis.com/v1/models`                                            | verified live 2026-09-07 with a key (HTTP 200); 401 without            |
+| `API_KEY_ACCOUNT`                                      | `LLM_LIBRAXIS_API_KEY`                                                          | Codescribe Keychain bundle account                                     |
+| `AUTH_HEADER` / `AUTH_VALUE_PREFIX`                    | `authorization` / `Bearer `                                                     | OpenAI-style bearer                                                    |
+| `EXTRA_HEADERS`                                        | none                                                                            | —                                                                      |
+| `DEFAULT_FORMATTING_MODEL` / `DEFAULT_ASSISTIVE_MODEL` | `buddy` / `buddy`                                                               | gateway profiles: `buddy`, `programmer`, `soap`, `chat`, `suggestions` |
+| `HOSTS`                                                | `api.libraxis.com`, `api.libraxis.cloud`                                        | both hosts migrate to this vendor row                                  |
 
 `key_required = true` (401 without a key). `oauth_vendor = None`: the gateway
 has a session token, but no desktop sign-in flow. Vision follows the Responses
@@ -36,8 +36,7 @@ policy (permissive; the gateway has a VLM path).
 
 ## Verified live on 2026-09-07 (keyed probe by the plan session)
 
-- `GET /v1/models` → HTTP 200, `{"object":"list","data":[{"id","object":"model",
-  "owned_by":"libraxis","is_alias":true,"modalities":[…],"capability_matrix":{"image":true,…}}]}`,
+- `GET /v1/models` → HTTP 200, `{"object":"list","data":[{"id","object":"model", "owned_by":"libraxis","is_alias":true,"modalities":[…],"capability_matrix":{"image":true,…}}]}`,
   eight aliases: `master`, `soap`, `ai-suggestions`, `chat`, `programmer`,
   `svetliq`, `gpt-oss-20b`, `buddy`. Raw body pinned as
   `core/llm/vendors/fixtures/libraxis_models_live_2026-09-07.json`; the parser

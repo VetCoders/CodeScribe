@@ -15,20 +15,20 @@ Read 2026-09-07 from official docs.x.ai. Codescribe account is `LLM_XAI_API_KEY`
 
 ## Stałe
 
-| Nazwa | Wartość | URL |
-|---|---|---|
-| CANONICAL | `xai-responses` | Codescribe id (not an xAI slug). Host: https://docs.x.ai/developers/rest-api-reference |
-| ALIASES | `xai`, `grok`, `xai_responses` | Existing `ProviderIdentity` spellings; docs do not list them |
-| DISPLAY_NAME | `xAI (Grok)` | https://docs.x.ai/overview |
-| DOCS_URL | `https://docs.x.ai/developers/rest-api-reference` | REST overview |
-| ENDPOINT | `https://api.x.ai/v1/responses` | https://docs.x.ai/developers/rest-api-reference/inference/responses |
-| MODELS_ENDPOINT | `https://api.x.ai/v1/models` | https://docs.x.ai/developers/rest-api-reference/inference/models |
-| API_KEY_ACCOUNT | `LLM_XAI_API_KEY` | Codescribe Keychain. Vendor header uses `$XAI_API_KEY`: https://docs.x.ai/developers/rest-api-reference |
-| AUTH_HEADER | `authorization` | `Authorization: Bearer <your xAI API key>` — https://docs.x.ai/developers/rest-api-reference |
-| AUTH_VALUE_PREFIX | `Bearer ` | same |
-| EXTRA_HEADERS | `[]` | Inference REST documents Bearer only |
-| DEFAULT_FORMATTING_MODEL | `grok-4.6` | https://docs.x.ai/developers/grok-4-6 (seed 2026-09-07) |
-| DEFAULT_ASSISTIVE_MODEL | `grok-4.6` | same |
+| Nazwa                    | Wartość                                           | URL                                                                                                     |
+| ------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| CANONICAL                | `xai-responses`                                   | Codescribe id (not an xAI slug). Host: https://docs.x.ai/developers/rest-api-reference                  |
+| ALIASES                  | `xai`, `grok`, `xai_responses`                    | Existing `ProviderIdentity` spellings; docs do not list them                                            |
+| DISPLAY_NAME             | `xAI (Grok)`                                      | https://docs.x.ai/overview                                                                              |
+| DOCS_URL                 | `https://docs.x.ai/developers/rest-api-reference` | REST overview                                                                                           |
+| ENDPOINT                 | `https://api.x.ai/v1/responses`                   | https://docs.x.ai/developers/rest-api-reference/inference/responses                                     |
+| MODELS_ENDPOINT          | `https://api.x.ai/v1/models`                      | https://docs.x.ai/developers/rest-api-reference/inference/models                                        |
+| API_KEY_ACCOUNT          | `LLM_XAI_API_KEY`                                 | Codescribe Keychain. Vendor header uses `$XAI_API_KEY`: https://docs.x.ai/developers/rest-api-reference |
+| AUTH_HEADER              | `authorization`                                   | `Authorization: Bearer <your xAI API key>` — https://docs.x.ai/developers/rest-api-reference            |
+| AUTH_VALUE_PREFIX        | `Bearer `                                         | same                                                                                                    |
+| EXTRA_HEADERS            | `[]`                                              | Inference REST documents Bearer only                                                                    |
+| DEFAULT_FORMATTING_MODEL | `grok-4.6`                                        | https://docs.x.ai/developers/grok-4-6 (seed 2026-09-07)                                                 |
+| DEFAULT_ASSISTIVE_MODEL  | `grok-4.6`                                        | same                                                                                                    |
 
 ## Auth headers
 
@@ -42,13 +42,11 @@ not replace Bearer (https://docs.x.ai/developers/advanced-api-usage/mtls).
 
 ## Kształt `/v1/models`
 
-`GET /v1/models` returns `{ "object": "list", "data": [ { "id", "object": "model",
-"owned_by", "created", pricing… } ] }`. There is **no** `display_name` field.
+`GET /v1/models` returns `{ "object": "list", "data": [ { "id", "object": "model", "owned_by", "created", pricing… } ] }`. There is **no** `display_name` field.
 Fixture copied into `models_from_response` tests:
 https://docs.x.ai/developers/rest-api-reference/inference/models.md
 
-`GET /v1/language-models` returns `{ "models": [ { "id", "aliases", modalities,
-fingerprint, version, pricing… } ] }`. Still no display-name field; extra vs
+`GET /v1/language-models` returns `{ "models": [ { "id", "aliases", modalities, fingerprint, version, pricing… } ] }`. Still no display-name field; extra vs
 `/v1/models` is modalities / fingerprint / aliases.
 
 ## OAuth
