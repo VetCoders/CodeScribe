@@ -592,3 +592,43 @@ source as an unauthenticated fallback:
   enclosing function, so a caller-attribution proof observes zero callsites for
   calls that genuinely exist. That is an `INSTRUMENT_FALSE_NEGATIVE` and must be
   classified as one before anyone repairs product code to satisfy it.
+
+## 15. Guarded ordering is a separate obligation (2026-09-10)
+
+Re-pointing a corridor onto the owner that actually executes the code proves
+presence. It does not prove sequence, and in an admission chain sequence is the
+property that matters: qualification after admission is not qualification. A
+corridor therefore carries two independent kinds of evidence, and a repair that
+supplies only the first is a renamed callsite wearing a proof's clothes.
+
+**In-order body evidence.** A hop's `required_code` must appear in the declared
+order inside one complete brace-extent body, judged after comments and string
+literals are removed. This is what pins ownership against recognition context:
+the capture chain mints its occurrence from the physical Silero range and
+qualifies it before `bound_context_range` produces any padded window, so the
+padded window cannot become the thing that is owned. Reordering those two lines
+is refused as `executable code out of required order`, not as missing code.
+
+**Cross-callsite ordering evidence.** A corridor's `ordering` rows compare the
+observed lines of two declared invocation receipts inside one caller, and may
+require a single-line `barrier` fragment strictly between them. The barrier
+exists because two calls in the correct order can still be wrong when the guard
+that used to sit between them is gone; naming the guard makes its removal a
+failure rather than a silent widening.
+
+Ordering has a falsification property worth stating, because getting it wrong
+produces a green that cannot go red. Observed lines come from occurrence
+receipts, not from body text, so **mutating a body can never falsify an ordering
+row**. A suite that drops `ordering` before mutating bodies proves the hops and
+nothing else. Ordering falsifiers must mutate the occurrence receipts — move a
+callsite, drop an edge — and a barrier falsifier must remove a fragment that is
+deliberately _not_ also a `required_code` snippet, or it merely re-tests the hop.
+
+**One manifest key is read; a near-twin is not.** The corridor engine reads
+`minimum_count` and defaults to 1; `min_calls` is never consulted. Every
+surviving `min_calls` entry in this repository declares 1, so no obligation is
+currently lost — but a future `min_calls: 2` would be silently downgraded to 1
+and would read as an enforced multiplicity that is not enforced. The capture
+corridor is normalized to `minimum_count` and pinned by a test; the remaining
+33 entries in two other corridors are a separate, deliberately unrepaired cut,
+because rewriting them is only safe with each corridor's counts re-measured.

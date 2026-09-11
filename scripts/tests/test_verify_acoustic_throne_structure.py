@@ -2401,7 +2401,11 @@ class CurrentChainMutantTests(unittest.TestCase):
     and are falsified separately in NeutralAstTests.
     """
 
-    CORRIDORS = ("settings_to_capture_admission", "speech_coverage_to_terminal_truth")
+    CORRIDORS = (
+        "settings_to_capture_admission",
+        "speech_coverage_to_terminal_truth",
+        "capture_to_ledger",
+    )
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -2422,19 +2426,29 @@ class CurrentChainMutantTests(unittest.TestCase):
         cls.seed.context()
         _, cls.positive_failures = VERIFIER.verify_code_corridors(cls.seed, cls.contracts)
 
-    def run_mutated(self, symbol, file, old, new):
+    def run_mutations(self, symbol, file, pairs):
+        """Apply an ordered edit script to one live body and re-judge it.
+
+        Some bypasses cannot be expressed as a single substitution: moving a
+        statement means deleting it here and re-inserting it there. One pair
+        keeps the old single-edit call shape; several pairs express a move.
+        """
         clone = VERIFIER.StructuralVerifier(self.repo)
         clone._occurrences = dict(self.seed._occurrences)
         clone._literal_occurrences = dict(self.seed._literal_occurrences)
         clone._bodies = copy.deepcopy(self.seed._bodies)
         row = next(item for item in clone._bodies[(symbol, file)]["bodies"]
                    if item["symbol"] == symbol)
-        self.assertIn(old, row["source"], f"{symbol}: stale mutation anchor")
-        row["source"] = row["source"].replace(old, new, 1)
+        for old, new in pairs:
+            self.assertIn(old, row["source"], f"{symbol}: stale mutation anchor")
+            row["source"] = row["source"].replace(old, new, 1)
         row["total_lines"] = len(row["source"].splitlines())
         row["end_line"] = row["start_line"] + row["total_lines"] - 1
         _, failures = VERIFIER.verify_code_corridors(clone, self.contracts)
         return failures
+
+    def run_mutated(self, symbol, file, old, new):
+        return self.run_mutations(symbol, file, [(old, new)])
 
     def test_positive_current_chains_pass(self):
         self.assertEqual(self.positive_failures, [])
@@ -2541,6 +2555,133 @@ class CurrentChainMutantTests(unittest.TestCase):
                     any("speech_coverage_to_terminal_truth" in failure and obligation in failure
                         for failure in failures), (name, failures))
 
+    def test_capture_chain_bypasses_are_rejected(self):
+        """Break one capture guard at a time and require a named refusal.
+
+        Every case names the hop that must reject it, so a failure firing for
+        an unrelated reason cannot be read as a rejection. Ownership, identity,
+        calibration, exact PCM and the qualification-before-admission order are
+        each falsified separately; none of them is proven by the positive run
+        alone, because a positive that cannot go red proves only that it ran.
+        """
+        apple = "core/pipeline/streaming/apple_live_session.rs"
+        cases = [
+            # The armed branch stops routing into the physical lane at all.
+            ("armed_routing_removed", "seal_utterance_final",
+             [("        seal_sliced_by_silero(state, ev_tx, &segments);\n        return true;\n", "")]),
+            # The armed branch forwards cursor-filtered segments instead of the
+            # original timed ones, so revised earlier coordinates are lost.
+            ("armed_branch_forwards_filtered_input", "seal_utterance_final",
+             [("seal_sliced_by_silero(state, ev_tx, &segments);",
+               "seal_sliced_by_silero(state, ev_tx, &disjoint);")]),
+            # Untimed Apple text is allowed to create an occurrence.
+            ("untimed_segments_accepted", "seal_utterance_final",
+             [("if segments.is_empty() {", "if segments.len() > usize::MAX {")]),
+            # The legacy cursor filter is moved ahead of the armed routing.
+            ("cursor_filter_precedes_armed_routing", "seal_utterance_final",
+             [("    if state.fusion_seal_armed {",
+               "    let mut cursor = state.last_apple_segment_end;\n    if state.fusion_seal_armed {"),
+              ("    let mut cursor = state.last_apple_segment_end;\n    let mut overlap_normalized = false;",
+               "    let mut overlap_normalized = false;")]),
+            # The dispatcher stops delegating to reconciliation.
+            ("dispatcher_stops_reconciling", "seal_sliced_by_silero",
+             [("reconcile_silero_ledger(state, ev_tx, &ledger, disjoint)", "true")]),
+            # The revision fence stops being advanced, so a reopened range can
+            # no longer be distinguished from a replayed one.
+            ("slice_revision_guard_dropped", "seal_sliced_by_silero",
+             [("    state.silero_slice_revision = Some((utterances.len(), utterances.last().cloned()));\n", "")]),
+            # Evidence from another capture is accepted as this occurrence's.
+            ("foreign_capture_identity_accepted", "reconcile_silero_ledger",
+             [("utterance.range.session != state.session_id", "false")]),
+            # The identity refusal warns and then continues anyway.
+            ("identity_refusal_falls_through", "reconcile_silero_ledger",
+             [("        });\n        return false;\n    }\n    let apple_words",
+               "        });\n    }\n    let apple_words")]),
+            # Ownership is minted from the padded recognition context instead of
+            # the physical Silero range.
+            ("ownership_minted_from_padded_range", "reconcile_silero_ledger",
+             [("let occurrence = OccurrenceIdentity::from(&silero.range);",
+               "let occurrence = OccurrenceIdentity::from(&bound_context_range(&silero.range, context, pad_samples, &bounds));")]),
+            # The qualifier is still called but its refusal cannot fire.
+            ("qualification_refusal_ignored", "reconcile_silero_ledger",
+             [("if !qualify_owned_occurrence(state, &occurrence) {",
+               "if !qualify_owned_occurrence(state, &occurrence) && false {")]),
+            # A refused qualification stops being recorded as a failure.
+            ("refusal_not_routed_to_failure", "reconcile_silero_ledger",
+             [("state.fail_refinement(ev_tx, utterance_id, &occurrence, reason);", "")]),
+            # Admission re-qualifies itself instead of reusing the qualification
+            # reconciliation already established, which would let the ordering
+            # guarantee be satisfied by accident.
+            ("admission_self_qualifies_instead_of_reusing", "reconcile_silero_ledger",
+             [("energy: EnergyAdmission::RequireExistingQualification,",
+               "energy: EnergyAdmission::QualifyFromOwnedPcm,")]),
+            # A comment carrying the exact required text discharges nothing.
+            ("comment_cannot_discharge", "reconcile_silero_ledger",
+             [("        if !qualify_owned_occurrence(state, &occurrence) {",
+               "        // if !qualify_owned_occurrence(state, &occurrence) {\n"
+               "        if occurrence.sample_end == 0 {")]),
+            # Neither does a string literal carrying the same text.
+            ("string_literal_cannot_discharge", "reconcile_silero_ledger",
+             [('        if !qualify_owned_occurrence(state, &occurrence) {',
+               '        let _marker = "if !qualify_owned_occurrence(state, &occurrence) {";\n'
+               '        if occurrence.sample_end == 0 {')]),
+            # Qualification stops checking the capture epoch.
+            ("wrong_session_or_epoch_qualified", "qualify_owned_occurrence",
+             [("if occurrence.session != state.session_id || occurrence.capture_epoch != state.capture_epoch {",
+               "if occurrence.session != state.session_id {")]),
+            # Calibration becomes optional, so energy is measured against none.
+            ("calibration_omitted", "qualify_owned_occurrence",
+             [("let Some(calibration) = state.energy_calibration.as_ref() else {",
+               "let Some(calibration) = state.energy_calibration.as_ref().or(Some(&EnergyCalibration::DEFAULT)) else {")]),
+            # The exact owned window is padded, so measured energy would come
+            # from samples this occurrence does not own.
+            ("exact_window_replaced_by_padded", "qualify_owned_occurrence",
+             [("let Some(window) = state.window_by_samples(occurrence.sample_start, occurrence.sample_end)",
+               "let Some(window) = state.window_by_samples(occurrence.sample_start.saturating_sub(16_000), occurrence.sample_end.saturating_add(16_000))")]),
+            # An empty PCM window stops refusing qualification.
+            ("empty_pcm_accepted", "qualify_owned_occurrence",
+             [("if window.samples.is_empty() {", "if window.samples.len() > usize::MAX {")]),
+            # The ledger never mints evidence; a prior qualification is reused.
+            ("ledger_qualify_dropped", "qualify_owned_occurrence",
+             [("if !ledger.qualify(&evidence, calibration).is_qualified() {",
+               "if !ledger.is_qualified(occurrence) {")]),
+            # Evidence is minted against a calibration version nobody measured.
+            ("calibration_version_forged", "qualify_owned_occurrence",
+             [("evidence_calibration_version: calibration.version.clone(),",
+               "evidence_calibration_version: String::new(),")]),
+            # Admission stops requiring an existing qualification.
+            ("existing_qualification_guard_bypassed", "admit_ledger_label",
+             [("    if !ledger.is_qualified(&occurrence) {\n        return None;\n    }\n", "")]),
+            # The self-qualifying admission modes stop invoking the qualifier.
+            ("energy_mode_guard_ignored", "admit_ledger_label",
+             [(") && !qualify_owned_occurrence(state, &occurrence)", ") && true")]),
+            # Admission stops checking which session the occurrence belongs to.
+            ("admission_session_epoch_guard_narrowed", "admit_ledger_label",
+             [("if occurrence.session != state.session_id || occurrence.capture_epoch != state.capture_epoch {",
+               "if occurrence.capture_epoch != state.capture_epoch {")]),
+        ]
+        for name, symbol, pairs in cases:
+            with self.subTest(mutation=name):
+                failures = self.run_mutations(symbol, apple, pairs)
+                self.assertTrue(failures, name)
+                self.assertTrue(
+                    any("capture_to_ledger" in failure and symbol in failure
+                        for failure in failures), (name, failures))
+
+    def test_retired_capture_names_are_absent_from_the_manifest(self):
+        """The stale capture corridor named a predicate and an argument shape
+        the product retired in the delegation refactor. Naming them again must
+        be caught here rather than by a corridor that dies before it reports.
+        """
+        manifest = (self.repo / VERIFIER.DEFAULT_MANIFEST).read_text()
+        for retired in (
+            "state.fusion_seal_armed && seal_sliced_by_silero(state, ev_tx, &disjoint)",
+            "window_by_samples(occurrence.sample_start, occurrence.sample_end)?",
+            "let energy_integral = window.samples.iter()",
+            "let peak = window.samples.iter()",
+        ):
+            self.assertNotIn(retired, manifest, retired)
+
     def test_retired_acoustic_names_are_absent_from_the_manifest(self):
         """The stale corridor named symbols the product no longer defines.
 
@@ -2553,6 +2694,223 @@ class CurrentChainMutantTests(unittest.TestCase):
                         "select_coverage_speech_source",
                         "coverage_speech_ranges"):
             self.assertNotIn(f'"{retired}"', manifest, retired)
+
+
+class CaptureOrderingProofTests(unittest.TestCase):
+    """The capture corridor judged with its ordering contract still attached.
+
+    `CurrentChainMutantTests` drops `ordering` because a body mutation cannot
+    move a callsite: observed lines come from occurrences, not from source
+    text. Ordering therefore needs its own falsifiers, which mutate the
+    occurrence receipts instead. Without this class the ordering rows would
+    only ever be observed green, and a green that cannot go red is decoration.
+    """
+
+    APPLE = "core/pipeline/streaming/apple_live_session.rs"
+    CORRIDOR = "capture_to_ledger"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.repo = SCRIPT.parents[1]
+        manifest = json.loads((cls.repo / VERIFIER.DEFAULT_MANIFEST).read_text())
+        cls.contracts = [
+            copy.deepcopy(corridor)
+            for corridor in manifest["stages"]["wired"]["required_corridors"]
+            if corridor["name"] == cls.CORRIDOR
+        ]
+        if len(cls.contracts) != 1:
+            raise AssertionError(f"{cls.CORRIDOR} missing from manifest")
+        if not cls.contracts[0].get("ordering"):
+            raise AssertionError(f"{cls.CORRIDOR} declares no ordering contract")
+        cls.seed = VERIFIER.StructuralVerifier(cls.repo)
+        cls.seed.context()
+        cls.observations, cls.failures = VERIFIER.verify_code_corridors(
+            cls.seed, cls.contracts
+        )
+
+    def clone(self):
+        clone = VERIFIER.StructuralVerifier(self.repo)
+        clone._occurrences = copy.deepcopy(self.seed._occurrences)
+        clone._literal_occurrences = dict(self.seed._literal_occurrences)
+        clone._bodies = copy.deepcopy(self.seed._bodies)
+        return clone
+
+    def callsites(self, verifier, callee, caller):
+        rows = verifier._occurrences[callee]["occurrences"]
+        return [
+            row
+            for row in rows
+            if row.get("file") == self.APPLE
+            and row.get("match_role") == "reference"
+            and isinstance(row.get("enclosing_symbol"), dict)
+            and row["enclosing_symbol"].get("name") == caller
+        ]
+
+    def test_positive_capture_chain_with_ordering_passes(self):
+        self.assertEqual(self.failures, [])
+        ordering = self.observations[self.CORRIDOR]["ordering"]
+        self.assertTrue(ordering, "ordering rows were not observed at all")
+        for row in ordering:
+            with self.subTest(barrier=row["barrier"]["required_code"]):
+                self.assertEqual(row["verdict"], "GREEN", row)
+                # Relational, never absolute: an unrelated edit above these
+                # functions must not turn a real proof red.
+                self.assertTrue(row["before_observed_lines"], row)
+                self.assertTrue(row["after_observed_lines"], row)
+                self.assertTrue(row["barrier_observed_lines"], row)
+                self.assertLess(
+                    max(row["before_observed_lines"]),
+                    min(row["barrier_observed_lines"]),
+                    row,
+                )
+                self.assertLess(
+                    max(row["barrier_observed_lines"]),
+                    min(row["after_observed_lines"]),
+                    row,
+                )
+
+    def test_each_capture_edge_is_individually_required(self):
+        """Remove one declared edge at a time; each must be named in refusal."""
+        cases = [
+            ("dispatcher_to_reconciliation", "reconcile_silero_ledger",
+             "seal_sliced_by_silero", 0),
+            ("worker_to_dispatcher", "seal_sliced_by_silero",
+             "apple_stream_worker", 0),
+            ("reconciliation_to_qualification", "qualify_owned_occurrence",
+             "reconcile_silero_ledger", 0),
+            ("reconciliation_to_admission", "admit_ledger_label",
+             "reconcile_silero_ledger", 0),
+            ("admission_to_qualification", "qualify_owned_occurrence",
+             "admit_ledger_label", 0),
+            ("qualification_to_ledger", "qualify", "qualify_owned_occurrence", 0),
+            # Halving a two-callsite edge: the Lexicon admission and the second
+            # worker tick are obligations, not decoration. A `minimum_count`
+            # nobody enforces would let either disappear silently.
+            ("lexicon_admission_dropped", "admit_ledger_label",
+             "reconcile_silero_ledger", 1),
+            ("second_worker_tick_dropped", "seal_sliced_by_silero",
+             "apple_stream_worker", 1),
+        ]
+        for name, callee, caller, keep in cases:
+            with self.subTest(edge=name):
+                clone = self.clone()
+                hits = self.callsites(clone, callee, caller)
+                self.assertGreater(len(hits), keep, f"{name}: stale edge anchor")
+                for row in hits[keep:]:
+                    clone._occurrences[callee]["occurrences"].remove(row)
+                _, failures = VERIFIER.verify_code_corridors(clone, self.contracts)
+                self.assertTrue(failures, name)
+                self.assertTrue(
+                    any(self.CORRIDOR in failure and callee in failure
+                        and caller in failure for failure in failures),
+                    (name, failures))
+
+    def test_qualification_must_precede_admission(self):
+        """Move the qualification callsite past both admissions.
+
+        Nothing about the bodies changes; only where the call happens. The
+        corridor must still refuse, because ownership qualified after the
+        label is admitted is not ownership.
+        """
+        clone = self.clone()
+        admissions = self.callsites(clone, "admit_ledger_label", "reconcile_silero_ledger")
+        self.assertTrue(admissions, "stale admission anchor")
+        moved = max(int(row["line"]) for row in admissions) + 1
+        hits = self.callsites(clone, "qualify_owned_occurrence", "reconcile_silero_ledger")
+        self.assertTrue(hits, "stale qualification anchor")
+        for row in hits:
+            row["line"] = moved
+        _, failures = VERIFIER.verify_code_corridors(clone, self.contracts)
+        self.assertTrue(failures)
+        self.assertTrue(
+            any(self.CORRIDOR in failure and "ordering" in failure
+                and "qualify_owned_occurrence" in failure
+                and "admit_ledger_label" in failure for failure in failures),
+            failures)
+
+    def test_ordering_barriers_are_required(self):
+        """Delete a declared barrier and the ordering claim loses its guard.
+
+        The seal-immutability barrier is deliberately not one of the hop's
+        `required_code` snippets, so its removal can only be caught by the
+        ordering contract. That is what makes it a barrier test rather than a
+        second copy of the body test.
+        """
+        clone = self.clone()
+        row = next(
+            item
+            for item in clone._bodies[("reconcile_silero_ledger", self.APPLE)]["bodies"]
+            if item["symbol"] == "reconcile_silero_ledger"
+        )
+        anchor = "            if ledger.is_sealed(&occurrence) {"
+        self.assertIn(anchor, row["source"], "stale barrier anchor")
+        row["source"] = row["source"].replace(
+            anchor, "            if ledger.frontier_of(&occurrence).is_some() {", 1
+        )
+        row["total_lines"] = len(row["source"].splitlines())
+        row["end_line"] = row["start_line"] + row["total_lines"] - 1
+        _, failures = VERIFIER.verify_code_corridors(clone, self.contracts)
+        self.assertTrue(failures)
+        self.assertTrue(
+            any(self.CORRIDOR in failure and "barrier" in failure
+                for failure in failures), failures)
+
+    def test_capture_invocations_use_the_key_the_verifier_reads(self):
+        """`minimum_count` is read; `min_calls` is not.
+
+        `verify_code_corridors` reads `minimum_count` and defaults to 1. A
+        manifest entry spelled `min_calls: 2` is therefore silently downgraded
+        to 1 — it looks like an enforced obligation and is not one. This pins
+        the capture corridor to the spelling the instrument actually consumes;
+        the other corridors are a separate, reported finding.
+        """
+        manifest = json.loads((self.repo / VERIFIER.DEFAULT_MANIFEST).read_text())
+        corridor = next(
+            row
+            for row in manifest["stages"]["wired"]["required_corridors"]
+            if row["name"] == self.CORRIDOR
+        )
+        for invocation in corridor["required_invocations"]:
+            with self.subTest(invocation=invocation["caller"]):
+                self.assertNotIn("min_calls", invocation, invocation)
+                self.assertIn("minimum_count", invocation, invocation)
+
+    def test_local_const_callsite_attribution_limit_is_declared(self):
+        """A declared instrument limit, pinned so it cannot rot silently.
+
+        `seal_utterance_final` opens with a function-local `const`, and
+        Loctree attributes every callsite in that function to the constant
+        instead of the function. Its two real `admit_ledger_label` calls and
+        its `seal_sliced_by_silero` call therefore observe zero production
+        callsites, so those edges are deliberately NOT declared — declaring
+        them would be a red obligation caused by the provider, not the product.
+
+        The bodies below prove the calls exist. When the provider is fixed this
+        test goes red and forces the corridor to gain the missing edges, which
+        is exactly the behaviour a silent limit does not have.
+        """
+        body = VERIFIER.corridor_body_rows(
+            self.seed.body("seal_utterance_final", self.APPLE),
+            symbol="seal_utterance_final",
+            file=self.APPLE,
+            signature_contains=None,
+        )
+        self.assertEqual(len(body), 1)
+        source = VERIFIER.code_without_comments_or_strings(body[0]["source"])
+        for present in ("admit_ledger_label(", "seal_sliced_by_silero(state,ev_tx,&segments)"):
+            self.assertIn(present, source, present)
+        for callee in ("admit_ledger_label", "seal_sliced_by_silero"):
+            with self.subTest(callee=callee):
+                self.assertEqual(
+                    self.callsites(self.seed, callee, "seal_utterance_final"), [],
+                    f"{callee}: provider now attributes this caller; declare the edge")
+        corridor = next(
+            row for row in self.contracts if row["name"] == self.CORRIDOR
+        )
+        for invocation in corridor["required_invocations"]:
+            self.assertNotEqual(
+                invocation["caller"], "seal_utterance_final",
+                "an edge is declared on a caller the provider cannot attribute")
 
 
 if __name__ == "__main__":
