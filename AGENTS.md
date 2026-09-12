@@ -1,69 +1,60 @@
 # Codescribe Local Agent Contract
 
 The Vetcoders Global Agent Charter is authoritative. This file adds only
-Codescribe-specific runtime laws, release cadence, and canonical pointers.
+Codescribe-specific runtime laws, thrones of authority, release cadence, and canonical pointers.
 
-## Runtime authority
+## Naming & Authority (Founder decision 2026-08-28)
 
-- `RecordingController` is the only in-app microphone owner. Dictation, Agent,
-  and Assistive may route differently downstream; none may create a recorder.
-- `PresentationEmitter` is the transcript reducer of record. The Transcript Bus
-  observes committed reducer events; previews and raw engine text are not truth.
-- Only occurrence-authenticated ledger receipts may create committed Bus
-  projections. Raw final/correction/patch events are telemetry or diagnostics.
-- Preview is ephemeral overlay paint. It never writes delivery or Bus state.
-- A terminal ledger seal closes committed Bus truth; no arbitrary text seal,
-  draft publication API, or raw-event delta reducer exists.
-- Apple is the first observer, not immutable text authority. A later observer
-  may repair the same occurrence only with matching session, epoch, and PCM span.
-- Equal words may be intentional repetition. Reject replayed observation
-  identity, never text merely because its string repeats.
-- Machine layers are Apple, Whisper, Lexicon + Light+, and the Responses
-  formatter. Silero supplies VAD/time evidence; `SessionFinalised` is lifecycle.
-- Delivery follows explicit operator intent, never OS focus alone.
-- Terminal events release microphone state, UI phase, and Agent-thread ownership.
-- Agent capture stays bound to the thread selected when capture starts.
-- Diagnostic and CLI consumers observe the Transcript Bus; they never open a
-  competing microphone.
+- **Founder** = Maciej Gad and Monika Szymańska (human voice, decisions, buttons).
+- **Operator** is exclusively an AGENT role (`vc-operator`, integrator). Never call the Founder "operator".
+- **Prawo Cięcia**: Jeden tron na władzę, zero nowych warstw. Konkurent tronu jest bezwzględnie
+  USUWANY (`git rm` / wycięcie symbolu), nigdy opakowywany.
+- **Zakazane słowa w diffach, kodzie i commitach**: `shim`, `compat`, `legacy`, `adapter-for-old`,
+  `fallback-to-previous`, `bridge-until`, `TODO remove`. Każde = odrzucony cut. Żadnych fikuśnych garbatych wrapperów.
+- **Falsyfikator przed edycją**: test „pięć Iwo” (5 fizycznych wystąpień PCM → 5 w ledgerze → 5 w reducerze → 5 w delivery).
+- Zobacz `CANARY_MAP.md` oraz `AGENT_CANARY.md` dla pełnej mapy kolizji i 7 tronów.
+
+## Trony władzy (Runtime authority)
+
+- `acoustic_ledger.rs` (`core/pipeline/acoustic_ledger.rs`): jedyny tron tożsamości PCM (`OccurrenceIdentity`, `ObservationIdentity`, `MutationReceipt`). Tekst jest etykietą przypiętą do occurrence, nigdy kluczem identity.
+- **Seal authority**: predykat na energii PCM + dolinach Silero VAD na tym samym capture epoch, nigdy na równości stringów. Równość stringów nie tworzy, nie łączy i nie kasuje occurrence.
+- `RecordingController`: jedyny właściciel mikrofonu w aplikacji. Dictation, Agent i Assistive mogą routować downstream; żaden nie tworzy własnego recordera.
+- `PresentationEmitter` (`TranscriptReducer`): jedyny reducer dokumentu. `OverlayState.swift` to wyłącznie projekcja i malowanie UI bez własnego stanu dokumentu.
+- `TranscriptBus`: wyłącznie obserwator zatwierdzonych zdarzeń reducera. Zero reinterpretacji dokumentu.
+- `delivery_route.rs` (`app/controller/delivery_route.rs`): jedyny tron routingu delivery. Delivery kieruje się jawną intencją Foundera / użytkownika, nigdy samym fokusem OS.
+- `settings.json` → loader → immutable runtime snapshot: jedyne źródło konfiguracji runtime. Zero pięciogłosu.
+- Terminal events zwalniają stan mikrofonu, fazę UI i wątek Agenta.
 
 ## Canonical contracts
 
-- `docs/STT_CONTRACT.md` — engines and adjudication.
-- `docs/TRANSCRIPT_BUS.md` — clean events, privacy, and path resolution.
-- `docs/HOTKEYS_CONTRACT.md` — gestures, ownership, and mode routing.
+- `CANARY_MAP.md` — mapa kolizji, 20 konkurentów i 7 tronów.
+- `docs/STT_CONTRACT.md` — silniki i adjudykacja.
+- `docs/TRANSCRIPT_BUS.md` — czyste zdarzenia, prywatność i ścieżki.
+- `docs/HOTKEYS_CONTRACT.md` — gesty, ownership i tryby.
 - `docs/DELIVERY_ROUTE.md` — destination selection.
-- `docs/ENV_REGISTRY.toml` — supported environment variables.
+- `docs/ENV_REGISTRY.toml` — rejestr zmiennych środowiskowych.
 
-When prose conflicts with executable behavior, establish runtime truth and
-update both code and the relevant contract in the same cut. After Rust bridge
-API changes, regenerate UniFFI Swift bindings with `make app-bindings`.
+Po zmianach w API Rust bridge regeneruj bindingi Swift przez `make app-bindings`.
 
 ## Daily app and release cadence
 
-- After a coherent app-changing cut, run `make install-if-idle`. It refuses
-  only while a take is recording (Transcript Bus) or an agent turn is in
-  flight (`~/.codescribe/agent-turn.lock`); a merely running app does not
-  block (Founder, 2026-09-08) — the new build is picked up on restart.
-- Treat installation as the required operator handoff for every major app cut.
-  Verify `/Applications/Codescribe.app` version, build, source commit,
-  signature, and successful launch; then play
-  `/usr/bin/afplay /System/Library/Sounds/Ping.aiff`. Never play the success
-  ping for a failed or unverified installation.
-- Refuse installation while a current take is live: the most recently started
-  app session has no later `session_ended` (legacy `transcript_sealed` still
-  counts), any unpaired `cli_file_verdict` session is open, or the app holds
-  the install-runtime lock. Historical unpaired starts are abandoned, not
-  live. Never tear down the app mid-take.
-- Cut at most one `make release-standard` notarized slim DMG per calendar day
-  when the bus is idle. Recut only when the operator asks.
-- An ad-hoc `/Applications` build is not a distribution DMG. Production DMGs
-  require signing, notarization, checksum, stapling, and `verify-dmg`.
+- Po spójnym cucie zmieniającym aplikację uruchom `make install-if-idle`. Odmawia
+  tylko podczas trwającego nagrywania (Transcript Bus) lub aktywnej tury agenta
+  (`~/.codescribe/agent-turn.lock`); samo działanie aplikacji nie blokuje (Founder, 2026-09-08).
+- Traktuj instalację jako wymagany odbiór dla Foundera przy każdym większym cucie.
+  Zweryfikuj wersję, build, commit, podpis i pomyślny start `/Applications/Codescribe.app`;
+  dopiero wtedy odtwórz `/usr/bin/afplay /System/Library/Sounds/Ping.aiff`.
+- Odmów instalacji, gdy trwa nagranie: aktywna sesja nie ma `session_ended`
+  (historyczny unpaired `transcript_sealed` nadal się liczy), trwa sesja `cli_file_verdict`
+  lub aplikacja trzyma blokadę runtime. Nigdy nie ubijaj aplikacji w trakcie take'a.
+- Co najwyżej jeden `make release-standard` (notaryzowany slim DMG) dziennie,
+  gdy bus jest idle. Wypuszczaj tylko na wyraźne polecenie Foundera.
+- Ad-hoc build `/Applications` to nie jest dystrybucyjny DMG. Produkcyjny DMG
+  wymaga podpisu, notaryzacji, sumy kontrolnej, staplingu i `verify-dmg`.
 
 ## Verification
 
-- `make check` — formatting, Clippy, Semgrep, env registry, and gate ledger.
-- `make verify` — hermetic Rust tests and doctests; this is the CI contract.
-- `make test-swift` — bindings/project regeneration plus the Swift suite.
-- Both Swift targets build in Swift 6 language mode with strict concurrency and warnings as errors; warning suppressors are forbidden.
-- Report host-only corpus, real-API, loopback, and parity evidence explicitly;
-  these are bench evidence, not implicit merge gates.
+- `make check` — formatowanie, Clippy, Semgrep, rejestr env i gate ledger.
+- `make verify` — hermetyczne testy Rusta i doctesty (kontrakt CI).
+- `make test-swift` — regeneracja bindingów oraz pakiet testów Swifta (Swift 6 strict concurrency, warnings as errors).
+- Swift targets budują się bez wyciszania ostrzeżeń; warning suppressors są zabronione.
